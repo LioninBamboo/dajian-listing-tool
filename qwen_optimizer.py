@@ -121,39 +121,71 @@ class QwenOptimizer:
    - NEVER include "AquaVerve" in title
    - Use Title Case, no special characters
 
-2. **Description (HTML, MAX 3500 characters):**
-   Use this compact template:
+2. **Description (HTML, MAX 3800 characters):**
+   Create a COMPREHENSIVE, visually appealing product description. Use this enhanced template:
    
    ```html
    <div style="max-width:900px;margin:0 auto;font-family:Arial,sans-serif;color:#1a1a1a;line-height:1.7">
-   <div style="text-align:center;padding:25px 15px;background:#0d1b2a">
-     <h1 style="margin:0;font-size:24px;font-weight:300;letter-spacing:4px;color:#d4af37">AQUAVERVE</h1>
+   
+   <!-- Header -->
+   <div style="text-align:center;padding:30px 15px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">
+     <h1 style="margin:0;font-size:28px;font-weight:300;letter-spacing:6px;color:#d4af37">AQUAVERVE</h1>
+     <p style="margin:8px 0 0;font-size:12px;color:#a0a0a0;letter-spacing:2px">PREMIUM HOME FURNISHINGS</p>
    </div>
-   <div style="background:#f8f9fa;padding:20px;text-align:center">
-     <h2 style="margin:0;font-size:18px;color:#2d3436">[PRODUCT TITLE]</h2>
+   
+   <!-- Product Title -->
+   <div style="background:#f8f9fa;padding:25px;text-align:center;border-bottom:2px solid #d4af37">
+     <h2 style="margin:0;font-size:20px;color:#2d3436;font-weight:500">[FULL PRODUCT TITLE]</h2>
    </div>
-   <div style="padding:20px">
+   
+   <!-- Key Features Section -->
+   <div style="padding:25px">
+     <h3 style="margin:0 0 15px;font-size:16px;color:#0d1b2a;border-left:4px solid #d4af37;padding-left:12px">KEY FEATURES</h3>
      <ul style="margin:0;padding-left:20px;color:#4a4a4a">
-       <li style="margin-bottom:8px">[Feature 1 with benefit]</li>
-       <li style="margin-bottom:8px">[Feature 2 with benefit]</li>
-       <li style="margin-bottom:8px">[Feature 3 with benefit]</li>
-       <li style="margin-bottom:8px">[Feature 4 with benefit]</li>
+       <li style="margin-bottom:10px"><strong>[Feature 1]:</strong> [Detailed benefit explanation]</li>
+       <li style="margin-bottom:10px"><strong>[Feature 2]:</strong> [Detailed benefit explanation]</li>
+       <li style="margin-bottom:10px"><strong>[Feature 3]:</strong> [Detailed benefit explanation]</li>
+       <li style="margin-bottom:10px"><strong>[Feature 4]:</strong> [Detailed benefit explanation]</li>
+       <li style="margin-bottom:10px"><strong>[Feature 5]:</strong> [Detailed benefit explanation]</li>
+       <li style="margin-bottom:10px"><strong>[Feature 6]:</strong> [Detailed benefit explanation]</li>
      </ul>
    </div>
-   <div style="padding:20px;background:#f8f9fa">
-     <h3 style="margin:0 0 15px;font-size:14px;color:#2d3436">SPECIFICATIONS</h3>
+   
+   <!-- Perfect For Section -->
+   <div style="padding:20px 25px;background:#f0f4f8">
+     <h3 style="margin:0 0 12px;font-size:14px;color:#0d1b2a">PERFECT FOR</h3>
+     <p style="margin:0;color:#636e72">[Room types, use cases, who it's ideal for - 2-3 sentences]</p>
+   </div>
+   
+   <!-- Specifications Table -->
+   <div style="padding:25px;background:#fff">
+     <h3 style="margin:0 0 15px;font-size:16px;color:#0d1b2a;border-left:4px solid #d4af37;padding-left:12px">SPECIFICATIONS</h3>
      <table style="width:100%;border-collapse:collapse">
-       <tr><td style="padding:8px;border-bottom:1px solid #ddd;color:#636e72;width:35%">Dimensions (L×W×H)</td><td style="padding:8px;border-bottom:1px solid #ddd">[MUST FILL]</td></tr>
-       <tr><td style="padding:8px;border-bottom:1px solid #ddd;color:#636e72">Weight</td><td style="padding:8px;border-bottom:1px solid #ddd">[MUST FILL]</td></tr>
-       <tr><td style="padding:8px;border-bottom:1px solid #ddd;color:#636e72">Material</td><td style="padding:8px;border-bottom:1px solid #ddd">[Value]</td></tr>
-       <tr><td style="padding:8px;border-bottom:1px solid #ddd;color:#636e72">Color</td><td style="padding:8px;border-bottom:1px solid #ddd">[Value]</td></tr>
+       <tr><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72;width:40%">Overall Dimensions (L×W×H)</td><td style="padding:10px;border-bottom:1px solid #e0e0e0;font-weight:500">[XX × XX × XX inches]</td></tr>
+       <tr style="background:#fafafa"><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72">Weight</td><td style="padding:10px;border-bottom:1px solid #e0e0e0;font-weight:500">[XX lbs]</td></tr>
+       <tr><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72">Material</td><td style="padding:10px;border-bottom:1px solid #e0e0e0">[Materials list]</td></tr>
+       <tr style="background:#fafafa"><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72">Color/Finish</td><td style="padding:10px;border-bottom:1px solid #e0e0e0">[Color details]</td></tr>
+       <tr><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72">Assembly</td><td style="padding:10px;border-bottom:1px solid #e0e0e0">[Required/Not Required, time estimate]</td></tr>
+       <tr style="background:#fafafa"><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72">Load Capacity</td><td style="padding:10px;border-bottom:1px solid #e0e0e0">[XX lbs if applicable]</td></tr>
      </table>
    </div>
-   <div style="text-align:center;padding:15px;background:#0d1b2a">
-     <p style="margin:0;font-size:11px;color:#808080">Ships from CA, USA</p>
+   
+   <!-- What's Included -->
+   <div style="padding:20px 25px;background:#f8f9fa;border-top:1px solid #e0e0e0">
+     <h3 style="margin:0 0 10px;font-size:14px;color:#0d1b2a">PACKAGE INCLUDES</h3>
+     <p style="margin:0;color:#636e72">[1× Main product, hardware kit, assembly instructions, etc.]</p>
    </div>
+   
+   <!-- Footer -->
+   <div style="text-align:center;padding:20px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">
+     <p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">✦ Ships from California, USA ✦</p>
+     <p style="margin:8px 0 0;font-size:11px;color:#808080">Quality Guaranteed • Fast Shipping • Dedicated Support</p>
+   </div>
+   
    </div>
    ```
+   
+   IMPORTANT: Fill ALL sections with meaningful content. Be descriptive and detailed.
 
 3. **Aspects (Item Specifics) - FILL AS MANY AS POSSIBLE:**
    
@@ -284,19 +316,58 @@ class QwenOptimizer:
             if "Country/Region of Manufacture" not in data["aspects"]:
                 data["aspects"]["Country/Region of Manufacture"] = ["China"]
             
-            # Remove categoryId if invalid (let eBay suggest correct one)
+            # Truncate description if too long (eBay limit: 4000 chars)
+            description = data.get("description", "")
+            if len(description) > 3900:
+                print(f"[WARN] Description is {len(description)} chars, truncating to 3900...")
+                # Find the last complete section before 3900 chars
+                description = description[:3900]
+                # Try to close at a natural break point
+                last_div_close = description.rfind("</div>")
+                if last_div_close > 3000:
+                    description = description[:last_div_close + 6]
+                # Ensure proper closing
+                if description.count("<div") > description.count("</div>"):
+                    description += "</div>" * (description.count("<div") - description.count("</div>"))
+                data["description"] = description
+            
+            # Use fallback category based on title keywords
+            title_lower = data.get("title", "").lower()
+            category_fallback = None
+            
+            if "dog" in title_lower and ("crate" in title_lower or "kennel" in title_lower):
+                category_fallback = "177800"  # Cages & Crates
+            elif "cat" in title_lower and "litter" in title_lower:
+                category_fallback = "116363"  # Litter Boxes
+            elif "cat" in title_lower and "tree" in title_lower:
+                category_fallback = "20744"  # Cat Trees
+            elif "vanity" in title_lower or "makeup" in title_lower:
+                category_fallback = "32878"  # Vanities
+            elif "tv stand" in title_lower:
+                category_fallback = "20488"  # TV Stands
+            elif "desk" in title_lower:
+                category_fallback = "88057"  # Desks
+            elif "office chair" in title_lower:
+                category_fallback = "54235"  # Office Chairs
+            elif "bookshelf" in title_lower or "bookcase" in title_lower:
+                category_fallback = "3199"  # Bookcases
+            
+            # Validate or override categoryId
             if data.get("categoryId"):
                 try:
                     cat_id = int(data["categoryId"])
-                    # Valid eBay category IDs are typically 5-6 digits
-                    if cat_id < 10000:
-                        data["categoryId"] = None
+                    # Valid eBay category IDs are typically 6 digits (100000+)
+                    if cat_id < 100000:
+                        data["categoryId"] = category_fallback
                 except:
-                    data["categoryId"] = None
+                    data["categoryId"] = category_fallback
+            else:
+                data["categoryId"] = category_fallback
             
             print(f"✅ Optimization complete. Title: {data.get('title', '')[:50]}...")
             print(f"   Aspects count: {len(data.get('aspects', {}))}")
             print(f"   Description length: {len(data.get('description', ''))}")
+            print(f"   CategoryId: {data.get('categoryId')}")
             
             return data
 

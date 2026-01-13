@@ -12,9 +12,39 @@ import requests
 import json
 import os
 import logging
+import re
+from urllib.parse import urlparse, parse_qs, urlencode
 from typing import Dict, List, Optional, Any
 from src.services.ebay_auth import EbayOAuthService
 from src.services.ebay_policy_manager import EbayPolicyManager
+
+
+def clean_image_url(url: str) -> str:
+    """
+    Clean image URL to get original full-size image
+    Removes resize/thumbnail parameters from CDN URLs
+    """
+    if not url:
+        return url
+    
+    # Remove OSS image processing parameters (阿里云 OSS)
+    # Example: x-oss-process=image%2Fresize%2Cw_74%2Ch_74%2Cm_pad
+    if 'x-oss-process' in url:
+        # Parse URL and remove the x-oss-process parameter
+        if '?' in url:
+            base, query = url.split('?', 1)
+            params = parse_qs(query)
+            # Remove resize parameters
+            params.pop('x-oss-process', None)
+            if params:
+                return base + '?' + urlencode(params, doseq=True)
+            return base
+    
+    # Remove common resize patterns
+    # Pattern: /w_74,h_74/ or similar
+    url = re.sub(r'/w_\d+,h_\d+[^/]*/', '/', url)
+    
+    return url
 
 # Create session with proxy bypass for eBay
 def create_ebay_session():
@@ -77,11 +107,15 @@ class RealEbayClient:
         # eBay limits: title 80 chars, description 4000 chars, images 12, video 1
         description = product.get("description", "")
         
-        # Warn if description is too long (should not happen with updated prompt)
+        # Truncate description if too long (eBay limit: 4000 chars)
         if len(description) > 4000:
-            print(f"[WARN] Description is {len(description)} chars (limit: 4000)")
-            print(f"   This should not happen - Gemini prompt needs adjustment")
-            description = description[:3997] + "..."  # Fallback safety
+            print(f"[WARN] Description is {len(description)} chars (limit: 4000), truncating...")
+            # Find a good breakpoint before 3900 chars to leave room for closing tags
+            description = description[:3900]
+            # Try to close any open HTML tags
+            if "</div>" not in description[-100:]:
+                description = description + "</div>"
+            description = description + "</div>"  # Close outer div
         
         # Validate aspects format (must be list of strings)
         aspects = product.get("aspects", {})
@@ -104,7 +138,8 @@ class RealEbayClient:
             "product": {
                 "title": product["title"][:80],  # eBay limit
                 "description": description,
-                "imageUrls": product.get("image_urls", [])[:12],  # eBay max 12
+                # Clean image URLs to get full-size originals (remove thumbnail params)
+                "imageUrls": [clean_image_url(url) for url in product.get("image_urls", [])[:12]],
                 "aspects": cleaned_aspects
             }
         }
@@ -336,9 +371,9 @@ class RealEbayClient:
     
     def get_category_suggestions(self, title: str, limit: int = 3) -> List[Dict]:
         """
-        Get category suggestions based on title
+        Get category suggestions based on title using Taxonomy API
         
-        GET /commerce/taxonomy/v1/category_tree/0/get_category_suggestions
+        GET /commerce/taxonomy/v1/category_tree/{category_tree_id}/get_category_suggestions
         
         Args:
             title: Product title
@@ -347,20 +382,78 @@ class RealEbayClient:
         Returns:
             List of category suggestions
         """
-        url = f"{self.base_url}/commerce/taxonomy/v1/category_tree/0/get_category_suggestions"
+        # EBAY_US category tree ID
+        category_tree_id = "0"
+        url = f"{self.base_url}/commerce/taxonomy/v1/category_tree/{category_tree_id}/get_category_suggestions"
         
         token = self.oauth.get_valid_token()
         
         headers = {
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+            "Accept": "application/json"
         }
         
         params = {
-            "q": title
+            "q": title[:100]  # Limit query length
         }
         
-        response = self.session.get(url, headers=headers, params=params)
+        try:
+            response = self.session.get(url, headers=headers, params=params)
+            
+            if response.status_code == 403:
+                # Fallback: Return common category mappings
+                logging.warning("[WARN] Taxonomy API 403, using fallback categories")
+                return self._get_fallback_category(title)
+            
+            response.raise_for_status()
+            data = response.json()
+            return data.get("categorySuggestions", [])[:limit]
+            
+        except Exception as e:
+            logging.error(f"[ERROR] Category suggestion failed: {e}")
+            return self._get_fallback_category(title)
+    
+    def _get_fallback_category(self, title: str) -> List[Dict]:
+        """
+        Return fallback category based on keywords in title
+        """
+        title_lower = title.lower()
+        
+        # Common product -> category mappings
+        category_map = {
+            # Pet supplies
+            "dog crate": {"categoryId": "177800", "categoryName": "Cages & Crates"},
+            "dog kennel": {"categoryId": "177800", "categoryName": "Cages & Crates"},
+            "cat litter": {"categoryId": "116363", "categoryName": "Litter Boxes"},
+            "cat tree": {"categoryId": "20744", "categoryName": "Cat Trees & Condos"},
+            "pet bed": {"categoryId": "20743", "categoryName": "Beds"},
+            
+            # Furniture
+            "desk": {"categoryId": "88057", "categoryName": "Desks & Tables"},
+            "vanity": {"categoryId": "32878", "categoryName": "Vanities & Makeup Tables"},
+            "tv stand": {"categoryId": "20488", "categoryName": "TV Stands & Entertainment Units"},
+            "coffee table": {"categoryId": "38204", "categoryName": "Coffee Tables"},
+            "dining table": {"categoryId": "38204", "categoryName": "Tables"},
+            "bookshelf": {"categoryId": "3199", "categoryName": "Bookcases"},
+            "cabinet": {"categoryId": "38221", "categoryName": "Cabinets & Cupboards"},
+            "chair": {"categoryId": "54235", "categoryName": "Chairs"},
+            "sofa": {"categoryId": "38208", "categoryName": "Sofas"},
+            
+            # Office
+            "office chair": {"categoryId": "54235", "categoryName": "Office Chairs"},
+            
+            # Outdoor
+            "patio": {"categoryId": "25863", "categoryName": "Patio & Garden Furniture"},
+            "outdoor": {"categoryId": "25863", "categoryName": "Patio & Garden Furniture"},
+        }
+        
+        # Find matching category
+        for keyword, category in category_map.items():
+            if keyword in title_lower:
+                return [{"category": category}]
+        
+        # Default to Home & Garden -> Furniture
+        return [{"category": {"categoryId": "3197", "categoryName": "Furniture"}}]
         response.raise_for_status()
         
         result = response.json()

@@ -381,31 +381,42 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             category_id=category_id
         )
         
-        # 4. Publish (DISABLED - Save as Draft Mode)
+        # 4. Publish Offer to eBay
         if offer and offer.get("offerId"):
-            # SKIPPING LIVE PUBLISH AS REQUESTED
-            # print(f" Publishing offer {offer['offerId']}...")
-            # listing = ebay_client.publish_offer(offer["offerId"])
+            print(f" Publishing offer {offer['offerId']}...")
+            listing = ebay_client.publish_offer(offer["offerId"])
             
-            product.listing_id = "DRAFT-OFFER-" + offer["offerId"]
-            product.status = "READY_TO_PUBLISH" # specific status for drafts
-            product.published_at = datetime.utcnow() # timestamp of draft creation
-            product.logs = (product.logs or []) + [
-                f"Saved as DRAFT (offer created): {offer['offerId']}",
-                f"Category ID: {category_id}" if category_id else "No category"
-            ]
+            listing_id = listing.get("listingId") if listing else None
+            
+            if listing_id:
+                product.listing_id = listing_id
+                product.status = "PUBLISHED"
+                product.published_at = datetime.utcnow()
+                product.logs = (product.logs or []) + [
+                    f"Published successfully! Listing ID: {listing_id}",
+                    f"Offer ID: {offer['offerId']}",
+                    f"Category ID: {category_id}" if category_id else "No category"
+                ]
+            else:
+                product.listing_id = "DRAFT-OFFER-" + offer["offerId"]
+                product.status = "READY_TO_PUBLISH"
+                product.published_at = datetime.utcnow()
+                product.logs = (product.logs or []) + [
+                    f"Saved as DRAFT (publish failed): {offer['offerId']}",
+                    f"Category ID: {category_id}" if category_id else "No category"
+                ]
             
             if product.videos:
                 product.logs.append("Video upload in progress...")
             
             db.commit()
             
-            print(f"?Product {sku} saved as DRAFT. Offer ID: {offer['offerId']}")
+            print(f"✅ Product {sku} published! Listing ID: {listing_id}")
             
             return {
                 "status": "success",
-                "message": "Product saved as Draft (Offer created)",
-                "listing_id": None, 
+                "message": f"Product published to eBay! Listing ID: {listing_id}" if listing_id else "Saved as Draft",
+                "listing_id": listing_id, 
                 "offer_id": offer["offerId"],
                 "video_processing": bool(product.videos)
             }

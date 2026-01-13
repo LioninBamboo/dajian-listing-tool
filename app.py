@@ -591,10 +591,14 @@ elif page == "📦 产品管理":
                 if product.get('optimization'):
                     with st.popover("📝 优化结果"):
                         opt = product['optimization']
-                        st.write(f"**优化标题**: {opt.get('title', 'N/A')}")
-                        if opt.get('aspects'):
-                            st.write("**Item Specifics**:")
-                            st.json(opt['aspects'])
+                        # Handle both dict and string formats
+                        if isinstance(opt, dict):
+                            st.write(f"**优化标题**: {opt.get('title', 'N/A')}")
+                            if opt.get('aspects'):
+                                st.write("**Item Specifics**:")
+                                st.json(opt['aspects'])
+                        else:
+                            st.write(f"**优化结果**: {str(opt)[:500]}")
 
 # ============================================================================
 # Page: 批量发布
