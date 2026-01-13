@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AquaVerve Collector Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .product-card {
+            transition: transform 0.2s;
+        }
+
+        .product-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
+        }
+
+        .status-badge {
+            font-size: 0.8em;
+        }
+    </style>
+</head>
+
+<body class="bg-light">
+
+    <div class="container py-5">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h1 class="text-primary">🐟 AquaVerve Dashboard</h1>
+            <button onclick="loadProducts()" class="btn btn-outline-primary">🔄 Refresh</button>
+        </div>
+
+        <!-- eBay Authorization Status Banner -->
+        <div id="ebay-auth-banner" class="alert d-none mb-4" role="alert">
+            <div class="d-flex justify-content-between align-items-center">
+                <div>
+                    <strong id="auth-status-text">Checking eBay authorization...</strong>
+                    <span id="auth-environment" class="badge bg-secondary ms-2"></span>
+                </div>
+                <a href="/ebay/auth" class="btn btn-sm btn-primary" id="auth-button" style="display:none;">
+                    🔐 Authorize eBay
+                </a>
+            </div>
+        </div>
+
+        <div id="product-list" class="row g-4">
+            <!-- Products will be injected here -->
+            <div class="col-12 text-center text-muted py-5">
+                <h3>⏳ Loading...</h3>
+            </div>
+        </div>
+    </div>
+
+    <!-- Preview Modal -->
+    <div class="modal fade" id="previewModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">📦 Product Review</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body" id="modal-body">
+                    <!-- Details injected here -->
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+                    <button type="button" class="btn btn-success" id="btn-confirm-upload" onclick="uploadProduct()">🚀
+                        Confirm & Publish</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let currentSku = null;
+        let allProducts = {};
+
+        // Check eBay authorization status
+        async function checkEbayAuth() {
+            try {
+                const res = await fetch("/api/ebay/auth/status");
+                const data = await res.json();
+
+                const banner = document.getElementById("ebay-auth-banner");
+                const statusText = document.getElementById("auth-status-text");
+                const envBadge = document.getElementById("auth-environment");
+                const authButton = document.getElementById("auth-button");
+
+                banner.classList.remove("d-none");
+
+                if (data.authorized) {
+                    banner.classList.remove("alert-warning");
+                    banner.classList.add("alert-success");
+                    statusText.textContent = "✅ eBay Authorized";
+                    envBadge.textContent = data.environment;
+                    envBadge.classList.remove("bg-secondary");
+                    envBadge.classList.add("bg-success");
+                    authButton.style.display = "none";
+                } else {
+                    banner.classList.remove("alert-success");
+                    banner.classList.add("alert-warning");
+                    statusText.textContent = "⚠️ eBay Not Authorized - Listings will fail";
+                    envBadge.textContent = data.environment;
+                    authButton.style.display = "inline-block";
+                }
+            } catch (e) {
+                console.error("Failed to check eBay auth:", e);
+            }
+        }
+
+        async function loadProducts() {
+            try {
+                const res = await fetch("/api/products");
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+                const data = await res.json();
+                const list = document.getElementById("product-list");
+                list.innerHTML = "";
+                allProducts = {};
+
+                // Defensive check
+                if (!data || !data.products || !Array.isArray(data.products)) {
+                    list.innerHTML = `<div class="col-12 text-center text-danger py-5"><h3>⚠️ Invalid API Response</h3><p>Please check server logs.</p></div>`;
+                    console.error("Invalid API response:", data);
+                    return;
+                }
+
+                if (data.products.length === 0) {
+                    list.innerHTML = `<div class="col-12 text-center text-muted py-5"><h3>📭 No products collected yet.</h3><p>Go to GigaB2B and click "Collect"!</p></div>`;
+                    return;
+                }
+
+                data.products.forEach(p => {
+                    allProducts[p.sku] = p;
+                    let statusColor = 'warning';
+                    let statusLabel = p.status;
+                    
+                    if (p.status === 'PUBLISHED') {
+                        statusColor = 'success';
+                        statusLabel = 'PUBLISHED';
+                    } else if (p.status === 'READY_TO_PUBLISH') {
+                        statusColor = 'info';
+                        statusLabel = 'DRAFT SAVED';
+                    } else if (p.status === 'READY') {
+                        statusColor = 'primary';
+                    }
+
+                    // Check video status
+                    const videoStatus = p.optimization && p.optimization.video_status;
+                    const hasVideo = p.videos && p.videos.length > 0;
+                    let videoBadge = '';
+                    if (hasVideo) {
+                        if (videoStatus === 'LIVE') {
+                            videoBadge = '<span class="badge bg-success ms-1">📹 Video Live</span>';
+                        } else if (videoStatus === 'PROCESSING') {
+                            videoBadge = '<span class="badge bg-warning ms-1">📹 Processing...</span>';
+                        } else if (videoStatus === 'FAILED') {
+                            videoBadge = '<span class="badge bg-danger ms-1">📹 Failed</span>';
+                        } else {
+                            videoBadge = '<span class="badge bg-info ms-1">📹 Pending</span>';
+                        }
+                    }
+
+                    const html = `
+                    <div class="col-md-6 col-lg-4">
+                        <div class="card product-card h-100 border-${statusColor}">
+                            <div class="card-header bg-white d-flex justify-content-between">
+                                <div>
+                                    <span class="badge bg-${statusColor}">${statusLabel}</span>
+                                    ${videoBadge}
+                                </div>
+                                <small class="text-muted">${p.sku}</small>
+                            </div>
+                            <img src="${p.images && p.images[0] ? p.images[0] : 'https://via.placeholder.com/200'}" class="card-img-top" style="height: 200px; object-fit: contain; padding: 10px;" alt="...">
+                            <div class="card-body">
+                                <h5 class="card-title text-truncate">${p.title}</h5>
+                                <div class="d-flex justify-content-between mt-3">
+                                    <span class="text-danger fw-bold">Cost: $${p.price}</span>
+                                    <span class="text-success fw-bold">Sell: $${p.suggested_price ? p.suggested_price.toFixed(2) : '...'}</span>
+                                </div>
+                                <div class="mt-2">
+                                    <small>📸 ${p.images ? p.images.length : 0} Images | 🎥 ${p.videos ? p.videos.length : 0} Videos</small>
+                                </div>
+                            </div>
+                            <div class="card-footer bg-white text-end">
+                                <button class="btn btn-sm btn-outline-dark" onclick="openPreview('${p.sku}')">Review & Publish</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                    list.insertAdjacentHTML('beforeend', html);
+                });
+            } catch (e) {
+                console.error("Load products error:", e);
+                const list = document.getElementById("product-list");
+                list.innerHTML = `<div class="col-12 text-center text-danger py-5"><h3>❌ Failed to load products</h3><p>${e.message}</p></div>`;
+            }
+        }
+
+        function openPreview(sku) {
+            currentSku = sku;
+            const item = allProducts[sku];
+            const opt = item.optimization;
+            const costBreakdown = item.cost_breakdown;
+
+            if (!opt || !costBreakdown) {
+                alert("AI Analysis pending... please refresh in a few seconds.");
+                return;
+            }
+
+            const modalBody = document.getElementById("modal-body");
+            modalBody.innerHTML = `
+            <div class="row">
+                <div class="col-md-4 border-end">
+                    <h6>💰 Pricing Breakdown</h6>
+                    <ul class="list-group mb-3 text-sm">
+                        <li class="list-group-item d-flex justify-content-between"><span>Base Cost</span> <span>$${item.price}</span></li>
+                        <li class="list-group-item d-flex justify-content-between"><span>Shipping</span> <span>$${item.shipping}</span></li>
+                        <li class="list-group-item d-flex justify-content-between bg-light"><span>Total Cost (w/ Fees)</span> <span>$${costBreakdown.total_dajian_cost}</span></li>
+                        <li class="list-group-item d-flex justify-content-between fw-bold text-success"><span>Target Price</span> <span>$${item.suggested_price}</span></li>
+                        <li class="list-group-item d-flex justify-content-between text-muted"><span>📍 Ships From</span> <span>California</span></li>
+                    </ul>
+
+                    <h6>✨ AI Title</h6>
+                    <div class="alert alert-info py-2 small">${opt.title}</div>
+                    
+                    <h6>🏷️ Item Specifics (eBay Attributes)</h6>
+                    <div class="border rounded p-2 mb-3" style="max-height: 200px; overflow-y: auto; font-size: 0.85rem;">
+                        ${opt.aspects ? Object.entries(opt.aspects).map(([key, values]) => `
+                            <div class="d-flex border-bottom py-1">
+                                <strong class="text-muted" style="min-width: 120px;">${key}:</strong>
+                                <span>${Array.isArray(values) ? values.join(', ') : values}</span>
+                            </div>
+                        `).join('') : '<span class="text-muted">No attributes generated</span>'}
+                    </div>
+                    
+                    <h6>📸 Media</h6>
+                    <div class="d-flex flex-wrap gap-2">
+                        ${item.images ? item.images.map(img => `<img src="${img}" style="width:50px; height:50px; object-fit:cover; border:1px solid #ddd;">`).slice(0, 8).join('') : ''}
+                    </div>
+                </div>
+                <div class="col-md-8">
+                    <h6>📄 HTML Preview</h6>
+                    <div class="border rounded p-2 bg-white" style="height: 600px; overflow-y: auto;">
+                        ${opt.description}
+                    </div>
+                </div>
+            </div>
+        `;
+
+            const btn = document.getElementById("btn-confirm-upload");
+            if (item.status === 'PUBLISHED') {
+                btn.disabled = true;
+                btn.innerText = "✅ Already Published";
+            } else if (item.status === 'READY_TO_PUBLISH') {
+                btn.disabled = true;
+                btn.innerText = "📝 Saved as Draft";
+            } else {
+                btn.disabled = false;
+                btn.innerText = "🚀 Confirm & Publish";
+            }
+
+            const modal = new bootstrap.Modal(document.getElementById('previewModal'));
+            modal.show();
+        }
+
+        async function uploadProduct() {
+            if (!currentSku) return;
+            const btn = document.getElementById("btn-confirm-upload");
+            btn.disabled = true;
+            btn.innerText = "⏳ Uploading...";
+
+            try {
+                const res = await fetch(`/api/publish/${currentSku}`, { method: "POST" });
+                const data = await res.json();
+
+                if (data.status === "success") {
+                    const msg = data.offer_id ? `🎉 Draft Saved! Offer ID: ${data.offer_id}` : `🎉 Success! Listing ID: ${data.listing_id}`;
+                    alert(msg);
+                    loadProducts(); // Refresh list
+                    bootstrap.Modal.getInstance(document.getElementById('previewModal')).hide();
+                } else {
+                    alert("❌ Error: " + data.message);
+                    btn.disabled = false;
+                    btn.innerText = "🚀 Confirm & Publish";
+                }
+            } catch (e) {
+                alert("Network Error");
+                console.error(e);
+            }
+        }
+
+        // Auto load
+        loadProducts();
+        setInterval(loadProducts, 5000); // Auto refresh status
+    </script>
+</body>
+
+</html>

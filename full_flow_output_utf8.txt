@@ -1,0 +1,16 @@
+﻿=== Starting End-to-End Test (SKU: FLOW-TEST-7913) ===
+
+[1/3] [STEP] Simulating Browser Extension: Collecting FLOW-TEST-7913...
+   [SUCCESS] Product collected: Product collected successfully
+
+[2/3] [WAIT] Waiting for Qwen AI Optimization...
+   Polling status every 2 seconds.....
+   [SUCCESS] AI Optimization Complete!
+   Generated Title: ErgoLife Black Mesh Office Chair with Lumbar Support & Adjustable Height
+   Aspects: {'Brand': ['ErgoLife'], 'Color': ['Black'], 'Material': ['Mesh'], 'Type': ['Office Chair'], 'Features': ['Lumbar Support', 'Adjustable Height', '360 Swivel', 'Breathable Back']}
+
+[3/3] [PUBLISH] Triggering Publish (Save as Draft)...
+   [ERROR] Publish failed: 500
+   Response: {
+  "detail": "Failed to initialize eBay client: 401: eBay not authorized. Please authorize at /ebay/auth"
+}

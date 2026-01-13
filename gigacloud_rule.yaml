@@ -1,0 +1,17 @@
+# 将此规则添加到你的Clash配置文件的rules部分
+
+# 方案1: 让gigacloud.com走代理（推荐先试这个）
+# 在rules列表最前面添加：
+- DOMAIN-SUFFIX,gigacloud.com,PROXY
+
+# 方案2: 如果方案1不行，尝试直连
+# - DOMAIN-SUFFIX,gigacloud.com,DIRECT
+
+# 方案3: 指定具体节点（需要替换成你实际的节点名）
+# - DOMAIN-SUFFIX,gigacloud.com,🇺🇸 美国节点
+
+# 完整示例（添加到你的config.yaml的rules部分）:
+# rules:
+#   - DOMAIN-SUFFIX,gigacloud.com,PROXY  # 添加这一行
+#   - GEOIP,CN,DIRECT
+#   - MATCH,PROXY

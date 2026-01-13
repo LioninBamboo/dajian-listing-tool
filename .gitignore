@@ -1,0 +1,107 @@
+# Environment variables (CRITICAL - contains API keys)
+.env
+.env.local
+.env.*.local
+
+# Database files
+*.db
+ebay_tokens.db
+ebay_collection.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+debug_*.log
+
+# Test files (keep but don't deploy)
+test_*.py
+debug_*.py
+*_test.py
+
+# Temp files
+*.tmp
+*.temp
+.cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Documentation files that may contain sensitive info
+COMPLETION_CHECKLIST.md
+EBAY_AUTH_DIAGNOSIS.md
+EBAY_COUNTRY_FIELD_DIAGNOSIS.txt
+COUNTRY_FIELD_ANALYSIS.md
+DIAGNOSTIC_REPORT.txt
+FINAL_SUMMARY.txt
+NEXT_STEPS.txt
+QUICK_ANSWER.md
+QUICK_STATUS.md
+SOLUTION_SUMMARY.md
+SOLUTION_IMPLEMENTED.md
+START_HERE.md
+STATUS_AND_NEXT_STEPS.md
+READY_TO_PUBLISH.md
+INDEX.md
+OAUTH_*.md
+README_OAUTH_SOLUTION.md
+STREAMLIT_DEPLOY.md
+EBAY_PUBLISH_SUCCESS_GUIDE.md
+ACTION_CHECKLIST.*
+auth_url*.txt
+full_flow_output*.txt
+
+# Documentation files that may contain sensitive info
+COMPLETION_CHECKLIST.md
+*_DIAGNOSIS.md
+*_CHECKLIST.md
+DIAGNOSTIC_*.txt
+FINAL_*.txt
+*_SUMMARY.md
+*_GUIDE.md
+START_HERE.md
+STATUS_*.md
+NEXT_STEPS.txt
+QUICK_*.md
+SOLUTION_*.md
+READY_*.md
+INDEX.md
+auth_url*.txt
+full_flow_output*.txt

@@ -1,0 +1,36 @@
+{
+    "manifest_version": 3,
+    "name": "Dajian Collector & Calculator (AquaVerve)",
+    "version": "1.3",
+    "description": "Collect Dajian/GigaCloud products to eBay (AquaVerve).",
+    "permissions": [
+        "activeTab",
+        "scripting",
+        "storage"
+    ],
+    "host_permissions": [
+        "*://*.dajianyunchang.com/*",
+        "*://*.gigacloudtech.com/*",
+        "*://*.gigab2b.com/*",
+        "http://localhost:8000/*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "action": {
+        "default_popup": "popup.html",
+        "default_title": "Profit Calculator"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "*://*.dajianyunchang.com/*",
+                "*://*.gigacloudtech.com/*",
+                "*://*.gigab2b.com/*"
+            ],
+            "js": [
+                "content.js"
+            ]
+        }
+    ]
+}
