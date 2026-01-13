@@ -1,19 +1,11 @@
-# Core dependencies
-fastapi>=0.109.0
-uvicorn>=0.27.0
-pydantic>=2.5.0
-sqlalchemy>=2.0.25
+# Core dependencies - Streamlit 单一应用
+streamlit>=1.30.0
 python-dotenv>=1.0.0
 requests>=2.31.0
-
-# Streamlit for OAuth callback handler
-streamlit>=1.30.0
+sqlalchemy>=2.0.25
 
 # AI/ML
-google-generativeai>=0.3.0
 openai>=1.0.0
-duckduckgo-search>=4.0.0
 
 # Optional: for development
 pytest>=7.4.3
-pytest-asyncio>=0.21.1
