@@ -264,11 +264,35 @@ class QwenOptimizer:
                 if isinstance(value, str):
                     data["aspects"][key] = [value]
             
+            # CRITICAL: eBay requires single-value fields to have only ONE value
+            # These fields cannot have multiple values
+            single_value_fields = [
+                'Type', 'Brand', 'Material', 'Item Length', 'Item Width', 'Item Height', 
+                'Item Weight', 'Shape', 'Indoor/Outdoor', 'Age Group', 
+                'Country/Region of Manufacture', 'MPN', 'Number of Drawers', 
+                'Number of Items in Set', 'Assembly Required', 'Load Capacity', 
+                'Seating Capacity', 'Number of Shelves', 'Adjustable Height'
+            ]
+            for field in single_value_fields:
+                if field in data["aspects"] and len(data["aspects"][field]) > 1:
+                    # Keep only the first (most relevant) value
+                    data["aspects"][field] = data["aspects"][field][:1]
+            
             # Add standard aspects if missing
             if "MPN" not in data["aspects"]:
                 data["aspects"]["MPN"] = ["Does Not Apply"]
             if "Country/Region of Manufacture" not in data["aspects"]:
                 data["aspects"]["Country/Region of Manufacture"] = ["China"]
+            
+            # Remove categoryId if invalid (let eBay suggest correct one)
+            if data.get("categoryId"):
+                try:
+                    cat_id = int(data["categoryId"])
+                    # Valid eBay category IDs are typically 5-6 digits
+                    if cat_id < 10000:
+                        data["categoryId"] = None
+                except:
+                    data["categoryId"] = None
             
             print(f"✅ Optimization complete. Title: {data.get('title', '')[:50]}...")
             print(f"   Aspects count: {len(data.get('aspects', {}))}")
