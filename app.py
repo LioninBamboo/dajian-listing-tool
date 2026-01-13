@@ -263,7 +263,8 @@ def run_ai_optimization(product: dict) -> dict:
             original_title=product.get('title', ''),
             original_description=product.get('description', ''),
             attributes=product.get('attributes', {}),
-            images=product.get('images', [])
+            images=product.get('images', []),
+            specs=product.get('specs', {})  # 传入规格信息提取尺寸
         )
         return result
     except Exception as e:
