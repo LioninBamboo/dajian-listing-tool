@@ -1,0 +1,15 @@
+{
+  "_comment": "F22 — MI 品类映射配置。顺序敏感：先匹配多词短语，再匹配单词。第一行命中即返回 label。修改后无需重启 FastAPI——下次调用自动按 mtime 重载。",
+  "categories": [
+    {"label": "sectional sofa", "keywords": ["sectional sofa", "modular sofa"]},
+    {"label": "sofa",           "keywords": ["sofa", "couch", "loveseat"]},
+    {"label": "bed",            "keywords": ["bed", "platform", "headboard", "bedframe"]},
+    {"label": "table",          "keywords": ["dining table", "coffee table", "table", "desk", "island"]},
+    {"label": "chair",          "keywords": ["recliner", "armchair", "accent chair", "chair", "stool"]},
+    {"label": "storage",        "keywords": ["dresser", "wardrobe", "cabinet", "bookcase", "shelf"]},
+    {"label": "outdoor",        "keywords": ["patio", "outdoor", "garden", "umbrella"]},
+    {"label": "mattress",       "keywords": ["mattress", "topper"]},
+    {"label": "lighting",       "keywords": ["lamp", "chandelier", "pendant"]}
+  ],
+  "fallback": "other"
+}
