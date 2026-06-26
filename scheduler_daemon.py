@@ -1,0 +1,1670 @@
+#!/usr/bin/env python3
+"""
+Dajian Listing Tool — 后台调度守护进程
+
+解决的问题:
+1. Windows 计划任务 "Interactive Only" → 锁屏就不执行
+2. start.bat 每次运行只执行一次 → 无持续调度
+3. cmd /k + pause → 窗口堆积不关闭
+4. 可在流量高峰前后自动运行关键审计任务
+
+架构:
+- 单个 Python 进程 (无窗口, 无 GUI 依赖)
+- PID 锁文件防重复启动
+- schedule 库内置 cron 调度
+- 每个任务独立 subprocess 执行, 超时自动杀死
+- 健康状态文件 → Dashboard 可读
+- 异常邮件通知
+
+时间表 (可修改):
+  (已停用) 09:00  标题优化 (daily_optimize.py --batch-size 50 --email)
+  09:30  每日全量任务 (daily_tasks.py，含库存同步；智能调价仅周一/周四在此流程中执行)
+  11:30  eBay/GIGA live listing 内容审计 (audit_fix_active_listings.py --live --email)
+  (已移除) 10:00  库存同步 — 已合并到 09:30 daily_tasks.py
+  每2h   自动分析 (daily_tasks.py --analyze-only)
+
+使用:
+  python scheduler_daemon.py          # 前台运行 (调试)
+  pythonw scheduler_daemon.py         # 无窗口后台运行 (推荐)
+  python scheduler_daemon.py --once   # 立即执行全部任务一次后退出
+"""
+import os
+import sys
+import io
+import json
+import time
+import signal
+import logging
+import subprocess
+import argparse
+import atexit
+from pathlib import Path
+from datetime import datetime, timedelta
+
+# Ensure UTF-8 output on Chinese Windows
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    if not _stream:
+        continue
+    try:
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        elif hasattr(_stream, "buffer"):
+            setattr(
+                sys,
+                _stream_name,
+                io.TextIOWrapper(_stream.buffer, encoding="utf-8", errors="replace", line_buffering=True),
+            )
+    except Exception:
+        pass
+
+import schedule
+
+# ─── 配置 ───────────────────────────────────────────────
+PROJECT_ROOT = Path(__file__).parent
+PYTHON_EXE = str(PROJECT_ROOT / '.venv' / 'Scripts' / 'python.exe')
+PID_FILE = PROJECT_ROOT / 'logs' / '_scheduler.pid'
+HEALTH_FILE = PROJECT_ROOT / 'logs' / '_scheduler_health.json'
+LOG_DIR = PROJECT_ROOT / 'logs'
+TASK_LOCK_DIR = LOG_DIR / '_task_locks'
+LOG_DIR.mkdir(exist_ok=True)
+
+# 任务超时 (秒)
+TASK_TIMEOUT = {
+    'title_optimize': 7200,    # 2小时
+    'listing_audit': 10800,    # 3小时 (全量 live eBay/GIGA 内容审计)
+    'daily_tasks': 10800,      # 3小时 (含库存同步 + 智能调价)
+    'auto_analyze': 3600,      # 1小时
+    'smart_reprice': 7200,     # 2小时
+    'ad_restore': 3600,        # 1小时
+    'smart_bid': 3600,         # 1小时
+    'bid_rollback': 3600,      # 1小时
+    'blacklist_cleanup': 1800, # 30分钟
+    'guard_anomaly': 600,      # 10分钟
+    'health_check': 3600,      # 1小时
+    'cro_consume': 5400,
+    'cro_image_refresh': 1800,
+    'cro_fill_specifics': 1800,       # 90分钟 (CRO 队列消费 + 改价)
+    'cro_promote': 1800,
+    'cro_ops_snapshot': 1800,
+}
+
+# Windows execution-state flags. Do not use ES_DISPLAY_REQUIRED: the scheduler
+# should keep background tasks alive without keeping the screen visible.
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+
+# ─── 日志 ─────────────────────────────────────────────────
+log_file = LOG_DIR / 'scheduler_daemon.log'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(log_file, encoding='utf-8', mode='a'),
+        logging.StreamHandler(),
+    ]
+)
+logger = logging.getLogger('scheduler')
+
+# ─── PID 锁 ──────────────────────────────────────────────
+
+_mutex_handle = None  # 保持 mutex 生命周期
+IS_DAEMON_PROCESS = False
+
+
+def _windows_awake_flags(enable: bool) -> int:
+    """Build SetThreadExecutionState flags for background scheduler work."""
+    flags = ES_CONTINUOUS
+    if enable:
+        flags |= ES_SYSTEM_REQUIRED
+    return flags
+
+
+def request_system_awake(enable: bool = True, set_thread_execution_state=None) -> bool:
+    """Prevent Windows idle sleep while still allowing the display to turn off."""
+    if sys.platform != 'win32':
+        return False
+
+    try:
+        if set_thread_execution_state is None:
+            import ctypes
+            set_thread_execution_state = ctypes.windll.kernel32.SetThreadExecutionState
+
+        result = set_thread_execution_state(_windows_awake_flags(enable))
+        if result == 0:
+            action = "设置" if enable else "释放"
+            logger.warning(f"{action} Windows 保持唤醒状态失败 (SetThreadExecutionState returned 0)")
+            return False
+
+        if enable:
+            logger.info("已请求 Windows 保持系统运行（允许屏幕关闭）")
+        else:
+            logger.info("已释放 Windows 保持系统运行请求")
+        return True
+    except Exception as e:
+        action = "设置" if enable else "释放"
+        logger.warning(f"{action} Windows 保持唤醒状态异常: {e}")
+        return False
+
+
+def ensure_pid_file() -> None:
+    """确保 PID 文件存在且与当前进程一致。"""
+    try:
+        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        current_pid = str(os.getpid())
+        existing_pid = PID_FILE.read_text().strip() if PID_FILE.exists() else ""
+        if existing_pid != current_pid:
+            PID_FILE.write_text(current_pid, encoding='utf-8')
+    except Exception as e:
+        logger.warning(f"无法写入 PID 文件: {e}")
+
+def acquire_lock():
+    """获取 PID 锁, 防止守护进程重复启动 (Windows Named Mutex)"""
+    global _mutex_handle
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+
+    # 使用 Windows Named Mutex — 内核级互斥，彻底防止竞争
+    MUTEX_NAME = "Global\\DajianSchedulerDaemonMutex"
+    ERROR_ALREADY_EXISTS = 183
+
+    _mutex_handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    last_err = kernel32.GetLastError()
+
+    if last_err == ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(_mutex_handle)
+        _mutex_handle = None
+        logger.error("调度器已在运行 (另一个实例持有 mutex), 退出")
+        sys.exit(1)
+
+    if not _mutex_handle:
+        logger.error(f"无法创建 mutex (error={last_err}), 退出")
+        sys.exit(1)
+
+    # 同时写入 PID 文件 (用于监控/日志)
+    ensure_pid_file()
+    atexit.register(release_lock)
+    logger.info(f"PID 锁已获取: {os.getpid()} (mutex)")
+
+
+def release_lock():
+    """释放 PID 锁和 mutex"""
+    global _mutex_handle
+    try:
+        PID_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if _mutex_handle:
+        import ctypes
+        ctypes.windll.kernel32.ReleaseMutex(_mutex_handle)
+        ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+        _mutex_handle = None
+
+
+def _is_pid_alive(pid):
+    """检查 PID 是否存活 (Windows 兼容)"""
+    def _tasklist_pid_alive() -> bool:
+        try:
+            result = subprocess.run(
+                ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
+                capture_output=True, text=True, timeout=5
+            )
+            return str(pid) in result.stdout
+        except Exception:
+            return False
+
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return _tasklist_pid_alive()
+    except Exception:
+        return _tasklist_pid_alive()
+
+
+# ─── 健康状态 ─────────────────────────────────────────────
+
+def update_health(task_name, status, message='', duration_sec=0.0):
+    """更新健康状态文件 (Dashboard/监控用)"""
+    if IS_DAEMON_PROCESS:
+        ensure_pid_file()
+    try:
+        health = {}
+        if HEALTH_FILE.exists():
+            health = json.loads(HEALTH_FILE.read_text(encoding='utf-8'))
+    except Exception:
+        health = {}
+
+    if IS_DAEMON_PROCESS:
+        health['daemon_pid'] = os.getpid()
+        health['daemon_alive_at'] = datetime.now().isoformat()
+    health.setdefault('tasks', {})
+    health['tasks'][task_name] = {
+        'status': status,       # 'running', 'success', 'failed', 'timeout'
+        'message': message[:500],
+        'at': datetime.now().isoformat(),
+        'duration_sec': round(duration_sec, 1),
+    }
+
+    HEALTH_FILE.write_text(json.dumps(health, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def _get_task_health(task_name):
+    """读取某任务的最新健康状态。"""
+    try:
+        if not HEALTH_FILE.exists():
+            return {}
+        health = json.loads(HEALTH_FILE.read_text(encoding='utf-8'))
+        if task_name == 'mi_self_check':
+            info = dict(health.get('mi_self_check') or {})
+            if info and 'at' not in info:
+                info['at'] = info.get('checked_at')
+            return info
+        return health.get('tasks', {}).get(task_name, {}) or {}
+    except Exception:
+        return {}
+
+
+def _task_succeeded_today(task_name, now=None):
+    """判断任务今天是否已经成功执行过（用于防止重复触发）。"""
+    now = now or datetime.now()
+    info = _get_task_health(task_name)
+    if not info:
+        return False
+
+    status = str(info.get('status', '')).lower()
+    at = info.get('at')
+    if status not in {'success', 'ok'} or not at:
+        return False
+
+    try:
+        last_dt = datetime.fromisoformat(at)
+    except (TypeError, ValueError):
+        return False
+
+    return last_dt.date() == now.date()
+
+
+def _iso_at_or_none(value):
+    try:
+        if not value:
+            return None
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _task_in_progress_or_recovered_today(task_name, scheduled_dt, now=None):
+    """Return True when a task is already running or a watchdog recovery was launched today."""
+    now = now or datetime.now()
+    info = _get_task_health(task_name)
+    status = str(info.get('status', '')).lower()
+    at_dt = _iso_at_or_none(info.get('at'))
+    if (
+        status in {'running', 'recovering'}
+        and at_dt is not None
+        and at_dt.date() == now.date()
+        and at_dt >= scheduled_dt
+    ):
+        return True
+
+    try:
+        if not HEALTH_FILE.exists():
+            return False
+        health = json.loads(HEALTH_FILE.read_text(encoding='utf-8'))
+        recovery = (health.get('watchdog_recovery') or {}).get(task_name) or {}
+        recovery_dt = _iso_at_or_none(recovery.get('at'))
+        return (
+            recovery_dt is not None
+            and recovery_dt.date() == now.date()
+            and recovery_dt >= scheduled_dt
+        )
+    except Exception:
+        return False
+
+
+def _task_lock_path(task_name):
+    safe_name = ''.join(ch if ch.isalnum() or ch in {'-', '_'} else '_' for ch in str(task_name))
+    return TASK_LOCK_DIR / f'{safe_name}.lock'
+
+
+def _task_lock_is_stale(lock_info, timeout_sec, now=None):
+    now = now or datetime.now()
+    pid = 0
+    try:
+        pid = int(lock_info.get('pid') or 0)
+    except (TypeError, ValueError):
+        pid = 0
+
+    started_at = _iso_at_or_none(lock_info.get('started_at'))
+    if pid and not _is_pid_alive(pid):
+        return True
+    if started_at is None:
+        return not pid
+
+    max_age = timedelta(seconds=max(int(timeout_sec) + 600, 1800))
+    if now - started_at > max_age:
+        return True
+    return False
+
+
+def acquire_task_run_lock(task_name, timeout_sec):
+    """Acquire an atomic per-task lock so recovery races cannot launch duplicates."""
+    TASK_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _task_lock_path(task_name)
+    lock_info = {
+        'task_name': str(task_name),
+        'pid': os.getpid(),
+        'started_at': datetime.now().isoformat(),
+        'timeout_sec': int(timeout_sec),
+    }
+
+    for _ in range(3):
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(lock_info, f, ensure_ascii=False, indent=2)
+            return True
+        except FileExistsError:
+            try:
+                existing = json.loads(lock_path.read_text(encoding='utf-8'))
+            except Exception:
+                existing = {}
+            if _task_lock_is_stale(existing, timeout_sec):
+                try:
+                    lock_path.unlink()
+                    continue
+                except FileNotFoundError:
+                    continue
+                except Exception as e:
+                    logger.warning(f"无法清理陈旧任务锁 {task_name}: {e}")
+                    return False
+            logger.info(
+                f"↪ 跳过任务 {task_name}: 已有实例或补跑锁 "
+                f"(pid={existing.get('pid')}, started_at={existing.get('started_at')})"
+            )
+            return False
+        except Exception as e:
+            logger.warning(f"任务锁创建失败 {task_name}: {e}; 继续执行以避免漏跑")
+            return True
+    return False
+
+
+def release_task_run_lock(task_name):
+    lock_path = _task_lock_path(task_name)
+    try:
+        if not lock_path.exists():
+            return
+        existing = json.loads(lock_path.read_text(encoding='utf-8'))
+        if int(existing.get('pid') or 0) == os.getpid():
+            lock_path.unlink()
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        logger.warning(f"释放任务锁失败 {task_name}: {e}")
+
+
+def clear_stale_running_tasks():
+    """Mark leftover running task states as interrupted after a daemon restart."""
+    try:
+        if not HEALTH_FILE.exists():
+            return
+        health = json.loads(HEALTH_FILE.read_text(encoding='utf-8'))
+        tasks = health.get('tasks', {})
+        now_iso = datetime.now().isoformat()
+        changed = False
+        for name, info in tasks.items():
+            if name.startswith('_'):
+                continue
+            if info.get('status') == 'running':
+                info['status'] = 'interrupted'
+                info['message'] = f"Marked stale after daemon restart at {now_iso}"
+                info['at'] = now_iso
+                info['duration_sec'] = 0.0
+                changed = True
+        if changed:
+            HEALTH_FILE.write_text(json.dumps(health, ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception as e:
+        logger.warning(f"清理陈旧任务状态失败: {e}")
+
+
+# ─── 任务执行器 ──────────────────────────────────────────
+
+def run_task(task_name, cmd_args, timeout_sec=3600):
+    """
+    在子进程中执行任务
+
+    - 完全独立进程 (不占用守护进程的内存/状态)
+    - 超时自动杀死
+    - 返回 (success, message)
+    """
+    full_cmd = [PYTHON_EXE] + cmd_args
+    cmd_str = ' '.join(cmd_args)
+    logger.info(f"{'='*50}")
+    logger.info(f"▶ 启动任务: {task_name}")
+    logger.info(f"  命令: {cmd_str}")
+    logger.info(f"  超时: {timeout_sec}s")
+
+    if not acquire_task_run_lock(task_name, timeout_sec):
+        return True, 'Skipped (already running or recovering)'
+
+    update_health(task_name, 'running', f'Started: {cmd_str}')
+    start_time = time.time()
+
+    # 任务级日志文件
+    task_log = LOG_DIR / f'_task_{task_name}.log'
+
+    try:
+        with open(task_log, 'w', encoding='utf-8') as f:
+            proc = subprocess.Popen(
+                full_cmd,
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                cwd=str(PROJECT_ROOT),
+                env={**os.environ, 'PYTHONIOENCODING': 'utf-8'},
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
+            )
+
+        # 轮询等待，避免长任务期间心跳和 PID 文件完全停更
+        while True:
+            returncode = proc.poll()
+            duration = time.time() - start_time
+
+            if returncode is not None:
+                break
+
+            if duration >= timeout_sec:
+                logger.error(f"⏰ 任务超时 ({timeout_sec}s): {task_name}")
+                proc.kill()
+                proc.wait(timeout=10)
+                update_health(task_name, 'timeout', f'Killed after {timeout_sec}s', duration)
+                update_health('_daemon', 'running', f'Timeout while waiting for {task_name}')
+                _notify_failure(task_name, f'任务超时 ({timeout_sec}秒), 已强制终止')
+                return False, f'Timeout after {timeout_sec}s'
+
+            update_health('_daemon', 'running', f'Running {task_name} | elapsed {duration:.0f}s')
+            time.sleep(30)
+
+        duration = time.time() - start_time
+
+        if returncode == 0:
+            logger.info(f"✅ 任务完成: {task_name} ({duration:.0f}s)")
+            update_health(task_name, 'success', f'OK in {duration:.0f}s', duration)
+            return True, f'Success in {duration:.0f}s'
+        else:
+            # 读取最后几行日志
+            tail = _tail_file(task_log, 5)
+            msg = f'Exit code {returncode}: {tail}'
+            logger.error(f"❌ 任务失败: {task_name} (code={returncode}, {duration:.0f}s)")
+            logger.error(f"  最后输出: {tail}")
+            update_health(task_name, 'failed', msg, duration)
+            _notify_failure(task_name, msg)
+            return False, msg
+
+    except Exception as e:
+        duration = time.time() - start_time
+        msg = f'Exception: {e}'
+        logger.error(f"❌ 任务异常: {task_name}: {e}")
+        update_health(task_name, 'failed', msg, duration)
+        _notify_failure(task_name, msg)
+        return False, msg
+    finally:
+        release_task_run_lock(task_name)
+
+
+def _tail_file(path, n=5):
+    """读取文件最后 n 行"""
+    try:
+        lines = Path(path).read_text(encoding='utf-8', errors='replace').strip().split('\n')
+        return '\n'.join(lines[-n:])
+    except Exception:
+        return '(无法读取日志)'
+
+
+def _notify_failure(task_name, error_msg):
+    """任务失败时发送简短通知邮件"""
+    try:
+        from src.utils.email_sender import send_email
+        now = datetime.now().strftime('%Y-%m-%d %H:%M')
+        html = f"""
+        <h3 style="color:red;">⚠️ Dajian 任务失败: {task_name}</h3>
+        <p>时间: {now}</p>
+        <pre style="background:#f5f5f5;padding:10px;">{error_msg[:1000]}</pre>
+        <p style="color:#999;font-size:12px;">来自 scheduler_daemon.py</p>
+        """
+        send_email(f"⚠️ {task_name} 失败 - {now}", html)
+    except Exception as e:
+        logger.warning(f"失败通知邮件发送失败: {e}")
+
+
+# ─── 预定任务函数 ─────────────────────────────────────────
+
+def task_title_optimize():
+    """标题优化任务已硬停，避免继续向 live listing 写入未经审计的新事实。"""
+    message = 'Disabled: title optimization is stopped pending hallucination audit'
+    logger.warning("↪ 跳过标题优化: %s", message)
+    update_health('title_optimize', 'success', message)
+    return True, message
+
+
+def task_listing_audit():
+    """只读 eBay/GIGA live listing 内容审计。"""
+    if _task_succeeded_today('listing_audit'):
+        logger.info("↪ 跳过刊登内容审计: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+
+    run_task(
+        'listing_audit',
+        [
+            str(PROJECT_ROOT / 'scripts' / 'audit_fix_active_listings.py'),
+            '--live',
+            '--email',
+            '--record-clean-state',
+            '--exit-zero-on-issues',
+        ],
+        timeout_sec=TASK_TIMEOUT['listing_audit'],
+    )
+
+
+def task_daily_full():
+    """每日全量任务 (分析 + 库存同步 + 报告；智能调价仅周一/周四执行)"""
+    if _task_succeeded_today('daily_tasks'):
+        logger.info("↪ 跳过每日全量任务: 今日已成功执行，避免重复发送每日汇总")
+        return True, 'Skipped (already succeeded today)'
+
+    run_task(
+        'daily_tasks',
+        [str(PROJECT_ROOT / 'daily_tasks.py')],
+        timeout_sec=TASK_TIMEOUT['daily_tasks'],
+    )
+
+
+# task_inventory_sync() 已移除 — daily_tasks.py (09:30) 已包含库存同步+邮件报告
+# 推荐单独入口: python daily_tasks.py --sync-only
+# 仅调试时再用: python src/plugins/inventory_sync/daily_sync.py --email
+
+
+def task_auto_analyze():
+    """自动分析采集产品"""
+    run_task(
+        'auto_analyze',
+        [str(PROJECT_ROOT / 'daily_tasks.py'), '--analyze-only'],
+        timeout_sec=TASK_TIMEOUT['auto_analyze'],
+    )
+
+
+def task_smart_reprice():
+    """手动智能重新定价（保留给人工触发，不再定时调度）"""
+    run_task(
+        'smart_reprice',
+        [str(PROJECT_ROOT / 'scripts' / 'batch_smart_reprice.py'), '--apply', '--email'],
+        timeout_sec=TASK_TIMEOUT['smart_reprice'],
+    )
+
+
+def task_health_check():
+    """每日销售健康诊断 (含自动修复定价偏高/低转化)"""
+    if _task_succeeded_today('health_check'):
+        logger.info("↪ 跳过销售健康诊断: 今日已成功执行，避免重复发送健康报告")
+        return True, 'Skipped (already succeeded today)'
+
+    run_task(
+        'health_check',
+        [str(PROJECT_ROOT / 'scripts' / 'sales_health_check.py'), '--auto-fix', '--email'],
+        timeout_sec=TASK_TIMEOUT['health_check'],
+    )
+
+
+def task_promotion_rotate():
+    """自动轮转 5% 店铺促销 (2天一期)"""
+    run_task(
+        'promotion_rotate',
+        [str(PROJECT_ROOT / 'scripts' / 'auto_rotate_promotions.py')],
+        timeout_sec=1800,
+    )
+
+
+def _daily_tasks_ready_for_cro(task_label):
+    if _task_succeeded_today('daily_tasks'):
+        return True
+    logger.info(f"↪ 跳过 {task_label}: daily_tasks 尚未成功完成，等待 CRO 队列生成")
+    return False
+
+
+def task_cro_consume():
+    """CRO P1 改价消费 — 把 daily_tasks 09:30 入队的 P1 price_drop 真的执行掉.
+
+    依赖 09:30 daily_tasks 完成 (run_cro_diagnose 写队列), 故安排 10:00 触发.
+    成功改价的 SKU 会被自动 mark_done.
+    """
+    if _task_succeeded_today('cro_consume'):
+        logger.info("↪ 跳过 CRO 队列消费: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    if not _daily_tasks_ready_for_cro('CRO 队列消费'):
+        return True, 'Skipped (waiting for daily_tasks)'
+
+    run_task(
+        'cro_consume',
+        [str(PROJECT_ROOT / 'scripts' / 'batch_smart_reprice.py'),
+         '--apply', '--from-cro-queue', '--email'],
+        timeout_sec=TASK_TIMEOUT['cro_consume'],
+    )
+
+
+def task_cro_image_refresh():
+    """CRO P1 image_refresh 消费 — 把 low_ctr 的产品主图重拼为本地完整多图."""
+    if _task_succeeded_today('cro_image_refresh'):
+        logger.info("↪ 跳过 CRO 图片刷新: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    if not _daily_tasks_ready_for_cro('CRO 图片刷新'):
+        return True, 'Skipped (waiting for daily_tasks)'
+    run_task(
+        'cro_image_refresh',
+        [str(PROJECT_ROOT / 'scripts' / 'cro_image_refresh.py'),
+         '--apply', '--limit', '80', '--email'],
+        timeout_sec=TASK_TIMEOUT['cro_image_refresh'],
+    )
+
+
+def task_cro_fill_specifics():
+    """CRO P1 fill_specifics 消费 — 给 low_cvr 产品补品类必填 aspects."""
+    if _task_succeeded_today('cro_fill_specifics'):
+        logger.info("↪ 跳过 CRO 补 specifics: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    if not _daily_tasks_ready_for_cro('CRO 补 specifics'):
+        return True, 'Skipped (waiting for daily_tasks)'
+    run_task(
+        'cro_fill_specifics',
+        [str(PROJECT_ROOT / 'scripts' / 'cro_fill_specifics.py'),
+         '--apply', '--limit', '80', '--email'],
+        timeout_sec=TASK_TIMEOUT['cro_fill_specifics'],
+    )
+
+
+def task_cro_ops_snapshot():
+    """Weekly CRO ops/governance snapshot with safe DB restore drill."""
+    if _task_succeeded_today('cro_ops_snapshot'):
+        logger.info("↪ 跳过 CRO ops 快照: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    run_task(
+        'cro_ops_snapshot',
+        [str(PROJECT_ROOT / 'scripts' / 'cro_ops_snapshot.py'),
+         '--output', str(PROJECT_ROOT / 'logs' / 'cro_ops_snapshot.json'),
+         '--brief', str(PROJECT_ROOT / 'logs' / 'cro_weekly_improvement.md'),
+         '--capacity-sample-log', str(PROJECT_ROOT / 'logs' / 'cro_capacity_samples.jsonl'),
+         '--record-capacity-sample',
+         '--dr-drill'],
+        timeout_sec=TASK_TIMEOUT['cro_ops_snapshot'],
+    )
+
+
+def task_cro_sentinel():
+    """CRO 北极星指标告警 — 7d avg 跌 ≥ 5 分 或 当日恶化占比 ≥ 20% 时邮件.
+
+    安排 10:30 (在 cro_consume 之后), 避开高峰邮件.
+    """
+    if _task_succeeded_today('cro_sentinel'):
+        logger.info("↪ 跳过 CRO 北极星告警: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    if not _daily_tasks_ready_for_cro('CRO 北极星告警'):
+        return True, 'Skipped (waiting for daily_tasks)'
+    run_task(
+        'cro_sentinel',
+        [str(PROJECT_ROOT / 'scripts' / 'cro_sentinel.py'), '--email'],
+        timeout_sec=600,
+    )
+
+
+def task_cro_learn_thresholds():
+    """周日 02:00 — S21 阶段 1: 按 categoryId 学到 cro_thresholds_pending (不动生产)."""
+    run_task(
+        'cro_learn_thresholds',
+        [str(PROJECT_ROOT / 'src' / 'services' / 'cro_thresholds.py'), '--pending'],
+        timeout_sec=900,
+    )
+
+
+def task_cro_promote_thresholds():
+    """周日 02:30 — S21 阶段 2+3: shadow 守门 + 安全则把 pending 推到生产."""
+    if _task_succeeded_today('cro_promote_thresholds'):
+        logger.info("↪ 跳过阈值 promote: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    run_task(
+        'cro_promote_thresholds',
+        [str(PROJECT_ROOT / 'scripts' / 'cro_promote_thresholds.py'),
+         '--apply', '--email'],
+        timeout_sec=900,
+    )
+
+
+def task_cro_monthly_report():
+    """S22 — 每月 1 日 09:45 跑 effect_audit + 阈值反哺融合月报."""
+    if datetime.now().date().day != 1:
+        update_health('cro_monthly_report', 'success', 'Skipped (not month start)')
+        return True, 'Skipped (not month start)'
+    if _task_succeeded_today('cro_monthly_report'):
+        return True, 'Skipped (already succeeded today)'
+    run_task(
+        'cro_monthly_report',
+        [str(PROJECT_ROOT / 'scripts' / 'cro_effect_audit.py'),
+         '--monthly', '--email'],
+        timeout_sec=1200,
+    )
+
+
+def task_cro_promote():
+    """S23 — 每日执行 CRO promote 队列: 已推广则提 bid, 未推广则安全开广告."""
+    if _task_succeeded_today('cro_promote'):
+        return True, 'Skipped (already succeeded today)'
+    if not _daily_tasks_ready_for_cro('CRO 推广执行'):
+        return True, 'Skipped (waiting for daily_tasks)'
+    run_task(
+        'cro_promote',
+        [str(PROJECT_ROOT / 'scripts' / 'cro_promote.py'),
+         '--apply', '--limit', '200', '--email'],
+        timeout_sec=TASK_TIMEOUT['cro_promote'],
+    )
+
+
+def task_cro_delist_email():
+    """S25 — 周一 11:00: 给运营发死链下架候选 + magic-link (人工确认才下架)."""
+    if _task_succeeded_today('cro_delist_email'):
+        return True, 'Skipped (already succeeded today)'
+    base = os.environ.get('CRO_DELIST_BASE_URL', 'http://localhost:8000')
+    run_task(
+        'cro_delist_email',
+        [str(PROJECT_ROOT / 'scripts' / 'cro_delist.py'),
+         '--base-url', base, '--limit', '50', '--email'],
+        timeout_sec=900,
+    )
+
+
+def task_ad_restore():
+    """广告自动恢复审计 — 把因触底被关掉的广告在条件改善后重新打开 (Phase 3 闭环).
+
+    依赖 09:30 daily_tasks 的跟价完成, 故安排在 09:40.
+    """
+    if _task_succeeded_today('ad_restore'):
+        logger.info("↪ 跳过广告恢复审计: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+
+    run_task(
+        'ad_restore',
+        [str(PROJECT_ROOT / 'scripts' / 'ad_restore_audit.py'), '--apply', '--email'],
+        timeout_sec=TASK_TIMEOUT['ad_restore'],
+    )
+
+
+def task_smart_bid():
+    """分级动态 bid 优化 (P3) — 高 CTR/转化 ↑ bid, 低 CTR/零销 ↓ bid.
+
+    每条调整都被 PricingEngine 守门员复核 — 现价不支持则取可支持的最大 bid.
+    每周二 10:00 运行, 给性能数据足够一周的样本量.
+    """
+    if _task_succeeded_today('smart_bid'):
+        logger.info("↪ 跳过智能 Bid: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+
+    run_task(
+        'smart_bid',
+        [str(PROJECT_ROOT / 'scripts' / 'batch_smart_bid.py'), '--apply', '--email'],
+        timeout_sec=TASK_TIMEOUT['smart_bid'],
+    )
+
+
+def task_bid_rollback():
+    """P5: smart_bid 7 天后回溯 — 提升 bid 未见效果则回退到 5%."""
+    if _task_succeeded_today('bid_rollback'):
+        logger.info("↪ 跳过 Bid 回溯: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    run_task(
+        'bid_rollback',
+        [str(PROJECT_ROOT / 'scripts' / 'bid_rollback_audit.py'), '--apply', '--email'],
+        timeout_sec=TASK_TIMEOUT['bid_rollback'],
+    )
+
+
+def task_blacklist_cleanup():
+    """P7: 广告黑名单自动清理 — 连续 7 天现价支持 5% 广告则自动移出 (仅 auto)."""
+    if _task_succeeded_today('blacklist_cleanup'):
+        logger.info("↪ 跳过黑名单清理: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    run_task(
+        'blacklist_cleanup',
+        [str(PROJECT_ROOT / 'scripts' / 'ad_blacklist_cleanup.py'), '--apply', '--email'],
+        timeout_sec=TASK_TIMEOUT['blacklist_cleanup'],
+    )
+
+
+def task_guard_anomaly():
+    """P8: 守门员异常告警 — 当日 reject/关广告数远高于 7 日均值则立即邮件."""
+    # 不查 _task_succeeded_today: 脚本内部用 logs/guard_anomaly_<date>.json 自防重
+    run_task(
+        'guard_anomaly',
+        [str(PROJECT_ROOT / 'scripts' / 'guard_anomaly_alert.py')],
+        timeout_sec=TASK_TIMEOUT['guard_anomaly'],
+    )
+
+
+# ─── F32: MI 流水线自检 ──────────────────────────────────
+
+def check_mi_pipeline_health(reports_dir: Path = None,
+                              now: datetime = None,
+                              today_only: bool = True) -> dict:
+    """F32 — 体检 MI 流水线四件套：
+    1) 当日是否有新快照 mi_opportunities_*.json
+    2) 当日是否有日报归档 mi_digest_YYYYMMDD.html
+    3) 长周期 trend 历史 mi_long_window_history.json 最新一条是否为今日
+    4) 屏蔽名单文件是否可读
+
+    返回 {ok: bool, status: str, severity: str, issues: [..], details: {...}}。
+    """
+    rdir = reports_dir or (PROJECT_ROOT / 'reports')
+    ts = now or datetime.now()
+    today = ts.strftime('%Y%m%d')
+    issues: list = []
+    details: dict = {}
+
+    if not rdir.exists():
+        return {
+            "ok": False,
+            "status": "fail",
+            "severity": "high",
+            "issues": ["reports/ 目录不存在"],
+            "details": {},
+        }
+
+    # 1) 当日快照
+    snaps_today = list(rdir.glob(f"mi_opportunities_{today}_*.json"))
+    details["snapshots_today"] = len(snaps_today)
+    if today_only and not snaps_today:
+        issues.append(f"当日 ({today}) 无 MI 快照，run_mi_snapshot 可能未运行")
+
+    # 2) 当日日报归档
+    digest = rdir / f"mi_digest_{today}.html"
+    details["digest_today_exists"] = digest.exists()
+    if today_only and not digest.exists():
+        issues.append(f"当日日报归档缺失: mi_digest_{today}.html (F25)")
+    elif digest.exists():
+        details["digest_references_today_snapshot"] = None
+        details["digest_snapshot_name"] = None
+        details["digest_count_matches_snapshot"] = None
+        try:
+            import re
+
+            digest_html = digest.read_text(encoding='utf-8')
+            matched_snapshot = None
+            for snap in sorted(snaps_today, key=lambda path: path.stat().st_mtime, reverse=True):
+                if snap.name in digest_html:
+                    matched_snapshot = snap
+                    break
+
+            details["digest_references_today_snapshot"] = matched_snapshot is not None
+            if today_only and snaps_today and not matched_snapshot:
+                issues.append("当日日报归档内容未引用任何当日快照，可能被覆盖、过期或被测试样例污染")
+
+            if matched_snapshot is not None:
+                details["digest_snapshot_name"] = matched_snapshot.name
+                try:
+                    snap_data = json.loads(matched_snapshot.read_text(encoding='utf-8'))
+                    expected_count = len(snap_data.get("opportunities") or [])
+                    details["digest_snapshot_opportunity_count"] = expected_count
+                    count_pattern = re.compile(
+                        rf"共发现\s*<b>\s*{expected_count}\s*</b>\s*条机会"
+                    )
+                    details["digest_count_matches_snapshot"] = bool(
+                        count_pattern.search(digest_html)
+                    )
+                    if today_only and not details["digest_count_matches_snapshot"]:
+                        issues.append(
+                            f"当日日报归档机会数与快照 {matched_snapshot.name} 不一致"
+                        )
+                except Exception as e:
+                    details["digest_snapshot_opportunity_count"] = None
+                    details["digest_count_matches_snapshot"] = None
+                    issues.append(f"当日快照不可读，无法校验 digest 内容: {e}")
+        except Exception as e:
+            details["digest_references_today_snapshot"] = None
+            details["digest_snapshot_name"] = None
+            details["digest_count_matches_snapshot"] = None
+            issues.append(f"日报归档不可读: {e}")
+
+    # 3) 长周期 trend 历史
+    trend_path = rdir / "mi_long_window_history.json"
+    details["trend_history_exists"] = trend_path.exists()
+    if trend_path.exists():
+        try:
+            data = json.loads(trend_path.read_text(encoding='utf-8'))
+            if not isinstance(data, list):
+                issues.append("trend 文件结构异常: 期望为 list")
+                details["trend_entry_count"] = None
+                details["trend_latest_date"] = None
+            elif not data:
+                details["trend_entry_count"] = 0
+                details["trend_latest_date"] = None
+                if today_only:
+                    issues.append("长周期 trend 历史为空 (F27)")
+            else:
+                details["trend_entry_count"] = len(data)
+                latest = data[-1].get("date")
+                details["trend_latest_date"] = latest
+                if today_only and latest != ts.strftime('%Y-%m-%d'):
+                    issues.append(
+                        f"长周期 trend 最新日期为 {latest}，非今日 (F27)"
+                    )
+        except Exception as e:
+            issues.append(f"trend 文件不可读: {e}")
+            details["trend_entry_count"] = None
+            details["trend_latest_date"] = None
+    else:
+        details["trend_entry_count"] = 0
+        details["trend_latest_date"] = None
+        if today_only:
+            issues.append("长周期 trend 历史缺失: mi_long_window_history.json (F27)")
+
+    # 4) 屏蔽名单
+    bl_path = rdir / "mi_blacklist.json"
+    if bl_path.exists():
+        try:
+            json.loads(bl_path.read_text(encoding='utf-8'))
+            details["blacklist_readable"] = True
+        except Exception as e:
+            details["blacklist_readable"] = False
+            issues.append(f"mi_blacklist.json 不可读: {e}")
+    else:
+        details["blacklist_readable"] = None
+
+    ok = len(issues) == 0
+    return {
+        "ok": ok,
+        "status": "ok" if ok else "fail",
+        "severity": "info" if ok else "high",
+        "issues": issues,
+        "details": details,
+    }
+
+
+def _daily_tasks_active_today(now: datetime = None) -> dict | None:
+    """Return daily_tasks health when today's full task is still running."""
+    ts = now or datetime.now()
+    info = _get_task_health('daily_tasks')
+    status = str(info.get('status', '')).lower()
+    at_dt = _iso_at_or_none(info.get('at'))
+    if (
+        status in {'running', 'recovering'}
+        and at_dt is not None
+        and at_dt.date() == ts.date()
+    ):
+        return info
+    return None
+
+
+def _write_mi_self_check_health(result: dict, checked_at: datetime = None) -> None:
+    """Persist MI self-check result without touching daily task success records."""
+    ts = checked_at or datetime.now()
+    health_payload = {}
+    if HEALTH_FILE.exists():
+        health_payload = json.loads(HEALTH_FILE.read_text(encoding='utf-8') or '{}')
+    health_payload.setdefault('mi_self_check', {})
+    health_payload['mi_self_check'] = {
+        "checked_at": ts.isoformat(),
+        **result,
+    }
+    status = str(result.get("status") or "").lower()
+    if result.get("ok") and status == "ok":
+        task_status = "success"
+        task_message = "OK"
+    elif status == "pending":
+        task_status = "pending"
+        task_message = result.get("details", {}).get("reason", "Pending")
+    else:
+        task_status = "failed"
+        task_message = "; ".join(result.get("issues") or []) or status or "failed"
+    health_payload.setdefault('tasks', {})['mi_self_check'] = {
+        "status": task_status,
+        "message": str(task_message)[:500],
+        "at": ts.isoformat(),
+        "duration_sec": 0.0,
+    }
+    HEALTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HEALTH_FILE.write_text(
+        json.dumps(health_payload, ensure_ascii=False, indent=2),
+        encoding='utf-8',
+    )
+
+
+def task_mi_self_check():
+    """F32 — MI 流水线自检（与 09:30 daily_tasks 解耦）。
+
+    任一缺失 → 写入 _scheduler_health.json + 发一封中文邮件提醒。
+    """
+    try:
+        checked_at = datetime.now()
+        active_daily = _daily_tasks_active_today(now=checked_at)
+        if active_daily:
+            result = {
+                "ok": True,
+                "status": "pending",
+                "severity": "info",
+                "issues": [],
+                "details": {
+                    "reason": "daily_tasks still running; MI snapshot/digest may not be final yet",
+                    "daily_tasks_status": active_daily.get("status"),
+                    "daily_tasks_at": active_daily.get("at"),
+                },
+            }
+            try:
+                _write_mi_self_check_health(result, checked_at=checked_at)
+            except Exception as we:
+                logger.warning(f"MI self-check 写入 health 文件失败: {we}")
+            logger.info("[MI SELF-CHECK] daily_tasks 仍在运行，等待后续检查")
+            return True, "Pending: daily_tasks still running"
+
+        result = check_mi_pipeline_health(now=checked_at)
+        # 落地到 health 文件（不污染 daily 任务的成功记录）
+        try:
+            _write_mi_self_check_health(result, checked_at=checked_at)
+        except Exception as we:
+            logger.warning(f"MI self-check 写入 health 文件失败: {we}")
+
+        if result["ok"]:
+            logger.info("[MI SELF-CHECK] 流水线健康")
+            return True, "OK"
+
+        # 发邮件提醒
+        try:
+            from src.utils.email_sender import send_email
+            issues_html = "".join(f"<li>{i}</li>" for i in result["issues"])
+            details_html = "<br>".join(f"{k} = {v}" for k, v in result["details"].items())
+            html = f"""
+            <html><body style="font-family:'Microsoft YaHei',Arial,sans-serif;">
+            <h2>🚨 MI 流水线自检发现 {len(result["issues"])} 项异常</h2>
+            <p>检测时间: {datetime.now():%Y-%m-%d %H:%M}</p>
+            <h3>异常列表</h3>
+            <ul>{issues_html}</ul>
+            <h3>诊断详情</h3>
+            <p>{details_html}</p>
+            <hr>
+            <p style="color:#999;font-size:12px;">
+              由 scheduler_daemon.task_mi_self_check 触发 ·
+              排查：python scripts/mi_diagnose.py
+            </p>
+            </body></html>
+            """
+            send_email(
+                f"🚨 MI 流水线自检异常 - {datetime.now():%Y-%m-%d}",
+                html,
+            )
+            logger.warning(f"[MI SELF-CHECK] 已发送告警邮件: {result['issues']}")
+        except Exception as ee:
+            logger.error(f"MI self-check 邮件发送失败: {ee}")
+        return False, "; ".join(result["issues"])
+    except Exception as e:
+        logger.error(f"task_mi_self_check 异常: {e}")
+        return False, str(e)
+
+
+# ─── 调度配置 ─────────────────────────────────────────────
+
+def setup_schedule():
+    """配置任务调度时间表"""
+    # 每天 09:30 — 全量任务 (分析+同步+报告)
+    #   注意: daily_tasks.py 已包含库存同步；智能调价在同一流程里仅周一/周四执行
+    schedule.every().day.at("09:30").do(task_daily_full).tag('daily', 'full')
+
+    # F32 — 10:05 MI 流水线自检（给 09:30 daily_tasks 留出生成快照/digest 的时间）
+    schedule.every().day.at("10:05").do(task_mi_self_check).tag('daily', 'mi_check')
+
+    # 09:40 — 广告恢复审计 (Phase 3 闭环：跟价后重新评估被关广告的 SKU)
+    schedule.every().day.at("09:40").do(task_ad_restore).tag('daily', 'ad_restore')
+    # S25: 周一 11:00 给运营发死链下架候选 (magic-link 人工确认)
+    schedule.every().monday.at("11:00").do(task_cro_delist_email).tag('weekly', 'cro_delist_email')
+
+    # 每周二 10:00 分级 bid 优化 (需足量近 7 天性能数据)
+    schedule.every().tuesday.at("10:00").do(task_smart_bid).tag('weekly', 'smart_bid')
+    schedule.every().tuesday.at("11:00").do(task_bid_rollback).tag('weekly', 'bid_rollback')
+
+    # 周日 02:00 学到 pending 表; 02:30 shadow 守门后 promote 到生产 (S21)
+    schedule.every().sunday.at("02:00").do(task_cro_learn_thresholds).tag('weekly', 'cro_learn_thresholds')
+    schedule.every().sunday.at("02:30").do(task_cro_promote_thresholds).tag('weekly', 'cro_promote_thresholds')
+    schedule.every().sunday.at("03:00").do(task_cro_ops_snapshot).tag('weekly', 'cro_ops_snapshot')
+
+    # S22 — 每天 09:55 检查是否月初 (脚本内自门控), 是则跑融合月报
+    schedule.every().day.at("09:55").do(task_cro_monthly_report).tag('daily', 'cro_monthly_report')
+
+    # 09:45 — 广告黑名单自动清理 (P7 — 连续7天安全则移出 auto_off_streak)
+    schedule.every().day.at("09:45").do(task_blacklist_cleanup).tag('daily', 'bl_cleanup')
+
+    # 09:50 — 守门员异常告警 (P8 — 当日数据 vs 7日均值)
+    schedule.every().day.at("09:50").do(task_guard_anomaly).tag('daily', 'guard_alert')
+
+    # 10:00 — CRO P1 改价消费 (主线: 把 daily_tasks 09:30 入队的转化率优化建议落地)
+    schedule.every().day.at("10:00").do(task_cro_consume).tag('daily', 'cro_consume')
+
+    # 10:15 — CRO P1 图片刷新 (本地多图 → 远端 inventory)
+    schedule.every().day.at("10:15").do(task_cro_image_refresh).tag('daily', 'cro_image_refresh')
+
+    # 10:20 — CRO P1 补 specifics (品类必填 aspects)
+    schedule.every().day.at("10:20").do(task_cro_fill_specifics).tag('daily', 'cro_fill_specifics')
+
+    # 10:25 — CRO P1 推广执行 (安全开广告/提 bid)
+    schedule.every().day.at("10:25").do(task_cro_promote).tag('daily', 'cro_promote')
+
+    # 10:30 — CRO 北极星告警 (7d avg 跌 ≥ 5 分 / 恶化占比 ≥ 20%)
+    schedule.every().day.at("10:30").do(task_cro_sentinel).tag('daily', 'cro_sentinel')
+
+    # 11:30 — 只读审计 live eBay 刊登内容 vs GIGA 原文，发现 AI 幻觉/事实偏差后发邮件
+    schedule.every().day.at("11:30").do(task_listing_audit).tag('daily', 'listing_audit')
+
+    # ⚠️ (旧) 10:00 库存同步已移除 — daily_tasks.py (09:30) 已包含库存同步
+    # 之前 10:00 的 task_inventory_sync 会导致重复发送库存报告邮件 (内容不同)
+    # 如果需要单独测试库存同步: python scheduler_daemon.py --task inventory
+
+    # 每 2 小时 — 自动分析
+    schedule.every(2).hours.do(task_auto_analyze).tag('recurring', 'analyze')
+
+    # 每天 20:00 — 销售健康诊断 (含自动降价修复)
+    schedule.every().day.at("20:00").do(task_health_check).tag('daily', 'health')
+
+    # 每 6 小时 — 促销自动轮转 (2天一期 5% off)
+    schedule.every(6).hours.do(task_promotion_rotate).tag('recurring', 'promotion')
+
+    logger.info("调度表已配置:")
+    logger.info("  标题优化: 已停用 (不会定时/补跑/手动执行优化脚本)")
+    logger.info("  09:30  每日全量任务 (daily_tasks.py — 含库存同步+报告；智能调价仅周一/周四)")
+    logger.info("  10:05  MI 流水线自检 (F32 — 异常发邮件)")
+    logger.info("  09:40  广告恢复审计 (ad_restore_audit --apply --email)")
+    logger.info("  周二 10:00  分级 Bid 优化 (batch_smart_bid --apply --email)")
+    logger.info("  周二 11:00  Bid 7 天回溯 (bid_rollback_audit --apply --email)")
+    logger.info("  周日 03:00  CRO ops 快照 + DB DR 演练 (cro_ops_snapshot)")
+    logger.info("  09:45  广告黑名单自动清理 (P7 — ad_blacklist_cleanup)")
+    logger.info("  09:50  守门员异常告警 (P8 — guard_anomaly_alert)")
+    logger.info("  10:00-10:25  CRO 队列自动执行 (改价/图/specifics/推广)")
+    logger.info("  11:30  eBay/GIGA live listing 内容审计 (audit_fix_active_listings --live --email)")
+    logger.info("  20:00  销售健康诊断 (health_check --auto-fix --email)")
+    logger.info("  每 2h  自动分析 (daily_tasks.py --analyze-only)")
+    logger.info("  每 6h  促销轮转 (auto_rotate_promotions.py)")
+
+
+# ─── 清理旧进程 ──────────────────────────────────────────
+
+def cleanup_stale_processes():
+    """清理可能残留的旧任务进程 (端口占用等)"""
+    logger.info("清理残留进程...")
+    killed = 0
+
+    # 清理占用 8000 端口的旧 FastAPI 进程 — 仅在不是由 start.bat 管理时才清
+    # 这里不清理 8000/8501 端口, 因为那是 start.bat 管理的服务进程
+    # 仅清理可能残留的旧 daily_tasks / daily_optimize 窗口
+    for title in ['Daily Tasks', 'Title Optimizer']:
+        try:
+            result = subprocess.run(
+                ['taskkill', '/F', '/FI', f'WINDOWTITLE eq {title}*'],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
+            )
+            if 'SUCCESS' in result.stdout.upper():
+                killed += 1
+                logger.info(f"  已清理: {title} 窗口")
+        except Exception:
+            pass
+
+    if killed:
+        logger.info(f"  共清理 {killed} 个残留窗口")
+    else:
+        logger.info("  无残留进程")
+
+
+# ─── 主循环 ──────────────────────────────────────────────
+
+def run_once():
+    """立即执行所有任务一次 (调试/手动触发)"""
+    logger.info("=" * 60)
+    logger.info("立即执行全部任务 (--once 模式)")
+    logger.info("=" * 60)
+
+    task_listing_audit()
+    task_daily_full()  # 已包含库存同步 + 智能调价
+
+    logger.info("全部任务执行完毕")
+
+
+def recover_missed_tasks(log_when_clean=True):
+    """检查并恢复错过的定时任务（例如电脑关机/休眠导致的）"""
+    logger.info("检查是否有遗漏的定时任务...")
+    now = datetime.now()
+    recovered = []
+    
+    try:
+        health = {}
+        if HEALTH_FILE.exists():
+            health = json.loads(HEALTH_FILE.read_text(encoding='utf-8'))
+        tasks = health.get('tasks', {})
+        
+        # 定义需要在 daemon 重启后补跑的关键定时任务。
+        # 判断标准是: 已经过了今日的恢复窗口，且自今日计划时间之后还没有成功过。
+        critical_tasks = [
+            {
+                'name': 'daily_tasks',
+                'scheduled_time': '09:30',
+                'recovery_grace_minutes': 20,
+                'func': task_daily_full,
+                'label': '每日全量任务',
+                'priority': 20,
+            },
+            {
+                'name': 'mi_self_check',
+                'scheduled_time': '10:05',
+                'recovery_grace_minutes': 10,
+                'func': task_mi_self_check,
+                'label': 'MI 流水线自检',
+                'priority': 30,
+            },
+            {
+                'name': 'ad_restore',
+                'scheduled_time': '09:40',
+                'recovery_grace_minutes': 10,
+                'func': task_ad_restore,
+                'label': '广告恢复审计',
+                'priority': 40,
+            },
+            {
+                'name': 'blacklist_cleanup',
+                'scheduled_time': '09:45',
+                'recovery_grace_minutes': 10,
+                'func': task_blacklist_cleanup,
+                'label': '广告黑名单清理',
+                'priority': 50,
+            },
+            {
+                'name': 'guard_anomaly',
+                'scheduled_time': '09:50',
+                'recovery_grace_minutes': 10,
+                'func': task_guard_anomaly,
+                'label': '守门员异常告警',
+                'priority': 60,
+            },
+            {
+                'name': 'cro_monthly_report',
+                'scheduled_time': '09:55',
+                'recovery_grace_minutes': 10,
+                'func': task_cro_monthly_report,
+                'label': 'CRO 月报门控',
+                'priority': 70,
+            },
+            {
+                'name': 'cro_consume',
+                'scheduled_time': '10:00',
+                'recovery_grace_minutes': 30,
+                'func': task_cro_consume,
+                'label': 'CRO 改价消费',
+                'priority': 80,
+                'depends_on_success': 'daily_tasks',
+            },
+            {
+                'name': 'smart_bid',
+                'scheduled_time': '10:00',
+                'recovery_grace_minutes': 30,
+                'func': task_smart_bid,
+                'label': '智能 Bid',
+                'priority': 85,
+                'weekday': 1,
+            },
+            {
+                'name': 'cro_image_refresh',
+                'scheduled_time': '10:15',
+                'recovery_grace_minutes': 30,
+                'func': task_cro_image_refresh,
+                'label': 'CRO 图片刷新',
+                'priority': 90,
+                'depends_on_success': 'daily_tasks',
+            },
+            {
+                'name': 'cro_fill_specifics',
+                'scheduled_time': '10:20',
+                'recovery_grace_minutes': 30,
+                'func': task_cro_fill_specifics,
+                'label': 'CRO 补 specifics',
+                'priority': 100,
+                'depends_on_success': 'daily_tasks',
+            },
+            {
+                'name': 'cro_promote',
+                'scheduled_time': '10:25',
+                'recovery_grace_minutes': 30,
+                'func': task_cro_promote,
+                'label': 'CRO 推广执行',
+                'priority': 110,
+                'depends_on_success': 'daily_tasks',
+            },
+            {
+                'name': 'cro_sentinel',
+                'scheduled_time': '10:30',
+                'recovery_grace_minutes': 30,
+                'func': task_cro_sentinel,
+                'label': 'CRO 北极星告警',
+                'priority': 120,
+                'depends_on_success': 'daily_tasks',
+            },
+            {
+                'name': 'bid_rollback',
+                'scheduled_time': '11:00',
+                'recovery_grace_minutes': 20,
+                'func': task_bid_rollback,
+                'label': 'Bid 7 天回溯',
+                'priority': 125,
+                'weekday': 1,
+            },
+            {
+                'name': 'cro_delist_email',
+                'scheduled_time': '11:00',
+                'recovery_grace_minutes': 20,
+                'func': task_cro_delist_email,
+                'label': 'CRO 下架候选邮件',
+                'priority': 130,
+                'weekday': 0,
+            },
+            {
+                'name': 'listing_audit',
+                'scheduled_time': '11:30',
+                'recovery_grace_minutes': 15,
+                'func': task_listing_audit,
+                'label': '刊登内容审计',
+                'priority': 140,
+            },
+            {
+                'name': 'health_check',
+                'scheduled_time': '20:00',
+                'recovery_grace_minutes': 10,
+                'func': task_health_check,
+                'label': '销售健康诊断',
+                'priority': 200,
+            },
+            {
+                'name': 'cro_learn_thresholds',
+                'scheduled_time': '02:00',
+                'recovery_grace_minutes': 20,
+                'func': task_cro_learn_thresholds,
+                'label': 'CRO 阈值学习',
+                'priority': 300,
+                'weekday': 6,
+            },
+            {
+                'name': 'cro_promote_thresholds',
+                'scheduled_time': '02:30',
+                'recovery_grace_minutes': 20,
+                'func': task_cro_promote_thresholds,
+                'label': 'CRO 阈值推广',
+                'priority': 310,
+                'weekday': 6,
+            },
+            {
+                'name': 'cro_ops_snapshot',
+                'scheduled_time': '03:00',
+                'recovery_grace_minutes': 20,
+                'func': task_cro_ops_snapshot,
+                'label': 'CRO ops 快照',
+                'priority': 320,
+                'weekday': 6,
+            },
+        ]
+
+        ordered_tasks = sorted(
+            critical_tasks,
+            key=lambda item: (item.get('priority', 99), item['scheduled_time'])
+        )
+
+        for config in ordered_tasks:
+            task_name = str(config['name'])
+            weekday = config.get('weekday')
+            if weekday is not None and now.weekday() != int(weekday):
+                continue
+
+            scheduled_time = str(config.get('scheduled_time', '00:00'))
+            try:
+                scheduled_hour, scheduled_minute = [int(x) for x in scheduled_time.split(':', 1)]
+            except Exception:
+                logger.warning(f"  ⚠️ 任务 {task_name} scheduled_time 配置非法: {scheduled_time}")
+                continue
+
+            scheduled_dt = now.replace(
+                hour=scheduled_hour, minute=scheduled_minute, second=0, microsecond=0
+            )
+            grace_minutes = int(config.get('recovery_grace_minutes', 10))
+            recovery_window_start = scheduled_dt + timedelta(minutes=grace_minutes)
+
+            # 今天已经成功执行过，不再补跑
+            if _task_succeeded_today(task_name, now=now):
+                continue
+            
+            # 未到补跑窗口（给定时任务留出执行时间）
+            if now < recovery_window_start:
+                continue
+
+            depends_on = config.get('depends_on_success')
+            if depends_on and not _task_succeeded_today(str(depends_on), now=now):
+                continue
+
+            if _task_in_progress_or_recovered_today(task_name, scheduled_dt, now=now):
+                continue
+
+            last_run = _get_task_health(task_name).get('at', '')
+            if last_run:
+                try:
+                    last_dt = datetime.fromisoformat(last_run)
+                except (ValueError, TypeError):
+                    continue
+                if last_dt >= scheduled_dt:
+                    continue
+                logger.info(
+                    f"  ⚠️ 发现遗漏任务: {config['label']} "
+                    f"(上次运行: {last_run}, 今日计划: {scheduled_time})"
+                )
+            else:
+                logger.info(
+                    f"  ⚠️ 发现遗漏任务: {config['label']} "
+                    f"(无历史记录, 今日计划: {scheduled_time})"
+                )
+
+            recovered.append(task_name)
+            config['func']()
+        
+        if recovered:
+            logger.info(f"  已恢复 {len(recovered)} 个遗漏任务: {recovered}")
+        elif log_when_clean:
+            logger.info("  ✅ 没有遗漏的任务")
+    except Exception as e:
+        logger.error(f"  遗漏任务检查异常: {e}")
+
+
+def run_daemon():
+    """启动守护进程主循环"""
+    global IS_DAEMON_PROCESS
+    acquire_lock()
+    IS_DAEMON_PROCESS = True
+    if request_system_awake(True):
+        atexit.register(request_system_awake, False)
+
+    logger.info("=" * 60)
+    logger.info(f"Dajian Listing Tool 调度守护进程启动")
+    logger.info(f"PID: {os.getpid()}")
+    logger.info(f"Python: {sys.executable}")
+    logger.info(f"Project: {PROJECT_ROOT}")
+    logger.info("=" * 60)
+
+    cleanup_stale_processes()
+    setup_schedule()
+    clear_stale_running_tasks()
+    
+    # 恢复错过的任务
+    recover_missed_tasks()
+
+    # 更新初始健康状态
+    update_health('_daemon', 'running', f'Started at {datetime.now().isoformat()}')
+
+    # 优雅退出
+    running = True
+
+    def signal_handler(signum, frame):
+        nonlocal running
+        logger.info(f"收到信号 {signum}, 准备退出...")
+        running = False
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    if sys.platform == 'win32':
+        signal.signal(signal.SIGBREAK, signal_handler)
+
+    # 主循环
+    heartbeat_interval = 300  # 5分钟心跳
+    last_heartbeat = time.time()
+
+    logger.info("进入调度循环 (Ctrl+C 退出)...")
+    logger.info(f"下一个任务: {schedule.next_run()}")
+
+    while running:
+        try:
+            now = time.time()
+            if now - last_heartbeat >= heartbeat_interval:
+                recover_missed_tasks(log_when_clean=False)
+                next_run = schedule.next_run()
+                update_health('_daemon', 'running',
+                            f'Heartbeat OK | Next: {next_run}')
+                last_heartbeat = now
+
+            schedule.run_pending()
+
+            # 短睡眠, 便于响应 Ctrl+C
+            time.sleep(30)
+
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            logger.error(f"调度循环异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            time.sleep(60)  # 异常后等待 1 分钟再重试
+
+    logger.info("调度守护进程已停止")
+    update_health('_daemon', 'stopped', f'Stopped at {datetime.now().isoformat()}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Dajian Listing Tool 后台调度守护进程')
+    parser.add_argument('--once', action='store_true',
+                       help='立即执行全部任务一次后退出')
+    parser.add_argument('--task', type=str,
+                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_self_check', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops'],
+                       help='立即执行指定单个任务后退出')
+    parser.add_argument('--status', action='store_true',
+                       help='显示守护进程状态')
+    args = parser.parse_args()
+
+    if args.status:
+        show_status()
+        return
+
+    if args.task:
+        task_map = {
+            'title': task_title_optimize,
+            'listing_audit': task_listing_audit,
+            'daily': task_daily_full,
+            'analyze': task_auto_analyze,
+            'reprice': task_smart_reprice,
+            'health': task_health_check,
+            'promotion': task_promotion_rotate,
+            'mi_self_check': task_mi_self_check,
+            'ad_restore': task_ad_restore,
+            'blacklist_cleanup': task_blacklist_cleanup,
+            'guard_anomaly': task_guard_anomaly,
+            'cro_monthly_report': task_cro_monthly_report,
+            'cro_consume': task_cro_consume,
+            'smart_bid': task_smart_bid,
+            'cro_image_refresh': task_cro_image_refresh,
+            'cro_fill_specifics': task_cro_fill_specifics,
+            'cro_promote': task_cro_promote,
+            'cro_sentinel': task_cro_sentinel,
+            'bid_rollback': task_bid_rollback,
+            'cro_delist_email': task_cro_delist_email,
+            'cro_ops': task_cro_ops_snapshot,
+        }
+        task_map[args.task]()
+        return
+
+    if args.once:
+        run_once()
+        return
+
+    # 默认: 守护进程模式
+    run_daemon()
+
+
+def show_status():
+    """显示守护进程和任务状态"""
+    print("=" * 55)
+    print("  Dajian Listing Tool — 调度器状态")
+    print("=" * 55)
+
+    # PID 检查
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            alive = _is_pid_alive(pid)
+            status = "🟢 运行中" if alive else "🔴 已停止 (残留PID)"
+            print(f"\n守护进程: {status} (PID={pid})")
+        except Exception:
+            print("\n守护进程: ⚪ 未知")
+    else:
+        fallback_printed = False
+        if HEALTH_FILE.exists():
+            try:
+                health = json.loads(HEALTH_FILE.read_text(encoding='utf-8'))
+                health_pid = int(health.get('daemon_pid') or 0)
+                if health_pid and _is_pid_alive(health_pid):
+                    print(f"\n守护进程: 🟡 运行中但 PID 文件缺失 (PID={health_pid})")
+                    fallback_printed = True
+            except Exception:
+                pass
+        if not fallback_printed:
+            print("\n守护进程: ⚪ 未启动")
+
+    # 健康状态
+    if HEALTH_FILE.exists():
+        try:
+            health = json.loads(HEALTH_FILE.read_text(encoding='utf-8'))
+            alive_at = health.get('daemon_alive_at', 'N/A')
+            print(f"最后心跳: {alive_at}")
+            print(f"\n任务状态:")
+            display_tasks = dict(health.get('tasks', {}) or {})
+            if isinstance(health.get('mi_self_check'), dict):
+                mi_info = dict(health['mi_self_check'])
+                if mi_info.get('checked_at') and not mi_info.get('at'):
+                    mi_info['at'] = mi_info['checked_at']
+                if mi_info.get('status') == 'ok':
+                    mi_info['status'] = 'success'
+                    mi_info['message'] = 'OK'
+                display_tasks['mi_self_check'] = mi_info
+            for name, info in display_tasks.items():
+                if name.startswith('_'):
+                    continue
+                st = info.get('status', '?')
+                at = info.get('at', '?')[:19]
+                dur = info.get('duration_sec', 0)
+                icon = {'success': '✅', 'failed': '❌', 'timeout': '⏰',
+                        'running': '🔄', 'pending': '⏳', 'recovering': '🔄',
+                        'ok': '✅'}.get(st, '⚪')
+                print(f"  {icon} {name:20s} | {st:8s} | {at} | {dur:.0f}s")
+        except Exception:
+            print("  (无法读取健康状态)")
+    else:
+        print("\n  (无健康状态文件)")
+    print()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,231 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+from datetime import datetime
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+WATCHDOG_SPEC = importlib.util.spec_from_file_location('scheduler_watchdog', ROOT / 'scheduler_watchdog.py')
+scheduler_watchdog = importlib.util.module_from_spec(WATCHDOG_SPEC)
+WATCHDOG_SPEC.loader.exec_module(scheduler_watchdog)
+
+
+class FixedMondayNoonDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 5, 11, 12, 0, 0)
+
+
+class FixedTuesdayNoonDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 5, 12, 12, 0, 0)
+
+
+def test_watchdog_recovers_full_monday_morning_chain(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'success',
+                    'at': '2026-05-11T11:30:00',
+                },
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    launched = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert aliases == [
+        'mi_self_check',
+        'ad_restore',
+        'blacklist_cleanup',
+        'guard_anomaly',
+        'cro_monthly_report',
+        'cro_consume',
+        'cro_image_refresh',
+        'cro_fill_specifics',
+        'cro_promote',
+        'cro_sentinel',
+        'cro_delist_email',
+        'listing_audit',
+    ]
+
+
+def test_watchdog_honors_tuesday_only_tasks(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(json.dumps({}, ensure_ascii=False), encoding='utf-8')
+
+    launched = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedTuesdayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert 'smart_bid' in aliases
+    assert 'bid_rollback' in aliases
+    assert 'cro_delist_email' not in aliases
+
+
+def test_watchdog_skips_task_already_running_today(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'running',
+                    'at': '2026-05-11T11:59:00',
+                    'message': 'already launched by daemon recovery',
+                },
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    launched = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert 'daily' not in aliases
+    assert 'cro_consume' not in aliases
+    assert 'cro_image_refresh' not in aliases
+    assert 'cro_fill_specifics' not in aliases
+    assert 'cro_promote' not in aliases
+    assert 'cro_sentinel' not in aliases
+
+
+def test_watchdog_records_recovery_as_in_progress(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(json.dumps({}, ensure_ascii=False), encoding='utf-8')
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            pass
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    health = json.loads(health_path.read_text(encoding='utf-8'))
+    assert health['tasks']['daily_tasks']['status'] == 'recovering'
+    assert health['watchdog_recovery']['daily_tasks']['at'] == '2026-05-11T12:00:00'
+
+
+def test_watchdog_uses_top_level_mi_self_check_success(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'mi_self_check': {
+                    'status': 'recovering',
+                    'at': '2026-05-11T09:46:00',
+                    'message': 'old watchdog recovery state',
+                },
+            },
+            'mi_self_check': {
+                'checked_at': '2026-05-11T10:06:00',
+                'ok': True,
+                'status': 'ok',
+                'severity': 'info',
+                'issues': [],
+                'details': {},
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    launched = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert 'mi_self_check' not in aliases
+
+
+def test_watchdog_restarts_stale_daemon_without_restoring_old_health_pid(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    pid_path = tmp_path / '_scheduler.pid'
+    stale_pid = 35108
+    health_path.write_text(
+        json.dumps({
+            'daemon_pid': stale_pid,
+            'daemon_alive_at': '2026-05-11T22:30:00',
+            'tasks': {
+                '_daemon': {
+                    'status': 'running',
+                    'message': 'Heartbeat OK | Next: 2026-05-11 22:44:30',
+                },
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    pid_path.write_text(str(stale_pid), encoding='utf-8')
+
+    launched = []
+    stopped = []
+
+    class FakePopen:
+        pid = 99999
+
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'PID_FILE', pid_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedTuesdayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog, 'is_pid_alive', lambda pid: pid == stale_pid)
+    monkeypatch.setattr(scheduler_watchdog, 'stop_pid', lambda pid, reason: stopped.append((pid, reason)))
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_and_restart()
+
+    assert stopped == [(stale_pid, 'stale heartbeat > 15m')]
+    assert launched == [[scheduler_watchdog.PYTHONW, scheduler_watchdog.DAEMON_SCRIPT]]
