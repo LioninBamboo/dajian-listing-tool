@@ -9,49 +9,277 @@ Implements complete eBay listing workflow using:
 """
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import json
 import os
 import logging
 import re
+import time
+import urllib3
 from urllib.parse import urlparse, parse_qs, urlencode
 from typing import Dict, List, Optional, Any
 from src.services.ebay_auth import EbayOAuthService
 from src.services.ebay_policy_manager import EbayPolicyManager
+from src.utils.publish_autofix import (
+    EBAY_MAX_ASPECT_VALUE_LEN,
+    SINGLE_VALUE_ASPECTS,
+    sanitize_single_value_aspects,
+    prepare_ebay_aspects,
+)
+from src.utils.title_sanitizer import normalize_listing_title_for_ebay
+
+# Suppress InsecureRequestWarning when verify=False
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+EBAY_HOSTED_IMAGE_DOMAINS = ("i.ebayimg.com",)
+EPS_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+EPS_TARGET_MAX_IMAGE_BYTES = 9_500_000
+EPS_MIN_IMAGE_SIDE = 500
+FALLBACK_LISTING_POLICIES = {
+    "fulfillmentPolicyId": "321897899021",
+    "returnPolicyId": "321896608021",
+    "paymentPolicyId": "321896606021",
+}
+UNBRANDED_MARKERS = {"unbranded", "unbrand", "generic"}
+IDENTIFIER_PATTERNS = {
+    "upc": r"\d{12}",
+    "ean": r"(?:\d{8}|\d{13})",
+    "isbn": r"(?:\d{9}[\dXx]|\d{13})",
+}
+
+
+def _first_text_value(value: Any) -> str:
+    if isinstance(value, list):
+        for item in value:
+            text = str(item).strip()
+            if text:
+                return text
+        return ""
+    return str(value).strip() if value is not None else ""
+
+
+def _normalize_offer_description_for_compare(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _sanitize_inventory_identifiers(
+    sku: str,
+    cleaned_aspects: Dict[str, List[str]],
+    product: Dict[str, Any],
+) -> tuple[str, str, dict[str, list[str]]]:
+    brand = str(product.get("brand") or _first_text_value(cleaned_aspects.get("Brand"))).strip()
+    mpn = str(product.get("mpn") or _first_text_value(cleaned_aspects.get("MPN"))).strip()
+
+    if brand.lower() in UNBRANDED_MARKERS and not mpn:
+        mpn = "Does Not Apply"
+        cleaned_aspects["MPN"] = [mpn]
+
+    identifiers: dict[str, list[str]] = {}
+    for field_name, pattern in IDENTIFIER_PATTERNS.items():
+        explicit = product.get(field_name)
+        aspect_value = _first_text_value(cleaned_aspects.get(field_name.upper()))
+        identifier = explicit or aspect_value
+        if not identifier:
+            cleaned_aspects.pop(field_name.upper(), None)
+            continue
+
+        raw_values = identifier if isinstance(identifier, list) else [identifier]
+        valid_values: list[str] = []
+        for raw_value in raw_values:
+            normalized = re.sub(r"[-\s]", "", str(raw_value or "").strip())
+            if not normalized or normalized.upper() == str(sku or "").strip().upper():
+                continue
+            if not re.fullmatch(pattern, normalized):
+                continue
+            valid_values.append(normalized)
+
+        if valid_values:
+            identifiers[field_name] = valid_values
+            cleaned_aspects[field_name.upper()] = valid_values
+        else:
+            cleaned_aspects.pop(field_name.upper(), None)
+
+    return brand, mpn, identifiers
+
+
+def normalize_eps_image_data(
+    image_data: bytes,
+    content_type: str = "image/jpeg",
+    *,
+    max_bytes: int = EPS_TARGET_MAX_IMAGE_BYTES,
+    min_side: int = EPS_MIN_IMAGE_SIDE,
+) -> tuple[bytes, str, tuple[int, int]]:
+    """Prepare source image bytes for eBay EPS constraints."""
+    from io import BytesIO
+    from PIL import Image
+
+    with Image.open(BytesIO(image_data)) as img:
+        width, height = img.size
+        needs_reencode = (
+            len(image_data) > max_bytes
+            or width < min_side
+            or height < min_side
+            or content_type.lower() not in {"image/jpeg", "image/jpg", "image/png"}
+        )
+
+        if not needs_reencode:
+            return image_data, content_type, (width, height)
+
+        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+            background = Image.new("RGB", img.size, "white")
+            background.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[-1])
+            img = background
+        else:
+            img = img.convert("RGB")
+
+        width, height = img.size
+        if width < min_side or height < min_side:
+            scale = max(min_side / max(width, 1), min_side / max(height, 1))
+            img = img.resize((int(width * scale + 0.5), int(height * scale + 0.5)), Image.LANCZOS)
+            width, height = img.size
+
+        quality = 92
+        while True:
+            out = BytesIO()
+            img.save(out, format="JPEG", quality=quality, optimize=True)
+            encoded = out.getvalue()
+            if len(encoded) <= max_bytes or quality <= 70:
+                return encoded, "image/jpeg", (width, height)
+            quality -= 7
 
 
 def clean_image_url(url: str) -> str:
     """
-    Clean image URL to get original full-size image
-    Removes resize/thumbnail parameters from CDN URLs
+    Clean image URL to get original full-size image.
+    
+    eBay API (errorId 25721) rejects some image transformation parameters.
+    GigaB2B image URLs also carry signed access parameters in the query string,
+    so only remove the known resize/processing parameter and preserve the
+    signature fields.
+    
+    Args:
+        url: Raw image URL (may contain CDN processing parameters)
+        
+    Returns:
+        Clean URL without query parameters
     """
-    if not url:
-        return url
+    # 1. 验证 URL 非空
+    if not url or not isinstance(url, str):
+        return ""
     
-    # Remove OSS image processing parameters (阿里云 OSS)
-    # Example: x-oss-process=image%2Fresize%2Cw_74%2Ch_74%2Cm_pad
-    if 'x-oss-process' in url:
-        # Parse URL and remove the x-oss-process parameter
-        if '?' in url:
-            base, query = url.split('?', 1)
-            params = parse_qs(query)
-            # Remove resize parameters
-            params.pop('x-oss-process', None)
-            if params:
-                return base + '?' + urlencode(params, doseq=True)
-            return base
+    url = url.strip()
     
-    # Remove common resize patterns
+    # 2. 处理协议头
+    if url.startswith("//"):
+        url = "https:" + url
+    
+    # 3. 验证是 HTTP/HTTPS URL
+    if not url.startswith(("http://", "https://")):
+        return ""
+    
+    # 4. 移除图片处理参数，但保留签名参数。
+    # GigaB2B 的 x-cc/x-cu/x-ct/x-cs 是访问签名；删掉后 eBay 后续刷新
+    # 库存项时可能只保留 1 张可访问图片。
+    if "?" in url:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        params.pop("x-oss-process", None)
+        new_query = urlencode({k: v[0] for k, v in params.items() if v})
+        url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        if new_query:
+            url = f"{url}?{new_query}"
+    
+    # 5. 移除 URL 路径中的缩略图参数
     # Pattern: /w_74,h_74/ or similar
     url = re.sub(r'/w_\d+,h_\d+[^/]*/', '/', url)
+    # Pattern: _128x128.jpg -> .jpg
+    url = re.sub(r'_\d+x\d+\.', '.', url)
+    
+    # 5.5 Convert eBay-hosted tiny thumbnails to large versions
+    # $_1.JPG = 74px gallery thumbnail (fails eBay's 500px minimum)
+    # $_57.JPG = large version (~500-800px, acceptable)
+    if 'i.ebayimg.com' in url:
+        url = re.sub(r'\$_1\.(JPG|PNG|jpg|png)', r'$_57.\1', url)
+    
+    # 6. 验证 URL 结构
+    try:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+    except:
+        return ""
     
     return url
 
-# Create session with proxy bypass for eBay
+
+def is_ebay_hosted_image_url(url: str) -> bool:
+    """Return True when the URL already points to eBay-hosted image infrastructure."""
+    clean_url = clean_image_url(url)
+    if not clean_url:
+        return False
+
+    host = (urlparse(clean_url).netloc or "").lower()
+    return any(host == domain or host.endswith(f".{domain}") for domain in EBAY_HOSTED_IMAGE_DOMAINS)
+
+
+def normalize_inventory_image_urls(image_urls: List[str], max_images: int = 24) -> List[str]:
+    """Clean, dedupe, and clamp image URLs while preserving order."""
+    normalized = []
+    seen = set()
+
+    for raw_url in image_urls or []:
+        clean_url = clean_image_url(raw_url)
+        if not clean_url:
+            continue
+
+        key = clean_url.casefold()
+        if key in seen:
+            continue
+
+        seen.add(key)
+        normalized.append(clean_url)
+
+        if len(normalized) >= max_images:
+            break
+
+    return normalized
+
+# Session with enforced timeouts — requests.Session doesn't honour .timeout attr
+class _TimeoutSession(requests.Session):
+    """Session that applies a default (connect, read) timeout to every request."""
+
+    def __init__(self, default_timeout=(30, 120)):
+        super().__init__()
+        self._default_timeout = default_timeout
+
+    def request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", self._default_timeout)
+        return super().request(*args, **kwargs)
+
+
 def create_ebay_session():
-    """Create requests session with eBay-specific settings"""
-    session = requests.Session()
+    """Create requests session with eBay-specific settings, retry logic, and enforced timeouts."""
+    session = _TimeoutSession(default_timeout=(30, 120))
     # Disable proxy for eBay domains
     session.trust_env = False
+    # Disable SSL verification to work around intermittent SSL EOF errors
+    session.verify = False
+
+    # Configure retry strategy for connection errors + SSL errors
+    retry_strategy = Retry(
+        total=5,
+        connect=5,
+        backoff_factor=2,  # Wait 2, 4, 8, 16, 32 seconds between retries
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "PUT", "POST", "DELETE", "OPTIONS", "TRACE"],
+        raise_on_status=False,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
     return session
 
 
@@ -71,6 +299,143 @@ class RealEbayClient:
         self.base_url = oauth_service.api_base
         self.marketplace_id = "EBAY_US"
         self.session = create_ebay_session()
+
+    def _complete_listing_policies(self, existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Return listingPolicies with required business policy IDs present."""
+        policies = dict(existing or {})
+        try:
+            cached = {
+                "fulfillmentPolicyId": self.policy_manager.get_default_fulfillment_policy_id(),
+                "returnPolicyId": self.policy_manager.get_default_return_policy_id(),
+                "paymentPolicyId": self.policy_manager.get_default_payment_policy_id(),
+            }
+        except Exception:
+            cached = {}
+
+        for key, fallback_value in FALLBACK_LISTING_POLICIES.items():
+            if policies.get(key):
+                continue
+            policies[key] = cached.get(key) or fallback_value
+
+        return policies
+
+    def _prepare_inventory_image_urls(self, sku: str, image_urls: List[str], max_images: int = 24) -> List[str]:
+        """
+        Prepare a stable image set for inventory PUTs.
+
+        Rules:
+        - Reuse eBay-hosted URLs as-is.
+        - Convert external supplier URLs to EPS-hosted URLs before PUT.
+        - Refuse to overwrite a multi-image listing with only a single stable URL.
+        """
+        cleaned_urls = normalize_inventory_image_urls(image_urls, max_images=max_images)
+        if not cleaned_urls:
+            return []
+
+        if all(is_ebay_hosted_image_url(url) for url in cleaned_urls):
+            return cleaned_urls
+
+        live_inventory = self.get_inventory_item(sku) or {}
+        live_image_urls = normalize_inventory_image_urls(
+            (live_inventory.get("product") or {}).get("imageUrls") or [],
+            max_images=max_images,
+        )
+        live_hosted_urls = [url for url in live_image_urls if is_ebay_hosted_image_url(url)]
+
+        logging.info(
+            f"[IMAGES] {sku}: converting {len(cleaned_urls)} source image URLs to eBay EPS before inventory PUT"
+        )
+        eps_urls = normalize_inventory_image_urls(
+            self.upload_images_to_eps(cleaned_urls, max_images=max_images),
+            max_images=max_images,
+        )
+
+        chosen_urls = eps_urls if len(eps_urls) >= len(live_hosted_urls) else live_hosted_urls
+        if not chosen_urls:
+            raise ValueError(f"{sku}: unable to prepare stable eBay-hosted image URLs")
+
+        if len(cleaned_urls) >= 2 and len(chosen_urls) < 2:
+            raise ValueError(
+                f"{sku}: refusing to update inventory with only {len(chosen_urls)} stable image URL(s) "
+                f"from {len(cleaned_urls)} source image(s)"
+            )
+
+        if len(chosen_urls) < len(cleaned_urls):
+            logging.warning(
+                f"[IMAGES] {sku}: prepared {len(chosen_urls)}/{len(cleaned_urls)} stable image URLs; "
+                "keeping the largest verified hosted set"
+            )
+
+        return chosen_urls
+
+    def _verify_inventory_image_urls(self, sku: str, expected_count: int) -> None:
+        """Read back inventory imageUrls and fail fast on severe image collapse."""
+        if expected_count <= 0:
+            return
+
+        live_inventory = self.get_inventory_item(sku) or {}
+        live_image_urls = normalize_inventory_image_urls(
+            (live_inventory.get("product") or {}).get("imageUrls") or []
+        )
+        live_count = len(live_image_urls)
+
+        if expected_count >= 2 and live_count < 2:
+            raise RuntimeError(
+                f"{sku}: inventory imageUrls collapsed to {live_count}/{expected_count} after update"
+            )
+
+        if live_count < expected_count:
+            logging.warning(
+                f"[IMAGES] {sku}: inventory readback returned {live_count}/{expected_count} image URLs"
+            )
+    
+    def get_inventory_item(self, sku: str) -> Optional[Dict]:
+        """
+        Get inventory item details
+        
+        GET /sell/inventory/v1/inventory_item/{sku}
+        
+        Returns:
+            Inventory item dict or None if not found
+        """
+        url = f"{self.base_url}/sell/inventory/v1/inventory_item/{sku}"
+        token = self.oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json"
+        }
+        try:
+            response = self.session.get(url, headers=headers, timeout=30)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception as e:
+            logging.error(f"get_inventory_item({sku}): {e}")
+            return None
+
+    def get_offer(self, offer_id: str) -> Optional[Dict]:
+        """
+        Get offer details.
+
+        GET /sell/inventory/v1/offer/{offerId}
+        """
+        url = f"{self.base_url}/sell/inventory/v1/offer/{offer_id}"
+        token = self.oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+        try:
+            response = self.session.get(url, headers=headers, timeout=60)
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code == 404:
+                return None
+            logging.warning(f"get_offer({offer_id}): HTTP {response.status_code}")
+            return None
+        except Exception as e:
+            logging.error(f"get_offer({offer_id}): {e}")
+            return None
     
     def create_or_replace_inventory_item(self, sku: str, product: Dict) -> Dict:
         """
@@ -104,8 +469,13 @@ class RealEbayClient:
         }
         
         # Build payload
-        # eBay limits: title 80 chars, description 4000 chars, images 12, video 1
+        # eBay limits: title 80 chars, description 4000 chars, video 1
         description = product.get("description", "")
+        prepared_image_urls = self._prepare_inventory_image_urls(
+            sku,
+            product.get("image_urls", []),
+            max_images=24,
+        )
         
         # Truncate description if too long (eBay limit: 4000 chars)
         if len(description) > 4000:
@@ -119,15 +489,46 @@ class RealEbayClient:
         
         # Validate aspects format (must be list of strings)
         aspects = product.get("aspects", {})
+        required_aspect_names = {
+            str(name).strip()
+            for name in (product.get("required_aspect_names") or [])
+            if str(name).strip()
+        }
         cleaned_aspects = {}
         for k, v in aspects.items():
             if isinstance(v, str):
-                cleaned_aspects[k] = [v]
+                value = v.strip()
+                cleaned_aspects[k] = [value] if value else []
             elif isinstance(v, list):
-                cleaned_aspects[k] = [str(i) for i in v]
+                values = []
+                seen_values = set()
+                for item in v:
+                    value = str(item).strip()
+                    if not value:
+                        continue
+                    normalized = value.casefold()
+                    if normalized in seen_values:
+                        continue
+                    seen_values.add(normalized)
+                    values.append(value)
+                cleaned_aspects[k] = values
             else:
-                cleaned_aspects[k] = [str(v)]
-                
+                value = str(v).strip()
+                cleaned_aspects[k] = [value] if value else []
+
+        # Enforce single-value aspects and run pre-flight truncation/trimming
+        sanitize_single_value_aspects(
+            cleaned_aspects,
+            log=print,
+            multi_value_aspects={key for key in cleaned_aspects if key not in SINGLE_VALUE_ASPECTS},
+        )
+        prepare_ebay_aspects(cleaned_aspects, required_aspect_names, log=print)
+
+        safe_title, _ = normalize_listing_title_for_ebay(
+            product.get("title", ""),
+            source_title=product.get("title", ""),
+        )
+
         payload = {
             "condition": product.get("condition", "NEW"),
             "availability": {
@@ -136,13 +537,72 @@ class RealEbayClient:
                 }
             },
             "product": {
-                "title": product["title"][:80],  # eBay limit
+                "title": safe_title,
                 "description": description,
-                # Clean image URLs to get full-size originals (remove thumbnail params)
-                "imageUrls": [clean_image_url(url) for url in product.get("image_urls", [])[:12]],
+                "imageUrls": prepared_image_urls,
                 "aspects": cleaned_aspects
             }
         }
+        product_node = payload["product"]
+
+        brand, mpn, identifiers = _sanitize_inventory_identifiers(sku, cleaned_aspects, product)
+        epid = str(
+            product.get("epid")
+            or _first_text_value(cleaned_aspects.get("ePID"))
+            or _first_text_value(cleaned_aspects.get("EPID"))
+        ).strip()
+        if brand:
+            product_node["brand"] = brand
+        if mpn:
+            product_node["mpn"] = mpn
+        if epid:
+            product_node["epid"] = epid
+
+        for field_name, values in identifiers.items():
+            product_node[field_name] = values
+        
+        # Add packageWeightAndSize if provided (shipping dimensions & weight)
+        # Sanitize weight/dimension values to prevent eBay 25709 errors
+        pkg = product.get("packageWeightAndSize")
+        if pkg:
+            pkg = dict(pkg)  # shallow copy
+            # Validate weight
+            w = pkg.get("weight", {})
+            if w:
+                try:
+                    val = float(w.get("value", 0))
+                    if val <= 0 or val > 2000:
+                        logging.warning(f"[WARN] {sku}: Invalid weight {val}, removing weight")
+                        pkg.pop("weight", None)
+                    else:
+                        pkg["weight"] = {"value": round(val, 2), "unit": w.get("unit", "POUND")}
+                except (ValueError, TypeError):
+                    logging.warning(f"[WARN] {sku}: Non-numeric weight value, removing weight")
+                    pkg.pop("weight", None)
+            # Validate dimensions
+            for dim_key in ("dimensions", "packageDimensions"):
+                d = pkg.get(dim_key, {})
+                if d:
+                    cleaned_dim = {"unit": d.get("unit", "INCH")}
+                    valid = True
+                    for axis in ("length", "width", "height"):
+                        try:
+                            v = float(d.get(axis, 0))
+                            if v <= 0 or v > 999:
+                                valid = False
+                                break
+                            cleaned_dim[axis] = round(v, 2)
+                        except (ValueError, TypeError):
+                            valid = False
+                            break
+                    if valid:
+                        pkg[dim_key] = cleaned_dim
+                    else:
+                        logging.warning(f"[WARN] {sku}: Invalid {dim_key}, removing")
+                        pkg.pop(dim_key, None)
+            if pkg:  # still has some valid data
+                payload["packageWeightAndSize"] = pkg
+        
         # Note: Country comes from merchantLocationKey in offer, not inventory item
         
         # Add video if available
@@ -151,16 +611,119 @@ class RealEbayClient:
         
         response = self.session.put(url, headers=headers, json=payload)
         
-        if response.status_code == 204:
+        if response.status_code in (200, 204):
+            # HTTP 200 = success with warnings; HTTP 204 = success (no content)
+            if response.status_code == 200:
+                try:
+                    body = response.json()
+                    warnings = body.get("warnings", [])
+                    if warnings:
+                        for w in warnings:
+                            logging.info(f"[WARN] {sku}: {w.get('message', '')}")
+                except Exception:
+                    pass
+            self._verify_inventory_image_urls(sku, len(prepared_image_urls))
             logging.info(f"[SUCCESS] Inventory item created/updated: {sku}")
             return {"status": "success", "sku": sku}
+        elif response.status_code == 400:
+            # 解析并显示详细错误
+            error_detail = response.text
+            logging.error(f"[ERROR] eBay API 400 Bad Request: {error_detail}")
+            try:
+                error_json = response.json()
+                errors = error_json.get("errors", [])
+                for err in errors:
+                    msg = err.get("message", "")
+                    long_msg = err.get("longMessage", "")
+                    logging.error(f"   - {msg}: {long_msg}")
+            except:
+                pass
+            raise Exception(f"eBay API Error: {error_detail[:500]}")
         else:
             logging.error(f"[ERROR] eBay API Error {response.status_code}")
             logging.error(f"   Response: {response.text}")
             response.raise_for_status()
             return response.json()
+
+    def get_product_compatibility(self, sku: str) -> Dict:
+        """
+        Get product compatibility records for an inventory item.
+
+        GET /sell/inventory/v1/inventory_item/{sku}/product_compatibility
+        """
+        url = f"{self.base_url}/sell/inventory/v1/inventory_item/{sku}/product_compatibility"
+        token = self.oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+
+        try:
+            response = self.session.get(url, headers=headers, timeout=60)
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code == 404:
+                return {"compatibleProducts": []}
+            logging.warning(f"[COMPAT] get_product_compatibility({sku}) -> HTTP {response.status_code}")
+            return {"compatibleProducts": []}
+        except Exception as e:
+            logging.error(f"[COMPAT] Failed to get compatibility for {sku}: {e}")
+            return {"compatibleProducts": []}
+
+    def create_or_replace_product_compatibility(self, sku: str, compatible_products: List[Dict]) -> Dict:
+        """
+        Create or replace product compatibility records for an inventory item.
+
+        PUT /sell/inventory/v1/inventory_item/{sku}/product_compatibility
+        """
+        url = f"{self.base_url}/sell/inventory/v1/inventory_item/{sku}/product_compatibility"
+        token = self.oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Content-Language": "en-US",
+            "Accept": "application/json",
+        }
+        payload = {"compatibleProducts": compatible_products or []}
+
+        response = self.session.put(url, headers=headers, json=payload, timeout=120)
+
+        if response.status_code in (200, 201, 204):
+            logging.info(f"[COMPAT] Compatibility updated for {sku}: {len(compatible_products)} entries")
+            return {"status": "success", "sku": sku, "count": len(compatible_products)}
+
+        if response.status_code == 400:
+            logging.error(f"[COMPAT] eBay compatibility update failed for {sku}: {response.text[:500]}")
+            raise Exception(f"Compatibility update failed: {response.text[:300]}")
+
+        response.raise_for_status()
+        return response.json() if response.text else {}
+
+    def delete_product_compatibility(self, sku: str) -> bool:
+        """
+        Delete product compatibility records for an inventory item.
+
+        DELETE /sell/inventory/v1/inventory_item/{sku}/product_compatibility
+        """
+        url = f"{self.base_url}/sell/inventory/v1/inventory_item/{sku}/product_compatibility"
+        token = self.oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+
+        try:
+            response = self.session.delete(url, headers=headers, timeout=60)
+            if response.status_code in (200, 204, 404):
+                logging.info(f"[COMPAT] Compatibility cleared for {sku}")
+                return True
+            logging.warning(f"[COMPAT] delete_product_compatibility({sku}) -> HTTP {response.status_code}")
+            return False
+        except Exception as e:
+            logging.error(f"[COMPAT] Failed to clear compatibility for {sku}: {e}")
+            return False
     
-    def create_offer(self, sku: str, price: float, category_id: Optional[str] = None) -> Dict:
+    def create_offer(self, sku: str, price: float, category_id: Optional[str] = None, listing_description: Optional[str] = None, marketplace_id: Optional[str] = None) -> Dict:
         """
         Create offer for inventory item
         
@@ -170,6 +733,7 @@ class RealEbayClient:
             sku: Product SKU
             price: Listing price
             category_id: eBay category ID (optional, will use suggested if not provided)
+            listing_description: HTML description for the live listing (optional)
             
         Returns:
             {"offerId": "...", "status": "..."}
@@ -184,22 +748,11 @@ class RealEbayClient:
             "Content-Language": "en-US"
         }
         
-        # Try to get policy IDs (optional)
-        try:
-            fulfillment_policy_id = self.policy_manager.get_default_fulfillment_policy_id()
-            return_policy_id = self.policy_manager.get_default_return_policy_id()
-            payment_policy_id = self.policy_manager.get_default_payment_policy_id()
-        except:
-            # If policies not available, set to None
-            # eBay will use account default policies
-            fulfillment_policy_id = None
-            return_policy_id = None
-            payment_policy_id = None
-            print("[WARN] No cached policies found, eBay will use account defaults")
-        
+        target_marketplace = marketplace_id or self.marketplace_id
+
         payload = {
             "sku": sku,
-            "marketplaceId": self.marketplace_id,
+            "marketplaceId": target_marketplace,
             "format": "FIXED_PRICE",
             "merchantLocationKey": "DAJIAN_LA_WAREHOUSE",  # Los Angeles, CA
             "pricingSummary": {
@@ -210,60 +763,123 @@ class RealEbayClient:
             }
         }
         
-        # Add policies if available
-        if all([fulfillment_policy_id, return_policy_id, payment_policy_id]):
-            payload["listingPolicies"] = {
-                "fulfillmentPolicyId": fulfillment_policy_id,
-                "returnPolicyId": return_policy_id,
-                "paymentPolicyId": payment_policy_id
-            }
-            print(f"[OK] Using cached policies")
-        else:
-            # Use hardcoded user's policies as fallback
-            payload["listingPolicies"] = {
-                "fulfillmentPolicyId": "321897899021",
-                "returnPolicyId": "321896608021",
-                "paymentPolicyId": "321896606021"
-            }
-            print(f"[INFO] Using user's configured policies")
+        payload["listingPolicies"] = self._complete_listing_policies()
+        print(f"[OK] Using listing policies")
         
         # Add category if provided
         if category_id:
             payload["categoryId"] = category_id
         
-        try:
-            response = self.session.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            result = response.json()
-            logging.info(f"[SUCCESS] Offer created: {result.get('offerId')}")
-            return result
-            
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 400:
-                try:
-                    error_data = e.response.json()
-                    # Check if error is "Offer entity already exists" (ID 25002)
-                    errors = error_data.get("errors", [])
-                    for error in errors:
-                        if error.get("errorId") == 25002:
-                            # Extract offerId from parameters
-                            for param in error.get("parameters", []):
-                                if param.get("name") == "offerId":
-                                    offer_id = param.get("value")
-                                    print(f"[INFO] Offer already exists: {offer_id}")
-                                    return {"offerId": offer_id, "status": "EXISTING"}
-                except:
-                    pass
-            
-            # If not handled, re-raise
-            import sys
-            sys.stderr.write(f"\n[ERROR] Create Offer Failed: {e.response.status_code}\n")
-            sys.stderr.write(f"[ERROR] Response Body: {e.response.text}\n")
-            logging.error(f"[ERROR] Create Offer Failed: {e.response.status_code}")
-            logging.error(f"[ERROR] Response Body: {e.response.text}")
-            raise
+        # Add listing description if provided
+        if listing_description:
+            payload["listingDescription"] = listing_description
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.session.post(url, headers=headers, json=payload, timeout=60)
+                
+                if response.status_code in [200, 201]:
+                    result = response.json()
+                    logging.info(f"[SUCCESS] Offer created: {result.get('offerId')}")
+                    return result
+                elif response.status_code == 400:
+                    # Check for specific errors
+                    try:
+                        error_data = response.json()
+                        errors = error_data.get("errors", [])
+                        recreate_offer = False
+                        for error in errors:
+                            if error.get("errorId") == 25002:
+                                # Offer already exists - update with correct category
+                                offer_id = None
+                                for param in error.get("parameters", []):
+                                    if param.get("name") == "offerId":
+                                        offer_id = param.get("value")
+                                        break
+
+                                if not offer_id:
+                                    continue
+
+                                print(f"[INFO] Offer already exists: {offer_id}")
+                                existing_offer = self.get_offer(offer_id) or {}
+                                existing_marketplace = existing_offer.get("marketplaceId")
+                                offer_status = existing_offer.get("status", "")
+                                listing_status = (existing_offer.get("listing") or {}).get("listingStatus", "")
+
+                                if (
+                                    existing_marketplace
+                                    and existing_marketplace != target_marketplace
+                                    and listing_status != "ACTIVE"
+                                ):
+                                    print(
+                                        f"[FIX] Existing offer {offer_id} uses marketplace {existing_marketplace}; "
+                                        f"recreating in {target_marketplace}"
+                                    )
+                                    if not self.delete_offer(offer_id):
+                                        raise Exception(
+                                            f"Existing offer {offer_id} uses marketplace {existing_marketplace}, "
+                                            "but deletion failed"
+                                        )
+                                    recreate_offer = True
+                                    break
+
+                                # Update offer with correct category if provided
+                                if category_id:
+                                    print(f"[INFO] Updating existing offer with category: {category_id}")
+                                    try:
+                                        self.update_offer_category(
+                                            offer_id,
+                                            category_id,
+                                            price,
+                                            listing_description=listing_description,
+                                        )
+                                    except Exception as update_e:
+                                        print(f"[WARN] Failed to update existing offer category: {update_e}")
+                                        # Continue to return offerId so we can handle it downstream (e.g. delete it)
+
+                                return {
+                                    "offerId": offer_id,
+                                    "status": "EXISTING",
+                                    "marketplaceId": existing_marketplace or target_marketplace,
+                                    "offerStatus": offer_status,
+                                    "listingStatus": listing_status,
+                                }
+                        if recreate_offer:
+                            time.sleep(1)
+                            continue
+                    except ValueError:
+                        pass
+                    
+                    # Other 400 error
+                    logging.error(f"[ERROR] Create Offer Failed: {response.status_code}")
+                    logging.error(f"[ERROR] Response Body: {response.text[:500]}")
+                    raise Exception(f"Create offer failed: {response.text[:300]}")
+                else:
+                    response.raise_for_status()
+                    
+            except requests.exceptions.ConnectionError as e:
+                logging.error(f"[ERROR] Connection error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    print(f"[WARN] Connection error, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise Exception(f"Connection failed after {max_retries} attempts: {e}")
+            except requests.exceptions.Timeout as e:
+                logging.error(f"[ERROR] Timeout on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2
+                    print(f"[WARN] Timeout, retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise Exception(f"Request timed out after {max_retries} attempts")
+        
+        raise Exception(f"Create offer failed after {max_retries} attempts")
     
-    def publish_offer(self, offer_id: str) -> Dict:
+    def publish_offer(self, offer_id: str, max_retries: int = 3) -> Dict:
         """
         Publish offer to eBay
         
@@ -271,37 +887,393 @@ class RealEbayClient:
         
         Args:
             offer_id: Offer ID to publish
+            max_retries: Maximum number of retry attempts
             
         Returns:
             {"listingId": "...", "status": "..."}
         """
         url = f"{self.base_url}/sell/inventory/v1/offer/{offer_id}/publish"
         
+        for attempt in range(max_retries):
+            try:
+                token = self.oauth.get_valid_token()
+                
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "Content-Language": "en-US"
+                }
+                
+                # No payload needed - Country comes from merchantLocationKey in offer
+                response = self.session.post(url, headers=headers, timeout=120)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    listing_id = result.get("listingId")
+                    print(f"[OK] Listing published: {listing_id}")
+                    return result
+                elif response.status_code == 400:
+                    # Bad request - parse error details for specific message
+                    error_text = response.text
+                    logging.error(f"[ERROR] Publish failed (400): {error_text[:500]}")
+                    
+                    # Try to extract the actual error message from eBay response
+                    try:
+                        error_data = response.json()
+                        errors = error_data.get("errors", [])
+                        if errors:
+                            # Build detailed error from all eBay error messages
+                            error_msgs = []
+                            for err in errors:
+                                msg = err.get("message", "")
+                                if msg:
+                                    error_msgs.append(msg)
+                            if error_msgs:
+                                raise Exception(f"Publish failed: {'; '.join(error_msgs)}")
+                    except (ValueError, KeyError):
+                        pass
+                    
+                    raise Exception(f"Publish failed: {error_text[:300]}")
+                else:
+                    logging.error(f"[ERROR] Publish failed: {response.status_code}")
+                    logging.error(f"[ERROR] Response: {response.text[:500]}")
+                    
+                    # Retry on connection/server errors
+                    if response.status_code >= 500 or response.status_code == 0:
+                        if attempt < max_retries - 1:
+                            wait_time = (attempt + 1) * 2
+                            print(f"[WARN] Server error, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                            time.sleep(wait_time)
+                            continue
+                    
+                    response.raise_for_status()
+                    
+            except requests.exceptions.ConnectionError as e:
+                logging.error(f"[ERROR] Connection error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 3
+                    print(f"[WARN] Connection error, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise Exception(f"Connection failed after {max_retries} attempts: {e}")
+            except requests.exceptions.Timeout as e:
+                logging.error(f"[ERROR] Timeout on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 3
+                    print(f"[WARN] Timeout, retrying in {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    raise Exception(f"Request timed out after {max_retries} attempts")
+        
+        raise Exception(f"Publish failed after {max_retries} attempts")
+    
+    @staticmethod
+    def _positive_offer_quantity(value, default: int = 1) -> int:
+        try:
+            quantity = int(value)
+        except (TypeError, ValueError):
+            quantity = default
+        return max(default, quantity)
+
+    def update_offer_category(self, offer_id: str, category_id: str, price: float = None, listing_description: str = None) -> bool:
+        """
+        Update offer with correct category ID and optionally listing description
+        
+        PUT /sell/inventory/v1/offer/{offerId}
+        
+        Args:
+            offer_id: Existing offer ID
+            category_id: New category ID
+            price: Offer price (optional)
+            listing_description: HTML description for the live listing (optional)
+            
+        Returns:
+            True if successful
+        """
+        # First, get current offer details
+        get_url = f"{self.base_url}/sell/inventory/v1/offer/{offer_id}"
+        
         token = self.oauth.get_valid_token()
         
         headers = {
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+            "Accept": "application/json"
         }
         
-        # No payload needed - Country comes from merchantLocationKey in offer
-        response = self.session.post(url, headers=headers)
+        try:
+            response = self.session.get(get_url, headers=headers, timeout=60)
+            if response.status_code != 200:
+                logging.error(f"Failed to get offer {offer_id}: {response.status_code}")
+                return False
+            
+            offer_data = response.json()
+            
+            # 获取并清理 listingDescription（避免长度超限问题）
+            if listing_description:
+                # Use the provided description (from AI optimization)
+                listing_desc = listing_description
+            else:
+                listing_desc = offer_data.get("listingDescription", "")
+            
+            if not listing_desc or len(listing_desc) < 50:
+                # 如果描述为空或太短，使用基础描述
+                listing_desc = "Brand new product. Please refer to product images for details."
+            elif len(listing_desc) > 50000:  # 智能截断HTML，保持结构完整
+                from src.utils.html_truncator import smart_truncate_html
+                listing_desc = smart_truncate_html(listing_desc, max_length=50000, min_length=45000)
+            
+            put_headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Content-Language": "en-US",
+                "Accept": "application/json"
+            }
+
+            def _build_update_payload(quantity: int) -> Dict[str, Any]:
+                payload = {
+                    "availableQuantity": self._positive_offer_quantity(quantity),
+                    "categoryId": category_id,
+                    "listingDescription": listing_desc,
+                    "listingDuration": offer_data.get("listingDuration", "GTC"),
+                    "listingPolicies": self._complete_listing_policies(offer_data.get("listingPolicies", {})),
+                    "merchantLocationKey": offer_data.get("merchantLocationKey", "DAJIAN_LA_WAREHOUSE"),
+                    "pricingSummary": offer_data.get("pricingSummary", {}),
+                }
+                if price:
+                    payload["pricingSummary"] = {
+                        "price": {
+                            "value": str(price),
+                            "currency": "USD"
+                        }
+                    }
+                return payload
+
+            quantity = self._positive_offer_quantity(offer_data.get("availableQuantity", 1))
+            response = self.session.put(
+                get_url,
+                headers=put_headers,
+                json=_build_update_payload(quantity),
+                timeout=120,
+            )
+
+            if response.status_code in [200, 204]:
+                print(f"[OK] Offer {offer_id} updated with category: {category_id}")
+                return True
+
+            error_text = response.text[:500]
+            if quantity != 1 and any(
+                marker in error_text.lower()
+                for marker in ("selling limit", "amount you can list", "exceed the amount you can list")
+            ):
+                logging.warning(
+                    f"Offer {offer_id} update hit selling limit at quantity {quantity}; retrying with quantity=1"
+                )
+                response = self.session.put(
+                    get_url,
+                    headers=put_headers,
+                    json=_build_update_payload(1),
+                    timeout=120,
+                )
+                if response.status_code in [200, 204]:
+                    print(f"[OK] Offer {offer_id} updated with category: {category_id} (quantity fallback=1)")
+                    return True
+                error_text = response.text[:500]
+
+            verified_offer = self.get_offer(offer_id) or {}
+            verified_category = str(
+                verified_offer.get("categoryId")
+                or (verified_offer.get("category") or {}).get("categoryId")
+                or ""
+            ).strip()
+            verified_description = _normalize_offer_description_for_compare(
+                verified_offer.get("listingDescription", "")
+            )
+            expected_description = _normalize_offer_description_for_compare(listing_desc)
+
+            if verified_category == str(category_id).strip() and (
+                not listing_desc or verified_description == expected_description
+            ):
+                logging.warning(
+                    "Offer %s PUT returned HTTP %s, but follow-up GET matches target category/description; "
+                    "treating as success",
+                    offer_id,
+                    response.status_code,
+                )
+                return True
+
+            logging.error(f"Failed to update offer: {response.status_code} - {error_text[:200]}")
+            return False
         
-        if response.status_code != 200:
-            logging.error(f"[ERROR] Publish failed: {response.status_code}")
-            logging.error(f"[ERROR] Response: {response.text}")
-            print(f"[DEBUG] Response status: {response.status_code}")
-            print(f"[DEBUG] Response body: {response.text}")
+        except Exception as e:
+            logging.error(f"Error updating offer: {e}")
+            return False
+            
+    def delete_offer(self, offer_id: str) -> bool:
+        """
+        Delete an offer
         
-        response.raise_for_status()
+        DELETE /sell/inventory/v1/offer/{offerId}
+        """
+        url = f"{self.base_url}/sell/inventory/v1/offer/{offer_id}"
+        token = self.oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}"
+        }
         
-        result = response.json()
-        listing_id = result.get("listingId")
+        try:
+            response = self.session.delete(url, headers=headers)
+            if response.status_code in [200, 204]:
+                logging.info(f"[SUCCESS] Offer deleted: {offer_id}")
+                return True
+            else:
+                logging.error(f"Failed to delete offer: {response.status_code}")
+                return False
+        except Exception as e:
+            logging.error(f"Error deleting offer: {e}")
+            return False
+
+    def get_offers_by_sku(self, sku: str, marketplace_id: Optional[str] = None) -> list:
+        """
+        Get all offers for a specific SKU.
         
-        print(f"[OK] Listing published: {listing_id}")
+        GET /sell/inventory/v1/offer?sku={sku}
         
-        return result
-    
+        Returns:
+            List of offer dicts, or empty list on error
+        """
+        url = f"{self.base_url}/sell/inventory/v1/offer"
+        token = self.oauth.get_valid_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        params = {"sku": sku}
+        if marketplace_id:
+            params["marketplace_id"] = marketplace_id
+        
+        try:
+            response = self.session.get(url, headers=headers, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                offers = data.get("offers", [])
+
+                def _sort_key(offer: Dict[str, Any]):
+                    listing = offer.get("listing") or {}
+                    listing_status = listing.get("listingStatus", "")
+                    status = offer.get("status", "")
+                    offer_marketplace = offer.get("marketplaceId", "")
+                    marketplace_rank = 0 if marketplace_id and offer_marketplace == marketplace_id else 1
+                    active_rank = 0 if listing_status == "ACTIVE" else 1
+                    published_rank = 0 if status == "PUBLISHED" else 1
+                    return (marketplace_rank, active_rank, published_rank, offer.get("offerId", ""))
+
+                return sorted(offers, key=_sort_key)
+            elif response.status_code == 404:
+                return []
+            else:
+                logging.warning(f"get_offers_by_sku({sku}): HTTP {response.status_code}")
+                return []
+        except Exception as e:
+            logging.error(f"get_offers_by_sku error: {e}")
+            return []
+
+    def withdraw_offer(self, offer_id: str) -> bool:
+        """
+        Withdraw (end) a published offer, ending the live eBay listing.
+        
+        POST /sell/inventory/v1/offer/{offerId}/withdraw
+        
+        Returns:
+            True if successful
+        """
+        url = f"{self.base_url}/sell/inventory/v1/offer/{offer_id}/withdraw"
+        token = self.oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        
+        try:
+            response = self.session.post(url, headers=headers)
+            if response.status_code in [200, 204]:
+                logging.info(f"[SUCCESS] Offer withdrawn: {offer_id}")
+                return True
+            else:
+                logging.error(f"Failed to withdraw offer {offer_id}: {response.status_code} - {response.text[:200]}")
+                return False
+        except Exception as e:
+            logging.error(f"Error withdrawing offer: {e}")
+            return False
+
+    def delete_inventory_item(self, sku: str) -> bool:
+        """
+        Delete an inventory item by SKU.
+        
+        DELETE /sell/inventory/v1/inventory_item/{sku}
+        
+        Returns:
+            True if successful
+        """
+        url = f"{self.base_url}/sell/inventory/v1/inventory_item/{sku}"
+        token = self.oauth.get_valid_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        try:
+            response = self.session.delete(url, headers=headers)
+            if response.status_code in [200, 204]:
+                logging.info(f"[SUCCESS] Inventory item deleted: {sku}")
+                return True
+            else:
+                logging.error(f"Failed to delete inventory {sku}: {response.status_code}")
+                return False
+        except Exception as e:
+            logging.error(f"Error deleting inventory item: {e}")
+            return False
+
+    def delist_sku(self, sku: str) -> dict:
+        """
+        Full delist flow: withdraw all offers → delete offers → delete inventory item.
+        
+        Returns:
+            {'success': bool, 'steps': [...], 'error': str|None}
+        """
+        steps = []
+        
+        # 1. Get all offers for this SKU
+        offers = self.get_offers_by_sku(sku)
+        steps.append(f"Found {len(offers)} offer(s) for {sku}")
+        
+        # 2. Withdraw and delete each offer
+        for offer in offers:
+            offer_id = offer.get("offerId")
+            status = offer.get("status", "")
+            
+            if status == "PUBLISHED":
+                ok = self.withdraw_offer(offer_id)
+                steps.append(f"Withdraw offer {offer_id}: {'OK' if ok else 'FAILED'}")
+                if not ok:
+                    return {"success": False, "steps": steps, "error": f"Failed to withdraw offer {offer_id}"}
+            
+            ok = self.delete_offer(offer_id)
+            steps.append(f"Delete offer {offer_id}: {'OK' if ok else 'FAILED'}")
+            if not ok:
+                return {
+                    "success": False,
+                    "steps": steps,
+                    "error": f"Failed to delete offer {offer_id}",
+                }
+        
+        # 3. Delete inventory item
+        ok = self.delete_inventory_item(sku)
+        steps.append(f"Delete inventory item {sku}: {'OK' if ok else 'FAILED'}")
+        if not ok:
+            return {
+                "success": False,
+                "steps": steps,
+                "error": f"Failed to delete inventory item {sku}",
+            }
+        
+        return {"success": True, "steps": steps, "error": None}
+
     def upload_video(self, video_url: str, title: str, description: str = "") -> str:
         """
         Upload video to eBay Media API
@@ -386,7 +1358,12 @@ class RealEbayClient:
         category_tree_id = "0"
         url = f"{self.base_url}/commerce/taxonomy/v1/category_tree/{category_tree_id}/get_category_suggestions"
         
-        token = self.oauth.get_valid_token()
+        # Use Application Token for Taxonomy API (public API, doesn't need user auth)
+        try:
+            token = self.oauth.get_application_token()
+        except Exception as e:
+            logging.warning(f"[WARN] Failed to get application token: {e}, using user token")
+            token = self.oauth.get_valid_token()
         
         headers = {
             "Authorization": f"Bearer {token}",
@@ -422,13 +1399,33 @@ class RealEbayClient:
         # Common product -> category mappings
         category_map = {
             # Pet supplies
-            "dog crate": {"categoryId": "177800", "categoryName": "Cages & Crates"},
-            "dog kennel": {"categoryId": "177800", "categoryName": "Cages & Crates"},
-            "cat litter": {"categoryId": "116363", "categoryName": "Litter Boxes"},
-            "cat tree": {"categoryId": "20744", "categoryName": "Cat Trees & Condos"},
-            "pet bed": {"categoryId": "20743", "categoryName": "Beds"},
+            "dog crate": {"categoryId": "121851", "categoryName": "Dog Cages & Crates"},
+            "dog kennel": {"categoryId": "121851", "categoryName": "Dog Cages & Crates"},
+            "dog bed": {"categoryId": "20744", "categoryName": "Beds"},
+            "cat litter": {"categoryId": "100411", "categoryName": "Litter Boxes"},
+            "litter box": {"categoryId": "100411", "categoryName": "Litter Boxes"},
+            "cat tree": {"categoryId": "20740", "categoryName": "Furniture & Scratchers"},
+            "cat cabinet": {"categoryId": "20740", "categoryName": "Furniture & Scratchers"},
+            "cat house": {"categoryId": "20740", "categoryName": "Furniture & Scratchers"},
+            "pet bed": {"categoryId": "20744", "categoryName": "Beds"},
+            "chicken coop": {"categoryId": "63108", "categoryName": "Cages, Hutches & Enclosure"},
+            "garden statue": {"categoryId": "29511", "categoryName": "Ornaments & Statues"},
+            "statue": {"categoryId": "29511", "categoryName": "Ornaments & Statues"},
+            "planter": {"categoryId": "20518", "categoryName": "Baskets, Pots, Window Boxes & Saucers"},
             
-            # Furniture
+            # Furniture - Living Room
+            "sofa": {"categoryId": "38208", "categoryName": "Sofas, Armchairs & Couches"},
+            "sectional": {"categoryId": "38208", "categoryName": "Sofas, Armchairs & Couches"},
+            "couch": {"categoryId": "38208", "categoryName": "Sofas, Armchairs & Couches"},
+            "loveseat": {"categoryId": "38208", "categoryName": "Sofas, Armchairs & Couches"},
+            
+            # Furniture - Bedroom
+            "bed": {"categoryId": "131604", "categoryName": "Beds & Bedframes"},
+            "race car bed": {"categoryId": "131604", "categoryName": "Beds & Bedframes"},
+            "platform bed": {"categoryId": "131604", "categoryName": "Beds & Bedframes"},
+            "bunk bed": {"categoryId": "131604", "categoryName": "Beds & Bedframes"},
+            
+            # Furniture - Other
             "desk": {"categoryId": "88057", "categoryName": "Desks & Tables"},
             "vanity": {"categoryId": "32878", "categoryName": "Vanities & Makeup Tables"},
             "tv stand": {"categoryId": "20488", "categoryName": "TV Stands & Entertainment Units"},
@@ -437,14 +1434,13 @@ class RealEbayClient:
             "bookshelf": {"categoryId": "3199", "categoryName": "Bookcases"},
             "cabinet": {"categoryId": "38221", "categoryName": "Cabinets & Cupboards"},
             "chair": {"categoryId": "54235", "categoryName": "Chairs"},
-            "sofa": {"categoryId": "38208", "categoryName": "Sofas"},
             
             # Office
             "office chair": {"categoryId": "54235", "categoryName": "Office Chairs"},
             
             # Outdoor
-            "patio": {"categoryId": "25863", "categoryName": "Patio & Garden Furniture"},
-            "outdoor": {"categoryId": "25863", "categoryName": "Patio & Garden Furniture"},
+            "patio": {"categoryId": "139849", "categoryName": "Patio & Garden Furniture Sets"},
+            "outdoor": {"categoryId": "139849", "categoryName": "Patio & Garden Furniture Sets"},
         }
         
         # Find matching category
@@ -460,6 +1456,173 @@ class RealEbayClient:
         suggestions = result.get("categorySuggestions", [])
         
         return suggestions[:limit]
+
+
+    def upload_picture(self, image_url: str) -> Optional[str]:
+        """
+        Upload a picture to eBay's Picture Services (EPS) via UploadSiteHostedPictures.
+        
+        Downloads the image from the source URL and uploads it to eBay,
+        returning a permanent eBay-hosted URL (https://i.ebayimg.com/...).
+        
+        Args:
+            image_url: Source image URL (e.g., GigaCloud CDN)
+            
+        Returns:
+            eBay-hosted image URL, or None on failure
+        """
+        try:
+            # 1. Download the image
+            resp = requests.get(image_url, timeout=30, stream=True, verify=False)
+            if resp.status_code != 200:
+                logging.warning(f"[EPS] Failed to download image: HTTP {resp.status_code} from {image_url[:80]}")
+                return None
+            
+            image_data = resp.content
+            content_type = resp.headers.get('Content-Type', 'image/jpeg')
+            
+            # Validate it's actually an image
+            if not content_type.startswith('image/'):
+                logging.warning(f"[EPS] Not an image: {content_type} from {image_url[:80]}")
+                return None
+            
+            try:
+                image_data, content_type, (width, height) = normalize_eps_image_data(
+                    image_data,
+                    content_type,
+                )
+            except Exception as image_exc:
+                logging.warning(f"[EPS] Failed to prepare image for EPS: {image_exc}")
+                return None
+
+            if len(image_data) > EPS_MAX_IMAGE_BYTES:
+                logging.warning(
+                    f"[EPS] Image too large after normalization: {len(image_data)} bytes from {image_url[:80]}"
+                )
+                return None
+
+            if width < EPS_MIN_IMAGE_SIDE or height < EPS_MIN_IMAGE_SIDE:
+                logging.warning(
+                    f"[EPS] Image too small after normalization ({width}x{height}) from {image_url[:80]}"
+                )
+                return None
+            
+            # 2. Build XML request
+            xml_request = """<?xml version="1.0" encoding="utf-8"?>
+<UploadSiteHostedPicturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+    <ErrorLanguage>en_US</ErrorLanguage>
+    <WarningLevel>High</WarningLevel>
+    <PictureName>product_image</PictureName>
+    <PictureSet>Supersize</PictureSet>
+</UploadSiteHostedPicturesRequest>"""
+            
+            # 3. Get OAuth token
+            token = self.oauth.get_valid_token()
+            
+            # 4. Build Trading API headers
+            app_id = os.environ.get('EBAY_APP_ID', '')
+            dev_id = os.environ.get('EBAY_DEV_ID', '')
+            cert_id = os.environ.get('EBAY_CERT_ID', '')
+            
+            env = self.oauth.environment.lower()
+            api_endpoint = "https://api.ebay.com/ws/api.dll" if env == "production" else "https://api.sandbox.ebay.com/ws/api.dll"
+            
+            # 5. Build multipart/form-data with XML + binary image
+            boundary = "MIME_boundary_eBay_image_upload"
+            body = (
+                f"--{boundary}\r\n"
+                f"Content-Disposition: form-data; name=\"XML Payload\"\r\n"
+                f"Content-Type: text/xml;charset=utf-8\r\n\r\n"
+                f"{xml_request}\r\n"
+                f"--{boundary}\r\n"
+                f"Content-Disposition: form-data; name=\"image\"; filename=\"image.jpg\"\r\n"
+                f"Content-Type: {content_type}\r\n"
+                f"Content-Transfer-Encoding: binary\r\n\r\n"
+            ).encode('utf-8') + image_data + f"\r\n--{boundary}--\r\n".encode('utf-8')
+            
+            headers = {
+                "X-EBAY-API-COMPATIBILITY-LEVEL": "967",
+                "X-EBAY-API-CALL-NAME": "UploadSiteHostedPictures",
+                "X-EBAY-API-SITEID": "0",
+                "X-EBAY-API-IAF-TOKEN": token,
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(body)),
+            }
+            
+            # 6. Upload
+            resp = requests.post(api_endpoint, headers=headers, data=body, timeout=60, verify=False)
+            
+            if resp.status_code != 200:
+                logging.error(f"[EPS] Upload failed: HTTP {resp.status_code}")
+                return None
+            
+            # 7. Parse response XML for the hosted URL
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(resp.text)
+            ns = {'ebay': 'urn:ebay:apis:eBLBaseComponents'}
+            
+            ack = root.find('ebay:Ack', ns)
+            if ack is not None and ack.text in ('Success', 'Warning'):
+                pic_data = root.find('.//ebay:SiteHostedPictureDetails', ns)
+                if pic_data is not None:
+                    full_url = pic_data.find('ebay:FullURL', ns)
+                    if full_url is not None and full_url.text:
+                        logging.info(f"[EPS] Uploaded: {full_url.text[:80]}")
+                        return full_url.text
+            
+            # Parse errors
+            errors = root.findall('.//ebay:Errors', ns)
+            for err in errors:
+                code = err.find('ebay:ErrorCode', ns)
+                msg = err.find('ebay:LongMessage', ns)
+                logging.error(f"[EPS] Error {code.text if code is not None else '?'}: {msg.text if msg is not None else '?'}")
+            
+            return None
+            
+        except Exception as e:
+            logging.error(f"[EPS] Exception uploading image: {e}")
+            return None
+    
+    def upload_images_to_eps(self, image_urls: List[str], max_images: int = 24) -> List[str]:
+        """
+        Upload multiple images to eBay EPS, returning eBay-hosted URLs.
+        Skips failed uploads to avoid mixed EPS/non-EPS URL errors.
+
+        Args:
+            image_urls: List of source image URLs
+            max_images: Maximum number of images to upload (eBay limit used by this app: 24)
+
+        Returns:
+            List of eBay-hosted image URLs (only successfully uploaded)
+        """
+        eps_urls = []
+        for i, url in enumerate(image_urls[:max_images]):
+            clean_url = clean_image_url(url) if url else ""
+            if not clean_url:
+                continue
+
+            # Try to upload to EPS with retry for SSL errors
+            eps_url = None
+            for attempt in range(3):
+                eps_url = self.upload_picture(url)
+                if not eps_url:
+                    eps_url = self.upload_picture(clean_url)
+                if eps_url:
+                    break
+                logging.warning(f"[EPS] Upload attempt {attempt+1}/3 failed for image {i+1}, retrying in {3*(attempt+1)}s...")
+                time.sleep(3 * (attempt + 1))
+
+            if eps_url:
+                eps_urls.append(eps_url)
+            else:
+                # Do NOT fall back to non-EPS URL — eBay rejects mixed sets
+                logging.warning(f"[EPS] Upload failed for image {i+1} after 3 attempts, skipping (no fallback)")
+
+            # Rate limit
+            if i < len(image_urls[:max_images]) - 1:
+                time.sleep(0.5)
+
+        return eps_urls
 
 
 # Factory function for easy initialization

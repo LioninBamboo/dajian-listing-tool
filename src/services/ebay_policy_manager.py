@@ -7,7 +7,7 @@ Manages and caches eBay business policies (Fulfillment, Return, Payment)
 import sqlite3
 import requests
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import UTC, datetime
 from src.services.ebay_auth import EbayOAuthService
 
 
@@ -122,7 +122,7 @@ class EbayPolicyManager:
                 policy_name,
                 is_default,
                 str(policy),  # Store full policy data as string
-                datetime.utcnow().isoformat()
+                datetime.now(UTC).replace(tzinfo=None).isoformat()
             ))
         
         conn.commit()

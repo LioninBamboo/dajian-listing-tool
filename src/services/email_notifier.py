@@ -12,7 +12,7 @@ import os
 class EmailNotifier:
     """邮件通知器"""
     
-    def __init__(self, smtp_server="smtp.gmail.com", smtp_port=587):
+    def __init__(self, smtp_server=None, smtp_port=None):
         """
         初始化邮件通知器
         
@@ -20,8 +20,8 @@ class EmailNotifier:
             smtp_server: SMTP 服务器地址
             smtp_port: SMTP 端口
         """
-        self.smtp_server = smtp_server
-        self.smtp_port = smtp_port
+        self.smtp_server = smtp_server or os.getenv("SMTP_SERVER", "")
+        self.smtp_port = smtp_port or int(os.getenv("SMTP_PORT", "0") or 0)
         
     def send_optimization_report(
         self,
@@ -103,17 +103,20 @@ class EmailNotifier:
         html_part = MIMEText(html_content, 'html', 'utf-8')
         msg.attach(html_part)
         
-        # 发送邮件
+        # 使用统一邮件模块发送
         try:
             print(f"📧 正在发送邮件到 {to_email}...")
-            
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
-                server.starttls()
-                server.login(from_email, password)
-                server.send_message(msg)
-            
-            print(f"✅ 邮件发送成功！")
-            return True
+            from src.utils.email_sender import send_email
+            result = send_email(
+                subject=subject,
+                html_body=html_content,
+                to_email=to_email
+            )
+            if result:
+                print(f"✅ 邮件发送成功！")
+            else:
+                print(f"❌ 邮件发送失败")
+            return result
             
         except Exception as e:
             print(f"❌ 邮件发送失败: {e}")

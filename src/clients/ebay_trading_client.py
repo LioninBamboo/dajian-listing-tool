@@ -1,5 +1,30 @@
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import urllib3
 from .ebay_client import EbayClient
+
+# Suppress InsecureRequestWarning 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _create_trading_session():
+    """Create a requests session with retry + verify=False for Trading API."""
+    session = requests.Session()
+    session.verify = False
+    session.trust_env = False
+    retry_strategy = Retry(
+        total=5,
+        connect=5,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 class EbayTradingClient:
     """
@@ -16,6 +41,7 @@ class EbayTradingClient:
         self.ebay_client = ebay_client
         self.env = ebay_client.env
         self.endpoint = self.ENDPOINTS[self.env]
+        self.session = _create_trading_session()
         
     def _build_headers(self, call_name: str) -> dict:
         """Build headers for Trading API"""
@@ -52,12 +78,11 @@ class EbayTradingClient:
 
         headers = self._build_headers(call_name)
         
-        response = requests.post(
+        response = self.session.post(
             self.endpoint,
             headers=headers,
             data=xml_request.encode('utf-8'),
-            timeout=30,
-            verify=False  # 禁用 SSL 验证以应对代理
+            timeout=60,
         )
         
         # Simple error check (requests level)
