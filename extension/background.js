@@ -11,21 +11,31 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             body: JSON.stringify(request.data)
         })
             .then(async response => {
-                // Check if response is OK
-                if (!response.ok) {
-                    console.error(`Background: HTTP Error ${response.status}`);
+                const text = await response.text();
+                const contentType = response.headers.get("content-type") || "";
+
+                let data = null;
+                if (contentType.includes("application/json")) {
+                    try {
+                        data = JSON.parse(text);
+                    } catch (error) {
+                        console.error("Background: Invalid JSON response:", text.substring(0, 300));
+                        throw new Error(`Server returned invalid JSON: ${text.substring(0, 120)}`);
+                    }
                 }
 
-                // Try to parse as JSON
-                const contentType = response.headers.get("content-type");
-                if (contentType && contentType.includes("application/json")) {
-                    return response.json();
-                } else {
-                    // Not JSON, get text
-                    const text = await response.text();
-                    console.error("Background: Non-JSON response:", text.substring(0, 200));
-                    throw new Error(`Server returned non-JSON response: ${text.substring(0, 100)}`);
+                if (!response.ok) {
+                    const detail = (data && (data.message || data.error)) || text.substring(0, 200);
+                    console.error(`Background: HTTP Error ${response.status}`, detail);
+                    throw new Error(`HTTP ${response.status}: ${detail}`);
                 }
+
+                if (data) {
+                    return data;
+                }
+
+                console.error("Background: Non-JSON response:", text.substring(0, 200));
+                throw new Error(`Server returned non-JSON response: ${text.substring(0, 120)}`);
             })
             .then(data => {
                 console.log("Background: Success", data);

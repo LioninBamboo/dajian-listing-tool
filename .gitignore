@@ -5,6 +5,10 @@
 
 # Database files
 *.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 ebay_tokens.db
 ebay_collection.db
 
@@ -35,6 +39,7 @@ venv/
 ENV/
 env/
 .venv/
+.venv*/
 
 # IDE
 .idea/
@@ -44,18 +49,39 @@ env/
 *~
 
 # Logs
+logs/
 *.log
 debug_*.log
+logs/*.txt
+logs/*.json
+logs/*.csv
+logs/*.html
 
-# Test files (keep but don't deploy)
-test_*.py
-debug_*.py
-*_test.py
+# Generated reports
+reports/
+reports/*.html
+reports/*.json
+reports/*.csv
 
-# Temp files
+# Local backups / test caches
+backups/
+.pytest_cache/
+
+# Root-level ad hoc test/debug files (do not ignore tests/ suite)
+/test_*.py
+/debug_*.py
+/*_test.py
+
+# Temp files & scripts
 *.tmp
 *.temp
 .cache/
+cache/
+/_*.py
+/_*.txt
+/_*.json
+archive/temp_scripts/
+archive/temp_data/
 
 # OS files
 .DS_Store
@@ -87,6 +113,30 @@ EBAY_PUBLISH_SUCCESS_GUIDE.md
 ACTION_CHECKLIST.*
 auth_url*.txt
 full_flow_output*.txt
+
+# Codex / local workspace runtime artifacts
+.qwen/
+scratch/
+tmp_imgs/
+tmp_pdfs/
+.chrome_profile_gigacloud/
+archive/logs/
+tmp_*.png
+tmp_*.jpg
+tmp_*.jpeg
+tmp_*.webp
+tmp_*.html
+tmp_*.json
+tmp_*.csv
+debug_server.log
+debug_*.html
+debug_*.json
+*.jsonl
+
+# Root runtime/operator state
+favorite_progress.json
+sku_product_id_map.json
+unfavorited_skus.txt
 
 # Documentation files that may contain sensitive info
 COMPLETION_CHECKLIST.md

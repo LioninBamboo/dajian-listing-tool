@@ -1,10 +1,14 @@
 """数据库模型定义"""
-from datetime import datetime
+from datetime import UTC, datetime
 from sqlalchemy import Column, Integer, String, Text, DECIMAL, DateTime, create_engine
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
 
 Base = declarative_base()
+
+
+def _utcnow_naive() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class Product(Base):
@@ -35,8 +39,8 @@ class Product(Base):
     last_synced_at = Column(DateTime)
     error_message = Column(Text)
     
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow_naive)
+    updated_at = Column(DateTime, default=_utcnow_naive, onupdate=_utcnow_naive)
     
     # Traffic Optimization
     last_refreshed_at = Column(DateTime) # Last time we did a "Cycle" (End & Sell Similar)
@@ -77,7 +81,7 @@ class SyncLog(Base):
     status = Column(String(20))  # success, failed
     message = Column(Text)
     execution_time_ms = Column(Integer)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow_naive)
 
 
 class Config(Base):
@@ -86,4 +90,4 @@ class Config(Base):
     
     key = Column(String(50), primary_key=True)
     value = Column(Text)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=_utcnow_naive, onupdate=_utcnow_naive)
