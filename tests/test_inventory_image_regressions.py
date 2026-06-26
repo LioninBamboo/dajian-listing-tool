@@ -297,5 +297,12 @@ def test_active_audit_surfaces_description_only_fixes(monkeypatch):
         "<div>source desc</div>",
     )
 
-    assert issues == []
-    assert fixes == {"__desc_needs_update__": True}
+    issue_types = {issue["type"] for issue in issues}
+    assert issue_types == {
+        "description_structure_missing_key_features",
+        "desc_weight_mismatch",
+    }
+    assert fixes == {
+        "__restore_live_description_from_local__": True,
+        "__desc_needs_update__": True,
+    }

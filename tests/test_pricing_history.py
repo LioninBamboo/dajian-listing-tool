@@ -1,7 +1,7 @@
 """P9 — pricing_history tests."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -55,7 +55,8 @@ def test_skip_rows_without_sku(tmp_db):
 
 
 def test_blacklisted_persisted_as_int(tmp_db):
+    recent_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
     ph.record_daily_snapshot([{'sku': 'B', 'blacklisted': True}],
-                              db_path=tmp_db, date='2026-05-01')
+                              db_path=tmp_db, date=recent_date)
     h = ph.get_history('B', days=10, db_path=tmp_db)
     assert h[0]['blacklisted'] == 1

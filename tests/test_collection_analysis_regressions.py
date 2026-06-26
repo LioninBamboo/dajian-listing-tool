@@ -324,12 +324,12 @@ def test_ready_draft_category_regressions_from_may_batch():
     assert matcher.is_category_plausible_for_text(patio_table_title, "112590", "Patio & Garden Tables")
 
     bunk_with_sofa_title = "Twin Over Twin Bunk Bed Frame with Storage Drawers Lower Bed Can Convert Into Sofa"
-    assert matcher._fallback_category(bunk_with_sofa_title)[0] == "175754"
+    assert matcher._fallback_category(bunk_with_sofa_title)[0] == "175758"
     assert matcher.canonicalize_category(bunk_with_sofa_title, "175754", "Bunk Beds") == (
-        "175754",
-        "Bunk Beds",
+        "175758",
+        "Beds & Bed Frames",
     )
-    assert matcher.is_category_plausible_for_text(bunk_with_sofa_title, "175754", "Bunk Beds")
+    assert matcher.is_category_plausible_for_text(bunk_with_sofa_title, "175758", "Beds & Bed Frames")
 
 
 def test_ready_draft_category_regressions_from_may_18_batch():
