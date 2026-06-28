@@ -427,7 +427,7 @@ def generate_terapeak_report() -> dict:
     logger.info("="*60)
     
     try:
-        from daily_terapeak_report import DailyTerapeakReport
+        from scripts.daily_terapeak_report import DailyTerapeakReport
         
         reporter = DailyTerapeakReport()
         report_data = reporter.generate_report()
@@ -480,9 +480,13 @@ def run_listing_audit(
             build_live_listing_opt_snapshot,
             build_source_audit_payload,
             fix_listing_on_ebay,
+            get_quality_gate_meta,
             is_listing_frozen_clean,
             parse_json,
             persist_listing_audit_state,
+            QUALITY_GATE_META_VERSION,
+            QUALITY_GATE_RULESET_VERSION,
+            split_transport_issues,
         )
 
         if use_live is None:
@@ -513,6 +517,10 @@ def run_listing_audit(
         )
         aborted_network_failures = False
         attempted_live_fetches = 0
+        audited_live_listings = 0
+        skipped_incremental_scope = 0
+        transport_failures = 0
+        transport_issue_skus = []
 
         ebay_client = None
         if use_live or auto_fix:
@@ -523,6 +531,7 @@ def run_listing_audit(
 
         for row in rows:
             stored_opt = parse_json(row["optimization"])
+            meta = get_quality_gate_meta(stored_opt)
             source_fingerprint = build_audit_fingerprint(
                 build_source_audit_payload(
                     row["title"],
@@ -538,8 +547,20 @@ def run_listing_audit(
             live_offer = None
             current_listing_id = row["listing_id"]
             preflight_issues = []
+            should_audit_live = True
+            if use_live and not auto_fix and not ignore_clean_freeze:
+                should_audit_live = (
+                    meta.get("version") != QUALITY_GATE_META_VERSION
+                    or meta.get("ruleset_version") != QUALITY_GATE_RULESET_VERSION
+                    or meta.get("status") != "clean"
+                    or meta.get("source_fingerprint") != source_fingerprint
+                )
+                if not should_audit_live:
+                    skipped_incremental_scope += 1
+                    continue
             if use_live and ebay_client:
                 attempted_live_fetches += 1
+                audited_live_listings += 1
                 try:
                     live_inventory, live_offer = _fetch_live_listing_context(
                         ebay_client,
@@ -627,6 +648,7 @@ def run_listing_audit(
                 live_inventory=live_inventory if use_live else None,
             )
             issues = preflight_issues + issues
+            transport_issues, content_issues = split_transport_issues(issues)
             issue_types = sorted(
                 {
                     str(issue.get("type", "")).strip()
@@ -647,21 +669,35 @@ def run_listing_audit(
                         clean_state_recorded += 1
                 continue
             if issues:
-                issues_found += 1
                 severity_order = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
-                severity_max = min(
-                    severity_order.index(i["severity"])
-                    for i in issues
-                    if i.get("severity") in severity_order
-                )
-                if severity_max == 0:
-                    critical_count += 1
-                issue_skus.append({
-                    "sku": row["sku"],
-                    "listing_id": current_listing_id,
-                    "issues": len(issues),
-                    "max_severity": severity_order[severity_max],
-                })
+                if content_issues:
+                    issues_found += 1
+                    severity_max = min(
+                        severity_order.index(i["severity"])
+                        for i in content_issues
+                        if i.get("severity") in severity_order
+                    )
+                    if severity_max == 0:
+                        critical_count += 1
+                    issue_skus.append({
+                        "sku": row["sku"],
+                        "listing_id": current_listing_id,
+                        "issues": len(content_issues),
+                        "max_severity": severity_order[severity_max],
+                    })
+                if transport_issues:
+                    transport_failures += 1
+                    severity_max = min(
+                        severity_order.index(i["severity"])
+                        for i in transport_issues
+                        if i.get("severity") in severity_order
+                    )
+                    transport_issue_skus.append({
+                        "sku": row["sku"],
+                        "listing_id": current_listing_id,
+                        "issues": len(transport_issues),
+                        "max_severity": severity_order[severity_max],
+                    })
 
                 if auto_fix and fixes and ebay_client:
                     import time
@@ -720,18 +756,26 @@ def run_listing_audit(
             "critical": critical_count,
             "fixed": fixed_count if auto_fix else 0,
             "errors": error_count,
+            "transport_failures": transport_failures,
             "skipped_clean_frozen": skipped_clean_frozen if use_live else 0,
             "clean_state_recorded": clean_state_recorded if use_live and record_clean_state else 0,
             "aborted_network_failures": aborted_network_failures,
+            "audited_live_listings": audited_live_listings if use_live else 0,
+            "skipped_incremental_scope": skipped_incremental_scope if use_live and not auto_fix else 0,
             "unprocessed": max(0, total - attempted_live_fetches)
             if aborted_network_failures else 0,
             "top_issues": issue_skus[:10],
+            "top_transport_failures": transport_issue_skus[:10],
         }
 
         logger.info(f"刊登审计完成:")
         logger.info(f"  活跃链接: {total}")
         logger.info(f"  有问题: {issues_found} (严重: {critical_count})")
         if use_live:
+            logger.info(f"  抓取/availability 异常: {transport_failures}")
+            logger.info(f"  增量 live 审计: {audited_live_listings}")
+            if not auto_fix:
+                logger.info(f"  增量范围跳过: {skipped_incremental_scope}")
             logger.info(f"  clean freeze 跳过: {skipped_clean_frozen}")
             if record_clean_state:
                 logger.info(f"  clean 状态刷新: {clean_state_recorded}")

@@ -264,7 +264,7 @@ class TestRecommendationScope:
         assert skus == {"READY-1", "PENDING-1", "COLLECTED-1"}
 
     def test_daily_terapeak_report_inventory_excludes_published(self, tmp_path):
-        import daily_terapeak_report as rep_mod
+        from scripts import daily_terapeak_report as rep_mod
 
         db_path = tmp_path / "daily_report_scope.db"
         conn = sqlite3.connect(db_path)

@@ -50,7 +50,7 @@ CHROME_PATHS = [
 CDP_PORT = 9222
 
 # 缓存: SKU → product_id
-SKU_MAP_FILE = 'sku_product_id_map.json'
+SKU_MAP_FILE = 'cache/sku_product_id_map.json'
 
 
 def find_chrome():
@@ -82,7 +82,7 @@ def launch_chrome():
     return proc
 
 
-def load_skus(filepath='unfavorited_skus.txt'):
+def load_skus(filepath='cache/unfavorited_skus.txt'):
     skus = []
     with open(filepath, 'r') as f:
         for line in f:
@@ -92,7 +92,7 @@ def load_skus(filepath='unfavorited_skus.txt'):
     return skus
 
 
-def save_progress(favorited, failed, skipped, filepath='favorite_progress.json'):
+def save_progress(favorited, failed, skipped, filepath='cache/favorite_progress.json'):
     with open(filepath, 'w') as f:
         json.dump({
             'favorited': favorited,
@@ -102,7 +102,7 @@ def save_progress(favorited, failed, skipped, filepath='favorite_progress.json')
         }, f, indent=2, ensure_ascii=False)
 
 
-def load_progress(filepath='favorite_progress.json'):
+def load_progress(filepath='cache/favorite_progress.json'):
     if os.path.exists(filepath):
         with open(filepath, 'r') as f:
             return json.load(f)
@@ -301,7 +301,7 @@ def main():
     # --reset 参数
     if '--reset' in sys.argv:
         logger.info("重置进度文件...")
-        for f in ['favorite_progress.json']:
+        for f in ['cache/favorite_progress.json']:
             if os.path.exists(f):
                 os.remove(f)
 

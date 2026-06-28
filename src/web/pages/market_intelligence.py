@@ -1334,7 +1334,7 @@ def render_market_intelligence():
             st.info(
                 "⚠️ GigaCloud 上暂无满足条件的未刊登机会。"
                 "上方诊断面板会告诉你卡在哪一步——通常是「跳过：当前已 PUBLISHED/READY」吃掉了大部分收藏。"
-                "可以试着：放宽利润率、扩大扫描页数、或先用 `auto_favorite_gigacloud.py` 多收藏一些新品。"
+                "可以试着：放宽利润率、扩大扫描页数、或先用 `scripts/auto_favorite_gigacloud.py` 多收藏一些新品。"
             )
 
     # ========== Tab 2: 大建收藏分析 (新增) ==========

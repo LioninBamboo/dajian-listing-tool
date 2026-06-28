@@ -26,7 +26,7 @@ These files currently have mixed index/worktree content and should be reviewed w
 - `batch_analyze.py`
 - `batch_publish.py`
 - `daily_tasks.py`
-- `daily_terapeak_report.py`
+- `scripts/daily_terapeak_report.py`
 - `docs/DAJIAN_API_REFERENCE.md`
 - `docs/SMART_HTML_TRUNCATION.md`
 - `docs/USAGE.md`
