@@ -288,3 +288,52 @@ def test_ingest_external_opportunity_tristate(fake_db):
     assert rows["FRESH-INGEST-1"] == "PENDING"
     assert rows["ENDED-SKU"] == "PENDING"  # flipped back
     assert rows["LIVE-SKU"] == "PUBLISHED"  # untouched
+
+
+def test_external_discovery_credential_missing(fake_db, monkeypatch):
+    from src.plugins.terapeak_research.external_discovery import (
+        discover_external_opportunities,
+    )
+    # Ensure environment variables are clear
+    monkeypatch.delenv("DAJIAN_API_KEY", raising=False)
+    monkeypatch.delenv("DAJIAN_API_SECRET", raising=False)
+    
+    intel = _make_intel(fake_db)
+    # explicitly pass dajian_client=None to trigger _build_default_dajian_client
+    opps = discover_external_opportunities(
+        intel,
+        dajian_client=None,
+        min_margin=0.20,
+        max_results=10,
+        max_candidates=10,
+        page_size=100,
+        max_pages=1,
+        db_path=fake_db,
+    )
+    assert opps == []
+
+
+def test_external_discovery_no_candidates(fake_db):
+    from src.plugins.terapeak_research.external_discovery import (
+        discover_external_opportunities,
+    )
+    
+    # Client returns no records
+    client = _make_dajian_client([], {}, {})
+    intel = _make_intel(fake_db)
+    
+    opps, diag = discover_external_opportunities(
+        intel,
+        dajian_client=client,
+        min_margin=0.20,
+        max_results=10,
+        max_candidates=10,
+        page_size=100,
+        max_pages=1,
+        db_path=fake_db,
+        return_diagnostics=True,
+    )
+    assert opps == []
+    assert diag["scanned"] == 0
+    assert diag["candidates"] == 0
+
