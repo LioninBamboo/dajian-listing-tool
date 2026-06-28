@@ -118,19 +118,46 @@ def main():
 
     import sys
     sys.path.insert(0, str(PROJECT_ROOT))
-    from src.services.cro_thresholds import learn_all, load_thresholds
-    # 旧 = 当前表; 新 = learn_all 提议但未写表 (这里 learn_all 已经写表;
-    # MVP 假设我们在 learn_all 之后立即 shadow, 把两套都从 daily_runner 视角输入)
-    # 真闭环需把 learn_all 改成两阶段; 这里先提供 shadow 工具与算法.
+    from src.services.cro_thresholds import load_thresholds, load_pending_thresholds, promote_pending
+    from src.web.pages.competition_monitor import (
+        load_products_from_db, load_performance_data,
+        merge_performance_into_products, get_market_data_from_report,
+    )
+
     old_thr = load_thresholds()
-    new_thr = old_thr  # placeholder — 实际由 learn_all 改造后传入
-    # 简单 demo: 不跑 products, 直接 echo
-    print(json.dumps({
-        'note': '本脚本为 shadow 算法库; 调用方需传 products/market_data',
+    new_thr = load_pending_thresholds()
+
+    if not new_thr:
+        print(json.dumps({'note': 'No pending thresholds to compare. Aborting.'}))
+        return
+
+    products = load_products_from_db() or []
+    perf = load_performance_data(force_refresh=False)
+    merge_performance_into_products(products, perf or {})
+    for prod in products:
+        prod['images'] = [prod['image_url']] if prod.get('image_url') else []
+    market_data = get_market_data_from_report(None)
+
+    rep = shadow_compare(products, market_data or {}, old_thr, new_thr)
+    out_path = _write_report(rep)
+    
+    output = {
         'old_thr_categories': len(old_thr),
         'new_thr_categories': len(new_thr),
-    }, indent=2))
+        'shadow_result': rep,
+        'report_saved_to': str(out_path),
+        'promoted': False
+    }
 
+    if args.promote:
+        if rep.get('safe_to_promote'):
+            promoted_count = promote_pending()
+            output['promoted'] = True
+            output['promoted_categories'] = promoted_count
+        else:
+            output['note'] = 'Promotion blocked due to safety checks (explosions detected).'
+
+    print(json.dumps(output, ensure_ascii=False, indent=2))
 
 if __name__ == '__main__':
     main()
