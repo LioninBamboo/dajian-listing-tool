@@ -67,10 +67,46 @@ def _render_ops_snapshot(snapshot: Dict[str, Any]) -> None:
     c3.metric('合规缺口', int(compliance.get('missing_legal_basis', 0) or 0))
     c4.metric('改进建议', int(improvement.get('suggestion_count', 0) or 0))
 
+    with st.expander('容量详情 (Capacity Details)'):
+        if capacity.get('status') == 'skipped':
+            st.info(f"Skipped: {capacity.get('reason')}")
+        else:
+            by_comp = capacity.get('by_component', {})
+            if not by_comp:
+                st.info("No component data available.")
+            else:
+                rows = []
+                for comp, stats in by_comp.items():
+                    rows.append({
+                        "组件": comp,
+                        "状态": stats.get('status', ''),
+                        "使用率": f"{stats.get('used_pct', 0):.2%}",
+                        "剩余天数": round(stats.get('days_until_full', 0), 1) if stats.get('days_until_full') is not None else '-',
+                        "满载日期": stats.get('eta', '')[:10] if stats.get('eta') else '-',
+                        "严重级别": stats.get('severity', '')
+                    })
+                st.dataframe(rows, use_container_width=True)
+
+    with st.expander('DR Drill 详情 (Disaster Recovery)'):
+        if dr.get('status') == 'skipped':
+            st.info(f"Skipped: {dr.get('reason')}")
+        else:
+            st.json(dr)
+
+    with st.expander('合规缺口详情 (Compliance Details)'):
+        if compliance.get('status') == 'skipped':
+            st.info(f"Skipped: {compliance.get('reason')} - {compliance.get('path', '')}")
+        else:
+            st.json(compliance)
+
     brief = improvement.get('weekly_brief')
     if brief:
-        with st.expander('周度改进摘要'):
-            st.code(brief, language='markdown')
+        with st.expander('周度改进摘要 (Weekly Improvement Brief)'):
+            st.markdown(brief)
+            suggestions = improvement.get('suggestions', [])
+            if suggestions:
+                st.markdown("#### 具体建议")
+                st.json(suggestions)
 
 
 def render(set_page_config: bool = True) -> None:
