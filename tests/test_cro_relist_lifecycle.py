@@ -498,3 +498,166 @@ def test_transition_action_rejects_invalid_status_jump(tmp_path: Path):
         transition_action(action_id, "ready_to_publish", db_path=db)
 
     assert _actions(db)[0]["status"] == "candidate"
+
+from datetime import datetime, timedelta, timezone
+
+def test_evaluate_transitions_published_new_to_observing(tmp_path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _create_source_tables(db)
+    lifecycle.ensure_schema(db)
+    
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            """
+            INSERT INTO cro_listing_lifecycle_actions
+            (sku, action_type, status, priority, attempt_no, created_at)
+            VALUES ('SKU-1', 'revive_relist', 'published_new', 'P2', 1, ?)
+            """,
+            ("2026-05-01T00:00:00+00:00",)
+        )
+        conn.commit()
+    
+    res = lifecycle.evaluate_observations(db_path=db)
+    assert res["started_observing"] == 1
+    
+    row = _actions(db)[0]
+    assert row["status"] == "observing"
+    assert row["observe_window_days"] == 14
+    assert row["observe_until"]
+
+def test_evaluate_resolves_early_on_sale(tmp_path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _create_source_tables(db)
+    lifecycle.ensure_schema(db)
+    
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            """
+            INSERT INTO cro_listing_lifecycle_actions
+            (sku, action_type, status, priority, attempt_no, created_at, observe_until)
+            VALUES ('SKU-SALE', 'revive_relist', 'observing', 'P2', 1, ?, ?)
+            """,
+            ("2026-05-01T00:00:00+00:00", "2026-05-15T00:00:00+00:00")
+        )
+        conn.commit()
+    
+    _seed_snapshot(db, "SKU-SALE", transactions=1)
+    
+    res = lifecycle.evaluate_observations(db_path=db)
+    assert res["evaluated"] == 1
+    
+    row = _actions(db)[0]
+    assert row["status"] == "revived_success"
+
+def test_evaluate_waits_for_observe_until(tmp_path):
+    db = tmp_path / "cro.db"
+    _create_source_tables(db)
+    lifecycle.ensure_schema(db)
+    
+    future_date = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            """
+            INSERT INTO cro_listing_lifecycle_actions
+            (sku, action_type, status, priority, attempt_no, created_at, observe_until)
+            VALUES ('SKU-WAIT', 'revive_relist', 'observing', 'P2', 1, ?, ?)
+            """,
+            ("2026-05-01T00:00:00+00:00", future_date)
+        )
+        conn.commit()
+    
+    _seed_snapshot(db, "SKU-WAIT", transactions=0)
+    
+    res = lifecycle.evaluate_observations(db_path=db)
+    assert res["evaluated"] == 0
+    row = _actions(db)[0]
+    assert row["status"] == "observing"
+
+def test_evaluate_recovers_traffic_triggers_conversion_help(tmp_path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _create_source_tables(db)
+    lifecycle.ensure_schema(db)
+    
+    enqueued = []
+    monkeypatch.setattr("src.services.cro_action_queue.enqueue_unique_pending", lambda a, source: enqueued.append(a))
+    
+    past_date = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    metrics_before = json.dumps({"impressions": 10, "views": 1})
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            """
+            INSERT INTO cro_listing_lifecycle_actions
+            (sku, action_type, status, priority, attempt_no, created_at, observe_until, metrics_before_json, conversion_help_attempts)
+            VALUES ('SKU-HELP', 'revive_relist', 'observing', 'P2', 1, ?, ?, ?, 0)
+            """,
+            ("2026-05-01T00:00:00+00:00", past_date, metrics_before)
+        )
+        conn.commit()
+    
+    _seed_snapshot(db, "SKU-HELP", impressions=60, views=6, transactions=0)
+    
+    res = lifecycle.evaluate_observations(db_path=db)
+    assert res["evaluated"] == 1
+    
+    row = _actions(db)[0]
+    assert row["status"] == "observing"
+    assert row["conversion_help_attempts"] == 1
+    assert len(enqueued) == 1
+    assert enqueued[0][0]["action"] == "promoted_listings"
+
+def test_evaluate_traffic_dead_triggers_fallback_delist(tmp_path):
+    db = tmp_path / "cro.db"
+    _create_source_tables(db)
+    lifecycle.ensure_schema(db)
+    
+    past_date = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    metrics_before = json.dumps({"impressions": 100, "views": 10})
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            """
+            INSERT INTO cro_listing_lifecycle_actions
+            (sku, action_type, status, priority, attempt_no, created_at, observe_until, metrics_before_json, conversion_help_attempts)
+            VALUES ('SKU-DEAD', 'revive_relist', 'observing', 'P2', 1, ?, ?, ?, 0)
+            """,
+            ("2026-05-01T00:00:00+00:00", past_date, metrics_before)
+        )
+        conn.commit()
+    
+    _seed_snapshot(db, "SKU-DEAD", impressions=10, views=1, transactions=0)
+    
+    res = lifecycle.evaluate_observations(db_path=db)
+    assert res["evaluated"] == 1
+    
+    row = _actions(db)[0]
+    assert row["status"] == "fallback_delist_pending"
+
+def test_evaluate_caps_conversion_help_at_one(tmp_path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _create_source_tables(db)
+    lifecycle.ensure_schema(db)
+    
+    enqueued = []
+    monkeypatch.setattr("src.services.cro_action_queue.enqueue_unique_pending", lambda a, source: enqueued.append(a))
+    
+    past_date = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    metrics_before = json.dumps({"impressions": 10, "views": 1})
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            """
+            INSERT INTO cro_listing_lifecycle_actions
+            (sku, action_type, status, priority, attempt_no, created_at, observe_until, metrics_before_json, conversion_help_attempts)
+            VALUES ('SKU-CAP', 'revive_relist', 'observing', 'P2', 1, ?, ?, ?, 1)
+            """,
+            ("2026-05-01T00:00:00+00:00", past_date, metrics_before)
+        )
+        conn.commit()
+    
+    _seed_snapshot(db, "SKU-CAP", impressions=60, views=6, transactions=0)
+    
+    res = lifecycle.evaluate_observations(db_path=db)
+    assert res["evaluated"] == 1
+    
+    row = _actions(db)[0]
+    assert row["status"] == "fallback_delist_pending"
+    assert len(enqueued) == 0
+

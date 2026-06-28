@@ -23,6 +23,7 @@ STATUS_READY_TO_PUBLISH = "ready_to_publish"
 STATUS_PUBLISHED_NEW = "published_new"
 STATUS_OBSERVING = "observing"
 STATUS_REVIVED_SUCCESS = "revived_success"
+STATUS_NEEDS_CONVERSION_HELP = "needs_conversion_help"
 STATUS_FALLBACK_DELIST_PENDING = "fallback_delist_pending"
 STATUS_FINAL_DELISTED = "final_delisted"
 STATUS_SKIPPED = "skipped"
@@ -37,6 +38,7 @@ STATUSES = {
     STATUS_PUBLISHED_NEW,
     STATUS_OBSERVING,
     STATUS_REVIVED_SUCCESS,
+    STATUS_NEEDS_CONVERSION_HELP,
     STATUS_FALLBACK_DELIST_PENDING,
     STATUS_FINAL_DELISTED,
     STATUS_SKIPPED,
@@ -51,6 +53,7 @@ ACTIVE_STATUSES = (
     STATUS_READY_TO_PUBLISH,
     STATUS_PUBLISHED_NEW,
     STATUS_OBSERVING,
+    STATUS_NEEDS_CONVERSION_HELP,
     STATUS_FALLBACK_DELIST_PENDING,
     STATUS_FAILED,
 )
@@ -68,7 +71,8 @@ ALLOWED_TRANSITIONS = {
     STATUS_OLD_WITHDRAWN: {STATUS_READY_TO_PUBLISH},
     STATUS_READY_TO_PUBLISH: {STATUS_PUBLISHED_NEW},
     STATUS_PUBLISHED_NEW: {STATUS_OBSERVING},
-    STATUS_OBSERVING: {STATUS_REVIVED_SUCCESS, STATUS_FALLBACK_DELIST_PENDING},
+    STATUS_OBSERVING: {STATUS_REVIVED_SUCCESS, STATUS_NEEDS_CONVERSION_HELP, STATUS_FALLBACK_DELIST_PENDING},
+    STATUS_NEEDS_CONVERSION_HELP: {STATUS_OBSERVING},
     STATUS_FALLBACK_DELIST_PENDING: {STATUS_FINAL_DELISTED},
     STATUS_REVIVED_SUCCESS: set(),
     STATUS_FINAL_DELISTED: set(),
@@ -102,6 +106,8 @@ CREATE TABLE IF NOT EXISTS cro_listing_lifecycle_actions (
     started_at TEXT,
     finished_at TEXT,
     observe_until TEXT,
+    observe_window_days INTEGER,
+    conversion_help_attempts INTEGER NOT NULL DEFAULT 0,
     error TEXT,
     source TEXT,
     updated_at TEXT
@@ -123,6 +129,7 @@ WHERE status IN (
     'ready_to_publish',
     'published_new',
     'observing',
+    'needs_conversion_help',
     'fallback_delist_pending',
     'failed'
 );
@@ -701,6 +708,8 @@ def transition_action(
                 "started_at",
                 "finished_at",
                 "observe_until",
+                "observe_window_days",
+                "conversion_help_attempts",
                 "error",
                 "source",
             }:
@@ -1233,28 +1242,158 @@ def evaluate_observations(
     snapshot_date: str | None = None,
     db_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Phase 1 no-op observation selector.
-
-    Observation thresholds are left for Phase 4, but the API is present so
-    callers can be wired without mutating lifecycle state.
+    """Phase 4 observation evaluation.
+    
+    1. Transitions published_new to observing.
+    2. Evaluates observing rows against thresholds and resolves to terminal/fallback states.
     """
+    from src.services.cro_thresholds import get_lifecycle_thresholds
+    from src.services.cro_action_queue import enqueue_unique_pending
     ensure_schema(db_path)
+    thresholds = get_lifecycle_thresholds()
+    
     with _conn(db_path) as conn:
-        rows = [
-            dict(row)
-            for row in conn.execute(
-                """
-                SELECT *
-                FROM cro_listing_lifecycle_actions
-                WHERE status = ?
-                ORDER BY observe_until, id
-                """,
-                (STATUS_OBSERVING,),
+        new_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM cro_listing_lifecycle_actions WHERE status = ?",
+            (STATUS_PUBLISHED_NEW,)
+        )]
+        effective_snapshot = snapshot_date or _latest_snapshot_date(conn)
+    
+    now = datetime.now(timezone.utc)
+    started = 0
+    for row in new_rows:
+        try:
+            window = thresholds["observe_window_days_p3"] if row["priority"] == "P3" else thresholds["observe_window_days_p2"]
+            updated_text = str(row.get("updated_at") or row.get("finished_at") or _now_iso()).replace("Z", "+00:00")
+            try:
+                dt = datetime.fromisoformat(updated_text)
+            except ValueError:
+                dt = now
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            
+            observe_until = (dt + timedelta(days=window)).isoformat()
+            
+            transition_action(
+                row["id"],
+                STATUS_OBSERVING,
+                observe_window_days=window,
+                observe_until=observe_until,
+                db_path=db_path
             )
-        ]
+            started += 1
+        except Exception:
+            pass
+
+    with _conn(db_path) as conn:
+        observing_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM cro_listing_lifecycle_actions WHERE status = ?",
+            (STATUS_OBSERVING,)
+        )]
+
+    results = []
+    floor_imp = thresholds["revive_traffic_floor_impressions"]
+    floor_views = thresholds["revive_traffic_floor_views"]
+    
+    for row in observing_rows:
+        action_id = row["id"]
+        sku = row["sku"]
+        with _conn(db_path) as conn:
+            snapshot = _latest_snapshot_for_sku(conn, sku) or {}
+            
+        transactions = _int_value(snapshot.get("transactions"))
+        sold_qty = _int_value(snapshot.get("sold_qty"))
+        if transactions > 0 or sold_qty > 0:
+            try:
+                transition_action(
+                    action_id,
+                    STATUS_REVIVED_SUCCESS,
+                    note="sale_detected",
+                    db_path=db_path
+                )
+                results.append({"id": action_id, "sku": sku, "status": STATUS_REVIVED_SUCCESS, "reason": "sale"})
+            except Exception:
+                pass
+            continue
+            
+        observe_until_text = str(row.get("observe_until") or "").replace("Z", "+00:00")
+        try:
+            until_dt = datetime.fromisoformat(observe_until_text)
+            if until_dt.tzinfo is None:
+                until_dt = until_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            until_dt = now
+            
+        if now < until_dt:
+            continue
+            
+        before = _parse_json_value(row.get("metrics_before_json"), {})
+        before_imp = _int_value(before.get("impressions"))
+        before_views = _int_value(before.get("views"))
+        
+        snap_imp = _int_value(snapshot.get("impressions"))
+        snap_views = _int_value(snapshot.get("views"))
+        
+        traffic_recovered = (
+            snap_imp >= floor_imp and
+            snap_views >= floor_views and
+            snap_imp >= before_imp and
+            snap_views >= before_views
+        )
+        
+        try:
+            if traffic_recovered:
+                attempts = _int_value(row.get("conversion_help_attempts"))
+                if attempts < 1:
+                    enqueue_unique_pending([{
+                        "sku": sku,
+                        "action": "promoted_listings",
+                        "priority": "P2",
+                        "reason": "lifecycle_needs_conversion_help"
+                    }], source="cro_lifecycle_help")
+                    
+                    transition_action(
+                        action_id,
+                        STATUS_NEEDS_CONVERSION_HELP,
+                        note="traffic_recovered_needs_help",
+                        db_path=db_path
+                    )
+                    
+                    window = _int_value(row.get("observe_window_days")) or thresholds["observe_window_days_p2"]
+                    new_until = (now + timedelta(days=window)).isoformat()
+                    
+                    transition_action(
+                        action_id,
+                        STATUS_OBSERVING,
+                        observe_until=new_until,
+                        conversion_help_attempts=attempts + 1,
+                        note="re_observe_after_help",
+                        db_path=db_path
+                    )
+                    results.append({"id": action_id, "sku": sku, "status": STATUS_NEEDS_CONVERSION_HELP, "reason": "traffic_recovered"})
+                else:
+                    transition_action(
+                        action_id,
+                        STATUS_FALLBACK_DELIST_PENDING,
+                        note="traffic_recovered_but_max_attempts_reached",
+                        db_path=db_path
+                    )
+                    results.append({"id": action_id, "sku": sku, "status": STATUS_FALLBACK_DELIST_PENDING, "reason": "max_help_attempts"})
+            else:
+                transition_action(
+                    action_id,
+                    STATUS_FALLBACK_DELIST_PENDING,
+                    note="traffic_dead_after_window",
+                    db_path=db_path
+                )
+                results.append({"id": action_id, "sku": sku, "status": STATUS_FALLBACK_DELIST_PENDING, "reason": "traffic_dead"})
+        except Exception:
+            pass
+
     return {
-        "snapshot_date": snapshot_date,
-        "evaluated": 0,
-        "observing": len(rows),
-        "actions": rows,
+        "snapshot_date": effective_snapshot,
+        "started_observing": started,
+        "evaluated": len(results),
+        "observing_remaining": len(observing_rows) - len(results) + started,
+        "results": results,
     }

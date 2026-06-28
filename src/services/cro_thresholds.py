@@ -397,6 +397,18 @@ def promote_thresholds(products: List[Dict[str, Any]],
             'report_path': str(rep_path)}
 
 
+def get_lifecycle_thresholds() -> Dict[str, Any]:
+    """S25 / Phase 4: Lifecycle observation thresholds.
+    Defaults per spec; flow through shadow gate in the future.
+    """
+    return {
+        "observe_window_days_p2": 14,
+        "observe_window_days_p3": 21,
+        "revive_traffic_floor_impressions": 50,
+        "revive_traffic_floor_views": 5,
+    }
+
+
 def main():
     import argparse, json
     p = argparse.ArgumentParser(description='Learn per-category CRO thresholds')

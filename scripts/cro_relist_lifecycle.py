@@ -25,6 +25,11 @@ from scripts import cro_delist  # noqa: E402
 from src.services.cro_relist_lifecycle import (  # noqa: E402
     DEFAULT_DB,
     detect_candidates,
+    approve_actions,
+    precheck_approved,
+    execute_prechecked_relist,
+    execute_approved,
+    evaluate_observations,
 )
 
 
@@ -84,6 +89,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--detect", action="store_true", help="Detect lifecycle candidates")
+    mode.add_argument("--approve", action="store_true", help="Approve all currently detected candidates")
+    mode.add_argument("--precheck", action="store_true", help="Precheck approved candidates")
+    mode.add_argument("--execute", action="store_true", help="Execute prechecked relist actions")
+    mode.add_argument("--evaluate", action="store_true", help="Evaluate observing candidates")
     mode.add_argument(
         "--delist-links",
         action="store_true",
@@ -140,6 +149,47 @@ def run_cli(argv: list[str] | None = None) -> dict[str, Any]:
             )
             report["mode"] = "detect"
             report["detect"] = _summarize_candidates(detect_report)
+        elif args.approve:
+            # We need to find candidate IDs to approve. This is a bit hacky for the CLI,
+            # but we'll fetch all candidate IDs up to limit.
+            with sqlite3.connect(str(effective_db)) as conn:
+                rows = conn.execute(
+                    "SELECT id FROM cro_listing_lifecycle_actions WHERE status = 'candidate' LIMIT ?",
+                    (args.limit,)
+                ).fetchall()
+                action_ids = [row[0] for row in rows]
+            approve_report = approve_actions(
+                action_ids=action_ids,
+                operator="cli",
+                db_path=effective_db,
+            )
+            report["mode"] = "approve"
+            report["approve"] = approve_report
+        elif args.precheck:
+            precheck_report = precheck_approved(
+                limit=args.limit,
+                apply_changes=args.apply,
+                operator="cli",
+                db_path=effective_db,
+            )
+            report["mode"] = "precheck"
+            report["precheck"] = precheck_report
+        elif args.execute:
+            execute_report = execute_prechecked_relist(
+                limit=args.limit,
+                apply_changes=args.apply,
+                operator="cli",
+                db_path=effective_db,
+            )
+            report["mode"] = "execute"
+            report["execute"] = execute_report
+        elif args.evaluate:
+            evaluate_report = evaluate_observations(
+                snapshot_date=args.snapshot_date,
+                db_path=effective_db,
+            )
+            report["mode"] = "evaluate"
+            report["evaluate"] = evaluate_report
         elif args.delist_links:
             link_report = cro_delist.build_magic_links(
                 base_url=args.base_url,
