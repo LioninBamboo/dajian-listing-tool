@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import xml.etree.ElementTree as ET
 from collections import Counter
@@ -11,6 +12,8 @@ from typing import Any, Callable, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = PROJECT_ROOT / "ebay_collection.db"
+
+logger = logging.getLogger(__name__)
 
 ACTION_REVIVE_RELIST = "revive_relist"
 ACTION_FINAL_DELIST = "final_delist"
@@ -1282,8 +1285,8 @@ def evaluate_observations(
                 db_path=db_path
             )
             started += 1
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Observation error action={row.get('id')} sku={row.get('sku')}: {exc}")
 
     with _conn(db_path) as conn:
         observing_rows = [dict(r) for r in conn.execute(
@@ -1312,8 +1315,8 @@ def evaluate_observations(
                     db_path=db_path
                 )
                 results.append({"id": action_id, "sku": sku, "status": STATUS_REVIVED_SUCCESS, "reason": "sale"})
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"Observation error action={action_id} sku={sku}: {exc}")
             continue
             
         observe_until_text = str(row.get("observe_until") or "").replace("Z", "+00:00")
@@ -1348,6 +1351,11 @@ def evaluate_observations(
                     enqueue_unique_pending([{
                         "sku": sku,
                         "action": "promoted_listings",
+                        "priority": "P2",
+                        "reason": "lifecycle_needs_conversion_help"
+                    }, {
+                        "sku": sku,
+                        "action": "reprice",
                         "priority": "P2",
                         "reason": "lifecycle_needs_conversion_help"
                     }], source="cro_lifecycle_help")
@@ -1387,8 +1395,8 @@ def evaluate_observations(
                     db_path=db_path
                 )
                 results.append({"id": action_id, "sku": sku, "status": STATUS_FALLBACK_DELIST_PENDING, "reason": "traffic_dead"})
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(f"Observation error action={action_id} sku={sku}: {exc}")
 
     return {
         "snapshot_date": effective_snapshot,

@@ -603,7 +603,10 @@ def test_evaluate_recovers_traffic_triggers_conversion_help(tmp_path, monkeypatc
     assert row["status"] == "observing"
     assert row["conversion_help_attempts"] == 1
     assert len(enqueued) == 1
-    assert enqueued[0][0]["action"] == "promoted_listings"
+    actions = enqueued[0]
+    assert len(actions) == 2
+    assert actions[0]["action"] == "promoted_listings"
+    assert actions[1]["action"] == "reprice"
 
 def test_evaluate_traffic_dead_triggers_fallback_delist(tmp_path):
     db = tmp_path / "cro.db"
