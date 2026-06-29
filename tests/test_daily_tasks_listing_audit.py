@@ -14,45 +14,45 @@ requests_stub = types.SimpleNamespace(
     utils=types.SimpleNamespace(quote=lambda value: value),
     exceptions=types.SimpleNamespace(HTTPError=Exception),
 )
-sys.modules.setdefault(
-    "dotenv",
-    types.SimpleNamespace(load_dotenv=lambda *_args, **_kwargs: None),
-)
-sys.modules.setdefault("requests", requests_stub)
-sys.modules.setdefault(
-    "src.utils.report_images",
-    types.SimpleNamespace(
-        build_thumbnail_img_html=lambda *_args, **_kwargs: "",
-        normalize_thumbnail_url=lambda url: url,
-    ),
-)
-sys.modules.setdefault(
-    "src.utils.email_sender",
-    types.SimpleNamespace(send_email=lambda *_args, **_kwargs: True),
-)
-sys.modules.setdefault(
-    "src.services.ebay_category_matcher",
-    types.SimpleNamespace(create_category_matcher=lambda *_args, **_kwargs: object()),
-)
-sys.modules.setdefault(
-    "src.utils.mi_draft_origin",
-    types.SimpleNamespace(
-        MI_DRAFT_ORIGIN="auto",
-        apply_mi_draft_origin=lambda *_args, **_kwargs: None,
-        append_mi_draft_log=lambda *_args, **_kwargs: None,
-    ),
-)
-sys.modules.setdefault(
-    "src.utils.mi_opportunity_flow",
-    types.SimpleNamespace(
-        auto_prepare_mi_opportunity_drafts=lambda *_args, **_kwargs: {},
-        empty_auto_prepare_result=lambda: {},
-    ),
-)
-sys.modules.setdefault(
-    "src.clients.real_ebay_client",
-    types.SimpleNamespace(create_real_ebay_client=lambda *_args, **_kwargs: object()),
-)
+import pytest
+
+@pytest.fixture(autouse=True, scope="module")
+def stub_sys_modules():
+    stubs = {
+        "dotenv": types.SimpleNamespace(load_dotenv=lambda *_args, **_kwargs: None),
+        "requests": requests_stub,
+        "src.utils.report_images": types.SimpleNamespace(
+            build_thumbnail_img_html=lambda *_args, **_kwargs: "",
+            normalize_thumbnail_url=lambda url: url,
+        ),
+        "src.utils.email_sender": types.SimpleNamespace(send_email=lambda *_args, **_kwargs: True),
+        "src.services.ebay_category_matcher": types.SimpleNamespace(create_category_matcher=lambda *_args, **_kwargs: object()),
+        "src.utils.mi_draft_origin": types.SimpleNamespace(
+            MI_DRAFT_ORIGIN="auto",
+            apply_mi_draft_origin=lambda *_args, **_kwargs: None,
+            append_mi_draft_log=lambda *_args, **_kwargs: None,
+        ),
+        "src.utils.mi_opportunity_flow": types.SimpleNamespace(
+            auto_prepare_mi_opportunity_drafts=lambda *_args, **_kwargs: {},
+            empty_auto_prepare_result=lambda: {},
+        ),
+        "src.clients.real_ebay_client": types.SimpleNamespace(create_real_ebay_client=lambda *_args, **_kwargs: object()),
+    }
+    
+    saved = {}
+    for name, stub in stubs.items():
+        if name in sys.modules:
+            saved[name] = sys.modules[name]
+        sys.modules[name] = stub
+        
+    yield
+    
+    for name in stubs:
+        if name in saved:
+            sys.modules[name] = saved[name]
+        else:
+            sys.modules.pop(name, None)
+
 
 
 def _create_published_db(db_path: Path) -> None:

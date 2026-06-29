@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+import pytest
 requests_stub = types.SimpleNamespace(
     get=lambda *_args, **_kwargs: None,
     post=lambda *_args, **_kwargs: None,
@@ -15,11 +16,27 @@ requests_stub = types.SimpleNamespace(
     utils=types.SimpleNamespace(quote=lambda value: value),
     exceptions=types.SimpleNamespace(HTTPError=Exception),
 )
-sys.modules.setdefault(
-    "dotenv",
-    types.SimpleNamespace(load_dotenv=lambda *_args, **_kwargs: None),
-)
-sys.modules.setdefault("requests", requests_stub)
+@pytest.fixture(autouse=True, scope="module")
+def stub_sys_modules_for_cli():
+    stubs = {
+        "dotenv": types.SimpleNamespace(load_dotenv=lambda *_args, **_kwargs: None),
+        "requests": requests_stub,
+    }
+    
+    saved = {}
+    for name, stub in stubs.items():
+        if name in sys.modules:
+            saved[name] = sys.modules[name]
+        sys.modules[name] = stub
+        
+    yield
+    
+    for name in stubs:
+        if name in saved:
+            sys.modules[name] = saved[name]
+        else:
+            sys.modules.pop(name, None)
+
 
 AUDIT_SPEC = importlib.util.spec_from_file_location(
     "audit_fix_active_listings",
