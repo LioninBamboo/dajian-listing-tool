@@ -1201,6 +1201,115 @@ def _numbers_present(text: str, *values: str) -> bool:
     return True
 
 
+def _first_present_aspect(aspects: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = first_aspect_text(aspects, key)
+        if value:
+            return value
+    return ""
+
+
+def _build_fallback_feature_bullets(
+    *,
+    title: str,
+    description: str,
+    aspects: Mapping[str, Any],
+    source_facts: Mapping[str, Any] | None = None,
+) -> list[str]:
+    bullets: list[str] = []
+
+    feature_type = _first_present_aspect(aspects, "Type", "Set Includes")
+    if feature_type:
+        bullets.append(f"Product Type: {feature_type}.")
+
+    length = first_aspect_text(aspects, "Item Length")
+    width = first_aspect_text(aspects, "Item Width")
+    height = first_aspect_text(aspects, "Item Height")
+    if length and width and height:
+        bullets.append(f"Overall Dimensions (L x W x H): {length} x {width} x {height}.")
+
+    weight = first_aspect_text(aspects, "Item Weight")
+    if weight:
+        bullets.append(f"Item Weight: {weight}.")
+
+    material = _first_present_aspect(
+        aspects,
+        "Material",
+        "Upholstery Material",
+        "Upholstery Fabric",
+        "Frame Material",
+        "Base Material",
+    )
+    if material:
+        bullets.append(f"Material: {material}.")
+
+    color = first_aspect_text(aspects, "Color")
+    if color:
+        bullets.append(f"Color: {color}.")
+
+    assembly_required = ""
+    if isinstance(source_facts, Mapping):
+        assembly_required = str(source_facts.get("assembly_required") or "").strip()
+    if assembly_required and "assembly required" not in description.lower():
+        if assembly_required == "Yes":
+            bullets.append("Assembly Required: Yes - setup is required before use.")
+        else:
+            bullets.append("Assembly Required: No - ready for use without assembly.")
+
+    if not bullets and title:
+        bullets.append(_clean_text(title))
+
+    return bullets[:6]
+
+
+def _ensure_key_features_block(
+    description: str,
+    *,
+    title: str,
+    aspects: Mapping[str, Any],
+    source_facts: Mapping[str, Any] | None = None,
+) -> str:
+    if not description:
+        return description or ""
+
+    lowered = description.lower()
+    has_key_features = "key features" in lowered
+    has_bullets = "<li" in lowered
+    if has_key_features and has_bullets:
+        return description
+
+    if has_bullets and not has_key_features:
+        inserted = re.sub(
+            r"(<ul\b[^>]*>|<li\b)",
+            r'<h3 style="margin:16px 0 8px 0;font-size:18px;">KEY FEATURES</h3>\1',
+            description,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if inserted != description:
+            return inserted
+        return '<h3 style="margin:16px 0 8px 0;font-size:18px;">KEY FEATURES</h3>' + description
+
+    bullets = _build_fallback_feature_bullets(
+        title=title,
+        description=description,
+        aspects=aspects,
+        source_facts=source_facts,
+    )
+    if not bullets:
+        return description
+
+    bullet_html = "".join(f"<li>{_clean_text(bullet)}</li>" for bullet in bullets)
+    if has_key_features and not has_bullets:
+        return description + f"<ul>{bullet_html}</ul>"
+
+    intro = f"<p>{_clean_text(title)}</p>" if title else ""
+    return (
+        f"{intro}<h3 style=\"margin:16px 0 8px 0;font-size:18px;\">KEY FEATURES</h3>"
+        f"<ul>{bullet_html}</ul>{description}"
+    )
+
+
 def normalize_generated_listing(
     optimization: Mapping[str, Any] | None,
     *,
@@ -1275,6 +1384,12 @@ def normalize_generated_listing(
         attributes=attributes,
         specs=specs,
         videos=videos,
+    )
+    opt["description"] = _ensure_key_features_block(
+        opt.get("description", ""),
+        title=opt.get("title", ""),
+        aspects=opt.get("aspects", {}),
+        source_facts=opt["source_facts"],
     )
 
     # ── Layer 2: Deterministic claim violation detection ──

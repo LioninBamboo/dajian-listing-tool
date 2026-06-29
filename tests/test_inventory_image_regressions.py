@@ -259,6 +259,17 @@ def test_active_audit_uses_shared_measurement_validation(monkeypatch):
     assert fixes["Item Weight"] == ["85.0 lbs"]
 
 
+def test_build_claim_cleanup_pattern_handles_space_separated_claims():
+    pattern = audit_fix_active_listings.build_claim_cleanup_pattern("memory foam")
+
+    assert pattern
+    assert "memory" in pattern
+    assert "foam" in pattern
+
+    cleaned = __import__("re").sub(pattern, "", "Premium memory foam core", flags=__import__("re").IGNORECASE)
+    assert "memory foam" not in cleaned.lower()
+
+
 def test_active_audit_surfaces_description_only_fixes(monkeypatch):
     class _Matcher:
         def canonicalize_category(self, title_context, category_id, category_name, description=None):

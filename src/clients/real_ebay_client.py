@@ -42,6 +42,7 @@ FALLBACK_LISTING_POLICIES = {
     "paymentPolicyId": "321896606021",
 }
 UNBRANDED_MARKERS = {"unbranded", "unbrand", "generic"}
+VALID_ASSEMBLY_STATUS_VALUES = {"Part Assembled", "Fully Assembled", "Ready to Assemble"}
 IDENTIFIER_PATTERNS = {
     "upc": r"\d{12}",
     "ean": r"(?:\d{8}|\d{13})",
@@ -101,6 +102,20 @@ def _sanitize_inventory_identifiers(
             cleaned_aspects.pop(field_name.upper(), None)
 
     return brand, mpn, identifiers
+
+
+def _sanitize_assembly_aspects(cleaned_aspects: Dict[str, List[str]]) -> None:
+    assembly_status = cleaned_aspects.get("Assembly Status")
+    if not assembly_status:
+        return
+
+    normalized_values = [str(item).strip() for item in assembly_status if str(item).strip()]
+    if not normalized_values:
+        cleaned_aspects.pop("Assembly Status", None)
+        return
+
+    if normalized_values[0] not in VALID_ASSEMBLY_STATUS_VALUES:
+        cleaned_aspects.pop("Assembly Status", None)
 
 
 def normalize_eps_image_data(
@@ -522,6 +537,7 @@ class RealEbayClient:
             log=print,
             multi_value_aspects={key for key in cleaned_aspects if key not in SINGLE_VALUE_ASPECTS},
         )
+        _sanitize_assembly_aspects(cleaned_aspects)
         prepare_ebay_aspects(cleaned_aspects, required_aspect_names, log=print)
 
         safe_title, _ = normalize_listing_title_for_ebay(
@@ -605,10 +621,19 @@ class RealEbayClient:
         
         # Note: Country comes from merchantLocationKey in offer, not inventory item
         
-        # Add video if available
-        if product.get("video_urls"):
-            payload["product"]["videoIds"] = product["video_urls"][:1]  # eBay max 1 video
-        
+        # Preserve existing live videoIds unless the caller explicitly overrides them.
+        video_urls = product.get("video_urls")
+        if video_urls:
+            payload["product"]["videoIds"] = list(video_urls)[:1]  # eBay max 1 video
+        elif "video_urls" not in product:
+            try:
+                live_inventory = self.get_inventory_item(sku) or {}
+            except Exception:
+                live_inventory = {}
+            live_video_ids = ((live_inventory.get("product") or {}).get("videoIds") or [])
+            if live_video_ids:
+                payload["product"]["videoIds"] = list(live_video_ids)[:1]
+
         response = self.session.put(url, headers=headers, json=payload)
         
         if response.status_code in (200, 204):

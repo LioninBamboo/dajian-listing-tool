@@ -7,7 +7,7 @@ Build a controlled lifecycle action for stale live listings:
 1. If a listing has been live for 30+ days and has no sales, it becomes a lifecycle candidate.
 2. Listings with some traffic get one controlled `revive_relist` attempt: withdraw the old live listing, preserve local product data, republish the SKU as a fresh listing, and observe the new listing.
 3. Very old dead links go directly to the existing human-confirmed `final_delist` flow: 60+ days, zero impressions, zero views, and no sales should not spend a revive slot.
-4. If a relisted item still performs badly after the observation window, it falls back to the existing human-confirmed `delist` flow.
+4. After the observation window a relisted item resolves to exactly one of three outcomes: it counts as revived on a sale; if it recovered traffic but still has no sale it gets one soft-lever pass (reprice / Promoted Listings) and re-observes once; if traffic stayed dead it falls back to the existing human-confirmed `delist` flow.
 
 The goal is to avoid wasting listing quota on dead links while still giving viable products one clean relaunch before permanent removal.
 
@@ -86,6 +86,62 @@ Skip relist and go straight to human-confirmed delist when any are true:
 - The SKU already had one revive attempt and failed the observation window.
 - Operator manually marks "do not revive".
 
+## Observation Evaluation
+
+`evaluate_observations()` runs over rows in `observing` and decides each one's
+next state from post-relist performance. It must reuse the same snapshot metrics
+as detection (`impressions`, `views`, `transactions`, `sold_qty`) and compare
+them against `metrics_before_json` (the pre-relist baseline stored at candidacy).
+
+### Observation Window
+
+- `observe_until = published_new_date + observe_window_days`.
+- `observe_window_days` is stored on the action when it enters `observing`:
+  `21` by default for `P3` rows (zero pre-relist traffic), `14` for `P2` rows
+  (had pre-relist traffic).
+- Rationale: eBay gives a new listing a 48-72h freshness boost and then ranks on
+  performance; ~2-3 weeks is enough to see whether the fresh listing converts,
+  and it matches the "treat early no-traction as an indexing problem, not a
+  restart trigger" guidance.
+- Do not resolve a row to a branch/terminal state before `observe_until`, except
+  that a row may be marked `revived_success` early the moment a sale lands.
+
+### Outcomes At Window Close
+
+Resolve each `observing` row whose `observe_until` has passed into exactly one of
+three outcomes:
+
+1. `revived_success` — a `sale` (per Definitions) occurred at any point in the
+   window. Unambiguous; terminal.
+2. `needs_conversion_help` — no sale, but window traffic recovered above the
+   configured floor and at/above the pre-relist baseline. The listing is alive
+   but not converting; this is NOT a delist signal. Route the SKU to existing
+   soft levers (reprice via inventory sync, Promoted Listings via
+   `cro_action_queue`) and re-enter `observing` once. The soft levers must not
+   withdraw or republish the listing, so its listing ID and accrued CTR history
+   are preserved.
+3. `fallback_delist_pending` — no sale and traffic is still dead (below the floor
+   and not above baseline). Enters the existing human-confirmed delist flow.
+
+### Thresholds
+
+Traffic-recovery floors live in `cro_thresholds`, not hardcoded, so they flow
+through the Plan 3 two-stage shadow promotion and stay governed with other CRO
+thresholds. Initial proposed defaults (subject to shadow tuning):
+
+- `observe_window_days`: 21 (P3), 14 (P2)
+- `revive_traffic_floor_impressions`: 50 over the window
+- `revive_traffic_floor_views`: 5 over the window
+- recovery additionally requires window metrics `>=` the pre-relist baseline in
+  `metrics_before_json`, so a flat-dead link cannot pass on noise alone.
+
+### Re-Entry Cap
+
+- `needs_conversion_help -> observing` is allowed at most once per action
+  (`conversion_help_attempts <= 1`), tracked on the row.
+- A second window with no sale resolves to `fallback_delist_pending`, never an
+  unbounded reprice/promote loop.
+
 ## State Machine
 
 Use a SQLite table, not only the JSONL CRO queue, because relist is multi-step and must be recoverable.
@@ -113,6 +169,8 @@ Required fields:
 - `started_at`
 - `finished_at`
 - `observe_until`
+- `observe_window_days`
+- `conversion_help_attempts`
 - `error`
 - `source`
 
@@ -125,7 +183,8 @@ Statuses:
 - `ready_to_publish`: DB is ready for standard publish.
 - `published_new`: fresh listing exists.
 - `observing`: waiting for post-relist performance window.
-- `revived_success`: relisted listing got a sale, or hit configured healthy threshold.
+- `revived_success`: relisted listing got a sale within the observation window.
+- `needs_conversion_help`: relisted listing recovered traffic but not sales; routed to soft levers (reprice / Promoted Listings) for one more observation pass.
 - `fallback_delist_pending`: revive failed; waiting for final-delist confirmation.
 - `final_delisted`: final delist completed.
 - `skipped`: guard rule blocked execution.
@@ -137,6 +196,7 @@ Allowed transitions:
 candidate -> approved -> prechecked -> old_withdrawn -> ready_to_publish
 ready_to_publish -> published_new -> observing
 observing -> revived_success
+observing -> needs_conversion_help -> observing   (at most once)
 observing -> fallback_delist_pending -> final_delisted
 candidate/approved/prechecked -> skipped
 any execution status -> failed
@@ -305,10 +365,19 @@ Start with one manually selected SKU.
 
 ### Phase 4: Observation And Fallback
 
-1. Evaluate relisted listings after 14 and 30 days.
-2. Mark `revived_success` if sales occur or if agreed healthy thresholds are hit.
-3. Mark `fallback_delist_pending` if observation fails.
-4. Extend `scripts/cro_delist.py` to include fallback candidates in the magic-link email.
+Implement per the Observation Evaluation section above.
+
+1. Implement `evaluate_observations()`: join `observing` rows to the latest
+   snapshot, compute window metrics vs `metrics_before_json`, and resolve each
+   row whose `observe_until` has passed.
+2. Mark `revived_success` on a sale (allowed early, the moment a sale lands).
+3. Mark `needs_conversion_help` on traffic recovery without a sale; trigger the
+   reprice / Promoted Listings soft levers (`cro_action_queue`) and re-enter
+   `observing` once (`conversion_help_attempts <= 1`). Do not withdraw/republish.
+4. Mark `fallback_delist_pending` when traffic stays dead; extend
+   `scripts/cro_delist.py` to include these in the magic-link email.
+5. Read floors and `observe_window_days` from `cro_thresholds` so they promote
+   through the Plan 3 two-stage shadow gate.
 
 Verification:
 
@@ -328,7 +397,7 @@ Verification:
 
 ## Open Questions
 
-1. Observation threshold: should a relisted SKU count as revived only after sale, or is traffic recovery enough?
-2. Should 30-59 day zero-impression items be promoted once before relist, or relisted immediately?
+1. Resolved 2026-06-28: `revived_success` requires a `sale`. Traffic recovery without a sale routes to `needs_conversion_help` (soft levers + one more observation pass), which is neither success nor delist. See Observation Evaluation.
+2. Resolved 2026-06-28: relist immediately; do not promote before relist. Promotion spend is reserved for the post-relist `needs_conversion_help` fork, so it only targets listings that have proven they can recover traffic.
 3. Resolved 2026-05-13: 60+ days with zero impressions, zero views, and no sales routes directly to `final_delist` candidate; 30-59 day rows remain revive candidates.
 4. Who should be recorded as the operator for approvals in the Streamlit app?

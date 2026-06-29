@@ -63,6 +63,66 @@ def test_quality_gate_normalizes_patio_set_category_aspects_and_description_meas
     assert "31.9" in normalized["description"]
 
 
+def test_normalize_generated_listing_adds_key_features_heading_when_bullets_exist():
+    normalized = normalize_generated_listing(
+        {
+            "title": '54" Mobile Kitchen Island with Storage',
+            "description": "<ul><li>Rolling kitchen island with storage.</li><li>Power outlet included.</li></ul>",
+            "categoryId": "177000",
+            "categoryName": "Kitchen Islands & Carts",
+            "aspects": {
+                "Item Length": ["54.3 in"],
+                "Item Width": ["26.6 in"],
+                "Item Height": ["35.4 in"],
+                "Item Weight": ["97.66 lbs"],
+                "Type": ["Kitchen Island"],
+                "Color": ["Black"],
+                "Material": ["Wood"],
+            },
+        },
+        source_title='54" Mobile Kitchen Island with Storage',
+        source_description="<div>Kitchen island with rolling casters.</div>",
+    )
+
+    assert "KEY FEATURES" in normalized["description"]
+    issues = validate_listing_quality(
+        normalized,
+        source_title='54" Mobile Kitchen Island with Storage',
+        source_description="<div>Kitchen island with rolling casters.</div>",
+    )
+    assert not any(issue.code == "description_incomplete" for issue in issues)
+
+
+def test_normalize_generated_listing_adds_fallback_bullets_when_heading_exists_without_list():
+    normalized = normalize_generated_listing(
+        {
+            "title": "Classic Sofa",
+            "description": "<h3>KEY FEATURES</h3><p>Comfortable sofa for living room use.</p>",
+            "categoryId": "38208",
+            "categoryName": "Sofas, Armchairs & Couches",
+            "aspects": {
+                "Item Length": ["74.5 in"],
+                "Item Width": ["31.5 in"],
+                "Item Height": ["35.0 in"],
+                "Item Weight": ["99.0 lbs"],
+                "Type": ["Sofa"],
+                "Color": ["Black"],
+                "Material": ["PU Leather"],
+            },
+        },
+        source_title="Classic Sofa",
+        source_description="<div>Assembly Required No</div>",
+    )
+
+    assert "<li>" in normalized["description"]
+    issues = validate_listing_quality(
+        normalized,
+        source_title="Classic Sofa",
+        source_description="<div>Assembly Required No</div>",
+    )
+    assert not any(issue.code == "description_incomplete" for issue in issues)
+
+
 def test_quality_gate_uses_source_assembly_required_over_ai_copy():
     opt = {
         "title": "Transformer Coffee Table 2 in 1 Extendable Dining Table Walnut",

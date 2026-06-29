@@ -408,28 +408,16 @@ def test_run_listing_audit_skips_live_listing_when_clean_fingerprint_is_frozen(m
     conn.commit()
     conn.close()
 
-    def fake_fetch_live_listing_context(_ebay_client, sku, expected_listing_id=None):
-        assert sku == "SKU-FOLD"
-        assert expected_listing_id == "LISTING-1"
-        return live_inventory, live_offer
-
-    def fake_build_live_listing_opt_snapshot(_stored_opt, *, inventory_item=None, offer=None):
-        assert inventory_item == live_inventory
-        assert offer == live_offer
-        return dict(live_opt)
+    def fail_fetch_live_listing_context(*_args, **_kwargs):
+        raise AssertionError("incremental audit should skip live fetch for unchanged clean listing")
 
     def fail_audit_single_product(*_args, **_kwargs):
-        raise AssertionError("clean frozen listing should skip deep audit")
+        raise AssertionError("incremental audit should skip deep audit for unchanged clean listing")
 
     monkeypatch.setattr(
         audit_fix_active_listings,
         "_fetch_live_listing_context",
-        fake_fetch_live_listing_context,
-    )
-    monkeypatch.setattr(
-        audit_fix_active_listings,
-        "build_live_listing_opt_snapshot",
-        fake_build_live_listing_opt_snapshot,
+        fail_fetch_live_listing_context,
     )
     monkeypatch.setattr(
         audit_fix_active_listings,
@@ -446,11 +434,168 @@ def test_run_listing_audit_skips_live_listing_when_clean_fingerprint_is_frozen(m
     assert summary["source"] == "live_ebay"
     assert summary["issues_found"] == 0
     assert summary["fixed"] == 0
-    assert summary["skipped_clean_frozen"] == 1
+    assert summary["skipped_clean_frozen"] == 0
     assert summary["clean_state_recorded"] == 0
+    assert summary["audited_live_listings"] == 0
+    assert summary["skipped_incremental_scope"] == 1
 
 
-def test_run_listing_audit_marks_live_fetch_failure_as_issue(monkeypatch, tmp_path):
+def test_run_listing_audit_incremental_scope_keeps_dirty_and_pending_verify(monkeypatch, tmp_path):
+    import daily_tasks
+    from scripts import audit_fix_active_listings
+
+    db_path = tmp_path / "ebay_collection.db"
+    _create_published_db(db_path)
+    conn = sqlite3.connect(db_path)
+    source = conn.execute(
+        "SELECT sku, title, attributes, specs, optimization, description, images, videos, "
+        "price, suggested_price, listing_id, status FROM collected_products WHERE sku = ?",
+        ("SKU-FOLD",),
+    ).fetchone()
+
+    base_opt = json.loads(source[4])
+    clean_opt = dict(base_opt)
+    dirty_opt = dict(base_opt)
+    pending_opt = dict(base_opt)
+    clean_opt["_quality_gate"] = {
+        "version": audit_fix_active_listings.QUALITY_GATE_META_VERSION,
+        "ruleset_version": audit_fix_active_listings.QUALITY_GATE_RULESET_VERSION,
+        "status": "clean",
+        "listing_id": "LISTING-1",
+        "source_fingerprint": audit_fix_active_listings.build_audit_fingerprint(
+            audit_fix_active_listings.build_source_audit_payload(
+                source[1],
+                source[5],
+                source[2],
+                source[3],
+                images_raw=source[6],
+                videos_raw=source[7],
+            )
+        ),
+        "live_fingerprint": "live-fingerprint",
+        "verified_clean_at": "2026-06-22T12:00:00",
+        "updated_at": "2026-06-22T12:00:00",
+    }
+    dirty_opt["_quality_gate"] = {
+        "version": audit_fix_active_listings.QUALITY_GATE_META_VERSION,
+        "ruleset_version": audit_fix_active_listings.QUALITY_GATE_RULESET_VERSION,
+        "status": "dirty",
+        "listing_id": "LISTING-2",
+        "source_fingerprint": clean_opt["_quality_gate"]["source_fingerprint"],
+        "updated_at": "2026-06-22T12:00:00",
+    }
+    pending_opt["_quality_gate"] = {
+        "version": audit_fix_active_listings.QUALITY_GATE_META_VERSION,
+        "ruleset_version": audit_fix_active_listings.QUALITY_GATE_RULESET_VERSION,
+        "status": "pending_verify",
+        "listing_id": "LISTING-3",
+        "source_fingerprint": clean_opt["_quality_gate"]["source_fingerprint"],
+        "updated_at": "2026-06-22T12:00:00",
+    }
+    conn.execute("DELETE FROM collected_products")
+    conn.executemany(
+        "INSERT INTO collected_products VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                "SKU-CLEAN",
+                source[1],
+                source[2],
+                source[3],
+                json.dumps(clean_opt, ensure_ascii=False),
+                source[5],
+                source[6],
+                source[7],
+                source[8],
+                source[9],
+                "LISTING-1",
+                source[11],
+            ),
+            (
+                "SKU-DIRTY",
+                source[1],
+                source[2],
+                source[3],
+                json.dumps(dirty_opt, ensure_ascii=False),
+                source[5],
+                source[6],
+                source[7],
+                source[8],
+                source[9],
+                "LISTING-2",
+                source[11],
+            ),
+            (
+                "SKU-PENDING",
+                source[1],
+                source[2],
+                source[3],
+                json.dumps(pending_opt, ensure_ascii=False),
+                source[5],
+                source[6],
+                source[7],
+                source[8],
+                source[9],
+                "LISTING-3",
+                source[11],
+            ),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(daily_tasks, "PROJECT_ROOT", tmp_path, raising=False)
+    monkeypatch.setattr("time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        sys.modules["src.clients.real_ebay_client"],
+        "create_real_ebay_client",
+        lambda _env: object(),
+    )
+
+    attempted = []
+
+    def fake_fetch_live_listing_context(_client, sku, expected_listing_id=None):
+        attempted.append((sku, expected_listing_id))
+        return (
+            {"product": {"title": f"Live {sku}", "aspects": {}, "imageUrls": [], "videoIds": []}},
+            {"listingDescription": f"<div>{sku}</div>", "categoryId": "222"},
+        )
+
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "_fetch_live_listing_context",
+        fake_fetch_live_listing_context,
+    )
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "build_live_listing_opt_snapshot",
+        lambda _stored_opt, *, inventory_item=None, offer=None: {
+            "title": inventory_item["product"]["title"],
+            "description": offer["listingDescription"],
+            "aspects": {},
+            "categoryId": offer["categoryId"],
+        },
+    )
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "audit_single_product",
+        lambda *_args, **_kwargs: ([], {}),
+    )
+
+    summary = daily_tasks.run_listing_audit(
+        auto_fix=False,
+        use_live=True,
+        record_clean_state=True,
+    )
+
+    assert attempted == [
+        ("SKU-DIRTY", "LISTING-2"),
+        ("SKU-PENDING", "LISTING-3"),
+    ]
+    assert summary["audited_live_listings"] == 2
+    assert summary["skipped_incremental_scope"] == 1
+
+
+def test_run_listing_audit_tracks_live_fetch_failure_as_transport_issue(monkeypatch, tmp_path):
     import daily_tasks
     from scripts import audit_fix_active_listings
 
@@ -509,11 +654,13 @@ def test_run_listing_audit_marks_live_fetch_failure_as_issue(monkeypatch, tmp_pa
     quality_gate = json.loads(row[0])["_quality_gate"]
 
     assert summary["source"] == "live_ebay"
-    assert summary["issues_found"] == 1
+    assert summary["issues_found"] == 0
     assert summary["critical"] == 0
     assert summary["errors"] == 1
-    assert summary["top_issues"][0]["sku"] == "SKU-FOLD"
-    assert summary["top_issues"][0]["max_severity"] == "HIGH"
+    assert summary["transport_failures"] == 1
+    assert summary["top_issues"] == []
+    assert summary["top_transport_failures"][0]["sku"] == "SKU-FOLD"
+    assert summary["top_transport_failures"][0]["max_severity"] == "HIGH"
     assert quality_gate["status"] == "dirty"
     assert quality_gate["issue_types"] == ["live_fetch_failed"]
 

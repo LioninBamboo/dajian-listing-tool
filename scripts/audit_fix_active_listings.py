@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Comprehensive audit & fix for ALL active eBay listings.
 
@@ -57,6 +57,11 @@ LOG_DIR.mkdir(exist_ok=True)
 QUALITY_GATE_META_KEY = "_quality_gate"
 QUALITY_GATE_META_VERSION = 1
 QUALITY_GATE_RULESET_VERSION = 1
+TRANSPORT_ISSUE_TYPES = {
+    "live_fetch_failed",
+    "live_inventory_missing",
+    "live_offer_missing",
+}
 
 
 # ── Dimension extraction (reuse from dimension_helpers) ──
@@ -184,6 +189,19 @@ COUNTABLE_CLAIM_FIX_PATTERNS = {
     "drawer": r"(?:drawer|drawers)",
     "door": r"(?:door|doors)",
     "seat": r"(?:seat|seats|seater|seaters|seating)",
+}
+
+CLAIM_SPECIFIC_ASPECT_KEY_PATTERNS = {
+    "foldable": (
+        r"\bfolding\b",
+        r"\bfoldable\b",
+        r"\bcollapsible\b",
+    ),
+    "waterproof": (
+        r"\bwaterproof\b",
+        r"\bwater\s+resistance\b",
+        r"\bwater\s+resistant\b",
+    ),
 }
 
 
@@ -437,6 +455,18 @@ def get_quality_gate_meta(opt: dict) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
+def split_transport_issues(issues: list[dict]) -> tuple[list[dict], list[dict]]:
+    transport_issues = []
+    content_issues = []
+    for issue in issues or []:
+        issue_type = str((issue or {}).get("type", "")).strip()
+        if issue_type in TRANSPORT_ISSUE_TYPES:
+            transport_issues.append(issue)
+        else:
+            content_issues.append(issue)
+    return transport_issues, content_issues
+
+
 def is_listing_frozen_clean(
     opt: dict,
     *,
@@ -544,6 +574,16 @@ def persist_listing_audit_state(
 
 
 def build_claim_cleanup_pattern(claim_text: str) -> str:
+    normalized_claim = str(claim_text or "").strip()
+
+    claimed_match = re.search(
+        r"claimed\s+(.+?)(?:,\s*source\s+has\s+.+)?$",
+        normalized_claim,
+        flags=re.IGNORECASE,
+    )
+    if claimed_match:
+        normalized_claim = claimed_match.group(1).strip()
+
     feature_patterns = FEATURE_CLAIM_PATTERNS.get(claim_text)
     if feature_patterns:
         return "(?:" + "|".join(feature_patterns) + ")"
@@ -552,7 +592,7 @@ def build_claim_cleanup_pattern(claim_text: str) -> str:
     if wood_patterns:
         return "(?:" + "|".join(wood_patterns) + ")"
 
-    qty_match = re.fullmatch(r"(\d+)[\s\-_]+([a-z]+)", str(claim_text or "").strip(), flags=re.IGNORECASE)
+    qty_match = re.fullmatch(r"(\d+)[\s\-_]+([a-z]+)", normalized_claim, flags=re.IGNORECASE)
     if qty_match:
         count, claim_name = qty_match.groups()
         claim_pattern = COUNTABLE_CLAIM_FIX_PATTERNS.get(claim_name.lower())
@@ -565,9 +605,11 @@ def build_claim_cleanup_pattern(claim_text: str) -> str:
             separator = r"[\s\-_]+"
             return r"\b(?:" + separator.join(parts) + r")\b"
 
-    escaped = re.escape(str(claim_text or "").strip())
-    escaped = escaped.replace(r"\ ", r"[\s\-_]+").replace(r"\-", r"[\s\-_]+")
-    return rf"\b{escaped}\b"
+    parts = [re.escape(part) for part in re.split(r"[\s\-_]+", normalized_claim) if part]
+    if parts:
+        return r"\b(?:" + r"[\s\-_]+".join(parts) + r")\b"
+
+    return rf"\b{re.escape(normalized_claim)}\b"
 
 
 def extract_num(text):
@@ -1583,14 +1625,18 @@ def _send_audit_email(report, report_path):
 
     total_published = int(report.get("total_published", 0))
     total_with_issues = int(report.get("total_with_issues", 0))
+    total_transport_failures = int(report.get("total_transport_failures", 0))
     fixed_count = int(report.get("fixed_count", 0))
     mode = str(report.get("mode", ""))
     severity_counts = report.get("severity_counts", {})
     issues = report.get("issues", [])
+    transport_issues = report.get("transport_issues", [])
     fixed_items = [item for item in issues if item.get("fixes_applied")]
     manual_items = [item for item in issues if not item.get("fixes_applied")]
 
-    summary = f"检查 {total_published} 条，发现 {total_with_issues} 条 listing 有问题"
+    summary = f"检查 {total_published} 条，发现 {total_with_issues} 条 listing 有内容问题"
+    if total_transport_failures:
+        summary = f"{summary}，另有 {total_transport_failures} 条抓取/availability 异常"
     if mode == "fix":
         summary = f"{summary}，已修复 {fixed_count} 条"
         subject = f"eBay/GIGA 刊登修复报告 - {summary}"
@@ -1637,6 +1683,37 @@ def _send_audit_email(report, report_path):
         else ""
     )
     manual_rows_html = manual_rows if mode == "fix" else issue_rows
+    transport_rows, transport_rows_truncated = _render_audit_table_rows(
+        transport_issues,
+        include_fixes=False,
+    )
+    transport_section = ""
+    if transport_issues:
+        transport_note = (
+            "<p style='color:#666;'>邮件正文最多展示前 200 条抓取异常记录，其余请看附件报告。</p>"
+            if transport_rows_truncated
+            else ""
+        )
+        transport_section = """
+        <h3>抓取 / Availability 异常</h3>
+        <p>共 {transport_count} 条。这些不计入内容质检错误数，但需要复跑或排查 eBay API 可用性。</p>
+        {transport_note}
+        <table style="border-collapse:collapse;width:100%;">
+          <thead>
+            <tr>
+              <th align="left" style="padding:8px;border-bottom:2px solid #999;">SKU</th>
+              <th align="left" style="padding:8px;border-bottom:2px solid #999;">Listing ID</th>
+              <th align="left" style="padding:8px;border-bottom:2px solid #999;">Title</th>
+              <th align="left" style="padding:8px;border-bottom:2px solid #999;">Issues</th>
+            </tr>
+          </thead>
+          <tbody>{rows}</tbody>
+        </table>
+        """.format(
+            transport_count=total_transport_failures,
+            transport_note=transport_note,
+            rows=transport_rows,
+        )
 
     html_body = """
     <h2>eBay/GIGA 刊登内容审计</h2>
@@ -1647,6 +1724,7 @@ def _send_audit_email(report, report_path):
       <li>HIGH: {high}</li>
       <li>MEDIUM: {medium}</li>
       <li>LOW: {low}</li>
+      <li>抓取 / Availability 异常: {transport_failures}</li>
       <li>报告文件: <code>{report_path}</code></li>
     </ul>
     {fixed_section}
@@ -1663,6 +1741,7 @@ def _send_audit_email(report, report_path):
       </thead>
       <tbody>{manual_rows}</tbody>
     </table>
+    {transport_section}
     """.format(
         summary=html.escape(summary),
         mode=html.escape(mode),
@@ -1670,11 +1749,13 @@ def _send_audit_email(report, report_path):
         high=int(severity_counts.get("HIGH", 0)),
         medium=int(severity_counts.get("MEDIUM", 0)),
         low=int(severity_counts.get("LOW", 0)),
+        transport_failures=total_transport_failures,
         report_path=html.escape(str(report_path)),
         fixed_section=fixed_section,
         manual_title=manual_title,
         manual_note=manual_note,
         manual_rows=manual_rows_html or '<tr><td colspan="4" style="padding:8px;">未发现问题</td></tr>',
+        transport_section=transport_section,
     )
     return send_email(subject, html_body, attachments=[str(report_path)])
 
@@ -2017,9 +2098,27 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
 
         if key == "__claim_diff_violations__":
             for claim_text in value:
+                normalized_claim = str(claim_text or "").strip()
+                claimed_match = re.search(
+                    r"claimed\s+(.+?)(?:,\s*source\s+has\s+.+)?$",
+                    normalized_claim,
+                    flags=re.IGNORECASE,
+                )
+                if claimed_match:
+                    normalized_claim = claimed_match.group(1).strip()
                 claim_pattern = build_claim_cleanup_pattern(claim_text)
 
                 for aspect_key, aspect_val in list(aspects.items()):
+                    key_patterns = CLAIM_SPECIFIC_ASPECT_KEY_PATTERNS.get(normalized_claim.casefold(), ())
+                    if key_patterns and any(
+                        re.search(pattern, aspect_key, flags=re.IGNORECASE)
+                        for pattern in key_patterns
+                    ):
+                        aspects.pop(aspect_key, None)
+                        aspect_changed = True
+                        results.append(f"Aspect {aspect_key} removed (claim violation)")
+                        continue
+
                     original_list = aspect_val if isinstance(aspect_val, list) else [aspect_val]
                     new_list = []
                     for v in original_list:
@@ -2633,10 +2732,12 @@ def main(argv=None):
             sys.exit(1)
 
     all_issues = []
+    all_transport_issues = []
     fixed_count = 0
     error_count = 0
     skipped_clean_frozen = 0
     clean_state_recorded = 0
+    transport_issue_count = 0
     severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
 
     for row in rows:
@@ -2737,6 +2838,7 @@ def main(argv=None):
             live_inventory=live_inventory if args.live else None,
         )
         issues = preflight_issues + issues
+        transport_issues, content_issues = split_transport_issues(issues)
         issue_types = sorted(
             {
                 str(issue.get("type", "")).strip()
@@ -2761,11 +2863,15 @@ def main(argv=None):
             continue
 
         print(f"🔍 {sku}: {opt_title[:60] or title[:60]}")
-        for issue in issues:
+        for issue in content_issues:
             sev = issue.get("severity", "MEDIUM")
             severity_counts[sev] = severity_counts.get(sev, 0) + 1
             icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}.get(sev, "⚪")
             print(f"   {icon} [{sev}] {issue['detail']}")
+        for issue in transport_issues:
+            sev = issue.get("severity", "MEDIUM")
+            icon = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}.get(sev, "⚪")
+            print(f"   {icon} [TRANSPORT/{sev}] {issue['detail']}")
 
         fix_results = []
         if args.fix and fixes and ebay_client:
@@ -2812,14 +2918,26 @@ def main(argv=None):
                     issue_types=issue_types,
                 )
 
-        all_issues.append({
+        base_item = {
             "sku": sku,
             "title": (opt_title or title)[:120],
             "listing_id": current_listing_id,
-            "issues": issues,
-            "fix_keys": sorted(fixes.keys()),
-            "fixes_applied": fix_results if args.fix else [],
-        })
+        }
+        if content_issues:
+            all_issues.append({
+                **base_item,
+                "issues": content_issues,
+                "fix_keys": sorted(fixes.keys()),
+                "fixes_applied": fix_results if args.fix else [],
+            })
+        if transport_issues:
+            transport_issue_count += 1
+            all_transport_issues.append({
+                **base_item,
+                "issues": transport_issues,
+                "fix_keys": [],
+                "fixes_applied": [],
+            })
         print()
         if args.live:
             time.sleep(0.2)
@@ -2829,7 +2947,9 @@ def main(argv=None):
     print(f"  AUDIT SUMMARY")
     print(f"{'='*60}")
     print(f"  Total published: {len(rows)}")
-    print(f"  Listings with issues: {len(all_issues)}")
+    print(f"  Listings with content issues: {len(all_issues)}")
+    if args.live:
+        print(f"  Listings with transport/availability issues: {transport_issue_count}")
     print(f"  🔴 CRITICAL: {severity_counts.get('CRITICAL', 0)}")
     print(f"  🟠 HIGH: {severity_counts.get('HIGH', 0)}")
     print(f"  🟡 MEDIUM: {severity_counts.get('MEDIUM', 0)}")
@@ -2849,11 +2969,13 @@ def main(argv=None):
         "source": report_source,
         "total_published": len(rows),
         "total_with_issues": len(all_issues),
+        "total_transport_failures": transport_issue_count if args.live else 0,
         "severity_counts": severity_counts,
         "skipped_clean_frozen": skipped_clean_frozen if args.live else 0,
         "clean_state_recorded": clean_state_recorded if args.live and args.record_clean_state else 0,
         "fixed_count": fixed_count if args.fix else 0,
         "issues": all_issues,
+        "transport_issues": all_transport_issues if args.live else [],
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n📄 Full report: {report_path}")
@@ -2874,7 +2996,7 @@ def main(argv=None):
     conn.close()
     if args.exit_zero_on_issues:
         return 0
-    return len(all_issues)
+    return len(all_issues) + transport_issue_count
 
 
 if __name__ == "__main__":

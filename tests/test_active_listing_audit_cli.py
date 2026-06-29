@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 requests_stub = types.SimpleNamespace(
     get=lambda *_args, **_kwargs: None,
     post=lambda *_args, **_kwargs: None,
+    Session=object,
     utils=types.SimpleNamespace(quote=lambda value: value),
     exceptions=types.SimpleNamespace(HTTPError=Exception),
 )
@@ -26,6 +27,18 @@ AUDIT_SPEC = importlib.util.spec_from_file_location(
 )
 audit_fix_active_listings = importlib.util.module_from_spec(AUDIT_SPEC)
 AUDIT_SPEC.loader.exec_module(audit_fix_active_listings)
+
+import pytest
+
+@pytest.fixture(autouse=True)
+def mock_dependencies(monkeypatch):
+    class FakeCategoryMatcher:
+        def _get_category_aspects(self, category_id):
+            return [], []
+    monkeypatch.setattr(audit_fix_active_listings, "get_category_matcher", lambda: FakeCategoryMatcher())
+    if hasattr(audit_fix_active_listings, "_fill_missing_required_aspects"):
+        monkeypatch.setattr(audit_fix_active_listings, "_fill_missing_required_aspects", lambda aspects, cat, title: aspects)
+
 
 
 def test_live_listing_snapshot_prefers_ebay_title_description_aspects_and_category():
@@ -223,6 +236,7 @@ def test_fix_mode_audit_email_includes_fix_details_and_report_attachment(tmp_pat
         "mode": "fix",
         "total_published": 10,
         "total_with_issues": 2,
+        "total_transport_failures": 1,
         "severity_counts": {"CRITICAL": 1, "HIGH": 1, "MEDIUM": 0, "LOW": 0},
         "fixed_count": 1,
         "issues": [
@@ -256,6 +270,21 @@ def test_fix_mode_audit_email_includes_fix_details_and_report_attachment(tmp_pat
                 "fixes_applied": [],
             },
         ],
+        "transport_issues": [
+            {
+                "sku": "SKU-3",
+                "listing_id": "789",
+                "title": "Fetch timeout",
+                "issues": [
+                    {
+                        "severity": "HIGH",
+                        "type": "live_fetch_failed",
+                        "detail": "Failed to fetch live eBay listing data: timeout",
+                    }
+                ],
+                "fixes_applied": [],
+            }
+        ],
     }
     report_path = tmp_path / "listing_audit_fix.json"
     report_path.write_text("{}", encoding="utf-8")
@@ -267,10 +296,13 @@ def test_fix_mode_audit_email_includes_fix_details_and_report_attachment(tmp_pat
     args, kwargs = mock_send.call_args
     subject, html_body = args
     assert "已修复 1 条" in subject
+    assert "抓取/availability 异常" in subject
     assert "已自动修复明细" in html_body
     assert "Inventory product fields updated on eBay" in html_body
     assert "SKU-2" in html_body
+    assert "SKU-3" in html_body
     assert "待人工复核" in html_body
+    assert "抓取 / Availability 异常" in html_body
     assert kwargs["attachments"] == [str(report_path)]
 
 
@@ -1186,3 +1218,143 @@ def test_fix_listing_removes_claim_diff_pattern_variants(monkeypatch):
     assert "rubber wood" not in cleaned_title
     assert "Seating Capacity" not in captured["aspects"]
     assert "Material" not in captured["aspects"]
+
+
+def test_fix_listing_removes_claim_diff_count_mismatch_phrase(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        (
+            "SKU-COUNT-MISMATCH",
+            json.dumps({"title": "Stored title", "description": "<div>Stored description</div>", "aspects": {}}),
+        ),
+    )
+
+    captured = {}
+
+    def fake_put_inventory_product_only(ebay_client, sku, title, description, aspects):
+        captured["title"] = title
+        captured["description"] = description
+        captured["aspects"] = dict(aspects)
+        return object(), description, aspects
+
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "_put_inventory_product_only",
+        fake_put_inventory_product_only,
+    )
+
+    class FakeClient:
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "offer-count", "listing": {"listingId": "123"}, "status": "PUBLISHED"}]
+
+        def publish_offer(self, offer_id):
+            return {"listingId": "123"}
+
+    live_opt_raw = json.dumps(
+        {
+            "title": "Modern 4-Seat Chenille Sofa",
+            "description": "<div>Comfortable 4-seat sofa for daily use.</div>",
+            "aspects": {"Seating Capacity": ["4 seats"]},
+        }
+    )
+    product_row = {
+        "sku": "SKU-COUNT-MISMATCH",
+        "title": "Modern Sofa",
+        "description": "<div>Source description</div>",
+        "optimization": json.dumps({"title": "Stored title", "description": "<div>Stored</div>", "aspects": {}}),
+        "attributes": "{}",
+        "specs": "{}",
+        "images": "[]",
+        "price": 100,
+        "suggested_price": 100,
+        "listing_id": "123",
+    }
+
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-COUNT-MISMATCH",
+        product_row,
+        {"__claim_diff_violations__": ["claimed 4-seat, source has 3"]},
+        FakeClient(),
+        conn,
+        base_opt_raw=live_opt_raw,
+    )
+
+    assert any("claim violation" in item.lower() for item in results)
+    assert "4-seat" not in captured["title"].lower()
+    assert "4-seat" not in captured["description"].lower()
+    assert "Seating Capacity" not in captured["aspects"]
+
+
+def test_fix_listing_removes_claim_diff_feature_keys_for_waterproof_and_foldable(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        (
+            "SKU-FEATURE-KEYS",
+            json.dumps({"title": "Stored title", "description": "<div>Stored description</div>", "aspects": {}}),
+        ),
+    )
+
+    captured = {}
+
+    def fake_put_inventory_product_only(ebay_client, sku, title, description, aspects):
+        captured["aspects"] = dict(aspects)
+        captured["title"] = title
+        captured["description"] = description
+        return object(), description, aspects
+
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "_put_inventory_product_only",
+        fake_put_inventory_product_only,
+    )
+
+    class FakeClient:
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "offer-feature", "listing": {"listingId": "123"}, "status": "PUBLISHED"}]
+
+        def publish_offer(self, offer_id):
+            return {"listingId": "123"}
+
+    live_opt_raw = json.dumps(
+        {
+            "title": "Canvas Tent",
+            "description": "<div>Foldable design with waterproof coverage.</div>",
+            "aspects": {
+                "Folding Mechanism": ["No"],
+                "Is Waterproof": ["Yes"],
+                "Water Resistance Technology": ["0-5"],
+            },
+        }
+    )
+    product_row = {
+        "sku": "SKU-FEATURE-KEYS",
+        "title": "Canvas Tent",
+        "description": "<div>Source description</div>",
+        "optimization": json.dumps({"title": "Stored title", "description": "<div>Stored</div>", "aspects": {}}),
+        "attributes": "{}",
+        "specs": "{}",
+        "images": "[]",
+        "price": 100,
+        "suggested_price": 100,
+        "listing_id": "123",
+    }
+
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-FEATURE-KEYS",
+        product_row,
+        {"__claim_diff_violations__": ["foldable", "waterproof"]},
+        FakeClient(),
+        conn,
+        base_opt_raw=live_opt_raw,
+    )
+
+    assert any("Aspect Folding Mechanism removed" in item for item in results)
+    assert any("Aspect Is Waterproof removed" in item for item in results)
+    assert any("Aspect Water Resistance Technology removed" in item for item in results)
+    assert "Folding Mechanism" not in captured["aspects"]
+    assert "Is Waterproof" not in captured["aspects"]
+    assert "Water Resistance Technology" not in captured["aspects"]
