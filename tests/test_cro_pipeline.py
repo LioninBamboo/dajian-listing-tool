@@ -201,7 +201,10 @@ def test_run_cro_daily_default_stays_p1_only(tmp_db, tmp_queue, tmp_path):
     assert load_pending(action_type='image_refresh') == []
 
 
-def test_run_cro_daily_max_priority_2_queues_image_and_specifics(tmp_db, tmp_queue, tmp_path):
+def test_run_cro_daily_max_priority_2_queues_image_and_specifics(tmp_db, tmp_queue, tmp_path, monkeypatch):
+    # image_refresh 是 A/B 动作, 周哈希可能分 control 被 load_pending 隐藏; 钉死 cohort
+    import src.services.cro_action_queue as q_mod
+    monkeypatch.setattr(q_mod, 'assign_cohort', lambda sku, action: 'treatment')
     products = [
         # low_ctr + aligned + title 70 chars → image_refresh P2
         _prod('IMG', imp=2000, views=5, price=100),

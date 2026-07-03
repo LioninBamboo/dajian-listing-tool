@@ -25,6 +25,9 @@ from src.services.cro_action_queue import (
 from src.services.cro_thresholds import load_thresholds
 from src.services.cro_inventory_filter import filter_safe_actions
 from src.services.cro_diagnose_blacklist import filter_blacklisted
+from src.services.cro_promote_escalation import (
+    at_cap_cooldown_skus, escalation_candidates,
+)
 
 REPORT_DIR = Path(__file__).resolve().parents[2] / "reports"
 
@@ -35,6 +38,7 @@ def run_cro_daily(products: List[Dict[str, Any]],
                   enqueue_action_types: tuple = ('price_drop',),
                   enqueue_limit: int = 30,
                   enqueue_max_priority: int = 1,
+                  promote_at_cap_cooldown_days: int = 7,
                   snapshot_date: Optional[str] = None,
                   report_dir: Optional[Path] = None) -> Dict[str, Any]:
     """跑一次 daily CRO. 返回 report dict (并落盘).
@@ -44,6 +48,10 @@ def run_cro_daily(products: List[Dict[str, Any]],
       诊断器给 image_refresh / fill_specifics 恒为 P2, 这两类要进入
       10:15/10:20 执行器的队列必须由调用方放宽到 2. P3 (delist) 和
       P4 (反向提价) 永远不应自动入队.
+    promote_at_cap_cooldown_days: 最近 N 天内被 promote 执行器判定
+      'already at cap' 的 SKU 不再重复入队 promote (0 = 关闭冷却),
+      名额让给可加价的 SKU; 这些 SKU 以 promote_escalation 形式
+      进入日报, 等待非广告手段 (标题重写 / relist).
     """
     sd = snapshot_date or date.today().isoformat()
     learned_thresholds = load_thresholds()
@@ -64,7 +72,9 @@ def run_cro_daily(products: List[Dict[str, Any]],
     inv_dropped = 0
     recently_handled_skipped = 0
     duplicate_skipped = 0
+    at_cap_cooldown_dropped = 0
     queued_by_action: Dict[str, int] = {}
+    promote_escalation: List[Dict[str, Any]] = []
     if enqueue_p1:
         # 上限 2: delist (P3) 必须人工确认, 反向提价 (P4) 不自动执行
         max_prio = min(int(enqueue_max_priority), 2)
@@ -75,6 +85,22 @@ def run_cro_daily(products: List[Dict[str, Any]],
             a for a in all_actions
             if isinstance(a.get('priority'), int) and a['priority'] <= max_prio
         ]
+        # promote at-cap 冷却: 广告杠杆已打满的 SKU 不再占用入队名额
+        if promote_at_cap_cooldown_days > 0 and any(
+                a.get('action') == 'promote' for a in auto_actions):
+            try:
+                cooldown = at_cap_cooldown_skus(days=promote_at_cap_cooldown_days)
+            except Exception:
+                cooldown = set()
+            if cooldown:
+                kept = []
+                for a in auto_actions:
+                    if (a.get('action') == 'promote'
+                            and str(a.get('sku') or '').strip() in cooldown):
+                        at_cap_cooldown_dropped += 1
+                        continue
+                    kept.append(a)
+                auto_actions = kept
         # S27: 库存联动过滤 (price_drop / promote)
         if auto_actions:
             filt = filter_safe_actions(auto_actions)
@@ -98,6 +124,13 @@ def run_cro_daily(products: List[Dict[str, Any]],
                 if enqueue_result['added']:
                     queued_by_action[act] = enqueue_result['added']
 
+    if promote_at_cap_cooldown_days > 0:
+        try:
+            promote_escalation = escalation_candidates(
+                days=promote_at_cap_cooldown_days)
+        except Exception:
+            promote_escalation = []
+
     report = {
         'date': sd,
         'summary': summary,
@@ -108,6 +141,11 @@ def run_cro_daily(products: List[Dict[str, Any]],
         'p1_recently_handled_skipped': recently_handled_skipped,
         'p1_duplicate_skipped': duplicate_skipped,
         'queued_by_action': queued_by_action,
+        'promote_at_cap_cooldown_dropped': at_cap_cooldown_dropped,
+        'promote_escalation': {
+            'count': len(promote_escalation),
+            'candidates': promote_escalation,
+        },
         'queue_stats': queue_stats(),
     }
 

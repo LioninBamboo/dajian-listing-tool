@@ -95,6 +95,8 @@ The per-product table shows the thumbnail, product title, status, reason, and li
 
 - `already at cap (...)`: the SKU already sits at its margin-aware safe bid ceiling, so CRO checked it but refused to raise the ad bid further.
 
+SKUs skipped `already at cap` within the last 7 days enter a promote cooldown: `src/services/cro_promote_escalation.py` reads recent `logs/cro_promote_*.json` reports and the daily runner stops re-enqueueing `promote` for them, freeing the daily enqueue slots for SKUs whose bid can still move. These SKUs surface in the daily report under `promote_escalation` — the ad lever is exhausted for them, so they are the operator's candidates for non-ad levers (title/keyword rewrite, relist lifecycle). `promote_at_cap_cooldown_dropped` in the daily report counts how many promote recommendations the cooldown suppressed that day.
+
 ### When Each CRO Action Appears
 
 The diagnosis rules live in `src/services/conversion_diagnoser.py`. In operator terms:
