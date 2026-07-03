@@ -207,13 +207,77 @@ def _build_oauth():
     return oauth
 
 
+_TRADING_CLIENT = None
+
+
+def _get_trading_client():
+    """懒构建 Trading API client (模块级缓存, 单次运行最多 27 个 SKU)."""
+    global _TRADING_CLIENT
+    if _TRADING_CLIENT is None:
+        from src.clients.ebay_client import EbayClient
+        from src.clients.ebay_trading_client import EbayTradingClient
+        environment = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION").upper()
+        ebay = EbayClient(
+            os.getenv("EBAY_APP_ID"),
+            os.getenv("EBAY_CERT_ID"),
+            os.getenv("EBAY_DEV_ID"),
+            env="production" if environment == "PRODUCTION" else "sandbox",
+        )
+        _TRADING_CLIENT = EbayTradingClient(ebay)
+    return _TRADING_CLIENT
+
+
+# ReviseItem 返回这两个错误码 = 该 listing 由 Inventory API 管理 → 走回退
+_TRADING_USE_INVENTORY_CODES = {"21919474", "21919456"}
+
+
 def revise_title_live(oauth, sku: str, listing_id: str,
                       new_title: str) -> Dict[str, Any]:
-    """以 live inventory snapshot 为基只改 title, republish offer, 二次验证.
+    """双通道标题改写, 与 remove_supplier_brand_from_published_titles.py 同构:
 
-    与 scripts/remove_supplier_brand_from_published_titles.py 的
-    inventory-API 通道同构 (ADR-002 认可的写路径).
+    1. Trading API ReviseItem — 老 listing (Trading 创建) 的唯一可用通道;
+       Inventory API 对它们的 GET 直接 500 (2026-07-03 实测 11/16).
+    2. 错误码提示由 Inventory API 管理时, 回退 inventory 路径:
+       live snapshot 为基只改 title → PUT → republish offer → 二次验证.
     """
+    import xml.etree.ElementTree as ET
+    from xml.sax.saxutils import escape as xml_escape
+
+    safe_title, _ = normalize_listing_title_for_ebay(
+        new_title, source_title=new_title)
+
+    try:
+        trading = _get_trading_client()
+        xml_payload = (
+            f"<Item><ItemID>{xml_escape(str(listing_id))}</ItemID>"
+            f"<Title>{xml_escape(safe_title)}</Title></Item>"
+        )
+        response = trading.call("ReviseItem", xml_payload)
+        root = ET.fromstring(response)
+        ns = {"ebay": "urn:ebay:apis:eBLBaseComponents"}
+        ack = root.find(".//ebay:Ack", ns)
+        if ack is not None and ack.text in {"Success", "Warning"}:
+            return {"ok": True, "reason": "trading_api", "title": safe_title}
+        use_inventory = False
+        for err in root.findall(".//ebay:Errors", ns):
+            code = err.find("ebay:ErrorCode", ns)
+            if code is None:
+                continue
+            if code.text in _TRADING_USE_INVENTORY_CODES:
+                use_inventory = True
+            elif code.text == "291":
+                return {"ok": False, "reason": "listing_ended"}
+        if not use_inventory:
+            logger.info("ReviseItem non-fatal for %s, trying inventory path", sku)
+    except Exception as e:
+        logger.info("Trading path unavailable for %s (%s), trying inventory", sku, e)
+
+    return _revise_title_inventory(oauth, sku, listing_id, safe_title)
+
+
+def _revise_title_inventory(oauth, sku: str, listing_id: str,
+                            safe_title: str) -> Dict[str, Any]:
+    """Inventory API 回退: live snapshot 为基只改 title + 写后验证."""
     import requests
     token = oauth.get_valid_token()
     base_url = oauth.api_base
@@ -241,8 +305,6 @@ def revise_title_live(oauth, sku: str, listing_id: str,
     (availability.get("shipToLocationAvailability", {}) or {}).pop(
         "allocationByFormat", None)
 
-    safe_title, _ = normalize_listing_title_for_ebay(
-        new_title, source_title=new_title)
     inv_data.setdefault("product", {})["title"] = safe_title
 
     put_resp = requests.put(inv_url, headers=headers, json=inv_data, timeout=60)
