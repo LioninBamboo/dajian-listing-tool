@@ -42,10 +42,12 @@ def test_no_signals_yields_empty_trace(tmp_path):
 
 def test_read_traces_for_pending(tmp_path):
     qp = tmp_path / 'q.jsonl'
+    # promote 是 A/B 动作: 不显式钉 cohort 时按 (sku|action|周) 哈希分组,
+    # 某些 ISO 周 'B'/'promote' 会落 control 被 load_pending 隐藏 → 按周偶发.
     enqueue_with_trace(
         [{'sku': 'A', 'action': 'price_drop',
           'signals': {'funnel': 'low_ctr'}},
-         {'sku': 'B', 'action': 'promote',
+         {'sku': 'B', 'action': 'promote', 'cohort': 'treatment',
           'signals': {'roi': 0.4}}],
         queue_path=qp,
     )

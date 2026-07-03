@@ -40,18 +40,28 @@ def stub_sys_modules():
     }
     
     saved = {}
+    pre_existing = set(sys.modules)
     for name, stub in stubs.items():
         if name in sys.modules:
             saved[name] = sys.modules[name]
         sys.modules[name] = stub
-        
+
     yield
-    
+
     for name in stubs:
         if name in saved:
             sys.modules[name] = saved[name]
         else:
             sys.modules.pop(name, None)
+
+    # 若 daily_tasks / audit 脚本是在 stub 生效期间被首次 import 的,
+    # 它们的 from-import 已把 stub (如恒返回 {} 的
+    # auto_prepare_mi_opportunity_drafts) 绑进自身命名空间; 仅还原
+    # sys.modules 救不回绑定, 必须移除缓存让后续测试重新导入真实实现
+    # (否则 test_mi_e2e_smoke 的 auto-prepare 断言按测试顺序偶发失败).
+    for leaked in ("daily_tasks", "scripts.audit_fix_active_listings"):
+        if leaked not in pre_existing:
+            sys.modules.pop(leaked, None)
 
 
 
