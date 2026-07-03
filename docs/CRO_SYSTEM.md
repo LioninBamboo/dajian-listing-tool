@@ -97,6 +97,8 @@ The per-product table shows the thumbnail, product title, status, reason, and li
 
 SKUs skipped `already at cap` within the last 7 days enter a promote cooldown: `src/services/cro_promote_escalation.py` reads recent `logs/cro_promote_*.json` reports and the daily runner stops re-enqueueing `promote` for them, freeing the daily enqueue slots for SKUs whose bid can still move. These SKUs surface in the daily report under `promote_escalation` — the ad lever is exhausted for them, so they are the operator's candidates for non-ad levers (title/keyword rewrite, relist lifecycle). `promote_at_cap_cooldown_dropped` in the daily report counts how many promote recommendations the cooldown suppressed that day.
 
+The escalation list feeds `scripts/cro_title_rewrite.py`, the operator-only title/keyword enrichment channel (the controlled replacement for the scheduled title optimization removed by ADR-002). It is deliberately NOT scheduled: dry-run by default, `--apply` requires `--yes`, new titles only append the SKU's own whitelisted aspect values (no AI, no invented claims), every write goes through `normalize_listing_title_for_ebay` with a live-snapshot base plus post-write verification, and a 30-day per-SKU cooldown prevents title churn.
+
 ### When Each CRO Action Appears
 
 The diagnosis rules live in `src/services/conversion_diagnoser.py`. In operator terms:
