@@ -87,6 +87,8 @@ TASK_TIMEOUT = {
     'cro_fill_specifics': 1800,       # 90分钟 (CRO 队列消费 + 改价)
     'cro_promote': 1800,
     'cro_ops_snapshot': 1800,
+    'cro_lifecycle_detect': 900,
+    'cro_lifecycle_evaluate': 900,
 }
 
 # Windows execution-state flags. Do not use ES_DISPLAY_REQUIRED: the scheduler
@@ -703,6 +705,45 @@ def task_cro_ops_snapshot():
     )
 
 
+def task_cro_lifecycle_detect():
+    """CRO relist 生命周期候选检测 — 只写本地 candidate 行, 不动 eBay.
+
+    10:40 (spec Scheduler Contract), 在 CRO 诊断与安全动作之后.
+    withdraw/republish 执行不进调度器: revive_relist 保持人工批准,
+    运营走 scripts/cro_relist_lifecycle.py --precheck/--execute.
+    """
+    if _task_succeeded_today('cro_lifecycle_detect'):
+        logger.info("↪ 跳过 CRO 生命周期检测: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    if not _daily_tasks_ready_for_cro('CRO 生命周期检测'):
+        return True, 'Skipped (waiting for daily_tasks)'
+    run_task(
+        'cro_lifecycle_detect',
+        [str(PROJECT_ROOT / 'scripts' / 'cro_relist_lifecycle.py'),
+         '--detect', '--apply', '--limit', '200'],
+        timeout_sec=TASK_TIMEOUT['cro_lifecycle_detect'],
+    )
+
+
+def task_cro_lifecycle_evaluate():
+    """CRO relist 生命周期观察评估 — 状态转移 + 软手段入队, 仅本地写入.
+
+    10:50; evaluate 只做 published_new→observing→终态 的本地转移,
+    needs_conversion_help 经 cro_action_queue 走软手段, 绝不 withdraw/republish.
+    """
+    if _task_succeeded_today('cro_lifecycle_evaluate'):
+        logger.info("↪ 跳过 CRO 生命周期评估: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    if not _daily_tasks_ready_for_cro('CRO 生命周期评估'):
+        return True, 'Skipped (waiting for daily_tasks)'
+    run_task(
+        'cro_lifecycle_evaluate',
+        [str(PROJECT_ROOT / 'scripts' / 'cro_relist_lifecycle.py'),
+         '--evaluate', '--apply'],
+        timeout_sec=TASK_TIMEOUT['cro_lifecycle_evaluate'],
+    )
+
+
 def task_cro_sentinel():
     """CRO 北极星指标告警 — 7d avg 跌 ≥ 5 分 或 当日恶化占比 ≥ 20% 时邮件.
 
@@ -1158,6 +1199,12 @@ def setup_schedule():
     # 10:30 — CRO 北极星告警 (7d avg 跌 ≥ 5 分 / 恶化占比 ≥ 20%)
     schedule.every().day.at("10:30").do(task_cro_sentinel).tag('daily', 'cro_sentinel')
 
+    # 10:40 — CRO relist 生命周期候选检测 (本地 candidate 行, 不动 eBay)
+    schedule.every().day.at("10:40").do(task_cro_lifecycle_detect).tag('daily', 'cro_lifecycle_detect')
+
+    # 10:50 — CRO relist 生命周期观察评估 (本地状态转移 + 软手段入队)
+    schedule.every().day.at("10:50").do(task_cro_lifecycle_evaluate).tag('daily', 'cro_lifecycle_evaluate')
+
     # 11:30 — 只读审计 live eBay 刊登内容 vs GIGA 原文，发现 AI 幻觉/事实偏差后发邮件
     schedule.every().day.at("11:30").do(task_listing_audit).tag('daily', 'listing_audit')
 
@@ -1349,6 +1396,24 @@ def recover_missed_tasks(log_when_clean=True):
                 'func': task_cro_sentinel,
                 'label': 'CRO 北极星告警',
                 'priority': 120,
+                'depends_on_success': 'daily_tasks',
+            },
+            {
+                'name': 'cro_lifecycle_detect',
+                'scheduled_time': '10:40',
+                'recovery_grace_minutes': 30,
+                'func': task_cro_lifecycle_detect,
+                'label': 'CRO 生命周期检测',
+                'priority': 122,
+                'depends_on_success': 'daily_tasks',
+            },
+            {
+                'name': 'cro_lifecycle_evaluate',
+                'scheduled_time': '10:50',
+                'recovery_grace_minutes': 30,
+                'func': task_cro_lifecycle_evaluate,
+                'label': 'CRO 生命周期评估',
+                'priority': 124,
                 'depends_on_success': 'daily_tasks',
             },
             {
@@ -1559,7 +1624,7 @@ def main():
     parser.add_argument('--once', action='store_true',
                        help='立即执行全部任务一次后退出')
     parser.add_argument('--task', type=str,
-                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_self_check', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops'],
+                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_self_check', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_lifecycle_evaluate'],
                        help='立即执行指定单个任务后退出')
     parser.add_argument('--status', action='store_true',
                        help='显示守护进程状态')
@@ -1592,6 +1657,8 @@ def main():
             'bid_rollback': task_bid_rollback,
             'cro_delist_email': task_cro_delist_email,
             'cro_ops': task_cro_ops_snapshot,
+            'cro_lifecycle_detect': task_cro_lifecycle_detect,
+            'cro_lifecycle_evaluate': task_cro_lifecycle_evaluate,
         }
         task_map[args.task]()
         return

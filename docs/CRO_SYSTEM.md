@@ -67,6 +67,8 @@ The current CRO-relevant schedule in scheduler_daemon.py is:
 | `10:20` | `task_cro_fill_specifics()` | Executes queued specifics fixes |
 | `10:25` | `task_cro_promote()` | Executes queued promote work; existing ads get bid uplift, missing ads use `create_ad_safe` |
 | `10:30` | `task_cro_sentinel()` | Sends CRO alert signal and worsened-SKU output |
+| `10:40` | `task_cro_lifecycle_detect()` | Relist-lifecycle candidate detection (local candidate rows only; no eBay mutation) |
+| `10:50` | `task_cro_lifecycle_evaluate()` | Relist-lifecycle observation evaluation (local state transitions + soft-lever enqueue; never withdraw/republish) |
 | Tue `10:00` | `task_smart_bid()` | Bid optimization before promote step |
 | Tue `11:00` | `task_bid_rollback()` | Post-promote rollback audit |
 | Mon `11:00` | `task_cro_delist_email()` | Delist candidate email with confirmation link |
@@ -211,6 +213,7 @@ Production-facing S131-S140 entrypoints now go through `scripts/cro_ops_snapshot
 - `promote` can create missing ads only through `EbayAdService.create_ad_safe`; unsafe, blacklisted, or campaign-less SKUs must not be marked done.
 - CRO diagnose is additive; it should enqueue work, not directly mutate live listing state.
 - `scripts/cro_delist.py` stays human-confirmed. Never auto-delist live listings.
+- The scheduler runs relist-lifecycle detect/evaluate only. Live withdraw/republish requires the operator path (`scripts/cro_relist_lifecycle.py --precheck/--execute --apply`); `execute_approved()` is a thin orchestrator over that same two-step flow, never a bypass.
 - Threshold promotion must stay shadow-gated before production promotion.
 - DR helpers must preserve enough metadata to verify backup integrity before restore.
 - Compliance helpers must keep lawful-basis information attached to subject-access records.

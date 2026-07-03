@@ -171,10 +171,29 @@ def _conn(db_path: Optional[Path] = None) -> sqlite3.Connection:
     return conn
 
 
+# Phase 4 在 CREATE TABLE 里新增的列; 老库的既有表需要 ALTER 迁移,
+# 否则 evaluate_observations 对每行报 "no such column" (2026-07-03 生产实况).
+_LIFECYCLE_COLUMN_MIGRATIONS = {
+    "observe_until":
+        "ALTER TABLE cro_listing_lifecycle_actions ADD COLUMN observe_until TEXT",
+    "observe_window_days":
+        "ALTER TABLE cro_listing_lifecycle_actions ADD COLUMN observe_window_days INTEGER",
+    "conversion_help_attempts":
+        "ALTER TABLE cro_listing_lifecycle_actions "
+        "ADD COLUMN conversion_help_attempts INTEGER NOT NULL DEFAULT 0",
+}
+
+
 def ensure_schema(db_path: Optional[Path] = None) -> None:
     """Create lifecycle tables and duplicate-protection indexes."""
     with _conn(db_path) as conn:
         conn.executescript(_SCHEMA)
+        existing = _table_columns(conn, "cro_listing_lifecycle_actions")
+        if existing:
+            for column, ddl in _LIFECYCLE_COLUMN_MIGRATIONS.items():
+                if column not in existing:
+                    conn.execute(ddl)
+        conn.commit()
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -1214,31 +1233,38 @@ def execute_prechecked_relist(
 def execute_approved(
     limit: int = 10,
     apply_changes: bool = False,
+    operator: str = "system",
     db_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Phase 1 dry-run selector for approved actions.
+    """Thin orchestrator over the safe two-step flow.
 
-    Real withdraw/re-publish execution belongs to Phase 3 and is deliberately
-    blocked here when apply_changes=True.
+    等价于依次执行 `precheck_approved` → `execute_prechecked_relist`,
+    两步共用同一 apply_changes / limit. 不存在绕过 precheck 的直发路径:
+    执行阶段只消费 precheck 通过 (status=prechecked) 的行, 销量复查、
+    live 状态复查与 withdraw/republish 安全序全部由这两个阶段函数负责.
+
+    dry-run (apply_changes=False) 时 precheck 不落状态转移, 因此 execute
+    阶段只会看到此前已 prechecked 的行 — 报告如实反映两步各自的可见范围.
     """
     ensure_schema(db_path)
-    if apply_changes:
-        raise NotImplementedError("Approved relist execution is planned for Phase 3")
-    with _conn(db_path) as conn:
-        rows = [
-            dict(row)
-            for row in conn.execute(
-                """
-                SELECT *
-                FROM cro_listing_lifecycle_actions
-                WHERE action_type = ? AND status = ?
-                ORDER BY approved_at, id
-                LIMIT ?
-                """,
-                (ACTION_REVIVE_RELIST, STATUS_APPROVED, max(0, int(limit))),
-            )
-        ]
-    return {"apply_changes": False, "selected": len(rows), "actions": rows}
+    precheck_report = precheck_approved(
+        limit=limit,
+        apply_changes=apply_changes,
+        operator=operator,
+        db_path=db_path,
+    )
+    execute_report = execute_prechecked_relist(
+        limit=limit,
+        apply_changes=apply_changes,
+        operator=operator,
+        db_path=db_path,
+    )
+    return {
+        "apply_changes": bool(apply_changes),
+        "selected": precheck_report.get("selected", 0),
+        "precheck": precheck_report,
+        "execute": execute_report,
+    }
 
 
 def evaluate_observations(
