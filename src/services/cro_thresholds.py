@@ -12,11 +12,15 @@
 """
 from __future__ import annotations
 
+import json
+import logging
 import sqlite3
 import statistics
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = PROJECT_ROOT / 'ebay_collection.db'
@@ -77,6 +81,44 @@ def _seasonal_weighted_median(recent: list, older: list,
     return rm * recent_weight + om * (1 - recent_weight)
 
 
+def _sku_category_map(c: sqlite3.Connection) -> Dict[str, str]:
+    """sku \u2192 category \u952e. \u4e24\u4e2a\u6765\u6e90, \u524d\u8005\u4f18\u5148:
+
+    1. `products.dajian_category` \u2014 \u65e7\u8bbe\u8ba1/\u6d4b\u8bd5\u5939\u5177 schema.
+    2. `collected_products.optimization` JSON \u7684 `categoryId` \u2014 \u751f\u4ea7 schema.
+       \u5fc5\u987b\u7528 categoryId (\u800c\u975e liveCategoryId): \u6d88\u8d39\u4fa7
+       competition_monitor.load_products_from_db \u7ed9 diagnose_batch \u7684
+       \u5c31\u662f optimization.categoryId, \u952e\u4e0d\u4e00\u81f4\u9608\u503c\u6c38\u8fdc\u5339\u914d\u4e0d\u4e0a.
+    """
+    out: Dict[str, str] = {}
+    try:
+        for sku, cat in c.execute(
+            "SELECT sku, dajian_category FROM products "
+            "WHERE dajian_category IS NOT NULL AND dajian_category != ''"
+        ):
+            out[str(sku)] = str(cat)
+    except sqlite3.OperationalError:
+        pass
+    try:
+        for sku, opt_raw in c.execute(
+            "SELECT sku, optimization FROM collected_products "
+            "WHERE optimization IS NOT NULL"
+        ):
+            key = str(sku)
+            if key in out:
+                continue
+            try:
+                opt = json.loads(opt_raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            cat = str((opt or {}).get('categoryId') or '').strip()
+            if cat and cat != '?':
+                out[key] = cat
+    except sqlite3.OperationalError:
+        pass
+    return out
+
+
 def _learn_payload(db_path: Optional[Path] = None,
                    lookback_days: int = LOOKBACK_DAYS,
                    min_impressions: int = MIN_IMPRESSIONS_PER_SAMPLE,
@@ -91,25 +133,28 @@ def _learn_payload(db_path: Optional[Path] = None,
     recent_cutoff = (date.today() - timedelta(days=WEIGHT_RECENT_DAYS)).isoformat()
     with sqlite3.connect(str(db)) as c:
         c.row_factory = sqlite3.Row
+        cat_map = _sku_category_map(c)
         try:
-            rows = c.execute(
+            snap_rows = c.execute(
                 """
-                SELECT p.dajian_category AS cat, s.ctr, s.cvr, s.str_pct,
-                       s.impressions, s.snapshot_date
-                FROM cro_snapshots s
-                JOIN products p ON p.sku = s.sku
-                WHERE s.snapshot_date >= ?
-                  AND s.impressions >= ?
-                  AND p.dajian_category IS NOT NULL
-                  AND p.dajian_category != ''
+                SELECT sku, ctr, cvr, str_pct, impressions, snapshot_date
+                FROM cro_snapshots
+                WHERE snapshot_date >= ?
+                  AND impressions >= ?
                 """,
                 (cutoff, min_impressions),
             ).fetchall()
         except sqlite3.OperationalError:
-            rows = []
+            snap_rows = []
+    if snap_rows and not cat_map:
+        logger.warning(
+            "cro_thresholds: %s eligible snapshots but no sku\u2192category map "
+            "(no products table and no collected_products optimization "
+            "categoryId) \u2014 learning will yield nothing", len(snap_rows))
+    rows = [r for r in snap_rows if cat_map.get(str(r['sku']))]
     by_cat: Dict[str, Dict[str, Dict[str, list]]] = {}
     for r in rows:
-        cat = r['cat']
+        cat = cat_map[str(r['sku'])]
         bucket = 'recent' if r['snapshot_date'] >= recent_cutoff else 'older'
         d = by_cat.setdefault(cat, {
             'recent': {'ctr': [], 'cvr': [], 'str': []},
