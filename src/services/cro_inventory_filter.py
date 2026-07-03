@@ -18,9 +18,12 @@
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = PROJECT_ROOT / 'ebay_collection.db'
@@ -31,12 +34,19 @@ INVENTORY_GATED_ACTIONS = frozenset({'price_drop', 'promote'})
 
 
 def _load_stock_map(db_path: Optional[Path] = None) -> Dict[str, int]:
+    """sku → 库存. 双源, 前者优先 (与 cro_thresholds._sku_category_map 同模式):
+
+    1. `products.dajian_stock` — 旧设计/测试夹具 schema.
+    2. `collected_products.stock` — 生产 schema (ebay_collection.db 没有
+       products 表; 此前 OperationalError 被静默吞掉导致库存过滤在生产
+       从未生效, CRO 可能对缺货 SKU 调价/加广告).
+    """
     db = Path(db_path) if db_path else DEFAULT_DB
     if not db.exists():
         return {}
     out: Dict[str, int] = {}
-    try:
-        with sqlite3.connect(str(db)) as c:
+    with sqlite3.connect(str(db)) as c:
+        try:
             for sku, stock in c.execute(
                 "SELECT sku, dajian_stock FROM products"
             ):
@@ -46,8 +56,26 @@ def _load_stock_map(db_path: Optional[Path] = None) -> Dict[str, int]:
                     out[str(sku)] = int(stock)
                 except (TypeError, ValueError):
                     continue
-    except sqlite3.OperationalError:
-        return {}
+        except sqlite3.OperationalError:
+            pass
+        try:
+            for sku, stock in c.execute(
+                "SELECT sku, stock FROM collected_products"
+            ):
+                key = str(sku)
+                if key in out or stock is None:
+                    continue
+                try:
+                    out[key] = int(stock)
+                except (TypeError, ValueError):
+                    continue
+        except sqlite3.OperationalError:
+            pass
+    if not out:
+        logger.warning(
+            "cro_inventory_filter: no stock source available (neither "
+            "products.dajian_stock nor collected_products.stock) — "
+            "inventory gating is a no-op")
     return out
 
 
