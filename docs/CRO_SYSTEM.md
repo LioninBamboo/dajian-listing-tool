@@ -107,6 +107,24 @@ The diagnosis rules live in `src/services/conversion_diagnoser.py`. In operator 
 | `fill_specifics` | Listing gets clicks, but shoppers do not convert, and price is already reasonable | Buyers likely need clearer specifics or stronger description fields before they purchase. |
 | `delist` | Listing has 60+ days of zero impressions and zero sales | This is a dead listing candidate and must stay human-confirmed. |
 
+### Auto-Enqueue Policy (daily runner)
+
+`run_cro_daily()` only auto-queues a diagnosis action when both hold:
+
+1. The action type is whitelisted by the caller (`daily_tasks.run_cro_diagnose` passes `price_drop`, `image_refresh`, `fill_specifics`, `promote`).
+2. The action priority is within `enqueue_max_priority` (the daily run passes `2`).
+
+Priority semantics from `conversion_diagnoser.py`:
+
+| Priority | Actions | Auto-queued? |
+|----------|---------|--------------|
+| P1 | `price_drop` (drop), `promote` (zero-impression) | Yes |
+| P2 | `image_refresh`, `fill_specifics`, `title_refresh`, `promote` (30d no-sale) | Yes, if the type is whitelisted |
+| P3 | `delist` | Never — human-confirmed only |
+| P4 | `price_drop` reverse increase | Never |
+
+The runner hard-caps `enqueue_max_priority` at 2, so P3/P4 can never be auto-queued regardless of caller arguments. Before 2026-07, only P1 was queued, which meant the 10:15 `image_refresh` and 10:20 `fill_specifics` executors always consumed an empty queue (the diagnoser emits both only at P2). The daily report field `queued_by_action` shows what actually entered the queue per action type.
+
 ### Why A Run May Show Only `promote`
 
 If the daily diagnosis says most or all listings are in `no_impression`, CRO has no CTR or CVR signal to decide between price, image, or specifics fixes. In that state, the system will mostly emit:

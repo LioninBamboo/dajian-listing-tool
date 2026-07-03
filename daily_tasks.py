@@ -1338,6 +1338,9 @@ def run_cro_diagnose(enqueue_p1: bool = True) -> dict:
             enqueue_p1=enqueue_p1,
             enqueue_action_types=('price_drop', 'image_refresh',
                                   'fill_specifics', 'promote'),
+            # image_refresh / fill_specifics 诊断恒为 P2; 不放宽到 2 时
+            # 10:15/10:20 的执行器只会消费空队列
+            enqueue_max_priority=2,
         )
         s = rep['summary']
         delta = rep['delta_vs_yesterday']
@@ -1345,7 +1348,7 @@ def run_cro_diagnose(enqueue_p1: bool = True) -> dict:
             f"CRO 完成: 诊断 {s['total']} · 平均 {s.get('avg_cro_score', 0):.0f}/100 · "
             f"健康 {s.get('healthy_count', 0)} · "
             f"改善 {len(delta['improved'])} · 恶化 {len(delta['worsened'])} · "
-            f"P1 入队 {rep['p1_queued']}"
+            f"入队 {rep['p1_queued']} {rep.get('queued_by_action') or ''}"
         )
         return rep
     except Exception as e:

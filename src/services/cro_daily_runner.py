@@ -34,11 +34,16 @@ def run_cro_daily(products: List[Dict[str, Any]],
                   enqueue_p1: bool = True,
                   enqueue_action_types: tuple = ('price_drop',),
                   enqueue_limit: int = 30,
+                  enqueue_max_priority: int = 1,
                   snapshot_date: Optional[str] = None,
                   report_dir: Optional[Path] = None) -> Dict[str, Any]:
     """跑一次 daily CRO. 返回 report dict (并落盘).
 
     enqueue_action_types: 默认只把 price_drop 自动排队 (其它建议人工审核).
+    enqueue_max_priority: 允许自动入队的最低优先级 (1=仅 P1; 2=P1+P2).
+      诊断器给 image_refresh / fill_specifics 恒为 P2, 这两类要进入
+      10:15/10:20 执行器的队列必须由调用方放宽到 2. P3 (delist) 和
+      P4 (反向提价) 永远不应自动入队.
     """
     sd = snapshot_date or date.today().isoformat()
     learned_thresholds = load_thresholds()
@@ -59,33 +64,39 @@ def run_cro_daily(products: List[Dict[str, Any]],
     inv_dropped = 0
     recently_handled_skipped = 0
     duplicate_skipped = 0
+    queued_by_action: Dict[str, int] = {}
     if enqueue_p1:
+        # 上限 2: delist (P3) 必须人工确认, 反向提价 (P4) 不自动执行
+        max_prio = min(int(enqueue_max_priority), 2)
         all_actions: List[Dict[str, Any]] = []
         for at in enqueue_action_types:
             all_actions.extend(top_actions(diagnoses, limit=enqueue_limit, action_type=at))
-        # 仅 P1
-        p1_actions = [a for a in all_actions if a.get('priority') == 1]
+        auto_actions = [
+            a for a in all_actions
+            if isinstance(a.get('priority'), int) and a['priority'] <= max_prio
+        ]
         # S27: 库存联动过滤 (price_drop / promote)
-        if p1_actions:
-            filt = filter_safe_actions(p1_actions)
+        if auto_actions:
+            filt = filter_safe_actions(auto_actions)
             inv_dropped = len(filt['dropped'])
-            p1_actions = filt['kept']
-        if p1_actions:
+            auto_actions = filt['kept']
+        if auto_actions:
             recent_keys = recent_terminal_keys(hours=24)
-            fresh_actions = []
-            for action in p1_actions:
-                key = (str(action.get('sku') or '').strip(), str(action.get('action') or '').strip())
-                if key in recent_keys:
+            fresh_by_action: Dict[str, List[Dict[str, Any]]] = {}
+            for action in auto_actions:
+                sku = str(action.get('sku') or '').strip()
+                act = str(action.get('action') or '').strip()
+                if (sku, act) in recent_keys:
                     recently_handled_skipped += 1
                     continue
-                fresh_actions.append(action)
-            enqueue_result = enqueue_unique_pending(fresh_actions, source='cro_daily') if fresh_actions else {
-                'added': 0,
-                'skipped_duplicate': 0,
-                'input_count': 0,
-            }
-            queued = enqueue_result['added']
-            duplicate_skipped = enqueue_result['skipped_duplicate']
+                fresh_by_action.setdefault(act, []).append(action)
+            # 按动作类型分批入队, 以便日报按类型统计实际入队量
+            for act, fresh_actions in fresh_by_action.items():
+                enqueue_result = enqueue_unique_pending(fresh_actions, source='cro_daily')
+                queued += enqueue_result['added']
+                duplicate_skipped += enqueue_result['skipped_duplicate']
+                if enqueue_result['added']:
+                    queued_by_action[act] = enqueue_result['added']
 
     report = {
         'date': sd,
@@ -96,6 +107,7 @@ def run_cro_daily(products: List[Dict[str, Any]],
         'p1_inventory_dropped': inv_dropped,
         'p1_recently_handled_skipped': recently_handled_skipped,
         'p1_duplicate_skipped': duplicate_skipped,
+        'queued_by_action': queued_by_action,
         'queue_stats': queue_stats(),
     }
 
