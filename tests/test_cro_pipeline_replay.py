@@ -60,7 +60,8 @@ EXPECTED_FUNNEL_BUCKETS = {'no_impression', 'low_ctr', 'low_cvr', 'healthy'}
 EXPECTED_NO_IMP = 2
 EXPECTED_HEALTHY_MIN = 3
 EXPECTED_URGENT_MIN = 2  # \u4f4e\u5206\u8d77\u7801 no_imp + low_ctr
-EXPECTED_ACTION_TYPES = {'price_drop', 'image_refresh', 'fill_specifics', 'promote'}
+EXPECTED_ACTION_TYPES = {'price_drop', 'image_refresh', 'fill_specifics',
+                         'promote', 'send_offer'}
 
 
 def test_replay_fixture_summary_stable():
