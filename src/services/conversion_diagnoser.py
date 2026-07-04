@@ -185,6 +185,15 @@ def _build_actions(
                 expected_lift='+0.5-1.5% CVR',
                 detail={},
             ))
+            # 有点击不下单 → 给 watchers/加购买家发限时 offer 直接刺激下单.
+            # 执行器 (cro_send_offer) 有保本地板价守门: offer 价不低于
+            # PricingEngine 费率推导的最低净利率价, 无让利空间则 skip.
+            actions.append(CroAction(
+                type='send_offer', priority=2,
+                reason=f'CVR {cvr*100:.2f}% 低但有点击; 向已表达兴趣的买家发保本限时 offer',
+                expected_lift='+CVR (interested buyers)',
+                detail={'suggested_discount_pct': 5.0},
+            ))
 
     # 规则 5: 长期零销售 + 健康 funnel → 强力推广 + 价格复核
     if not has_sales and age_days >= 30 and impressions >= MIN_IMPRESSIONS_FOR_DIAGNOSIS * 4:

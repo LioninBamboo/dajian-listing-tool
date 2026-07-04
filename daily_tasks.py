@@ -1337,7 +1337,7 @@ def run_cro_diagnose(enqueue_p1: bool = True) -> dict:
             market_data=market_data,
             enqueue_p1=enqueue_p1,
             enqueue_action_types=('price_drop', 'image_refresh',
-                                  'fill_specifics', 'promote'),
+                                  'fill_specifics', 'promote', 'send_offer'),
             # image_refresh / fill_specifics 诊断恒为 P2; 不放宽到 2 时
             # 10:15/10:20 的执行器只会消费空队列
             enqueue_max_priority=2,

@@ -43,6 +43,7 @@
 | `scripts/cro_image_refresh.py` | CRO 队列主图刷新执行器 | `scheduler_daemon.py` 10:15 / 手动 | 主路径 | 消费 `cro_action_queue` 的 `image_refresh` |
 | `scripts/cro_fill_specifics.py` | CRO 队列 specifics 修复执行器 | `scheduler_daemon.py` 10:20 / 手动 | 主路径 | 消费 `fill_specifics` |
 | `scripts/cro_promote.py` | CRO promote 执行器 | `scheduler_daemon.py` 10:25 / 手动 | 主路径 | 已推广提 bid，未推广通过 `create_ad_safe` 安全开广告 |
+| `scripts/cro_send_offer.py` | low_cvr → interested buyers 保本限时 offer | `scheduler_daemon.py` 10:35 / 手动 | 主路径 | 地板价 = PricingEngine 费率推导最低净利率 5%; 折扣 ≤10%; 30 天频控; 禁止还价 |
 | `scripts/cro_delist.py` | CRO 下架候选与确认链路 | 周一邮件 / 手动 | 主路径 | 保持 magic-link 人工确认 |
 | `scripts/cro_title_rewrite.py` | 零曝光+广告打满 SKU 的标题关键词增强 | 仅手动 (不进调度) | 主路径 | 默认 dry-run; `--apply` 需 `--yes`; 只用 SKU 自身 aspects 真实值, 30 天重写防抖 |
 | `scripts/cro_threshold_feedback.py` | 将效果反馈写入 pending thresholds | 手动 | 专用工具 | 与 shadow / promote 配套 |

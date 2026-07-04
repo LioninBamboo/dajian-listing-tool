@@ -67,6 +67,7 @@ The current CRO-relevant schedule in scheduler_daemon.py is:
 | `10:20` | `task_cro_fill_specifics()` | Executes queued specifics fixes |
 | `10:25` | `task_cro_promote()` | Executes queued promote work; existing ads get bid uplift, missing ads use `create_ad_safe` |
 | `10:30` | `task_cro_sentinel()` | Sends CRO alert signal and worsened-SKU output |
+| `10:35` | `task_cro_send_offer()` | Sends margin-floored seller-initiated offers to interested buyers of low-CVR listings |
 | `10:40` | `task_cro_lifecycle_detect()` | Relist-lifecycle candidate detection (local candidate rows only; no eBay mutation) |
 | `10:50` | `task_cro_lifecycle_evaluate()` | Relist-lifecycle observation evaluation (local state transitions + soft-lever enqueue; never withdraw/republish) |
 | Tue `10:00` | `task_smart_bid()` | Bid optimization before promote step |
@@ -111,6 +112,7 @@ The diagnosis rules live in `src/services/conversion_diagnoser.py`. In operator 
 | `price_drop` | Listing has impressions, but CTR or CVR is weak and price is above market median | The listing is being seen, but price is likely the main blocker. |
 | `image_refresh` | Listing has impressions, CTR is weak, but price is already aligned with market | Price is probably not the problem; the thumbnail / hero image is the next lever. |
 | `fill_specifics` | Listing gets clicks, but shoppers do not convert, and price is already reasonable | Buyers likely need clearer specifics or stronger description fields before they purchase. |
+| `send_offer` | Same low-CVR trigger as `fill_specifics` | Interested buyers (watchers/cart adds) get a time-limited seller-initiated offer. The executor prices it against a PricingEngine-derived margin floor (net margin ≥ 5%, discount ≤ 10%, 30-day per-SKU cooldown, counter-offers disabled), so an offer can never sell below cost. |
 | `delist` | Listing has 60+ days of zero impressions and zero sales | This is a dead listing candidate and must stay human-confirmed. |
 
 ### Auto-Enqueue Policy (daily runner)
@@ -125,7 +127,7 @@ Priority semantics from `conversion_diagnoser.py`:
 | Priority | Actions | Auto-queued? |
 |----------|---------|--------------|
 | P1 | `price_drop` (drop), `promote` (zero-impression) | Yes |
-| P2 | `image_refresh`, `fill_specifics`, `title_refresh`, `promote` (30d no-sale) | Yes, if the type is whitelisted |
+| P2 | `image_refresh`, `fill_specifics`, `send_offer`, `title_refresh`, `promote` (30d no-sale) | Yes, if the type is whitelisted |
 | P3 | `delist` | Never — human-confirmed only |
 | P4 | `price_drop` reverse increase | Never |
 

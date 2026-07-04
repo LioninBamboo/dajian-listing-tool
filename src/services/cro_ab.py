@@ -19,7 +19,9 @@ from datetime import date, timedelta
 from typing import Optional
 
 CONTROL_RATIO = 0.20
-AB_ENABLED_ACTIONS = frozenset({'image_refresh', 'promote'})
+# send_offer 也入 A/B: 20% 对照组不发 offer, 用 cro_effect_audit 验证
+# offer 是增量销售而非把原价买家变成折扣买家 (左手倒右手).
+AB_ENABLED_ACTIONS = frozenset({'image_refresh', 'promote', 'send_offer'})
 
 
 def _week_bucket(d: Optional[str] = None) -> str:

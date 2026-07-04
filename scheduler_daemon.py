@@ -86,6 +86,7 @@ TASK_TIMEOUT = {
     'cro_image_refresh': 1800,
     'cro_fill_specifics': 1800,       # 90分钟 (CRO 队列消费 + 改价)
     'cro_promote': 1800,
+    'cro_send_offer': 900,
     'cro_ops_snapshot': 1800,
     'cro_lifecycle_detect': 900,
     'cro_lifecycle_evaluate': 900,
@@ -705,6 +706,25 @@ def task_cro_ops_snapshot():
     )
 
 
+def task_cro_send_offer():
+    """CRO send_offer 消费 — 给 low_cvr SKU 的 interested buyers 发保本 offer.
+
+    10:35; offer 价由 cro_offer_pricing 的地板价守门 (最低净利率 5%),
+    折扣封顶 10%, 同 SKU 30 天频控, A/B 对照组不执行.
+    """
+    if _task_succeeded_today('cro_send_offer'):
+        logger.info("↪ 跳过 CRO offer: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    if not _daily_tasks_ready_for_cro('CRO offer'):
+        return True, 'Skipped (waiting for daily_tasks)'
+    run_task(
+        'cro_send_offer',
+        [str(PROJECT_ROOT / 'scripts' / 'cro_send_offer.py'),
+         '--apply', '--limit', '20', '--email'],
+        timeout_sec=TASK_TIMEOUT['cro_send_offer'],
+    )
+
+
 def task_cro_lifecycle_detect():
     """CRO relist 生命周期候选检测 — 只写本地 candidate 行, 不动 eBay.
 
@@ -1199,6 +1219,9 @@ def setup_schedule():
     # 10:30 — CRO 北极星告警 (7d avg 跌 ≥ 5 分 / 恶化占比 ≥ 20%)
     schedule.every().day.at("10:30").do(task_cro_sentinel).tag('daily', 'cro_sentinel')
 
+    # 10:35 — CRO send_offer (low_cvr → interested buyers 保本限时 offer)
+    schedule.every().day.at("10:35").do(task_cro_send_offer).tag('daily', 'cro_send_offer')
+
     # 10:40 — CRO relist 生命周期候选检测 (本地 candidate 行, 不动 eBay)
     schedule.every().day.at("10:40").do(task_cro_lifecycle_detect).tag('daily', 'cro_lifecycle_detect')
 
@@ -1396,6 +1419,15 @@ def recover_missed_tasks(log_when_clean=True):
                 'func': task_cro_sentinel,
                 'label': 'CRO 北极星告警',
                 'priority': 120,
+                'depends_on_success': 'daily_tasks',
+            },
+            {
+                'name': 'cro_send_offer',
+                'scheduled_time': '10:35',
+                'recovery_grace_minutes': 30,
+                'func': task_cro_send_offer,
+                'label': 'CRO 保本 Offer',
+                'priority': 121,
                 'depends_on_success': 'daily_tasks',
             },
             {
@@ -1624,7 +1656,7 @@ def main():
     parser.add_argument('--once', action='store_true',
                        help='立即执行全部任务一次后退出')
     parser.add_argument('--task', type=str,
-                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_self_check', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_lifecycle_evaluate'],
+                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_self_check', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_lifecycle_evaluate', 'cro_send_offer'],
                        help='立即执行指定单个任务后退出')
     parser.add_argument('--status', action='store_true',
                        help='显示守护进程状态')
@@ -1659,6 +1691,7 @@ def main():
             'cro_ops': task_cro_ops_snapshot,
             'cro_lifecycle_detect': task_cro_lifecycle_detect,
             'cro_lifecycle_evaluate': task_cro_lifecycle_evaluate,
+            'cro_send_offer': task_cro_send_offer,
         }
         task_map[args.task]()
         return
