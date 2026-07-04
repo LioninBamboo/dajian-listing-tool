@@ -16,7 +16,6 @@
 """
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 from typing import Optional
 
@@ -42,21 +41,14 @@ def bid_cap_for_margin(margin: float) -> float:
 
 
 def _load_sku_economics(db_path: Path, sku: str) -> Optional[dict]:
-    if not db_path.exists():
-        return None
-    with sqlite3.connect(str(db_path)) as c:
-        c.row_factory = sqlite3.Row
-        try:
-            r = c.execute(
-                "SELECT ourPrice, total_cost FROM products WHERE sku=?",
-                (sku,),
-            ).fetchone()
-        except sqlite3.OperationalError:
-            return None
-    if not r:
-        return None
-    return {'price': float(r['ourPrice'] or 0),
-            'cost': float(r['total_cost'] or 0)}
+    """委托共享加载器 (products 表优先, 回退 collected_products).
+
+    修复前此处只查 products 表 — 生产库没有这张表, OperationalError 被
+    静默吞掉, bid cap 恒退化为 HARD_FLOOR_PCT=5%: S36 利润感知出价在
+    生产从未生效, 也是大量 SKU 卡在 'already at cap (5%)' 的根因.
+    """
+    from src.services.cro_sku_economics import load_sku_economics
+    return load_sku_economics(sku, db_path=db_path)
 
 
 def bid_cap_for_sku(sku: str, db_path: Optional[Path] = None,
