@@ -1325,6 +1325,21 @@ def run_cro_diagnose(enqueue_p1: bool = True) -> dict:
             return {'status': 'no_products', 'summary': {'total': 0}}
 
         perf = load_performance_data(force_refresh=False)
+        # 数据质量守门: 断网/Analytics API 失败时 traffic_meta.api_ok=False,
+        # 此时全部 listing 会被误判为 no_impression, 若照常落 cro_snapshots
+        # 会污染当日快照并令次日 diff 冒出大批假 "improved". 直接跳过诊断,
+        # 保留昨日快照不动. (is_truncated=True 是正常的 top-200 覆盖, 不算降级.)
+        traffic_meta = (perf or {}).get('traffic_meta') or {}
+        if not perf or not traffic_meta.get('api_ok'):
+            logger.warning(
+                "CRO: 流量数据不可用 (perf=%s, api_ok=%s), 跳过诊断以免污染快照",
+                bool(perf), traffic_meta.get('api_ok'),
+            )
+            return {
+                'status': 'degraded_skipped',
+                'reason': 'traffic data unavailable (api_ok=False)',
+                'summary': {'total': 0},
+            }
         merge_performance_into_products(products, perf or {})
         # images 字段补 list
         for p in products:
@@ -1338,6 +1353,15 @@ def run_cro_diagnose(enqueue_p1: bool = True) -> dict:
             enqueue_p1=enqueue_p1,
             enqueue_action_types=('price_drop', 'image_refresh',
                                   'fill_specifics', 'promote', 'send_offer'),
+            # 每日 listing 活跃维护总量 50: 避免把"活跃"等同于频繁改标题.
+            # 标题关键词增强保留在 scripts/cro_title_rewrite.py 的手动 dry-run/apply 通道.
+            action_quotas={
+                'price_drop': 10,
+                'image_refresh': 5,
+                'fill_specifics': 15,
+                'promote': 10,
+                'send_offer': 10,
+            },
             # image_refresh / fill_specifics 诊断恒为 P2; 不放宽到 2 时
             # 10:15/10:20 的执行器只会消费空队列
             enqueue_max_priority=2,
@@ -1931,6 +1955,8 @@ def main():
     parser.add_argument('--analyze-only', action='store_true', help='仅分析采集产品')
     parser.add_argument('--sync-only', action='store_true', help='仅同步库存')
     parser.add_argument('--audit-only', action='store_true', help='仅运行刊登质量审计')
+    parser.add_argument('--mi-only', action='store_true',
+                        help='仅运行 MI 自动机会发现 + 快照 (供 scheduler 独立定时任务解耦调用)')
     args = parser.parse_args()
     
     logger.info("="*60)
@@ -1943,6 +1969,10 @@ def main():
         results['inventory'] = sync_inventory()
     elif args.analyze_only:
         results['analyze'] = analyze_collected_products()
+    elif args.mi_only:
+        # F17 解耦: MI 快照独立于 45 分钟全量流程, 由 scheduler 单独定时,
+        # 自带超时, daily_tasks 卡顿/失败不再拖累 MI 每日产出.
+        results['mi_snapshot'] = run_mi_snapshot()
     elif args.audit_only:
         results['listing_audit'] = run_listing_audit(
             auto_fix=False,
@@ -2008,12 +2038,9 @@ def main():
             logger.error(f"刊登审计异常: {e}")
             results['listing_audit'] = {'error': str(e)}
 
-        # 6. F17 — MI 自动机会发现 + 快照存档（含 F18 告警）
-        try:
-            results['mi_snapshot'] = run_mi_snapshot()
-        except Exception as e:
-            logger.error(f"MI 快照异常: {e}")
-            results['mi_snapshot'] = {'error': str(e)}
+        # 6. F17 — MI 自动机会发现 + 快照存档已解耦为 scheduler 独立每日任务
+        #    (task_mi_snapshot → daily_tasks.py --mi-only), 不再随 45 分钟全量
+        #    流程执行, 避免 daily_tasks 卡顿/超时拖累 MI 每日产出.
 
         # 7. CRO 转化率诊断 (主线 — 漏斗诊断 + P1 改价入队)
         try:
@@ -2031,8 +2058,8 @@ def main():
     
     logger.info(f"日志已保存到: {log_file}")
     
-    # 发送汇总邮件（全量任务模式下）
-    if not (args.analyze_only or args.sync_only):
+    # 发送汇总邮件（全量任务模式下）— --mi-only 有自带 digest, 不发每日汇总
+    if not (args.analyze_only or args.sync_only or args.mi_only):
         try:
             send_daily_summary_email(results)
         except Exception as e:

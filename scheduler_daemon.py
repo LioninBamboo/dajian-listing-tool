@@ -19,6 +19,7 @@ Dajian Listing Tool — 后台调度守护进程
 时间表 (可修改):
   (已停用) 09:00  标题优化 (daily_optimize.py --batch-size 50 --email)
   09:30  每日全量任务 (daily_tasks.py，含库存同步；智能调价仅周一/周四在此流程中执行)
+  10:45  CRO 标题热词优化 dry-run (默认只生成报告; 显式 env 才 apply)
   11:30  eBay/GIGA live listing 内容审计 (audit_fix_active_listings.py --live --email)
   (已移除) 10:00  库存同步 — 已合并到 09:30 daily_tasks.py
   每2h   自动分析 (daily_tasks.py --analyze-only)
@@ -87,9 +88,13 @@ TASK_TIMEOUT = {
     'cro_fill_specifics': 1800,       # 90分钟 (CRO 队列消费 + 改价)
     'cro_promote': 1800,
     'cro_send_offer': 900,
+    'cro_title_rewrite': 900,
     'cro_ops_snapshot': 1800,
     'cro_lifecycle_detect': 900,
     'cro_lifecycle_evaluate': 900,
+    'mi_snapshot': 3600,       # 1小时 (F17 机会发现, 并发查 eBay Browse)
+    'listing_status_sync': 1800,  # 30分钟 (ActiveList 全量分页 + 死链协调)
+    'auto_publish': 3600,      # 1小时 (READY 草稿刊登; 默认 dry-run)
 }
 
 # Windows execution-state flags. Do not use ES_DISPLAY_REQUIRED: the scheduler
@@ -659,6 +664,65 @@ def task_cro_consume():
     )
 
 
+def task_listing_status_sync():
+    """每日死链协调 — 把 eBay 已结束的 listing 在本地标 ENDED / 清 READY 草稿的
+    死链 listing_id, 让 MI 重识别的"曾刊登→未出单→死链"候选自动变回可重发草稿.
+
+    内含抓取完整性闸: ActiveList 分页不全时整批跳过, 绝不把在售误判死链.
+    排在 mi_snapshot / auto_publish 之前, 保证发布用的是干净状态.
+    """
+    if _task_succeeded_today('listing_status_sync'):
+        logger.info("↪ 跳过死链协调: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    run_task(
+        'listing_status_sync',
+        [str(PROJECT_ROOT / 'src' / 'services' / 'listing_status_sync.py')],
+        timeout_sec=TASK_TIMEOUT['listing_status_sync'],
+    )
+
+
+def task_auto_publish():
+    """MI 机会自动刊登 — 把 READY 草稿发布到 eBay (质检硬门已强制在 batch_publish 内).
+
+    安全默认 dry-run: 只有 ENABLE_MI_AUTO_PUBLISH=1 才真正上架 (不可逆对外操作).
+    每次 --limit 上限由 MI_AUTO_PUBLISH_LIMIT 控制 (默认 10), 防一次性发太多.
+    依赖当日 listing_status_sync 先跑完 (清掉死链 listing_id), 故安排在其后.
+    """
+    if _task_succeeded_today('auto_publish'):
+        logger.info("↪ 跳过 MI 自动刊登: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+
+    enable = os.getenv('ENABLE_MI_AUTO_PUBLISH', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    try:
+        limit = max(1, int(os.getenv('MI_AUTO_PUBLISH_LIMIT', '10')))
+    except ValueError:
+        limit = 10
+
+    cmd = [str(PROJECT_ROOT / 'batch_publish.py'), '--limit', str(limit)]
+    if not enable:
+        cmd.append('--dry-run')
+        logger.info(f"[AUTO-PUBLISH] dry-run 预览 (ENABLE_MI_AUTO_PUBLISH 未开启), limit={limit}")
+    else:
+        logger.info(f"[AUTO-PUBLISH] 真实刊登已启用, limit={limit}")
+    run_task('auto_publish', cmd, timeout_sec=TASK_TIMEOUT['auto_publish'])
+
+
+def task_mi_snapshot():
+    """F17 解耦 — MI 自动机会发现 + 快照 (从 45 分钟 daily_tasks 拆出独立定时).
+
+    独立 subprocess + 自带 1h 超时, daily_tasks 卡顿/失败不再拖累 MI 每日产出.
+    不依赖 daily_tasks 完成 (MI 从本地采集库存 + eBay Browse 发现, 无需当日改价队列).
+    """
+    if _task_succeeded_today('mi_snapshot'):
+        logger.info("↪ 跳过 MI 快照: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    run_task(
+        'mi_snapshot',
+        [str(PROJECT_ROOT / 'daily_tasks.py'), '--mi-only'],
+        timeout_sec=TASK_TIMEOUT['mi_snapshot'],
+    )
+
+
 def task_cro_image_refresh():
     """CRO P1 image_refresh 消费 — 把 low_ctr 的产品主图重拼为本地完整多图."""
     if _task_succeeded_today('cro_image_refresh'):
@@ -742,6 +806,46 @@ def task_cro_lifecycle_detect():
         [str(PROJECT_ROOT / 'scripts' / 'cro_relist_lifecycle.py'),
          '--detect', '--apply', '--limit', '200'],
         timeout_sec=TASK_TIMEOUT['cro_lifecycle_detect'],
+    )
+
+
+def task_cro_title_rewrite():
+    """CRO title keyword enrichment — scheduled apply by default.
+
+    Scheduled live title writes stay bounded:
+    ENABLE_SCHEDULED_TITLE_REWRITE_APPLY=0 disables apply and falls back to
+    dry-run mode. Apply uses SCHEDULED_TITLE_REWRITE_APPLY_LIMIT (default 50).
+    Dry-run uses SCHEDULED_TITLE_REWRITE_DRY_RUN_LIMIT (default 50).
+    """
+    if _task_succeeded_today('cro_title_rewrite'):
+        logger.info("↪ 跳过 CRO 标题热词优化: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+    if not _daily_tasks_ready_for_cro('CRO 标题热词优化'):
+        return True, 'Skipped (waiting for daily_tasks)'
+
+    raw_apply = os.getenv('ENABLE_SCHEDULED_TITLE_REWRITE_APPLY', '').strip().lower()
+    apply_enabled = raw_apply not in {'0', 'false', 'no', 'off'}
+    limit_env = (
+        os.getenv('SCHEDULED_TITLE_REWRITE_APPLY_LIMIT', '50')
+        if apply_enabled else
+        os.getenv('SCHEDULED_TITLE_REWRITE_DRY_RUN_LIMIT', '50')
+    )
+    try:
+        limit = max(1, min(50, int(limit_env)))
+    except (TypeError, ValueError):
+        limit = 50
+
+    cmd = [
+        str(PROJECT_ROOT / 'scripts' / 'cro_title_rewrite.py'),
+        '--limit', str(limit),
+    ]
+    if apply_enabled:
+        cmd.extend(['--apply', '--yes'])
+
+    run_task(
+        'cro_title_rewrite',
+        cmd,
+        timeout_sec=TASK_TIMEOUT['cro_title_rewrite'],
     )
 
 
@@ -1178,8 +1282,17 @@ def setup_schedule():
     #   注意: daily_tasks.py 已包含库存同步；智能调价在同一流程里仅周一/周四执行
     schedule.every().day.at("09:30").do(task_daily_full).tag('daily', 'full')
 
-    # F32 — 10:05 MI 流水线自检（给 09:30 daily_tasks 留出生成快照/digest 的时间）
+    # 09:58 — 死链协调 (标 ENDED / 清 READY 死链 listing_id), 需在 MI 发布链路之前
+    schedule.every().day.at("09:58").do(task_listing_status_sync).tag('daily', 'listing_sync')
+
+    # F17 解耦 — 10:00 MI 机会发现快照 (独立于 45 分钟 daily_tasks, 自带超时)
+    schedule.every().day.at("10:00").do(task_mi_snapshot).tag('daily', 'mi_snapshot')
+
+    # F32 — 10:05 MI 流水线自检（在 mi_snapshot 之后, 验证当日快照/digest 已生成）
     schedule.every().day.at("10:05").do(task_mi_self_check).tag('daily', 'mi_check')
+
+    # 10:10 — MI 机会自动刊登 (READY 草稿 → eBay); 默认 dry-run, 需 env 开关才真发布
+    schedule.every().day.at("10:10").do(task_auto_publish).tag('daily', 'auto_publish')
 
     # 09:40 — 广告恢复审计 (Phase 3 闭环：跟价后重新评估被关广告的 SKU)
     schedule.every().day.at("09:40").do(task_ad_restore).tag('daily', 'ad_restore')
@@ -1225,6 +1338,9 @@ def setup_schedule():
     # 10:40 — CRO relist 生命周期候选检测 (本地 candidate 行, 不动 eBay)
     schedule.every().day.at("10:40").do(task_cro_lifecycle_detect).tag('daily', 'cro_lifecycle_detect')
 
+    # 10:45 — CRO 标题热词优化 (默认 dry-run 生成报告; 显式 env 才 apply)
+    schedule.every().day.at("10:45").do(task_cro_title_rewrite).tag('daily', 'cro_title_rewrite')
+
     # 10:50 — CRO relist 生命周期观察评估 (本地状态转移 + 软手段入队)
     schedule.every().day.at("10:50").do(task_cro_lifecycle_evaluate).tag('daily', 'cro_lifecycle_evaluate')
 
@@ -1255,6 +1371,7 @@ def setup_schedule():
     logger.info("  09:45  广告黑名单自动清理 (P7 — ad_blacklist_cleanup)")
     logger.info("  09:50  守门员异常告警 (P8 — guard_anomaly_alert)")
     logger.info("  10:00-10:25  CRO 队列自动执行 (改价/图/specifics/推广)")
+    logger.info("  10:45  CRO 标题热词优化 dry-run (显式 env 才 live apply)")
     logger.info("  11:30  eBay/GIGA live listing 内容审计 (audit_fix_active_listings --live --email)")
     logger.info("  20:00  销售健康诊断 (health_check --auto-fix --email)")
     logger.info("  每 2h  自动分析 (daily_tasks.py --analyze-only)")
@@ -1326,6 +1443,30 @@ def recover_missed_tasks(log_when_clean=True):
                 'func': task_daily_full,
                 'label': '每日全量任务',
                 'priority': 20,
+            },
+            {
+                'name': 'listing_status_sync',
+                'scheduled_time': '09:58',
+                'recovery_grace_minutes': 15,
+                'func': task_listing_status_sync,
+                'label': '死链协调',
+                'priority': 23,   # 先于 mi_snapshot(25)/auto_publish, 清干净死链再发布
+            },
+            {
+                'name': 'mi_snapshot',
+                'scheduled_time': '10:00',
+                'recovery_grace_minutes': 15,
+                'func': task_mi_snapshot,
+                'label': 'MI 机会发现快照',
+                'priority': 25,   # 先于 mi_self_check(30), 让自检验证到当日快照
+            },
+            {
+                'name': 'auto_publish',
+                'scheduled_time': '10:10',
+                'recovery_grace_minutes': 20,
+                'func': task_auto_publish,
+                'label': 'MI 自动刊登',
+                'priority': 35,   # 在 mi_snapshot/self_check 之后
             },
             {
                 'name': 'mi_self_check',
@@ -1656,7 +1797,7 @@ def main():
     parser.add_argument('--once', action='store_true',
                        help='立即执行全部任务一次后退出')
     parser.add_argument('--task', type=str,
-                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_self_check', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_lifecycle_evaluate', 'cro_send_offer'],
+                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_snapshot', 'mi_self_check', 'listing_status_sync', 'auto_publish', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_title_rewrite', 'cro_lifecycle_evaluate', 'cro_send_offer'],
                        help='立即执行指定单个任务后退出')
     parser.add_argument('--status', action='store_true',
                        help='显示守护进程状态')
@@ -1675,7 +1816,10 @@ def main():
             'reprice': task_smart_reprice,
             'health': task_health_check,
             'promotion': task_promotion_rotate,
+            'mi_snapshot': task_mi_snapshot,
             'mi_self_check': task_mi_self_check,
+            'listing_status_sync': task_listing_status_sync,
+            'auto_publish': task_auto_publish,
             'ad_restore': task_ad_restore,
             'blacklist_cleanup': task_blacklist_cleanup,
             'guard_anomaly': task_guard_anomaly,
@@ -1690,6 +1834,7 @@ def main():
             'cro_delist_email': task_cro_delist_email,
             'cro_ops': task_cro_ops_snapshot,
             'cro_lifecycle_detect': task_cro_lifecycle_detect,
+            'cro_title_rewrite': task_cro_title_rewrite,
             'cro_lifecycle_evaluate': task_cro_lifecycle_evaluate,
             'cro_send_offer': task_cro_send_offer,
         }

@@ -54,14 +54,23 @@ def _parse_image_urls(raw: Any) -> List[str]:
     return out
 
 
-def _load_local_images(sku: str) -> List[str]:
-    from src.db.database import SessionLocal
-    from src.db.models import Product
+def _load_local_product(sku: str) -> Dict[str, Any]:
+    from src.db.collection_db import SessionLocal
+    from src.db.collection_models import CollectedProduct
+
     with SessionLocal() as s:
-        p = s.query(Product).filter(Product.sku == sku).first()
+        p = s.query(CollectedProduct).filter(CollectedProduct.sku == sku).first()
         if not p:
-            return []
-        return _parse_image_urls(p.image_urls)
+            return {'images': [], 'title': '', 'description': ''}
+        return {
+            'images': _parse_image_urls(p.images),
+            'title': p.title or '',
+            'description': p.description or '',
+        }
+
+
+def _load_local_images(sku: str) -> List[str]:
+    return _load_local_product(sku)['images']
 
 
 def _should_refresh(local: List[str], live_urls: List[str]) -> Optional[str]:
@@ -77,21 +86,25 @@ def _should_refresh(local: List[str], live_urls: List[str]) -> Optional[str]:
     return None
 
 
-def _refresh_one(client, sku: str, local: List[str]) -> Dict[str, Any]:
+def _refresh_one(client, sku: str, local: Dict[str, Any]) -> Dict[str, Any]:
     item = client.get_inventory_item(sku)
     if not item:
         return {'sku': sku, 'status': 'skipped', 'reason': 'no inventory item'}
     product = (item.get('product') or {})
+    local_images = local.get('images') or []
     live_urls = product.get('imageUrls') or []
-    reason = _should_refresh(local, live_urls)
+    reason = _should_refresh(local_images, live_urls)
     if not reason:
         return {'sku': sku, 'status': 'skipped',
                 'reason': 'live already healthy', 'live_n': len(live_urls)}
 
+    title = (product.get('title') or local.get('title') or sku).strip()
+    description = (product.get('description') or local.get('description') or title).strip()
+    description = description[:4000] or title[:4000]
     payload = {
-        'title': product.get('title') or '',
-        'description': product.get('description') or '',
-        'image_urls': local,
+        'title': title,
+        'description': description,
+        'image_urls': local_images,
         'condition': item.get('condition', 'NEW'),
         'quantity': (((item.get('availability') or {}).get(
             'shipToLocationAvailability') or {}).get('quantity', 1)),
@@ -105,12 +118,17 @@ def _refresh_one(client, sku: str, local: List[str]) -> Dict[str, Any]:
     # 二次验证
     item2 = client.get_inventory_item(sku) or {}
     live2 = ((item2.get('product') or {}).get('imageUrls')) or []
-    if not live2 or live2[0] != local[0]:
+    expected_count = min(len(local_images), 24)
+    if not live2:
         return {'sku': sku, 'status': 'failed',
                 'reason': 'verification mismatch',
-                'expected_lead': local[0], 'live_lead': (live2 or [None])[0]}
+                'expected_count': expected_count, 'live_n': 0}
+    if len(live2) < max(1, expected_count - 1):
+        return {'sku': sku, 'status': 'failed',
+                'reason': 'verification image count mismatch',
+                'expected_count': expected_count, 'live_n': len(live2)}
     return {'sku': sku, 'status': 'done', 'reason': reason,
-            'live_n': len(live2), 'local_n': len(local)}
+            'live_n': len(live2), 'local_n': len(local_images)}
 
 
 def _default_ebay_client():
@@ -138,16 +156,19 @@ def run(apply_changes: bool, limit: int) -> Dict[str, Any]:
     client = _default_ebay_client() if apply_changes else None
 
     done_skus: List[str] = []
+    skipped_skus: List[str] = []
+    marked_done_count = 0
     for action in pending:
         sku = action.get('sku')
         if not sku:
             continue
-        local = _load_local_images(sku)
-        if not local:
+        local = _load_local_product(sku)
+        local_images = local.get('images') or []
+        if not local_images:
             row = {'sku': sku, 'status': 'skipped', 'reason': 'no local images'}
         elif not apply_changes:
             row = {'sku': sku, 'status': 'dry_run',
-                   'reason': 'would apply', 'local_n': len(local)}
+                   'reason': 'would apply', 'local_n': len(local_images)}
         else:
             try:
                 row = _refresh_one(client, sku, local)
@@ -158,10 +179,18 @@ def run(apply_changes: bool, limit: int) -> Dict[str, Any]:
         rep[bucket].append(sku)
         if row['status'] == 'done':
             done_skus.append(sku)
+            if apply_changes:
+                marked_done_count += mark_done([sku], action='image_refresh')
+        elif row['status'] == 'skipped' and apply_changes:
+            skipped_skus.append(sku)
 
     if done_skus and apply_changes:
-        marked = mark_done(done_skus, action='image_refresh')
-        rep['marked_done'] = marked
+        rep['marked_done'] = marked_done_count
+    if skipped_skus and apply_changes:
+        # 终态跳过 (本地无图 / 无 inventory) 是结构性无操作, 从 pending 出队,
+        # 否则每天被重新拉出空转. 与 fill_specifics 同处理.
+        rep['marked_skipped'] = mark_done(
+            skipped_skus, action='image_refresh', result='skipped')
 
     rep['finished_at'] = datetime.now().isoformat()
     return rep

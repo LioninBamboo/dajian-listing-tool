@@ -971,6 +971,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             if not eps_images:
                 return {"status": "error", "message": "No images after EPS upload"}
 
+            video_id = _try_upload_video(product, oauth, sku, title)
+
             # Create inventory item
             logger.info(f"  Creating inventory item (attempt {attempt+1})...")
             # Build shipping dimensions from product attributes/specs
@@ -988,6 +990,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 "aspects": completed_aspects,
                 "required_aspect_names": required_aspect_names,
             }
+            if video_id:
+                inv_product["video_urls"] = [video_id]
             if pws:
                 inv_product["packageWeightAndSize"] = pws
             
@@ -1023,9 +1027,6 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
 
             if not listing_id:
                 return {"status": "error", "message": "No listing ID after publish"}
-
-            # Video upload (best-effort)
-            video_id = _try_upload_video(product, oauth, sku, title)
 
             # Update DB
             extra_logs = [f"Video: {video_id}"] if video_id else []
@@ -1204,6 +1205,8 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Preview without publishing')
     parser.add_argument('--sku', type=str, help='Publish single SKU only')
     parser.add_argument('--enrich-only', action='store_true', help='Only enrich dimensions + pricing, no publish')
+    parser.add_argument('--limit', type=int, default=0,
+                        help='Max products to publish this run (0 = all; safety cap for auto-publish)')
     args = parser.parse_args()
 
     logger.info("=" * 60)
@@ -1216,6 +1219,10 @@ def main():
     if not products:
         logger.info("No READY products to publish.")
         return
+
+    if args.limit and args.limit > 0 and len(products) > args.limit:
+        logger.info(f"Limiting to first {args.limit} of {len(products)} READY products (--limit)")
+        products = products[:args.limit]
 
     logger.info(f"Products: {len(products)}\n")
 

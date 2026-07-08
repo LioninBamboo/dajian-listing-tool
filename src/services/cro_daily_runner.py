@@ -31,6 +31,14 @@ from src.services.cro_promote_escalation import (
 
 REPORT_DIR = Path(__file__).resolve().parents[2] / "reports"
 
+# 结构性执行动作: 其终态 (specifics 已完整 / 主图已是最新) 很稳定, 不会
+# 隔天改变. 对这些动作用远长于日周期的窗口抑制重复入队, 否则执行器每次
+# 终态 skip 的 SKU 会每隔一两天被诊断器重新拉出、白烧一次 eBay API
+# (2026-07 观察: 32 个 fill_specifics SKU 每天都以 'no missing aspect keys'
+# 空跳过). 与 promote at-cap 冷却同思路.
+STRUCTURAL_SKIP_ACTIONS = frozenset({'image_refresh', 'fill_specifics'})
+STRUCTURAL_SKIP_COOLDOWN_DAYS = 14
+
 
 def run_cro_daily(products: List[Dict[str, Any]],
                   market_data: Optional[Dict[str, Any]] = None,
@@ -38,6 +46,7 @@ def run_cro_daily(products: List[Dict[str, Any]],
                   enqueue_action_types: tuple = ('price_drop',),
                   enqueue_limit: int = 30,
                   enqueue_max_priority: int = 1,
+                  action_quotas: Optional[Dict[str, int]] = None,
                   promote_at_cap_cooldown_days: int = 7,
                   snapshot_date: Optional[str] = None,
                   report_dir: Optional[Path] = None) -> Dict[str, Any]:
@@ -48,6 +57,10 @@ def run_cro_daily(products: List[Dict[str, Any]],
       诊断器给 image_refresh / fill_specifics 恒为 P2, 这两类要进入
       10:15/10:20 执行器的队列必须由调用方放宽到 2. P3 (delist) 和
       P4 (反向提价) 永远不应自动入队.
+    action_quotas: optional per-action cap for the daily activity plan.
+      When absent, each action type uses enqueue_limit for backward
+      compatibility. When present, omitted actions fall back to enqueue_limit
+      and actions with quota <= 0 are skipped.
     promote_at_cap_cooldown_days: 最近 N 天内被 promote 执行器判定
       'already at cap' 的 SKU 不再重复入队 promote (0 = 关闭冷却),
       名额让给可加价的 SKU; 这些 SKU 以 promote_escalation 形式
@@ -80,7 +93,15 @@ def run_cro_daily(products: List[Dict[str, Any]],
         max_prio = min(int(enqueue_max_priority), 2)
         all_actions: List[Dict[str, Any]] = []
         for at in enqueue_action_types:
-            all_actions.extend(top_actions(diagnoses, limit=enqueue_limit, action_type=at))
+            action_limit = (
+                int(action_quotas.get(at, enqueue_limit))
+                if action_quotas is not None else enqueue_limit
+            )
+            if action_limit <= 0:
+                continue
+            all_actions.extend(
+                top_actions(diagnoses, limit=action_limit, action_type=at)
+            )
         auto_actions = [
             a for a in all_actions
             if isinstance(a.get('priority'), int) and a['priority'] <= max_prio
@@ -108,11 +129,15 @@ def run_cro_daily(products: List[Dict[str, Any]],
             auto_actions = filt['kept']
         if auto_actions:
             recent_keys = recent_terminal_keys(hours=24)
+            structural_recent = recent_terminal_keys(
+                hours=24 * STRUCTURAL_SKIP_COOLDOWN_DAYS)
             fresh_by_action: Dict[str, List[Dict[str, Any]]] = {}
             for action in auto_actions:
                 sku = str(action.get('sku') or '').strip()
                 act = str(action.get('action') or '').strip()
-                if (sku, act) in recent_keys:
+                window_keys = (structural_recent
+                               if act in STRUCTURAL_SKIP_ACTIONS else recent_keys)
+                if (sku, act) in window_keys:
                     recently_handled_skipped += 1
                     continue
                 fresh_by_action.setdefault(act, []).append(action)
@@ -142,6 +167,11 @@ def run_cro_daily(products: List[Dict[str, Any]],
         'p1_duplicate_skipped': duplicate_skipped,
         'queued_by_action': queued_by_action,
         'promote_at_cap_cooldown_dropped': at_cap_cooldown_dropped,
+        'action_quotas': {
+            'enabled': action_quotas is not None,
+            'total': sum(max(0, int(v)) for v in (action_quotas or {}).values()),
+            'by_action': dict(action_quotas or {}),
+        },
         'promote_escalation': {
             'count': len(promote_escalation),
             'candidates': promote_escalation,

@@ -188,6 +188,88 @@ def test_run_cro_daily_skips_recently_handled_terminal_actions(tmp_db, tmp_queue
     assert load_pending(action_type='price_drop') == []
 
 
+def _write_terminal_row(queue_path, sku, action, days_ago):
+    from datetime import datetime, timedelta, timezone
+    done_at = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+    queue_path.write_text(json.dumps({
+        'sku': sku, 'action': action, 'status': 'skipped',
+        'done_at': done_at, 'cohort': 'treatment',
+    }) + '\n', encoding='utf-8')
+
+
+def test_structural_skip_suppressed_beyond_24h(tmp_db, tmp_queue, tmp_path, monkeypatch):
+    # fill_specifics 终态 skip 在 14d 冷却窗内不重复入队 (即使已超 24h), 消除空转
+    import src.services.cro_action_queue as q_mod
+    monkeypatch.setattr(q_mod, 'assign_cohort', lambda sku, action: 'treatment')
+    _write_terminal_row(tmp_queue, 'SPEC', 'fill_specifics', days_ago=3)
+
+    products = [_prod('SPEC', imp=2000, views=100, price=100)]
+    rep = run_cro_daily(
+        products,
+        market_data={'X': {'median': 100}},
+        enqueue_action_types=('fill_specifics',),
+        enqueue_max_priority=2,
+        report_dir=tmp_path / 'reports',
+    )
+    assert rep['p1_queued'] == 0
+    assert rep['p1_recently_handled_skipped'] == 1
+    assert load_pending(action_type='fill_specifics') == []
+
+
+def test_actionable_skip_reenqueues_after_24h(tmp_db, tmp_queue, tmp_path, monkeypatch):
+    # 对照: price_drop 非结构性动作, 终态 skip 超 24h 后仍可重新入队
+    import src.services.cro_action_queue as q_mod
+    monkeypatch.setattr(q_mod, 'assign_cohort', lambda sku, action: 'treatment')
+    _write_terminal_row(tmp_queue, 'A', 'price_drop', days_ago=3)
+
+    products = [_prod('A', imp=2000, views=5, price=130)]
+    rep = run_cro_daily(
+        products,
+        market_data={'X': {'median': 100}},
+        enqueue_action_types=('price_drop',),
+        report_dir=tmp_path / 'reports',
+    )
+    assert rep['p1_queued'] == 1
+    assert rep['p1_recently_handled_skipped'] == 0
+
+
+def test_run_cro_diagnose_skips_when_traffic_degraded(monkeypatch):
+    # 流量数据 api_ok=False (断网/Analytics 失败) → 跳过诊断, 不落污染快照
+    import daily_tasks
+
+    monkeypatch.setattr(
+        daily_tasks, "logger",
+        type("L", (), {"info": lambda *a, **k: None,
+                       "warning": lambda *a, **k: None,
+                       "error": lambda *a, **k: None})(),
+    )
+
+    class FakeCompetitionMonitor:
+        @staticmethod
+        def load_products_from_db():
+            return [{'sku': 'SKU1', 'image_url': 'img'}]
+
+        @staticmethod
+        def load_performance_data(force_refresh=False):
+            return {'traffic_meta': {'api_ok': False}}
+
+        @staticmethod
+        def merge_performance_into_products(products, perf):
+            raise AssertionError('降级时不应进入 merge/诊断')
+
+        @staticmethod
+        def get_market_data_from_report(path):
+            return {}
+
+    monkeypatch.setitem(
+        __import__('sys').modules,
+        'src.web.pages.competition_monitor', FakeCompetitionMonitor)
+
+    rep = daily_tasks.run_cro_diagnose(enqueue_p1=True)
+    assert rep['status'] == 'degraded_skipped'
+    assert rep['summary']['total'] == 0
+
+
 def test_run_cro_daily_default_stays_p1_only(tmp_db, tmp_queue, tmp_path):
     # low_ctr + 价格对齐 + 标题充足 → image_refresh P2; 默认 max_priority=1 不入队
     products = [_prod('A', imp=2000, views=5, price=100)]
@@ -224,6 +306,110 @@ def test_run_cro_daily_max_priority_2_queues_image_and_specifics(tmp_db, tmp_que
     spec = load_pending(action_type='fill_specifics')
     assert [p['sku'] for p in img] == ['IMG']
     assert [p['sku'] for p in spec] == ['SPEC']
+
+
+def test_run_cro_daily_respects_per_action_activity_quotas(
+        tmp_db, tmp_queue, tmp_path, monkeypatch):
+    import src.services.cro_action_queue as q_mod
+    monkeypatch.setattr(q_mod, 'assign_cohort', lambda sku, action: 'treatment')
+    products = []
+    for i in range(3):
+        products.append(_prod(f'PRICE{i}', imp=2000, views=5, price=130))
+        products.append(_prod(f'IMAGE{i}', imp=2000, views=5, price=100))
+        products.append(_prod(f'SPEC{i}', imp=2000, views=100, price=100))
+        products.append(_prod(f'PROMO{i}', imp=0, views=0, price=100))
+
+    rep = run_cro_daily(
+        products,
+        market_data={'X': {'median': 100}},
+        enqueue_action_types=('price_drop', 'image_refresh',
+                              'fill_specifics', 'promote', 'send_offer'),
+        enqueue_max_priority=2,
+        action_quotas={
+            'price_drop': 1,
+            'image_refresh': 1,
+            'fill_specifics': 2,
+            'promote': 1,
+            'send_offer': 1,
+        },
+        report_dir=tmp_path / 'reports',
+    )
+
+    assert rep['p1_queued'] == 6
+    assert rep['queued_by_action'] == {
+        'price_drop': 1,
+        'image_refresh': 1,
+        'fill_specifics': 2,
+        'promote': 1,
+        'send_offer': 1,
+    }
+    assert rep['action_quotas']['total'] == 6
+    stats = queue_stats()
+    assert stats['pending_by_action'] == rep['queued_by_action']
+
+
+def test_daily_tasks_passes_50_slot_activity_quota(monkeypatch):
+    import daily_tasks
+
+    captured = {}
+
+    monkeypatch.setattr(
+        daily_tasks,
+        "logger",
+        type("L", (), {
+            "info": lambda *a, **k: None,
+            "warning": lambda *a, **k: None,
+            "error": lambda *a, **k: None,
+        })(),
+    )
+
+    def fake_run_cro_daily(products, **kwargs):
+        captured.update(kwargs)
+        return {
+            'summary': {'total': len(products), 'avg_cro_score': 80,
+                        'healthy_count': 1},
+            'delta_vs_yesterday': {'improved': [], 'worsened': []},
+            'p1_queued': 0,
+            'queued_by_action': {},
+        }
+
+    class FakeCompetitionMonitor:
+        @staticmethod
+        def load_products_from_db():
+            return [{'sku': 'SKU1', 'image_url': 'img'}]
+
+        @staticmethod
+        def load_performance_data(force_refresh=False):
+            # api_ok=True: 通过 run_cro_diagnose 的流量数据质量守门
+            return {'traffic_meta': {'api_ok': True}}
+
+        @staticmethod
+        def merge_performance_into_products(products, perf):
+            return None
+
+        @staticmethod
+        def get_market_data_from_report(path):
+            return {}
+
+    monkeypatch.setitem(
+        __import__('sys').modules,
+        'src.web.pages.competition_monitor',
+        FakeCompetitionMonitor,
+    )
+    import src.services.cro_daily_runner as runner
+    monkeypatch.setattr(runner, 'run_cro_daily', fake_run_cro_daily)
+
+    rep = daily_tasks.run_cro_diagnose(enqueue_p1=True)
+
+    assert rep['summary']['total'] == 1
+    assert captured['action_quotas'] == {
+        'price_drop': 10,
+        'image_refresh': 5,
+        'fill_specifics': 15,
+        'promote': 10,
+        'send_offer': 10,
+    }
+    assert sum(captured['action_quotas'].values()) == 50
 
 
 def test_run_cro_daily_never_queues_p3_or_p4(tmp_db, tmp_queue, tmp_path):

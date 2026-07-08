@@ -54,17 +54,22 @@ def _get_trading_client():
     return EbayTradingClient(ebay)
 
 
-def fetch_all_active_listing_ids(trading=None, max_pages=20) -> tuple[set, int]:
+def fetch_all_active_listing_ids(trading=None, max_pages=20) -> tuple[set, int, bool]:
     """
     获取 eBay 上所有在售的 listing ID 集合
 
     调用 GetMyeBaySelling + ActiveList，分页获取全部。
     注意：不按库存过滤，因为 eBay "Out of Stock" 功能会让零库存 listing
-    仍显示为 Active（Seller Hub 里也算在 Active 总数中）。
+    仍显示为 Active（Seller Hub 里也算在 Active 总数中）。因此本函数返回的
+    active_ids 会包含"已开启缺货控制的零库存 listing"，调用方据此判断死链时
+    不会误伤缺货商品。
 
     Returns:
         (active_ids: set of listing_id strings,
-         api_total: int — eBay API 报告的 TotalNumberOfEntries)
+         api_total: int — eBay API 报告的 TotalNumberOfEntries,
+         fetch_complete: bool — 仅当分页被完整抓取时为 True（未遇失败页、
+           未撞 max_pages 上限）。调用方必须在 fetch_complete=False 时放弃
+           "死链"协调，否则会把没抓到的在售 listing 误判为已结束。)
     """
     if trading is None:
         trading = _get_trading_client()
@@ -73,6 +78,7 @@ def fetch_all_active_listing_ids(trading=None, max_pages=20) -> tuple[set, int]:
     api_total = 0
     per_page = 200
     ns = {'ebay': 'urn:ebay:apis:eBLBaseComponents'}
+    fetch_complete = False  # 只有确认翻到最后一页/无更多条目才置 True
 
     for page in range(1, max_pages + 1):
         xml_payload = f"""
@@ -99,6 +105,7 @@ def fetch_all_active_listing_ids(trading=None, max_pages=20) -> tuple[set, int]:
 
         if not response_text:
             logger.error(f"Skipping page {page} after 3 retries")
+            fetch_complete = False  # 抓取失败 → 快照残缺，禁止据此判死链
             break
 
         root = ET.fromstring(response_text)
@@ -116,6 +123,7 @@ def fetch_all_active_listing_ids(trading=None, max_pages=20) -> tuple[set, int]:
         items = root.findall('.//ebay:ActiveList/ebay:ItemArray/ebay:Item', ns)
 
         if not items:
+            fetch_complete = True  # 无更多条目 → 抓完
             break
 
         for item in items:
@@ -130,13 +138,18 @@ def fetch_all_active_listing_ids(trading=None, max_pages=20) -> tuple[set, int]:
         if total_pages_elem is not None:
             total_pages = int(total_pages_elem.text)
             if page >= total_pages:
+                fetch_complete = True  # 翻到最后一页 → 抓完
                 break
 
         logger.info(f"  Page {page}: {len(items)} items, cumulative {len(active_ids)}")
         time.sleep(0.5)  # Rate limit courtesy
+    else:
+        # for 正常耗尽 range 而未 break → 撞上 max_pages 上限, 可能还有更多页
+        fetch_complete = False
 
-    logger.info(f"Total active listing IDs from API: {len(active_ids)} (API reported: {api_total})")
-    return active_ids, api_total
+    logger.info(f"Total active listing IDs from API: {len(active_ids)} "
+                f"(API reported: {api_total}, complete={fetch_complete})")
+    return active_ids, api_total, fetch_complete
 
 
 def get_db_published_listings() -> list:
@@ -151,6 +164,24 @@ def get_db_published_listings() -> list:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
         "SELECT sku, listing_id FROM collected_products WHERE status = 'PUBLISHED'"
+    ).fetchall()
+    conn.close()
+    return [{'sku': r['sku'], 'listing_id': r['listing_id']} for r in rows]
+
+
+def _get_db_listings_with_listing_id(statuses: tuple[str, ...]) -> list:
+    """返回给定状态、且挂着非空 listing_id 的 SKU → listing_id 映射。"""
+    if not statuses:
+        return []
+    db_path = str(PROJECT_ROOT / 'ebay_collection.db')
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in statuses)
+    rows = conn.execute(
+        f"SELECT sku, listing_id FROM collected_products "
+        f"WHERE status IN ({placeholders}) "
+        f"AND listing_id IS NOT NULL AND listing_id != ''",
+        tuple(statuses),
     ).fetchall()
     conn.close()
     return [{'sku': r['sku'], 'listing_id': r['listing_id']} for r in rows]
@@ -195,17 +226,39 @@ def sync_listing_status(force_refresh=False) -> dict:
         }
 
     # 1. 获取 eBay 真实在售
-    active_ids, api_total = fetch_all_active_listing_ids(trading)
+    active_ids, api_total, fetch_complete = fetch_all_active_listing_ids(trading)
 
     # 使用 API 报告的 TotalNumberOfEntries 作为权威数据
     # （比我们自己计数更准确，因为 eBay 内部可能有我们看不到的过滤）
     ebay_active_count = api_total if api_total > 0 else len(active_ids)
 
+    # 完整性闸: 只有确认抓取完整(未撞 max_pages 上限、无失败页, 且抓到数不少于
+    # API 报告总数)才允许据"不在 active_ids"判死链。否则残缺快照会把在售
+    # listing 误判为已结束/误清 listing_id — 直接放弃本轮协调, 不动任何数据。
+    fetch_looks_complete = fetch_complete and (api_total <= 0 or len(active_ids) >= api_total)
+    if not fetch_looks_complete:
+        logger.warning(
+            "ActiveList 抓取不完整 (complete=%s, fetched=%d, api_total=%d) — "
+            "跳过死链协调以免误伤在售 listing",
+            fetch_complete, len(active_ids), api_total,
+        )
+        return {
+            'ebay_active_count': ebay_active_count,
+            'ebay_fetched_ids': len(active_ids),
+            'db_published_count': -1,
+            'db_active_after_sync': -1,
+            'stale_ended': [],
+            'stale_ready_cleared': [],
+            'skipped_incomplete': True,
+            'synced_at': datetime.now().isoformat(),
+            'error': 'incomplete_active_list_fetch',
+        }
+
     # 2. 获取本地 PUBLISHED
     db_listings = get_db_published_listings()
     db_published_count = len(db_listings)
 
-    # 3. 找出本地 PUBLISHED 但 eBay 上已不在售的
+    # 3. 找出本地 PUBLISHED 但 eBay 上已不在售的 → 标记 ENDED
     stale_skus = []
     for item in db_listings:
         lid = item['listing_id']
@@ -215,9 +268,25 @@ def sync_listing_status(force_refresh=False) -> dict:
         if lid not in active_ids:
             stale_skus.append(item['sku'])
 
+    # 3b. 找出 READY/READY_TO_PUBLISH 但挂着已失效 listing_id 的行:
+    #     MI 重识别的"曾刊登 → 未出单 → 死链 → 下架"候选。stale listing_id 会让
+    #     batch_publish 复用死链而非重发, 并让状态看似"在售"而卡死。清掉 listing_id
+    #     → 变回干净草稿, batch_publish 会当全新 listing 重发。
+    #     缺货 listing 因开启 OOS 控制仍在 active_ids 里, 不会被清 (见 fetch 注释)。
+    ready_listings = _get_db_listings_with_listing_id(('READY', 'READY_TO_PUBLISH'))
+    stale_ready_cleared = [
+        item['sku'] for item in ready_listings
+        if item['listing_id']
+        and not item['listing_id'].startswith('DRAFT-')
+        and item['listing_id'] not in active_ids
+    ]
+
     # 4. 批量更新本地数据库
-    if stale_skus:
-        logger.info(f"Found {len(stale_skus)} stale listings (PUBLISHED in DB but not active on eBay)")
+    if stale_skus or stale_ready_cleared:
+        if stale_skus:
+            logger.info(f"Found {len(stale_skus)} stale listings (PUBLISHED in DB but not active on eBay)")
+        if stale_ready_cleared:
+            logger.info(f"Found {len(stale_ready_cleared)} READY drafts with dead listing_id — clearing for relist")
         db_path = str(PROJECT_ROOT / 'ebay_collection.db')
         conn = sqlite3.connect(db_path)
         for sku in stale_skus:
@@ -226,6 +295,13 @@ def sync_listing_status(force_refresh=False) -> dict:
                 (sku,)
             )
             logger.info(f"  {sku} → ENDED (no longer active on eBay)")
+        for sku in stale_ready_cleared:
+            conn.execute(
+                "UPDATE collected_products SET listing_id = NULL "
+                "WHERE sku = ? AND status IN ('READY', 'READY_TO_PUBLISH')",
+                (sku,)
+            )
+            logger.info(f"  {sku} → cleared stale listing_id (READY draft, listing dead) — will relist fresh")
         conn.commit()
         conn.close()
 
@@ -235,6 +311,7 @@ def sync_listing_status(force_refresh=False) -> dict:
         'db_published_count': db_published_count,
         'db_active_after_sync': db_published_count - len(stale_skus),
         'stale_ended': stale_skus,
+        'stale_ready_cleared': stale_ready_cleared,
         'synced_at': datetime.now().isoformat(),
     }
 

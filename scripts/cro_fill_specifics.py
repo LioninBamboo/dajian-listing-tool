@@ -79,13 +79,26 @@ def _missing_keys(current: Dict[str, List[str]],
     return miss
 
 
+def _load_local_product(sku: str) -> Dict[str, str]:
+    from src.db.collection_db import SessionLocal
+    from src.db.collection_models import CollectedProduct
+
+    with SessionLocal() as s:
+        p = s.query(CollectedProduct).filter(CollectedProduct.sku == sku).first()
+        if not p:
+            return {'title': '', 'description': ''}
+        return {'title': p.title or '', 'description': p.description or ''}
+
+
 def _fill_one(client, matcher, sku: str) -> Dict[str, Any]:
     item = client.get_inventory_item(sku)
     if not item:
         return {'sku': sku, 'status': 'skipped', 'reason': 'no inventory item'}
     product = (item.get('product') or {})
-    title = (product.get('title') or '').strip()
-    description = product.get('description') or ''
+    local = _load_local_product(sku)
+    title = (product.get('title') or local.get('title') or sku).strip()
+    description = (product.get('description') or local.get('description') or title).strip()
+    description = description[:4000] or title[:4000]
     cur_aspects = product.get('aspects') or {}
 
     if not title:
@@ -164,6 +177,7 @@ def run(apply_changes: bool, limit: int) -> Dict[str, Any]:
     matcher = _default_category_matcher() if apply_changes else None
 
     done_skus: List[str] = []
+    skipped_skus: List[str] = []
     for action in pending:
         sku = action.get('sku')
         if not sku:
@@ -182,9 +196,18 @@ def run(apply_changes: bool, limit: int) -> Dict[str, Any]:
         rep[bucket].append(sku)
         if row['status'] == 'done':
             done_skus.append(sku)
+        elif row['status'] == 'skipped':
+            skipped_skus.append(sku)
 
-    if done_skus and apply_changes:
-        rep['marked_done'] = mark_done(done_skus, action='fill_specifics')
+    if apply_changes:
+        if done_skus:
+            rep['marked_done'] = mark_done(done_skus, action='fill_specifics')
+        if skipped_skus:
+            # 终态跳过 (specifics 已完整 / 无 inventory / 无标题) 是结构性无操作,
+            # 隔天不会变. 从 pending 出队, 否则这些 SKU 永久滞留队列, 每天被
+            # 重新拉出、白烧一次 get_inventory_item + matcher 调用 (空转).
+            rep['marked_skipped'] = mark_done(
+                skipped_skus, action='fill_specifics', result='skipped')
 
     rep['finished_at'] = datetime.now().isoformat()
     return rep

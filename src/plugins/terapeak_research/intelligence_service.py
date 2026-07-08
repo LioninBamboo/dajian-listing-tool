@@ -721,11 +721,25 @@ class IntelligenceService:
             # F6 — join with seller performance bridge
             perf = seller_perf.get(sku) or {}
             seller_str = perf.get('str_pct')  # None when impressions < 50
+            # When we have no real seller STR (the common case — 大多数 SKU 曝光
+            # < 50), fall back to the same Browse-only estimated STR that
+            # analyze_market already derives. Without this the STR component of
+            # the opportunity score is permanently 0, capping furniture scores
+            # (competition 恒 very_high → 0 分) below the 推荐 threshold and
+            # producing days of all-"暂不推荐" snapshots.
+            est_str = None
+            if seller_str is None:
+                try:
+                    from .trend_discovery import TrendDiscovery
+                    est_str = TrendDiscovery.get_estimated_str(search_keywords)
+                except Exception:
+                    est_str = None
             score = self._calculate_opportunity_score(
                 margin_rate=margin_rate,
                 competition_level=market.competition_level,
                 price_spread=market.price_spread,
                 real_str=seller_str,
+                estimated_str=est_str,
             )
             price_advantage = "低于市场均价" if smart_price < market.avg_price else "接近市场均价"
             return {
