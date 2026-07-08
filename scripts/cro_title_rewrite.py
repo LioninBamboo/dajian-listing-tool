@@ -68,9 +68,31 @@ TITLE_WORTHY_KEYS: tuple = (
     "Finish",
     "Pattern",
 )
+HOT_KEYWORD_SUPPORT_KEYS: tuple = TITLE_WORTHY_KEYS + ("Features",)
 
 _MEANINGLESS = {"", "n/a", "na", "none", "null", "unknown", "does not apply",
                 "no", "yes", "0", "0.0", "tbd", "other", "multicolor"}
+_BLOCKED_HOT_KEYWORD_PHRASES = {
+    "hot sale",
+    "best gift",
+    "free shipping",
+    "fast shipping",
+    "ikea style",
+    "like ikea",
+    "better than",
+    "universal",
+    "oem",
+    "genuine",
+    "original",
+}
+_COLOR_TERMS = {
+    "black", "white", "blue", "red", "green", "gray", "grey", "brown",
+    "beige", "cream", "ivory", "yellow", "pink", "purple", "orange",
+    "gold", "silver", "navy", "natural", "walnut", "espresso",
+}
+_MATTRESS_SIZE_TERMS = {
+    "twin", "full", "queen", "king", "california king",
+}
 
 
 def _first_meaningful_value(raw: Any) -> str:
@@ -89,7 +111,109 @@ def _contains_phrase(title: str, phrase: str) -> bool:
         title, flags=re.IGNORECASE))
 
 
+def _phrase_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+
+
+def _title_case_keyword(text: str) -> str:
+    words = _phrase_key(text).split()
+    return " ".join(w.upper() if len(w) <= 3 and w.isalpha() else w.capitalize()
+                    for w in words)
+
+
+def _extract_hot_keywords(optimization: Dict[str, Any]) -> List[str]:
+    """Return ordered market/search keyword candidates from known opt shapes."""
+    opt = optimization or {}
+    sources = [
+        opt.get("hot_keywords"),
+        opt.get("market_keywords"),
+        opt.get("top_keywords"),
+        (opt.get("market_intel") or {}).get("top_keywords")
+        if isinstance(opt.get("market_intel"), dict) else None,
+    ]
+    out: List[str] = []
+    seen = set()
+    for raw in sources:
+        if not raw:
+            continue
+        values = raw if isinstance(raw, list) else [raw]
+        for item in values:
+            val = item.get("keyword") if isinstance(item, dict) else item
+            key = _phrase_key(val)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(str(val).strip())
+    return out
+
+
+def _supported_hot_keyword(keyword: str, aspects: Dict[str, Any]) -> str:
+    """Allow a hot/search term only when SKU aspects already prove it."""
+    key = _phrase_key(keyword)
+    if not key or key in _MEANINGLESS:
+        return ""
+    if any(blocked in key for blocked in _BLOCKED_HOT_KEYWORD_PHRASES):
+        return ""
+    if len(key) > 35:
+        return ""
+    key_tokens = set(key.split())
+    if not key_tokens:
+        return ""
+    for aspect_key in HOT_KEYWORD_SUPPORT_KEYS:
+        raw = (aspects or {}).get(aspect_key)
+        values = raw if isinstance(raw, list) else [raw]
+        for value in values:
+            support = _phrase_key(value)
+            if not support or support in _MEANINGLESS:
+                continue
+            support_tokens = set(support.split())
+            if key == support or key_tokens.issubset(support_tokens):
+                return _title_case_keyword(support)
+    return ""
+
+
+def _aspect_value_key(aspects: Dict[str, Any], key: str) -> str:
+    return _phrase_key(_first_meaningful_value((aspects or {}).get(key)))
+
+
+def _conflicting_known_term(title: str, expected: str,
+                            known_terms: set[str]) -> str:
+    if not expected:
+        return ""
+    expected_tokens = set(expected.split())
+    for term in sorted(known_terms, key=len, reverse=True):
+        if term == expected or set(term.split()).issubset(expected_tokens):
+            continue
+        if _contains_phrase(title, term):
+            return _title_case_keyword(term)
+    return ""
+
+
+def title_aspect_conflicts(title: str, aspects: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Return high-confidence title/SKU aspect mismatches before any live write."""
+    base = str(title or "")
+    conflicts: List[Dict[str, str]] = []
+    color = _aspect_value_key(aspects, "Color")
+    found_color = _conflicting_known_term(base, color, _COLOR_TERMS)
+    if found_color:
+        conflicts.append({
+            "aspect": "Color",
+            "expected": _title_case_keyword(color),
+            "found": found_color,
+        })
+    mattress_size = _aspect_value_key(aspects, "Compatible Mattress Size")
+    found_size = _conflicting_known_term(base, mattress_size, _MATTRESS_SIZE_TERMS)
+    if found_size:
+        conflicts.append({
+            "aspect": "Compatible Mattress Size",
+            "expected": _title_case_keyword(mattress_size),
+            "found": found_size,
+        })
+    return conflicts
+
+
 def build_enriched_title(title: str, aspects: Dict[str, Any],
+                         hot_keywords: Optional[List[str]] = None,
                          max_length: int = MAX_TITLE_LEN,
                          ) -> Optional[Dict[str, Any]]:
     """返回 {'new_title', 'added_keywords'} 或 None (无可安全添加的关键词).
@@ -101,6 +225,7 @@ def build_enriched_title(title: str, aspects: Dict[str, Any],
         return None
     parts = [base]
     added: List[str] = []
+    added_hot: List[str] = []
     current_len = len(base)
     for key in TITLE_WORTHY_KEYS:
         value = _first_meaningful_value((aspects or {}).get(key))
@@ -114,6 +239,19 @@ def build_enriched_title(title: str, aspects: Dict[str, Any],
         parts.append(value)
         added.append(value)
         current_len += 1 + len(value)
+    for raw_keyword in hot_keywords or []:
+        value = _supported_hot_keyword(raw_keyword, aspects or {})
+        if not value:
+            continue
+        candidate_title = " ".join(parts)
+        if _contains_phrase(candidate_title, value):
+            continue
+        if current_len + 1 + len(value) > max_length:
+            continue
+        parts.append(value)
+        added.append(value)
+        added_hot.append(value)
+        current_len += 1 + len(value)
     if not added:
         return None
     enriched = " ".join(parts)
@@ -125,7 +263,12 @@ def build_enriched_title(title: str, aspects: Dict[str, Any],
     surviving = [kw for kw in added if _contains_phrase(safe_title, kw)]
     if not surviving or safe_title == base:
         return None
-    return {"new_title": safe_title, "added_keywords": surviving}
+    surviving_hot = [kw for kw in added_hot if _contains_phrase(safe_title, kw)]
+    return {
+        "new_title": safe_title,
+        "added_keywords": surviving,
+        "added_hot_keywords": surviving_hot,
+    }
 
 
 def recently_rewritten_skus(days: int = REWRITE_COOLDOWN_DAYS,
@@ -185,6 +328,7 @@ def load_candidates(skus: List[str],
             "listing_id": str(row["listing_id"]),
             "title": (opt.get("title") or row["title"] or "").strip(),
             "aspects": opt.get("aspects") or {},
+            "hot_keywords": _extract_hot_keywords(opt),
             "optimization": opt,
         })
     return out
@@ -399,7 +543,18 @@ def run(skus: List[str], apply_changes: bool, limit: int,
 
     for cand in candidates:
         sku = cand["sku"]
-        proposal = build_enriched_title(cand["title"], cand["aspects"])
+        conflicts = title_aspect_conflicts(cand["title"], cand["aspects"])
+        if conflicts:
+            rep["rows"].append({
+                "sku": sku,
+                "status": "skipped",
+                "reason": "title conflicts with SKU aspects",
+                "conflicts": conflicts,
+            })
+            rep["skipped"].append(sku)
+            continue
+        proposal = build_enriched_title(
+            cand["title"], cand["aspects"], cand.get("hot_keywords") or [])
         if not proposal:
             rep["rows"].append({"sku": sku, "status": "skipped",
                                 "reason": "no safe keywords to add"})
@@ -411,6 +566,7 @@ def run(skus: List[str], apply_changes: bool, limit: int,
             "old_title": cand["title"],
             "new_title": proposal["new_title"],
             "added_keywords": proposal["added_keywords"],
+            "added_hot_keywords": proposal.get("added_hot_keywords", []),
         }
         if not apply_changes:
             row["status"] = "proposed"

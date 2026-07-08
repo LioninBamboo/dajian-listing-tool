@@ -246,6 +246,57 @@ def test_quality_gate_does_not_flag_no_assembly_required_as_contradiction():
     assert not any(issue.code.startswith("assembly_") for issue in issues)
 
 
+def test_normalize_generated_listing_adds_assembly_copy_from_aspect_value():
+    normalized = normalize_generated_listing(
+        {
+            "title": "Wicker Rocking Chair with Cushions",
+            "description": "<div><h3>KEY FEATURES</h3><ul><li>Outdoor rocker with cushion.</li></ul></div>",
+            "categoryId": "79684",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Assembly Required": ["Yes"],
+                "Item Length": ["32 in"],
+                "Item Width": ["28 in"],
+                "Item Height": ["36 in"],
+            },
+        },
+        source_title="Wicker Rocking Chair with Cushions",
+        source_description="<div>Outdoor rocking chair.</div>",
+        images=["img1", "img2"],
+    )
+
+    assert "assembly is required" in normalized["description"].lower()
+    issues = validate_listing_quality(
+        normalized,
+        source_title="Wicker Rocking Chair with Cushions",
+        source_description="<div>Outdoor rocking chair.</div>",
+        images=["img1", "img2"],
+    )
+    assert not any(issue.code == "assembly_description_missing" for issue in issues)
+
+
+def test_quality_gate_blocks_assembly_yes_without_description_copy():
+    issues = validate_listing_quality(
+        {
+            "title": "Wicker Rocking Chair with Cushions",
+            "description": "<div><h3>KEY FEATURES</h3><ul><li>Outdoor rocker with cushion.</li></ul></div>",
+            "categoryId": "79684",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Assembly Required": ["Yes"],
+                "Item Length": ["32 in"],
+                "Item Width": ["28 in"],
+                "Item Height": ["36 in"],
+            },
+        },
+        source_title="Wicker Rocking Chair with Cushions",
+        source_description="<div>Outdoor rocking chair.</div>",
+        images=["img1", "img2"],
+    )
+
+    assert any(issue.code == "assembly_description_missing" for issue in issues)
+
+
 def test_quality_gate_does_not_treat_no_tools_as_no_assembly():
     yes_opt = {
         "title": "Twin Platform Bed Frame",
@@ -989,6 +1040,53 @@ def test_quality_gate_routes_bed_storage_titles_out_of_cabinet_category():
     assert loft_bed["categoryId"] == "175758"
     assert loft_bed["categoryName"] == "Beds & Bed Frames"
     assert loft_bed["aspects"]["Type"] == ["Loft Bed"]
+
+
+def test_quality_gate_routes_bar_stools_and_outdoor_lounge_chairs():
+    stool = normalize_generated_listing(
+        {
+            "title": "Set of 2 Upgraded Version Modern Ash Wood Counter Height Bar Stools - Walnut",
+            "description": "<div>Counter height bar stools with wood frame.</div>",
+            "categoryId": "107578",
+            "categoryName": "Dining Sets",
+            "aspects": {"Brand": ["AquaVerve"]},
+        },
+        source_title="Set of 2 Upgraded Version Modern Ash Wood Counter Height Bar Stools - Walnut",
+        attributes={
+            "Assembled Length (in.)": "21.3",
+            "Assembled Width (in.)": "21.3",
+            "Assembled Height (in.)": "36.6",
+        },
+        specs={},
+        images=["img1", "img2"],
+    )
+    lounge = normalize_generated_listing(
+        {
+            "title": "[Set of 2] Bohemian Outdoor Lounge Chair with Handwoven Rope & Powder",
+            "description": "<div>Outdoor lounge chair set with rope weave and cushions.</div>",
+            "categoryId": "54235",
+            "categoryName": "Chairs",
+            "aspects": {"Brand": ["AquaVerve"]},
+        },
+        source_title="[Set of 2] Bohemian Outdoor Lounge Chair with Handwoven Rope & Powder",
+        attributes={
+            "Assembled Length (in.)": "27.2",
+            "Assembled Width (in.)": "27.0",
+            "Assembled Height (in.)": "26.8",
+        },
+        specs={},
+        images=["img1", "img2"],
+    )
+
+    assert stool["categoryId"] == "103431"
+    assert stool["categoryName"] == "Bar Stools & Stools"
+    assert stool["aspects"]["Type"] == ["Bar Stool"]
+    assert stool["aspects"]["Set Includes"] == ["Stools"]
+
+    assert lounge["categoryId"] == "79684"
+    assert lounge["categoryName"] == "Outdoor Chairs"
+    assert lounge["aspects"]["Type"] == ["Outdoor Chair"]
+    assert lounge["aspects"]["Set Includes"] == ["Chairs"]
 
 
 def test_quality_gate_normalizes_pantry_titles_and_specifics():

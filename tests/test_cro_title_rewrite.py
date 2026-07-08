@@ -9,6 +9,7 @@ import pytest
 
 from scripts.cro_title_rewrite import (
     build_enriched_title, recently_rewritten_skus, load_candidates, run,
+    title_aspect_conflicts,
 )
 
 
@@ -64,6 +65,64 @@ def test_enrich_empty_title_returns_none():
     assert build_enriched_title("", {"Color": ["Blue"]}) is None
 
 
+def test_enrich_adds_supported_hot_keywords_only():
+    title = "Cabinet Door Hinges 110 Degree Stainless Steel 10 Pack"
+    aspects = {
+        "Features": ["Soft Close"],
+        "Room": ["Kitchen"],
+    }
+    hot_keywords = ["soft close", "IKEA Style", "waterproof"]
+    res = build_enriched_title(title, aspects, hot_keywords=hot_keywords)
+    assert res is not None
+    assert "Soft Close" in res["new_title"]
+    assert "Kitchen" in res["new_title"]
+    assert "IKEA" not in res["new_title"]
+    assert "waterproof" not in res["new_title"].lower()
+    assert res["added_hot_keywords"] == ["Soft Close"]
+
+
+def test_enrich_rejects_hot_keyword_without_aspect_support():
+    title = "Cabinet Door Hinges 110 Degree Stainless Steel 10 Pack"
+    aspects = {"Room": ["Kitchen"]}
+    res = build_enriched_title(title, aspects, hot_keywords=["Soft Close"])
+    assert res is not None
+    assert "Soft Close" not in res["new_title"]
+    assert res["added_hot_keywords"] == []
+
+
+def test_title_aspect_conflicts_flags_color_mismatch():
+    conflicts = title_aspect_conflicts(
+        "Black Velvet Sofa Modern Living Room Couch",
+        {"Color": ["Blue"], "Material": ["Velvet"]},
+    )
+    assert conflicts == [{
+        "aspect": "Color",
+        "expected": "Blue",
+        "found": "Black",
+    }]
+
+
+def test_run_skips_candidate_with_title_aspect_conflict(tmp_db, tmp_path):
+    conn = sqlite3.connect(str(tmp_db))
+    conn.execute(
+        "UPDATE collected_products SET optimization=? WHERE sku='PUB1'",
+        (json.dumps({
+            "title": "Black Race Car Bed Kids Furniture",
+            "aspects": {"Color": ["Blue"], "Material": ["Plywood"]},
+        }),),
+    )
+    conn.commit()
+    conn.close()
+
+    rep = run(['PUB1'], apply_changes=False, limit=10,
+              db_path=tmp_db, logs_dir=tmp_path / 'logs')
+
+    row = next(r for r in rep['rows'] if r['sku'] == 'PUB1')
+    assert row['status'] == 'skipped'
+    assert row['reason'] == 'title conflicts with SKU aspects'
+    assert row['conflicts'][0]['aspect'] == 'Color'
+
+
 # ── 防抖 (recently_rewritten_skus) ───────────────────────────
 
 def _write_rewrite_log(logs_dir, dt, rows):
@@ -104,6 +163,7 @@ def tmp_db(tmp_path):
         ('PUB1', 'Race Car Bed Kids', json.dumps({
             'title': 'Race Car Bed Kids Furniture',
             'aspects': {'Color': ['Blue'], 'Material': ['Plywood']},
+            'market_intel': {'top_keywords': ['Twin']},
         }), 'L1', 'PUBLISHED'),
         ('PEND1', 'Pending item', None, '', 'PENDING'),
         ('NOLIST', 'Published no listing', None, '', 'PUBLISHED'),
@@ -123,6 +183,7 @@ def test_load_candidates_filters_published_with_listing(tmp_db):
     assert cands[0]['listing_id'] == 'L1'
     assert cands[0]['title'] == 'Race Car Bed Kids Furniture'  # optimization 优先
     assert cands[0]['aspects'] == {'Color': ['Blue'], 'Material': ['Plywood']}
+    assert cands[0]['hot_keywords'] == ['Twin']
 
 
 # ── run() 主流程 ─────────────────────────────────────────────

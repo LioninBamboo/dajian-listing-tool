@@ -69,6 +69,7 @@ The current CRO-relevant schedule in scheduler_daemon.py is:
 | `10:30` | `task_cro_sentinel()` | Sends CRO alert signal and worsened-SKU output |
 | `10:35` | `task_cro_send_offer()` | Sends margin-floored seller-initiated offers to interested buyers of low-CVR listings |
 | `10:40` | `task_cro_lifecycle_detect()` | Relist-lifecycle candidate detection (local candidate rows only; no eBay mutation) |
+| `10:45` | `task_cro_title_rewrite()` | Title hot-keyword enrichment; scheduled apply by default with a 50-SKU cap, env can force dry-run |
 | `10:50` | `task_cro_lifecycle_evaluate()` | Relist-lifecycle observation evaluation (local state transitions + soft-lever enqueue; never withdraw/republish) |
 | Tue `10:00` | `task_smart_bid()` | Bid optimization before promote step |
 | Tue `11:00` | `task_bid_rollback()` | Post-promote rollback audit |
@@ -100,7 +101,7 @@ The per-product table shows the thumbnail, product title, status, reason, and li
 
 SKUs skipped `already at cap` within the last 7 days enter a promote cooldown: `src/services/cro_promote_escalation.py` reads recent `logs/cro_promote_*.json` reports and the daily runner stops re-enqueueing `promote` for them, freeing the daily enqueue slots for SKUs whose bid can still move. These SKUs surface in the daily report under `promote_escalation` — the ad lever is exhausted for them, so they are the operator's candidates for non-ad levers (title/keyword rewrite, relist lifecycle). `promote_at_cap_cooldown_dropped` in the daily report counts how many promote recommendations the cooldown suppressed that day.
 
-The escalation list feeds `scripts/cro_title_rewrite.py`, the operator-only title/keyword enrichment channel (the controlled replacement for the scheduled title optimization removed by ADR-002). It is deliberately NOT scheduled: dry-run by default, `--apply` requires `--yes`, new titles only append the SKU's own whitelisted aspect values (no AI, no invented claims), every write goes through `normalize_listing_title_for_ebay` with a live-snapshot base plus post-write verification, and a 30-day per-SKU cooldown prevents title churn.
+The escalation list feeds `scripts/cro_title_rewrite.py`, the controlled title/keyword enrichment channel that replaces the unsafe scheduled title optimizer removed by ADR-002. It is scheduled at 10:45 and now applies live title changes by default with a 50-SKU cap. Setting `ENABLE_SCHEDULED_TITLE_REWRITE_APPLY=0` forces the scheduled run back to dry-run mode. New titles only append the SKU's own whitelisted aspect values plus market/search keyword candidates that are already proven by those aspects (no AI, no invented claims), every write goes through `normalize_listing_title_for_ebay` with a live-snapshot base plus post-write verification, and a 30-day per-SKU cooldown prevents title churn. Hot/search keyword candidates may come from `hot_keywords`, `market_keywords`, `top_keywords`, or `market_intel.top_keywords`; unsupported or blocked phrases such as unrelated brand/style terms, `hot sale`, `universal`, `OEM`, `genuine`, and `original` are skipped. If the existing title already conflicts with high-confidence SKU aspects such as `Color` or `Compatible Mattress Size`, the candidate is skipped instead of being optimized.
 
 ### When Each CRO Action Appears
 
@@ -132,6 +133,8 @@ Priority semantics from `conversion_diagnoser.py`:
 | P4 | `price_drop` reverse increase | Never |
 
 The runner hard-caps `enqueue_max_priority` at 2, so P3/P4 can never be auto-queued regardless of caller arguments. Before 2026-07, only P1 was queued, which meant the 10:15 `image_refresh` and 10:20 `fill_specifics` executors always consumed an empty queue (the diagnoser emits both only at P2). The daily report field `queued_by_action` shows what actually entered the queue per action type.
+
+`daily_tasks.run_cro_diagnose()` now passes a 50-slot daily activity quota so listing activity is spread across safer levers instead of title churn: `price_drop=10`, `image_refresh=5`, `fill_specifics=15`, `promote=10`, and `send_offer=10`. These caps limit how many recommendations per action type can enter `cro_action_queue` in one daily run; duplicate pending rows, recent terminal rows, inventory safety filters, and promote at-cap cooldown can reduce the actual count. Title keyword enrichment remains outside this quota because it is an operator-only dry-run/apply path.
 
 ### Why A Run May Show Only `promote`
 

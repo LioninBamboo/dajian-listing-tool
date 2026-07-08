@@ -110,6 +110,17 @@ class EbayCategoryMatcher:
             )
         )
         has_bean_bag = "bean bag" in title_lower
+        has_bar_stool = any(
+            kw in title_lower
+            for kw in (
+                "bar stool",
+                "bar stools",
+                "counter stool",
+                "counter stools",
+                "barstool",
+                "barstools",
+            )
+        )
         has_desk = any(
             kw in title_lower
             for kw in (
@@ -122,7 +133,7 @@ class EbayCategoryMatcher:
                 "standing desk",
                 "home office desk",
             )
-        )
+        ) and not (has_bunk_bed or has_bed_frame)
         has_treadmill = (
             any(kw in title_lower for kw in ("treadmill", "walking pad", "running machine"))
             and not any(kw in title_lower for kw in ("dog treadmill", "pet treadmill"))
@@ -181,6 +192,12 @@ class EbayCategoryMatcher:
                     "outdoor dining chairs",
                     "patio dining chair",
                     "patio dining chairs",
+                    "outdoor lounge chair",
+                    "outdoor lounge chairs",
+                    "patio lounge",
+                    "sun lounger",
+                    "camping chair",
+                    "camping chairs",
                 )
             )
         )
@@ -197,7 +214,7 @@ class EbayCategoryMatcher:
         )
         has_game_table = any(kw in title_lower for kw in ("board game table", "gaming table", "game table"))
         has_shade_sail = any(kw in title_lower for kw in ("shade sail", "sun shade sail", "sunshade sail"))
-        has_dining_set = not has_patio_furniture_set and (
+        has_dining_set = not has_bar_stool and not has_patio_furniture_set and (
             any(
                 kw in title_lower
                 for kw in (
@@ -231,7 +248,7 @@ class EbayCategoryMatcher:
             "hutch cabinet",
             "microwave shelf",
         )
-        has_pantry_cabinet = (
+        has_pantry_cabinet = not (has_bunk_bed or has_bed_frame) and (
             any(kw in text_lower for kw in pantry_markers)
             or ("hutch" in text_lower and any(kw in text_lower for kw in ("kitchen", "pantry", "microwave")))
         )
@@ -272,7 +289,16 @@ class EbayCategoryMatcher:
                 "footrest stool",
             )
         )
-        has_kids_table_set = any(
+        indoor_table_markers = (
+            "coffee table",
+            "cocktail table",
+            "nesting table",
+            "side table",
+            "end table",
+            "console table",
+            "center table",
+        )
+        has_kids_table_set = not any(kw in title_lower for kw in indoor_table_markers) and any(
             kw in text_lower
             for kw in (
                 "kids activity table",
@@ -343,6 +369,9 @@ class EbayCategoryMatcher:
         if has_bed_frame and not has_bunk_bed and cid != "175758":
             return "175758", "Beds & Bed Frames"
 
+        if has_bar_stool and cid != "103431":
+            return "103431", "Bar Stools & Stools"
+
         if has_desk and cid != "88057":
             return "88057", "Desks & Tables"
 
@@ -406,7 +435,6 @@ class EbayCategoryMatcher:
         if has_kids_table_set and cid != "66743":
             return "66743", "Play Table & Chair Sets"
 
-        indoor_table_markers = ("coffee table", "cocktail table", "nesting table", "side table", "end table", "console table")
         if (
             has_outdoor_table
             and not has_dining_set
@@ -766,6 +794,14 @@ class EbayCategoryMatcher:
             "table and chair set",
             "table with chair set",
         )
+        bar_stool_markers = (
+            "bar stool",
+            "bar stools",
+            "counter stool",
+            "counter stools",
+            "barstool",
+            "barstools",
+        )
         cooler_markers = (
             "hard cooler",
             "insulated cooler",
@@ -834,14 +870,12 @@ class EbayCategoryMatcher:
                 return False
 
         if any(marker in title_lower for marker in bunk_bed_markers):
-            if cid != "175758":
-                return False
+            return cid == "175758"
 
         if any(marker in title_lower for marker in bed_frame_markers) and not any(
             marker in title_lower for marker in bunk_bed_markers
         ):
-            if cid != "175758":
-                return False
+            return cid == "175758"
 
         if (
             any(marker in title_lower for marker in sofa_markers)
@@ -876,6 +910,12 @@ class EbayCategoryMatcher:
                     "patio armchairs",
                     "outdoor dining chair",
                     "outdoor dining chairs",
+                    "outdoor lounge chair",
+                    "outdoor lounge chairs",
+                    "patio lounge",
+                    "sun lounger",
+                    "camping chair",
+                    "camping chairs",
                 )
             )
         )
@@ -906,9 +946,12 @@ class EbayCategoryMatcher:
             if cid not in golf_mat_categories:
                 return False
 
+        if any(marker in title_lower for marker in bar_stool_markers):
+            return cid == "103431"
+
         if any(marker in title_lower for marker in dining_set_markers) and not any(
             marker in title_lower for marker in non_dining_table_set_markers
-        ):
+        ) and not any(marker in title_lower for marker in bar_stool_markers):
             return cid in dining_set_categories
 
         if any(marker in title_lower for marker in cooler_markers) or re.search(r"\bcooler\b", title_lower):
@@ -1323,7 +1366,7 @@ class EbayCategoryMatcher:
             (["egg chair", "egg swing chair", "hanging egg chair", "hanging swing chair", "hanging chair with stand", "wicker hanging swing chair", "patio hammock swing chair", "hanging basket chair"], "79682", "Patio Chairs"),
             (["outdoor daybed", "patio daybed", "sunbed"], "138996", "Outdoor Daybeds"),
             (["outdoor chair set", "patio chair set", "armchair set", "rattan chair set", "outdoor armchair", "outdoor armchairs", "patio armchair", "patio armchairs", "armchairs set"], "79682", "Patio Chairs"),
-            (["outdoor folding chair", "patio folding chair", "outdoor folding chair set", "patio folding chair set"], "79684", "Outdoor Chairs"),
+            (["outdoor folding chair", "patio folding chair", "outdoor folding chair set", "patio folding chair set", "camping chair", "camping chairs", "outdoor lounge chair", "outdoor lounge chairs", "patio lounge", "sun lounger"], "79684", "Outdoor Chairs"),
             (["porch swing bed", "patio swing bed", "garden swing bed"], "79694", "Porch Swings"),
             
             # ==================== SOFA BEDS (before Bedroom to avoid false match) ====================
@@ -1384,7 +1427,7 @@ class EbayCategoryMatcher:
             
             # ==================== DINING ROOM ====================
             # Bar stools first (higher specificity than "counter height" for dining)
-            (["bar stool", "counter stool", "barstool", "stool cushion", "barstools"], "103431", "Bar Stools & Stools"),
+            (["bar stool", "bar stools", "counter stool", "counter stools", "barstool", "stool cushion", "barstools"], "103431", "Bar Stools & Stools"),
             # More specific patterns first
             (["dining table set", "dining set", "piece dining set", "5-piece dining", "5 piece dining", "6-piece dining", "6 piece dining"], "107578", "Dining Sets"),
             (["farmhouse table", "farmhouse dining", "farm table"], "107578", "Dining Sets"),
@@ -1427,7 +1470,7 @@ class EbayCategoryMatcher:
             (["camping tent", "camping tents", "inflatable tent", "inflatable tents", "inflatabletent", "glamping tent", "glamping tents", "blow up tent", "blow-up tent", "air tent", "suv tent"], "179010", "Tents"),
             (["egg chair", "egg swing chair", "hanging egg chair", "hanging swing chair", "hanging chair with stand", "wicker hanging swing chair", "patio hammock swing chair", "hanging basket chair"], "79682", "Patio Chairs"),
             (["outdoor chair set", "patio chair set", "armchair set", "rattan chair set", "outdoor armchair", "outdoor armchairs", "patio armchair", "patio armchairs", "armchairs set"], "79682", "Patio Chairs"),
-            (["outdoor chaise", "patio chaise", "outdoor lounge chair", "patio lounge", "sun lounger"], "79682", "Patio Chairs & Lounges"),
+            (["outdoor chaise", "patio chaise", "outdoor lounge chair", "outdoor lounge chairs", "patio lounge", "sun lounger"], "79684", "Outdoor Chairs"),
             (["patio chat set", "patio conversation"], "139849", "Patio & Garden Furniture Sets"),
             (["patio set", "patio furniture", "outdoor sofa", "outdoor sectional"], "139849", "Patio & Garden Furniture Sets"),
             (["outdoor chair", "patio chair", "adirondack"], "79684", "Outdoor Chairs"),

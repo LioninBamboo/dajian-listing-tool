@@ -498,7 +498,7 @@ DESCRIPTION_BETWEEN_TAG_QUOTES_RE = re.compile(
 
 def _assembly_copy(expected: str) -> str:
     if expected == "Yes":
-        return "Yes - Hardware and instructions included; setup required before use."
+        return "Yes - Assembly is required; setup required before use with included hardware and instructions."
     return "No - Ready for use without assembly."
 
 
@@ -679,6 +679,20 @@ def apply_source_assembly_requirement(
         aspects.pop("Packaging", None)
 
     opt["description"] = rewrite_assembly_copy(opt.get("description", ""), expected)
+    return expected
+
+
+def apply_aspect_assembly_description_requirement(opt: dict[str, Any]) -> str | None:
+    """Keep description copy aligned when the generated aspect already declares assembly."""
+    aspects = opt.get("aspects") if isinstance(opt.get("aspects"), dict) else {}
+    current = first_aspect_text(aspects, "Assembly Required")
+    expected = _normalize_yes_no(current)
+    if not expected:
+        return None
+
+    description = opt.get("description", "")
+    if not has_expected_assembly_copy(description, expected):
+        opt["description"] = rewrite_assembly_copy(description, expected)
     return expected
 
 
@@ -985,6 +999,12 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
                 "outdoor dining chairs",
                 "patio dining chair",
                 "patio dining chairs",
+                "outdoor lounge chair",
+                "outdoor lounge chairs",
+                "patio lounge",
+                "sun lounger",
+                "camping chair",
+                "camping chairs",
             )
         )
     ):
@@ -995,6 +1015,15 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             type_value="Outdoor Chair",
             set_includes="Chairs" if any(marker in title_text for marker in ("set of 2", "set of two", "chairs")) else "Chair",
             indoor_outdoor="Outdoor",
+        )
+
+    if any(marker in title_text for marker in ("bar stool", "bar stools", "counter stool", "counter stools", "barstool", "barstools")):
+        return ListingProfile(
+            kind="bar_stool",
+            category_id="103431",
+            category_name="Bar Stools & Stools",
+            type_value="Bar Stool",
+            set_includes="Stools" if ("set of" in text or "stools" in text) else "Stool",
         )
 
     patio_set_markers = (
@@ -1359,6 +1388,7 @@ def normalize_generated_listing(
         attributes=attributes,
         specs=specs,
     )
+    apply_aspect_assembly_description_requirement(opt)
     opt["description"] = sanitize_generated_description_html(opt.get("description", ""))
     opt["description"] = _sanitize_specifications_table_html(opt.get("description", ""))
     sanitize_single_value_aspects(opt["aspects"])
@@ -1550,6 +1580,17 @@ def validate_listing_quality(
                     field="Packaging",
                 )
             )
+
+    current_assembly = first_aspect_text(aspects, "Assembly Required")
+    normalized_current_assembly = _normalize_yes_no(current_assembly)
+    if normalized_current_assembly and not has_expected_assembly_copy(description, normalized_current_assembly):
+        issues.append(
+            ListingQualityIssue(
+                "assembly_description_missing",
+                f"description must explicitly state Assembly Required={normalized_current_assembly}",
+                field="description",
+            )
+        )
 
     claim_facts = source_facts.get("claims") if isinstance(source_facts.get("claims"), Mapping) else {}
     for claim_name, label in CLAIM_LABELS.items():

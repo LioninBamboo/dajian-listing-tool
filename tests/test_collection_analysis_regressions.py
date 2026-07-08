@@ -451,6 +451,66 @@ def test_zero_gravity_indoor_recliner_is_not_forced_to_outdoor_chairs():
     assert not matcher.is_category_plausible_for_text(title, "79684", "Outdoor Chairs")
 
 
+def test_loft_bed_with_desk_does_not_canonicalize_to_cabinet_or_desk():
+    matcher = object.__new__(EbayCategoryMatcher)
+    title = "Multi-function Twin Metal Loft Bed with Length Desk & Open Storage Cabinet"
+
+    assert matcher._fallback_category(title) == ("175758", "Beds & Bed Frames")
+    assert matcher.canonicalize_category(title, "175758", "Beds & Bed Frames") == (
+        "175758",
+        "Beds & Bed Frames",
+    )
+    assert matcher.is_category_plausible_for_text(title, "175758", "Beds & Bed Frames")
+
+
+def test_bar_stools_do_not_fallback_to_dining_sets():
+    matcher = object.__new__(EbayCategoryMatcher)
+    title = "Set of 2 Upgraded Version Modern Ash Wood Counter Height Bar Stools - Walnut"
+
+    assert matcher._fallback_category(title) == ("103431", "Bar Stools & Stools")
+    assert matcher.canonicalize_category(title, "107578", "Dining Sets") == (
+        "103431",
+        "Bar Stools & Stools",
+    )
+    assert matcher.is_category_plausible_for_text(title, "103431", "Bar Stools & Stools")
+
+
+def test_outdoor_lounge_and_camping_chairs_route_to_outdoor_chairs():
+    matcher = object.__new__(EbayCategoryMatcher)
+    lounge_title = "[Set of 2] Bohemian Outdoor Lounge Chair with Handwoven Rope & Powder"
+    camping_title = "2PCS Outdoor Camping Chairs Folding Portable Adjustable Reclining"
+
+    assert matcher._fallback_category(lounge_title) == ("79684", "Outdoor Chairs")
+    assert matcher.canonicalize_category(lounge_title, "54235", "Chairs") == (
+        "79684",
+        "Outdoor Chairs",
+    )
+    assert matcher.is_category_plausible_for_text(lounge_title, "79684", "Outdoor Chairs")
+
+    assert matcher._fallback_category(camping_title) == ("79684", "Outdoor Chairs")
+    assert matcher.canonicalize_category(camping_title, "54235", "Chairs") == (
+        "79684",
+        "Outdoor Chairs",
+    )
+    assert matcher.is_category_plausible_for_text(camping_title, "79684", "Outdoor Chairs")
+
+
+def test_coffee_table_description_does_not_reclassify_to_kids_table_set():
+    matcher = object.__new__(EbayCategoryMatcher)
+    title = '31.5" Round Coffee Table with Storage,Fluted Lift Top Center Table, Midcentury Modern Flip'
+    description = (
+        "All-in-one multi-purpose table – acts as living room coffee table, hidden storage chest, "
+        "laptop work desk and kids activity table, ideal for small apartments."
+    )
+
+    assert matcher._fallback_category(title, description) == ("38204", "Coffee Tables")
+    assert matcher.canonicalize_category(title, "38204", "Coffee Tables", description) == (
+        "38204",
+        "Coffee Tables",
+    )
+    assert matcher.is_category_plausible_for_text(title, "38204", "Coffee Tables")
+
+
 def test_non_leaf_furniture_categories_canonicalize_to_sellable_leaves():
     matcher = object.__new__(EbayCategoryMatcher)
 

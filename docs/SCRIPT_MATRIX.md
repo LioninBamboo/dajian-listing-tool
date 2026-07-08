@@ -45,7 +45,7 @@
 | `scripts/cro_promote.py` | CRO promote 执行器 | `scheduler_daemon.py` 10:25 / 手动 | 主路径 | 已推广提 bid，未推广通过 `create_ad_safe` 安全开广告 |
 | `scripts/cro_send_offer.py` | low_cvr → interested buyers 保本限时 offer | `scheduler_daemon.py` 10:35 / 手动 | 主路径 | 地板价 = PricingEngine 费率推导最低净利率 5%; 折扣 ≤10%; 30 天频控; 禁止还价 |
 | `scripts/cro_delist.py` | CRO 下架候选与确认链路 | 周一邮件 / 手动 | 主路径 | 保持 magic-link 人工确认 |
-| `scripts/cro_title_rewrite.py` | 零曝光+广告打满 SKU 的标题关键词增强 | 仅手动 (不进调度) | 主路径 | 默认 dry-run; `--apply` 需 `--yes`; 只用 SKU 自身 aspects 真实值, 30 天重写防抖 |
+| `scripts/cro_title_rewrite.py` | 零曝光+广告打满 SKU 的标题关键词增强 | `scheduler_daemon.py` 10:45 / 手动 | 主路径 | 定时默认 live apply, 默认上限 50; `ENABLE_SCHEDULED_TITLE_REWRITE_APPLY=0` 可退回 dry-run; 只用 SKU 自身 aspects 真实值和被 aspects 证明的热词候选, 30 天重写防抖 |
 | `scripts/cro_threshold_feedback.py` | 将效果反馈写入 pending thresholds | 手动 | 专用工具 | 与 shadow / promote 配套 |
 | `scripts/cro_threshold_shadow.py` | threshold promote 前的 shadow gate | 手动 / 调度配套 | 主路径 | 先比对再决定 promote |
 | `scripts/cro_promote_thresholds.py` | 周日阈值推广 | `scheduler_daemon.py` Sun 02:30 | 主路径 | 只推广通过 shadow 的候选 |
