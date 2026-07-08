@@ -1803,6 +1803,15 @@ def main():
                        help='显示守护进程状态')
     args = parser.parse_args()
 
+    # 让调度进程本身读取 .env, 使任务级开关 (ENABLE_MI_AUTO_PUBLISH 等) 在守护进程
+    # 里可见 — task_* 在启动子进程前用 os.getenv 决定 dry-run/apply, 故必须在父进程。
+    # 仅在真正启动 (main) 时加载, 不影响模块导入/测试。
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(PROJECT_ROOT / '.env')
+    except Exception:
+        pass
+
     if args.status:
         show_status()
         return
