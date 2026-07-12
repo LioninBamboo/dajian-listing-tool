@@ -103,9 +103,12 @@ def _promote_one(ad_service, sku: str, suggested_bid_pct: float,
         )
         if not res or not res.get('success'):
             guard_reason = (res or {}).get('reason') or ''
-            terminal = guard_reason in {'unsafe', 'blacklisted'}
+            err = str((res or {}).get('error') or '')
+            # listing 已结束 (35037) 也是终态 — 死链每天重试没有意义
+            terminal = (guard_reason in {'unsafe', 'blacklisted'}
+                        or '35037' in err or 'has ended' in err)
             return {'sku': sku, 'status': 'skipped' if terminal else 'failed',
-                'reason': (res or {}).get('error') or guard_reason or 'create_ad_safe failed',
+                'reason': err or guard_reason or 'create_ad_safe failed',
                     'listing_id': listing_id,
                 'campaign_id': target_campaign,
                 'guard_reason': guard_reason,
@@ -123,7 +126,12 @@ def _promote_one(ad_service, sku: str, suggested_bid_pct: float,
     except Exception:
         dyn_cap = MAX_BID_PCT
     effective_cap = min(MAX_BID_PCT, dyn_cap)
-    new_bid = round(min(cur_bid + suggested_bid_pct, effective_cap), 2)
+    # eBay Marketing API \u53ea\u63a5\u53d7 1 \u4f4d\u5c0f\u6570\u7684 bidPercentage (35007);
+    # \u5411\u4e0b\u53d6\u6574\u5230 0.1, \u4e0d\u8d8a\u5229\u6da6 cap. margin cap \u4fee\u590d\u540e\u4ea7\u51fa 7.05/13.93
+    # \u8fd9\u7c7b\u4e24\u4f4d\u5c0f\u6570, 2026-07-12 \u66fe\u5bfc\u81f4\u5168\u90e8 update 400 \u7a7a\u8f6c.
+    import math
+    new_bid = math.floor(
+        min(cur_bid + suggested_bid_pct, effective_cap) * 10) / 10
     if new_bid <= cur_bid:
         return {'sku': sku, 'status': 'skipped',
                 'reason': f'already at cap ({cur_bid}% + {suggested_bid_pct}% > {effective_cap}%)',
@@ -131,8 +139,14 @@ def _promote_one(ad_service, sku: str, suggested_bid_pct: float,
                 'terminal': True}
     res = ad_service.update_ad_bid(ad['campaign_id'], listing_id, new_bid)
     if not res or not res.get('success'):
+        err = str((res or {}).get('error') or 'update_ad_bid failed')
+        if '35037' in err or 'has ended' in err:
+            # listing \u5df2\u7ed3\u675f \u2014 \u7ec8\u6001 skip, \u522b\u518d\u6bcf\u5929\u91cd\u8bd5\u6b7b\u94fe
+            return {'sku': sku, 'status': 'skipped',
+                    'reason': f'listing ended: {err[:120]}',
+                    'listing_id': listing_id, 'terminal': True}
         return {'sku': sku, 'status': 'failed',
-                'reason': (res or {}).get('error') or 'update_ad_bid failed',
+                'reason': err,
                 'cur_bid': cur_bid, 'target_bid': new_bid}
     return {'sku': sku, 'status': 'done',
             'listing_id': listing_id,
