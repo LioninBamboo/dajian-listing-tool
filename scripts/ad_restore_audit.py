@@ -101,9 +101,53 @@ def _offer_price(offer: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+def _build_trading_client():
+    """Trading API client — Inventory API 看不见 Trading 系 listing 时的回退."""
+    import os
+    from src.clients.ebay_client import EbayClient
+    from src.clients.ebay_trading_client import EbayTradingClient
+    environment = os.getenv('EBAY_ENVIRONMENT', 'PRODUCTION').upper()
+    ebay = EbayClient(
+        os.getenv('EBAY_APP_ID'),
+        os.getenv('EBAY_CERT_ID'),
+        os.getenv('EBAY_DEV_ID'),
+        env='production' if environment == 'PRODUCTION' else 'sandbox',
+    )
+    return EbayTradingClient(ebay)
+
+
+def _trading_live_state(trading, listing_id: str) -> Optional[Dict[str, Any]]:
+    """Trading GetItem: Active 且有现价 → live 状态 dict; 否则 None."""
+    import xml.etree.ElementTree as ET
+    try:
+        resp = trading.call('GetItem', f'<ItemID>{listing_id}</ItemID>')
+        root = ET.fromstring(resp)
+        ns = {'e': 'urn:ebay:apis:eBLBaseComponents'}
+        status = root.find('.//e:SellingStatus/e:ListingStatus', ns)
+        price = root.find('.//e:SellingStatus/e:CurrentPrice', ns)
+        if (status is not None and status.text == 'Active'
+                and price is not None and price.text):
+            return {
+                'state': 'live',
+                'listing_id': str(listing_id),
+                'live_price': float(price.text),
+                'channel': 'trading_api',
+            }
+    except Exception as e:
+        log.debug(f'  Trading GetItem {listing_id} 失败: {e}')
+    return None
+
+
 def fetch_live_listing_state(oauth, sku: str,
-                             expected_listing_id: Optional[str] = None) -> Dict[str, Any]:
-    """读取 SKU 当前 live offer 状态，避免把本地过期 listing 当作可恢复目标."""
+                             expected_listing_id: Optional[str] = None,
+                             trading=None) -> Dict[str, Any]:
+    """读取 SKU 当前 live offer 状态，避免把本地过期 listing 当作可恢复目标.
+
+    Trading API 创建的 listing 在 Inventory offer API 里不可见 (返回空).
+    2026-07-12 审计: 283 个未推广 SKU 全部被判 '无 PUBLISHED offer' 跳过,
+    实测 (366226629185) 其实 Active — 广告恢复对 Trading 系 listing 失明.
+    因此 offers 为空且给了 trading client 时, 回退 Trading GetItem 复核.
+    """
     token = oauth.get_valid_token()
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     try:
@@ -148,6 +192,11 @@ def fetch_live_listing_state(oauth, sku: str,
                     'reason': f'本地 listing_id={expected_listing_id} 不在 eBay 当前 PUBLISHED offers 中',
                     'live_listing_ids': live_listing_ids,
                 }
+            # Inventory offers 为空 ≠ 不在线: Trading 系 listing 在这里不可见
+            if trading is not None:
+                trading_state = _trading_live_state(trading, expected_listing_id)
+                if trading_state:
+                    return trading_state
             return {
                 'state': 'not_live',
                 'reason': f'SKU={sku} 当前无 PUBLISHED offer',
@@ -246,6 +295,11 @@ def run_audit(apply_changes: bool, send_email: bool,
 
     oauth = EbayOAuthService('PRODUCTION')
     ad_svc = EbayAdService()
+    try:
+        trading = _build_trading_client()
+    except Exception as e:
+        log.warning(f'Trading client 不可用, Trading 系 listing 无法复核: {e}')
+        trading = None
 
     # 1. 加载候选 SKU
     candidates = load_published_skus()
@@ -288,7 +342,9 @@ def run_audit(apply_changes: bool, send_email: bool,
         sku = sku_info['sku']
         if i % 25 == 0:
             log.info(f"  ...进度 {i}/{len(not_promoted)}")
-        live_state = fetch_live_listing_state(oauth, sku, expected_listing_id=sku_info['listing_id'])
+        live_state = fetch_live_listing_state(
+            oauth, sku, expected_listing_id=sku_info['listing_id'],
+            trading=trading)
         if live_state.get('state') == 'error':
             decisions['no_live_price'].append({
                 'sku': sku,
