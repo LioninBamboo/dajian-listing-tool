@@ -37,12 +37,30 @@ def test_compute_offer_normal_discount():
 def test_compute_offer_clamps_to_floor():
     cost = 200.0
     floor = floor_price(cost)
-    price = round(floor * 1.04, 2)  # 现价只比地板高 4%
+    price = round(floor * 1.08, 2)  # 现价比地板高 8%: 10% 折扣会击穿地板
     res = compute_offer(price=price, cost=cost, discount_pct=10.0)
     assert res['safe'] is True
     assert res['offer_price'] == pytest.approx(floor)      # 被抬回地板
-    assert res['discount_pct'] < 10.0
+    assert 5.0 <= res['discount_pct'] < 10.0               # 仍满足 eBay 5% 下限
     assert calc_net_margin(res['offer_price'], cost) >= MIN_NET_MARGIN - 1e-6
+
+
+def test_compute_offer_floor_clamp_below_ebay_minimum_is_unsafe():
+    # 现价只比地板高 4%: 触地板后折扣 <5%, 发出去必被 eBay 150008 拒
+    cost = 200.0
+    floor = floor_price(cost)
+    price = round(floor * 1.04, 2)
+    res = compute_offer(price=price, cost=cost, discount_pct=10.0)
+    assert res['safe'] is False
+    assert '5% minimum' in res['reason']
+
+
+def test_compute_offer_never_rounds_above_95_percent():
+    # round() 会把 5% 折扣抹成 4.9986% (150008); 必须向下取整到分
+    for price in (353.1, 99.99, 441.99, 123.45):
+        res = compute_offer(price=price, cost=price * 0.5, discount_pct=5.0)
+        assert res['safe'] is True
+        assert res['offer_price'] <= price * 0.95 + 1e-9
 
 
 def test_compute_offer_no_room_is_unsafe():
@@ -71,7 +89,7 @@ def test_compute_offer_tiny_discount_not_worth_sending():
     price = round(floor * 1.01, 2)  # 只有 ~1% 让利空间
     res = compute_offer(price=price, cost=cost, discount_pct=5.0)
     assert res['safe'] is False
-    assert 'too small' in res['reason']
+    assert '5% minimum' in res['reason']
 
 
 # ── 经济数据双源 ─────────────────────────────────────────────
@@ -142,7 +160,9 @@ def test_run_apply_sends_to_eligible_and_marks_done(tmp_queue, eco_db, tmp_path,
     from src.services.cro_action_queue import load_pending
     _enqueue_offer('PROD1', listing_id='L1')
     sent = {}
-    monkeypatch.setattr(so, 'fetch_eligible_listing_ids', lambda oauth: {'L1'})
+    # live 现价 340 (低于本地 353.1) — offer 必须基于 live 价
+    monkeypatch.setattr(so, 'fetch_eligible_listing_ids',
+                        lambda oauth: {'L1': 340.0})
     monkeypatch.setattr(so, 'send_offer_live',
                         lambda oauth, lid, price, message=so.OFFER_MESSAGE:
                         sent.update({'lid': lid, 'price': price}) or {'ok': True, 'reason': 'sent'})
@@ -151,7 +171,9 @@ def test_run_apply_sends_to_eligible_and_marks_done(tmp_queue, eco_db, tmp_path,
                  logs_dir=tmp_path / 'logs', oauth=object())
     assert rep['done'] == ['PROD1']
     assert sent['lid'] == 'L1'
-    assert sent['price'] >= so.compute_offer(353.1, 224.74)['floor']
+    expected = so.compute_offer(340.0, 224.74)
+    assert sent['price'] == pytest.approx(expected['offer_price'])
+    assert sent['price'] <= 340.0 * 0.95 + 1e-9   # eBay 5% 规则基于 live 价
     assert load_pending(action_type='send_offer') == []   # marked done
 
 
@@ -159,10 +181,11 @@ def test_run_apply_skips_not_eligible_non_terminal(tmp_queue, eco_db, tmp_path, 
     import scripts.cro_send_offer as so
     from src.services.cro_action_queue import load_pending
     _enqueue_offer('PROD1', listing_id='L1')
-    monkeypatch.setattr(so, 'fetch_eligible_listing_ids', lambda oauth: set())
+    monkeypatch.setattr(so, 'fetch_eligible_listing_ids', lambda oauth: {})
     rep = so.run(apply_changes=True, limit=10, db_path=eco_db,
                  logs_dir=tmp_path / 'logs', oauth=object())
     assert rep['skipped'] == ['PROD1']
+    assert rep['rows'][0]['reason'] == 'no interested buyers yet'
     # 非终态: 仍 pending, 等 interested buyers 出现
     assert len(load_pending(action_type='send_offer')) == 1
 
@@ -172,7 +195,8 @@ def test_run_apply_guard_blocks_unprofitable_terminal(tmp_queue, eco_db, tmp_pat
     from src.services.cro_action_queue import load_pending
     # NOCOST 无成本数据 → 保本闸终态 skip
     _enqueue_offer('NOCOST', listing_id='L2')
-    monkeypatch.setattr(so, 'fetch_eligible_listing_ids', lambda oauth: {'L2'})
+    monkeypatch.setattr(so, 'fetch_eligible_listing_ids',
+                        lambda oauth: {'L2': 100.0})
     monkeypatch.setattr(so, 'send_offer_live',
                         lambda *a, **k: pytest.fail('must not send without economics'))
     rep = so.run(apply_changes=True, limit=10, db_path=eco_db,

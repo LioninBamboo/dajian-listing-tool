@@ -112,11 +112,15 @@ def _headers(oauth) -> Dict[str, str]:
     }
 
 
-def fetch_eligible_listing_ids(oauth, limit: int = 200) -> Set[str]:
-    """GET find_eligible_items — 有 interested buyers 的 listing 集合."""
+def fetch_eligible_listing_ids(oauth, limit: int = 200) -> Dict[str, Optional[float]]:
+    """GET find_eligible_items — {listing_id: live 现价}.
+
+    offer 必须以 live 现价为基 (本地 suggested_price 可能过期):
+    过期偏高 → offer 超过挂牌价 (150016); 过期偏低 → 折扣不足 5% (150008).
+    """
     import requests
     url = f"{oauth.api_base}/sell/negotiation/v1/find_eligible_items"
-    out: Set[str] = set()
+    out: Dict[str, Optional[float]] = {}
     offset = 0
     while True:
         resp = requests.get(url, headers=_headers(oauth),
@@ -129,8 +133,14 @@ def fetch_eligible_listing_ids(oauth, limit: int = 200) -> Set[str]:
         data = resp.json() or {}
         for item in data.get('eligibleItems', []) or []:
             lid = str(item.get('listingId') or '').strip()
-            if lid:
-                out.add(lid)
+            if not lid:
+                continue
+            try:
+                live_price = float(((item.get('currentPrice') or {})
+                                    .get('value')) or 0) or None
+            except (TypeError, ValueError):
+                live_price = None
+            out[lid] = live_price
         total = int(data.get('total') or 0)
         offset += len(data.get('eligibleItems') or [])
         if offset >= total or not data.get('eligibleItems'):
@@ -179,7 +189,7 @@ def run(apply_changes: bool, limit: int,
     cooldown = recently_offered_skus(logs_dir=logs_dir)
     if apply_changes and oauth is None:
         oauth = _build_oauth()
-    eligible = fetch_eligible_listing_ids(oauth) if apply_changes else set()
+    eligible = fetch_eligible_listing_ids(oauth) if apply_changes else {}
 
     done_skus: List[str] = []
     terminal_skipped: List[str] = []
@@ -200,25 +210,39 @@ def run(apply_changes: bool, limit: int,
             rep['skipped'].append(sku)
             continue
 
+        listing_id = str(action.get('listing_id') or '').strip() \
+            or _lookup_listing_id(sku, db_path=db_path)
+        if not listing_id:
+            row = {'sku': sku, 'status': 'skipped',
+                   'reason': 'no listing_id', 'terminal': True}
+            rep['rows'].append(row)
+            rep['skipped'].append(sku)
+            terminal_skipped.append(sku)
+            continue
+
+        if apply_changes and listing_id not in eligible:
+            # 无 interested buyers — 非终态, 明天买家出现后可再试
+            row = {'sku': sku, 'status': 'skipped',
+                   'reason': 'no interested buyers yet',
+                   'listing_id': listing_id}
+            rep['rows'].append(row)
+            rep['skipped'].append(sku)
+            continue
+
         eco = load_sku_economics(sku, db_path=db_path)
-        offer = compute_offer(eco['price'], eco['cost'],
+        # apply 模式 offer 以 live 现价为基 (本地价可能过期 → 150008/150016);
+        # dry-run 无 API, 用本地价做预览
+        live_price = eligible.get(listing_id) if apply_changes else None
+        base_price = live_price or (eco['price'] if eco else 0)
+        offer = compute_offer(base_price, eco['cost'],
                               discount_pct=discount) if eco else {
             'safe': False, 'reason': 'missing economics (price/cost)'}
         if not offer['safe']:
             # 保本闸拦下 — 终态 skip, 24h 内不会被 daily runner 重新入队
             row = {'sku': sku, 'status': 'skipped',
                    'reason': f"offer guard: {offer['reason']}",
+                   'listing_id': listing_id,
                    'terminal': True}
-            rep['rows'].append(row)
-            rep['skipped'].append(sku)
-            terminal_skipped.append(sku)
-            continue
-
-        listing_id = str(action.get('listing_id') or '').strip() \
-            or _lookup_listing_id(sku, db_path=db_path)
-        if not listing_id:
-            row = {'sku': sku, 'status': 'skipped',
-                   'reason': 'no listing_id', 'terminal': True}
             rep['rows'].append(row)
             rep['skipped'].append(sku)
             terminal_skipped.append(sku)
@@ -230,15 +254,6 @@ def run(apply_changes: bool, limit: int,
                    'offer_price': offer['offer_price'],
                    'floor': offer['floor'],
                    'discount_pct': offer['discount_pct']}
-            rep['rows'].append(row)
-            rep['skipped'].append(sku)
-            continue
-
-        if listing_id not in eligible:
-            # 无 interested buyers — 非终态, 明天买家出现后可再试
-            row = {'sku': sku, 'status': 'skipped',
-                   'reason': 'no interested buyers yet',
-                   'listing_id': listing_id}
             rep['rows'].append(row)
             rep['skipped'].append(sku)
             continue

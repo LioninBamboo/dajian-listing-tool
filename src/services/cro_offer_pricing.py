@@ -24,7 +24,9 @@ from src.services.pricing_engine import PricingEngine
 MIN_NET_MARGIN = 0.05     # 让利后仍须保住的最低净利率
 MAX_DISCOUNT_PCT = 10.0   # 单次 offer 折扣硬上限
 DEFAULT_DISCOUNT_PCT = 5.0
-MIN_MEANINGFUL_DISCOUNT_PCT = 2.0  # 低于此折扣的 offer 对买家无感知, 不值得发
+# eBay Negotiation API 硬规则 (errorId 150008): offer 必须比 BIN 价
+# 低至少 5%. 触地板后折扣不足 5% 的 offer 发出去必被 400, 直接判 unsafe.
+EBAY_MIN_OFFER_DISCOUNT_PCT = 5.0
 
 
 def _net_revenue_ratio() -> float:
@@ -59,19 +61,21 @@ def compute_offer(price: float, cost: float,
         return {'safe': False, 'offer_price': None, 'floor': None,
                 'discount_pct': 0.0, 'reason': 'missing economics (price/cost)'}
     pct = min(float(discount_pct or DEFAULT_DISCOUNT_PCT), MAX_DISCOUNT_PCT)
-    pct = max(pct, 0.0)
+    pct = max(pct, EBAY_MIN_OFFER_DISCOUNT_PCT)
     floor = floor_price(cost)
     if floor >= price:
         return {'safe': False, 'offer_price': None, 'floor': floor,
                 'discount_pct': 0.0,
                 'reason': f'no discount room (floor {floor} >= price {price})'}
-    offer = round(price * (1 - pct / 100), 2)
+    # offer 向下取整到分: round() 可能把 5% 折扣抹成 4.9986%, 触发 eBay 150008
+    offer = math.floor(price * (1 - pct / 100) * 100) / 100
     if offer < floor:
         offer = floor
         pct = round((1 - offer / price) * 100, 2)
-    if pct < MIN_MEANINGFUL_DISCOUNT_PCT:
+    if pct < EBAY_MIN_OFFER_DISCOUNT_PCT:
         return {'safe': False, 'offer_price': None, 'floor': floor,
                 'discount_pct': pct,
-                'reason': f'discount too small to matter ({pct}%)'}
+                'reason': (f'discount {pct}% below eBay 5% minimum '
+                           '(floor leaves no room)')}
     return {'safe': True, 'offer_price': offer, 'floor': floor,
             'discount_pct': pct, 'reason': 'ok'}
