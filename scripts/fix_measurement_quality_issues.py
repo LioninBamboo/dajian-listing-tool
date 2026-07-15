@@ -51,7 +51,10 @@ from src.utils.dimension_helpers import (
     extract_dajian_measurements,
     extract_numeric_inches,
     extract_numeric_lbs,
+    insert_dimension_note_row,
     replace_description_measurements,
+    replace_description_weight_placeholder_with_package_weight,
+    source_description_marks_dimensions_unavailable,
 )
 
 
@@ -359,8 +362,18 @@ def main():
         same_weight, package_weight = _same_weight_candidate(attrs, specs, aspects)
         safe_weight = _resolve_safe_weight(attrs, aspects, package_weight, trusted)
         length, width, height = _resolve_dimensions(attrs, aspects, trusted)
-
         changed = False
+        if source_description_marks_dimensions_unavailable(raw_description):
+            length = width = height = None
+            for key in ("Assembled Length (in.)", "Assembled Width (in.)", "Assembled Height (in.)"):
+                if key in attrs:
+                    attrs.pop(key, None)
+                    changed = True
+            for key in ("Item Length", "Item Width", "Item Height"):
+                if key in aspects:
+                    aspects.pop(key, None)
+                    changed = True
+
         weight_cleared = False
         dimensions_filled = False
         weight_marked_unspecified = False
@@ -454,6 +467,28 @@ def main():
             dimensions_text=dimensions_text,
             weight_text=weight_text,
         )
+        needs_dimension_note = (
+            length is not None
+            and width is not None
+            and height is not None
+            and (
+                ("Not Applicable" in raw_description or "NOT AVAILABLE" in raw_description.upper())
+                and (
+                    "组装长度" in raw_description
+                    or "Overall Dimensions" in raw_description
+                )
+            )
+        )
+        if needs_dimension_note:
+            updated_live_description = insert_dimension_note_row(
+                updated_live_description,
+                "See product dimension image for additional size reference.",
+            )
+        if safe_weight is None and package_weight is not None:
+            updated_live_description = replace_description_weight_placeholder_with_package_weight(
+                updated_live_description,
+                package_weight,
+            )
 
         if updated_live_description != live_description:
             opt["description"] = updated_live_description

@@ -14,7 +14,8 @@
   - 写入以 live inventory snapshot 为基 (GET → 只改 title → PUT →
     republish offer → 二次 GET 验证).
   - 30 天重写防抖: 近期已重写过的 SKU 直接跳过, 防标题反复抖动.
-  - 不进 scheduler. 这是运营手动通道.
+  - 默认候选池 = promote 打满升级候选 + 最新 CRO 零曝光保守补池,
+    仅扩量, 不放宽任何标题质检条件.
 
 用法:
   python scripts/cro_title_rewrite.py                          # 升级候选 dry-run 预览
@@ -24,6 +25,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import os
@@ -62,11 +64,6 @@ TITLE_WORTHY_KEYS: tuple = (
     "Size",
     "Number of Seats",
     "Number of Pieces",
-    "Room",
-    "Shape",
-    "Indoor/Outdoor",
-    "Finish",
-    "Pattern",
 )
 HOT_KEYWORD_SUPPORT_KEYS: tuple = TITLE_WORTHY_KEYS + ("Features",)
 
@@ -339,6 +336,193 @@ def _escalation_skus(days: int = 7) -> List[str]:
     return [c["sku"] for c in escalation_candidates(days=days)]
 
 
+def _snapshot_fallback_skus(limit: int,
+                            db_path: Optional[Path] = None) -> List[str]:
+    """保守补池: 最新 CRO 快照里仍零曝光、主动作=promote、且未出现 delist 信号."""
+    db = Path(db_path) if db_path else DEFAULT_DB
+    if not db.exists() or limit <= 0:
+        return []
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.row_factory = sqlite3.Row
+        latest = conn.execute(
+            "SELECT MAX(snapshot_date) FROM cro_snapshots"
+        ).fetchone()
+        snapshot_date = latest[0] if latest else None
+        if not snapshot_date:
+            return []
+        rows = conn.execute(
+            """
+            SELECT sku
+            FROM cro_snapshots
+            WHERE snapshot_date = ?
+              AND funnel_stage = 'no_impression'
+              AND top_action = 'promote'
+              AND COALESCE(impressions, 0) = 0
+              AND (
+                    actions_json IS NULL
+                    OR actions_json NOT LIKE '%"type": "delist"%'
+                  )
+            ORDER BY cro_score ASC, sku ASC
+            LIMIT ?
+            """,
+            (snapshot_date, int(limit)),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [str(row["sku"]) for row in rows if row["sku"]]
+
+
+def default_candidate_skus(limit: int,
+                           escalation_days: int = 7,
+                           db_path: Optional[Path] = None) -> List[str]:
+    """默认候选池: 升级候选优先, 不足时用 CRO 零曝光保守补池补足."""
+    merged: List[str] = []
+    seen = set()
+    for sku in _escalation_skus(days=escalation_days):
+        if sku and sku not in seen:
+            merged.append(sku)
+            seen.add(sku)
+            if len(merged) >= limit:
+                return merged
+    remaining = limit - len(merged)
+    if remaining <= 0:
+        return merged
+    for sku in _snapshot_fallback_skus(limit=remaining * 3, db_path=db_path):
+        if sku and sku not in seen:
+            merged.append(sku)
+            seen.add(sku)
+            if len(merged) >= limit:
+                break
+    return merged
+
+
+def _status_counts(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    counts = {"proposed": 0, "done": 0, "failed": 0, "skipped": 0}
+    for row in rows or []:
+        status = str(row.get("status") or "").strip().lower()
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def render_email_html(rep: Dict[str, Any]) -> str:
+    counts = _status_counts(rep.get("rows") or [])
+    changed_rows = [
+        row for row in (rep.get("rows") or [])
+        if row.get("status") in {"proposed", "done"} and row.get("new_title")
+    ][:20]
+    blocked_rows = [
+        row for row in (rep.get("rows") or [])
+        if row.get("status") in {"skipped", "failed"}
+    ][:20]
+
+    def _fmt(text: Any) -> str:
+        return html.escape(str(text or ""))
+
+    def _join_keywords(row: Dict[str, Any]) -> str:
+        kws = list(row.get("added_keywords") or [])
+        hot = set(row.get("added_hot_keywords") or [])
+        parts = []
+        for kw in kws:
+            label = f"{kw} (hot)" if kw in hot else kw
+            parts.append(_fmt(label))
+        return "<br>".join(parts) if parts else "—"
+
+    changed_html = "".join(
+        f"""
+        <tr>
+          <td style="padding:8px;border:1px solid #e5e7eb;vertical-align:top;">{_fmt(row.get('sku'))}</td>
+          <td style="padding:8px;border:1px solid #e5e7eb;vertical-align:top;">{_fmt(row.get('status'))}</td>
+          <td style="padding:8px;border:1px solid #e5e7eb;vertical-align:top;">{_fmt(row.get('old_title'))}</td>
+          <td style="padding:8px;border:1px solid #e5e7eb;vertical-align:top;">{_fmt(row.get('new_title'))}</td>
+          <td style="padding:8px;border:1px solid #e5e7eb;vertical-align:top;">{_join_keywords(row)}</td>
+        </tr>
+        """
+        for row in changed_rows
+    ) or """
+        <tr><td colspan="5" style="padding:10px;border:1px solid #e5e7eb;color:#6b7280;">本次无可展示的改写结果</td></tr>
+    """
+
+    blocked_html = "".join(
+        f"""
+        <tr>
+          <td style="padding:8px;border:1px solid #e5e7eb;vertical-align:top;">{_fmt(row.get('sku'))}</td>
+          <td style="padding:8px;border:1px solid #e5e7eb;vertical-align:top;">{_fmt(row.get('status'))}</td>
+          <td style="padding:8px;border:1px solid #e5e7eb;vertical-align:top;">{_fmt(row.get('reason'))}</td>
+        </tr>
+        """
+        for row in blocked_rows
+    ) or """
+        <tr><td colspan="3" style="padding:10px;border:1px solid #e5e7eb;color:#6b7280;">本次无失败/拦截项</td></tr>
+    """
+
+    return f"""
+    <div style="font-family:Arial,'Microsoft YaHei',sans-serif;color:#111827;line-height:1.5;">
+      <h2 style="margin:0 0 12px 0;">✏️ CRO 标题热词优化日报</h2>
+      <p style="margin:0 0 16px 0;color:#4b5563;">
+        本邮件展示今日标题重写任务的候选池规模、质检拦截情况，以及实际改写明细。
+      </p>
+      <table style="border-collapse:collapse;width:100%;max-width:860px;margin-bottom:18px;">
+        <tr>
+          <td style="padding:12px;border:1px solid #e5e7eb;background:#f9fafb;"><b>候选输入</b><br>{int(rep.get('input_skus') or 0)}</td>
+          <td style="padding:12px;border:1px solid #e5e7eb;background:#f9fafb;"><b>冷却跳过</b><br>{int(rep.get('cooldown_skipped') or 0)}</td>
+          <td style="padding:12px;border:1px solid #e5e7eb;background:#ecfdf5;"><b>成功/建议</b><br>{counts['done'] + counts['proposed']}</td>
+          <td style="padding:12px;border:1px solid #e5e7eb;background:#fef2f2;"><b>失败/拦截</b><br>{counts['failed'] + counts['skipped']}</td>
+        </tr>
+      </table>
+
+      <p style="margin:0 0 10px 0;">
+        <b>执行模式：</b>{'正式改写' if rep.get('apply') else '预演预览'}
+        &nbsp;·&nbsp;
+        <b>建议/成功：</b>{counts['proposed']} / {counts['done']}
+        &nbsp;·&nbsp;
+        <b>失败：</b>{counts['failed']}
+        &nbsp;·&nbsp;
+        <b>质检拦截：</b>{counts['skipped']}
+      </p>
+
+      <h3 style="margin:18px 0 8px 0;">改写明细（前 20 条）</h3>
+      <table style="border-collapse:collapse;width:100%;max-width:1100px;">
+        <tr style="background:#f3f4f6;">
+          <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">SKU</th>
+          <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">状态</th>
+          <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">原标题</th>
+          <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">新标题</th>
+          <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">新增词</th>
+        </tr>
+        {changed_html}
+      </table>
+
+      <h3 style="margin:18px 0 8px 0;">失败 / 拦截（前 20 条）</h3>
+      <table style="border-collapse:collapse;width:100%;max-width:860px;">
+        <tr style="background:#f3f4f6;">
+          <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">SKU</th>
+          <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">状态</th>
+          <th style="padding:8px;border:1px solid #e5e7eb;text-align:left;">原因</th>
+        </tr>
+        {blocked_html}
+      </table>
+
+      <p style="margin:18px 0 0 0;color:#6b7280;font-size:12px;">
+        标题仅允许追加 SKU 自身 aspects 与可证实热词；冲突属性、30 天内已改写 SKU、无安全增词 SKU 均会被自动拦截。
+      </p>
+    </div>
+    """
+
+
+def _send_email(rep: Dict[str, Any], report_path: Path) -> None:
+    from src.utils.email_sender import send_email
+
+    counts = _status_counts(rep.get("rows") or [])
+    subject = (
+        f"✏️ CRO 标题优化 - 候选{int(rep.get('input_skus') or 0)} "
+        f"成功{counts['done']} 建议{counts['proposed']} "
+        f"失败{counts['failed']} 拦截{counts['skipped']}"
+    )
+    send_email(subject, render_email_html(rep), attachments=[str(report_path)])
+
+
 # ── live 写路径 (--apply) ────────────────────────────────────
 
 def _build_oauth():
@@ -606,6 +790,8 @@ def main():
                    help="Confirm you reviewed the dry-run preview")
     p.add_argument("--limit", type=int, default=10,
                    help="Max SKUs per run (default 10)")
+    p.add_argument("--email", action="store_true",
+                   help="Send email summary after run")
     p.add_argument("--out", help="Write JSON report to path")
     args = p.parse_args()
 
@@ -622,7 +808,10 @@ def main():
                 Path(args.sku_file).read_text(encoding="utf-8").splitlines()
                 if line.strip()]
     else:
-        skus = _escalation_skus(days=args.escalation_days)
+        skus = default_candidate_skus(
+            limit=args.limit,
+            escalation_days=args.escalation_days,
+        )
 
     rep = run(skus, apply_changes=args.apply, limit=args.limit)
     print(json.dumps({
@@ -647,6 +836,13 @@ def main():
     out_path.write_text(json.dumps(rep, ensure_ascii=False, indent=2),
                         encoding="utf-8")
     print(f"Report → {out_path}")
+
+    if args.email:
+        try:
+            _send_email(rep, out_path)
+            print("Email sent")
+        except Exception as e:
+            print(f"Email failed: {e}")
 
 
 if __name__ == "__main__":

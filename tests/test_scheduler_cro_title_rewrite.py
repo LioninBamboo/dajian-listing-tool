@@ -27,6 +27,7 @@ class SchedulerCroTitleRewriteTests(unittest.TestCase):
         self.assertTrue(any(str(a).endswith('cro_title_rewrite.py') for a in cmd_args))
         self.assertIn('--limit', cmd_args)
         self.assertIn('50', cmd_args)
+        self.assertIn('--email', cmd_args)
         self.assertIn('--apply', cmd_args)
         self.assertIn('--yes', cmd_args)
 
@@ -59,6 +60,7 @@ class SchedulerCroTitleRewriteTests(unittest.TestCase):
 
         task_name, cmd_args = run_task.call_args.args[:2]
         self.assertEqual(task_name, 'cro_title_rewrite')
+        self.assertIn('--email', cmd_args)
         self.assertNotIn('--apply', cmd_args)
         self.assertNotIn('--yes', cmd_args)
         limit_index = cmd_args.index('--limit')

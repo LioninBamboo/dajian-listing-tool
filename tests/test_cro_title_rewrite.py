@@ -4,12 +4,14 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from scripts.cro_title_rewrite import (
     build_enriched_title, recently_rewritten_skus, load_candidates, run,
-    title_aspect_conflicts,
+    default_candidate_skus, _snapshot_fallback_skus,
+    title_aspect_conflicts, render_email_html, _send_email,
 )
 
 
@@ -69,13 +71,13 @@ def test_enrich_adds_supported_hot_keywords_only():
     title = "Cabinet Door Hinges 110 Degree Stainless Steel 10 Pack"
     aspects = {
         "Features": ["Soft Close"],
-        "Room": ["Kitchen"],
+        "Material": ["Steel"],
     }
     hot_keywords = ["soft close", "IKEA Style", "waterproof"]
     res = build_enriched_title(title, aspects, hot_keywords=hot_keywords)
     assert res is not None
     assert "Soft Close" in res["new_title"]
-    assert "Kitchen" in res["new_title"]
+    assert "Steel" in res["new_title"]
     assert "IKEA" not in res["new_title"]
     assert "waterproof" not in res["new_title"].lower()
     assert res["added_hot_keywords"] == ["Soft Close"]
@@ -83,11 +85,17 @@ def test_enrich_adds_supported_hot_keywords_only():
 
 def test_enrich_rejects_hot_keyword_without_aspect_support():
     title = "Cabinet Door Hinges 110 Degree Stainless Steel 10 Pack"
-    aspects = {"Room": ["Kitchen"]}
+    aspects = {"Style": ["Modern"]}
     res = build_enriched_title(title, aspects, hot_keywords=["Soft Close"])
     assert res is not None
     assert "Soft Close" not in res["new_title"]
     assert res["added_hot_keywords"] == []
+
+
+def test_enrich_skips_low_signal_context_aspects():
+    title = "Potting Bench with Hutch"
+    aspects = {"Room": ["Entryway"], "Finish": ["Matte"], "Indoor/Outdoor": ["Indoor"]}
+    assert build_enriched_title(title, aspects) is None
 
 
 def test_title_aspect_conflicts_flags_color_mismatch():
@@ -186,6 +194,73 @@ def test_load_candidates_filters_published_with_listing(tmp_db):
     assert cands[0]['hot_keywords'] == ['Twin']
 
 
+def test_snapshot_fallback_skus_only_uses_conservative_no_impression_promote(tmp_db):
+    conn = sqlite3.connect(str(tmp_db))
+    conn.execute("""
+        CREATE TABLE cro_snapshots (
+            snapshot_date TEXT NOT NULL,
+            sku TEXT NOT NULL,
+            impressions INTEGER DEFAULT 0,
+            funnel_stage TEXT,
+            cro_score INTEGER DEFAULT 0,
+            top_action TEXT,
+            actions_json TEXT,
+            PRIMARY KEY (snapshot_date, sku)
+        )""")
+    rows = [
+        ('2026-07-10', 'SAFE1', 0, 'no_impression', 20, 'promote',
+         json.dumps([{'type': 'promote'}])),
+        ('2026-07-10', 'DELIST1', 0, 'no_impression', 20, 'promote',
+         json.dumps([{'type': 'promote'}, {'type': 'delist'}])),
+        ('2026-07-10', 'LOWCTR1', 80, 'low_ctr', 18, 'title_refresh',
+         json.dumps([{'type': 'title_refresh'}])),
+        ('2026-07-09', 'OLD1', 0, 'no_impression', 20, 'promote',
+         json.dumps([{'type': 'promote'}])),
+    ]
+    conn.executemany(
+        "INSERT INTO cro_snapshots (snapshot_date, sku, impressions, funnel_stage, cro_score, top_action, actions_json) VALUES (?,?,?,?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+    assert _snapshot_fallback_skus(limit=10, db_path=tmp_db) == ['SAFE1']
+
+
+def test_default_candidate_skus_fills_from_snapshot_when_escalation_short(tmp_db, monkeypatch):
+    import scripts.cro_title_rewrite as trw
+
+    conn = sqlite3.connect(str(tmp_db))
+    conn.execute("""
+        CREATE TABLE cro_snapshots (
+            snapshot_date TEXT NOT NULL,
+            sku TEXT NOT NULL,
+            impressions INTEGER DEFAULT 0,
+            funnel_stage TEXT,
+            cro_score INTEGER DEFAULT 0,
+            top_action TEXT,
+            actions_json TEXT,
+            PRIMARY KEY (snapshot_date, sku)
+        )""")
+    conn.executemany(
+        "INSERT INTO cro_snapshots (snapshot_date, sku, impressions, funnel_stage, cro_score, top_action, actions_json) VALUES (?,?,?,?,?,?,?)",
+        [
+            ('2026-07-10', 'ESC2', 0, 'no_impression', 20, 'promote',
+             json.dumps([{'type': 'promote'}])),
+            ('2026-07-10', 'FALL1', 0, 'no_impression', 20, 'promote',
+             json.dumps([{'type': 'promote'}])),
+            ('2026-07-10', 'FALL2', 0, 'no_impression', 21, 'promote',
+             json.dumps([{'type': 'promote'}])),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(trw, '_escalation_skus', lambda days=7: ['ESC1', 'ESC2'])
+    skus = default_candidate_skus(limit=4, escalation_days=7, db_path=tmp_db)
+    assert skus == ['ESC1', 'ESC2', 'FALL1', 'FALL2']
+
+
 # ── run() 主流程 ─────────────────────────────────────────────
 
 def test_run_dry_run_proposes_without_network(tmp_db, tmp_path):
@@ -248,3 +323,62 @@ def test_run_apply_failure_does_not_touch_db(tmp_db, tmp_path, monkeypatch):
         "SELECT title FROM collected_products WHERE sku='PUB1'").fetchone()
     conn.close()
     assert row[0] == 'Race Car Bed Kids'  # 原值未动
+
+
+def test_render_email_html_shows_summary_and_rows():
+    rep = {
+        'input_skus': 50,
+        'cooldown_skipped': 2,
+        'apply': True,
+        'rows': [
+            {
+                'sku': 'PUB1',
+                'status': 'done',
+                'old_title': 'Old Title',
+                'new_title': 'New Title',
+                'added_keywords': ['Blue'],
+                'added_hot_keywords': [],
+            },
+            {
+                'sku': 'PUB2',
+                'status': 'skipped',
+                'reason': 'no safe keywords to add',
+            },
+        ],
+    }
+    html = render_email_html(rep)
+    assert 'CRO 标题热词优化日报' in html
+    assert '候选输入' in html
+    assert 'PUB1' in html
+    assert 'New Title' in html
+    assert 'no safe keywords to add' in html
+
+
+def test_send_email_uses_attachment_and_summary(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_send_email(subject, html, attachments=None):
+        captured['subject'] = subject
+        captured['html'] = html
+        captured['attachments'] = attachments
+        return True
+
+    monkeypatch.setattr('src.utils.email_sender.send_email', fake_send_email)
+    rep = {
+        'input_skus': 12,
+        'apply': False,
+        'rows': [
+            {'sku': 'PUB1', 'status': 'proposed', 'new_title': 'New', 'added_keywords': ['Blue']},
+            {'sku': 'PUB2', 'status': 'failed', 'reason': 'inventory_put_500'},
+        ],
+    }
+    report_path = tmp_path / 'cro_title_rewrite_report.json'
+    report_path.write_text('{}', encoding='utf-8')
+
+    _send_email(rep, Path(report_path))
+
+    assert '候选12' in captured['subject']
+    assert '建议1' in captured['subject']
+    assert '失败1' in captured['subject']
+    assert 'CRO 标题热词优化日报' in captured['html']
+    assert captured['attachments'] == [str(report_path)]

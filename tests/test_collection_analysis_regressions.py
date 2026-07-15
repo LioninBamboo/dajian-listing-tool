@@ -10,8 +10,10 @@ from src.clients.real_ebay_client import RealEbayClient
 from src.services.ebay_category_matcher import EbayCategoryMatcher
 from src.utils.dimension_helpers import extract_all_dimensions
 from src.utils.dimension_helpers import find_dimension
+from src.utils.dimension_helpers import insert_dimension_note_row
 from src.utils.dimension_helpers import replace_description_measurements
 from src.utils.dimension_helpers import replace_description_weight_placeholder_with_package_weight
+from src.utils.dimension_helpers import source_description_marks_dimensions_unavailable
 from src.utils.publish_aspect_completion import infer_set_includes
 from src.utils.publish_autofix import sanitize_placeholder_aspects, try_fix_publish_error
 from src.utils.publish_validation import measurement_validation_errors
@@ -783,6 +785,58 @@ def test_replace_description_measurements_updates_overall_weight_rows():
 
     assert "<td>Overall Weight</td><td>113.09 lbs</td>" in updated
     assert "Not specified" not in updated
+
+
+def test_insert_dimension_note_row_after_overall_dimensions():
+    html = (
+        "<table>"
+        "<tr><td>Overall Dimensions (L×W×H)</td><td>22.8 × 21.6 × 48.9 inches</td></tr>"
+        "<tr><td>Weight</td><td>Not specified</td></tr>"
+        "</table>"
+    )
+
+    updated = insert_dimension_note_row(
+        html,
+        "See product dimension image for additional size reference.",
+    )
+
+    assert "Dimension Note" in updated
+    assert "See product dimension image for additional size reference." in updated
+    assert updated.index("Dimension Note") > updated.index("Overall Dimensions (L×W×H)")
+
+
+def test_source_description_marks_dimensions_unavailable_for_supplier_placeholder_block():
+    html = (
+        '<div class="items"><span>组装长度 (英寸):</span> <span title="Not Applicable">Not Applicable</span></div>'
+        '<div class="items"><span>组装宽度 (英寸):</span> <span title="Not Applicable">Not Applicable</span></div>'
+        '<div class="items"><span>组装高度 (英寸):</span> <span title="Not Applicable">Not Applicable</span></div>'
+    )
+
+    assert source_description_marks_dimensions_unavailable(html) is True
+
+
+def test_replace_description_measurements_replaces_dimension_placeholder_with_image_reference():
+    html = "<table><tr><td>Overall Dimensions (L×W×H)</td><td>Not Applicable</td></tr></table>"
+
+    updated = replace_description_measurements(html)
+
+    assert "<td>Overall Dimensions (L×W×H)</td><td>See product dimension image</td>" in updated
+    assert "Not Applicable" not in updated
+
+
+def test_replace_description_measurements_replaces_chinese_dimension_placeholders_with_image_reference():
+    html = (
+        '<div class="items"><span>组装长度 (英寸):</span> <span title="Not Applicable">Not Applicable</span></div>'
+        '<div class="items"><span>组装宽度 (英寸):</span> <span title="Not Applicable">Not Applicable</span></div>'
+        '<div class="items"><span>组装高度 (英寸):</span> <span title="Not Applicable">Not Applicable</span></div>'
+        '<div class="items"><span>产品重量 (磅):</span> <span title="Not Applicable">Not Applicable</span></div>'
+    )
+
+    updated = replace_description_measurements(html)
+
+    assert updated.count(">See product dimension image</span>") == 4
+    assert updated.count('title="See product dimension image"') == 4
+    assert "Not Applicable" not in updated
 
 
 def test_description_weight_placeholder_uses_explicit_package_weight_label():

@@ -114,14 +114,39 @@ KNOWN_PUBLISHABLE_CATEGORY_IDS = {
 # Data Layer
 # ═══════════════════════════════════════════════════════════════
 
-def get_ready_products(sku_filter: str = None) -> list:
+def _normalize_sku_filters(sku_filters) -> list[str]:
+    out = []
+    seen = set()
+    for raw in sku_filters or []:
+        sku = str(raw or '').strip()
+        if not sku or sku in seen:
+            continue
+        seen.add(sku)
+        out.append(sku)
+    return out
+
+
+def get_ready_products(sku_filter: str = None, sku_filters=None) -> list:
     """Load all READY products from SQLite."""
     conn = sqlite3.connect(str(PROJECT_ROOT / "ebay_collection.db"), timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.row_factory = sqlite3.Row
+    sku_list = _normalize_sku_filters(sku_filters)
 
-    if sku_filter:
+    if sku_filter and sku_list:
+        conn.close()
+        raise ValueError("Use either sku_filter or sku_filters, not both")
+
+    if sku_list:
+        placeholders = ",".join("?" for _ in sku_list)
+        rows = conn.execute(
+            "SELECT * FROM collected_products "
+            "WHERE status IN ('READY','READY_TO_PUBLISH') "
+            f"AND sku IN ({placeholders})",
+            sku_list,
+        ).fetchall()
+    elif sku_filter:
         rows = conn.execute(
             "SELECT * FROM collected_products WHERE status IN ('READY','READY_TO_PUBLISH') AND sku=?",
             (sku_filter,)
@@ -131,6 +156,7 @@ def get_ready_products(sku_filter: str = None) -> list:
             "SELECT * FROM collected_products WHERE status IN ('READY','READY_TO_PUBLISH') ORDER BY sku"
         ).fetchall()
 
+    products_by_sku = {}
     products = []
     for r in rows:
         d = dict(r)
@@ -140,7 +166,13 @@ def get_ready_products(sku_filter: str = None) -> list:
                     d[field] = json.loads(d[field])
                 except Exception:
                     pass
-        products.append(d)
+        if sku_list:
+            products_by_sku[d.get('sku')] = d
+        else:
+            products.append(d)
+
+    if sku_list:
+        products = [products_by_sku[sku] for sku in sku_list if sku in products_by_sku]
 
     conn.close()
     return products
@@ -1204,10 +1236,15 @@ def main():
     parser = argparse.ArgumentParser(description="Batch publish READY products to eBay")
     parser.add_argument('--dry-run', action='store_true', help='Preview without publishing')
     parser.add_argument('--sku', type=str, help='Publish single SKU only')
+    parser.add_argument('--sku-list', type=str,
+                        help='Comma-separated READY SKU allowlist; preserves the given order')
     parser.add_argument('--enrich-only', action='store_true', help='Only enrich dimensions + pricing, no publish')
     parser.add_argument('--limit', type=int, default=0,
                         help='Max products to publish this run (0 = all; safety cap for auto-publish)')
     args = parser.parse_args()
+
+    if args.sku and args.sku_list:
+        parser.error('--sku and --sku-list are mutually exclusive')
 
     logger.info("=" * 60)
     mode = '(DRY RUN)' if args.dry_run else ('(ENRICH ONLY)' if args.enrich_only else '')
@@ -1215,7 +1252,10 @@ def main():
     logger.info(f"Log: {LOG_FILE}")
     logger.info("=" * 60)
 
-    products = get_ready_products(args.sku)
+    sku_filters = None
+    if args.sku_list:
+        sku_filters = [s.strip() for s in args.sku_list.split(',') if s.strip()]
+    products = get_ready_products(args.sku, sku_filters=sku_filters)
     if not products:
         logger.info("No READY products to publish.")
         return
