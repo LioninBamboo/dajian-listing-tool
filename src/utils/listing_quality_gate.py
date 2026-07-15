@@ -91,9 +91,35 @@ CLAIM_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# Single arbiter patterns for "does SOURCE support foldable?"
+# Design (HANDOFF_FOLLOWUP): fold/folding/collapsible/折叠 = support;
+# extendable / extending / drop leaf alone do NOT constitute foldable evidence.
+FOLDABLE_SOURCE_EVIDENCE_PATTERNS: tuple[str, ...] = (
+    # Inflection-aware: previous \bfold\b missed "folded"/"folds", so a
+    # drop-leaf island whose source says "can be folded" was wrongly judged
+    # unsupported and every rewrite of it stalled (2026-07-14 foldable regression).
+    # Still excludes drop-leaf/extendable *alone* — those carry no fold verb.
+    r"\bfold(?:s|ed|ing|able|away)?\b",
+    r"\bcollaps(?:e|es|ed|ing|ible)\b",
+    r"折叠",
+)
+
+NATURALLY_FOLDABLE_TITLE_KEYWORDS: tuple[str, ...] = (
+    "umbrella",
+    "camping chair",
+    "canopy",
+    "shade sail",
+    "tent",
+    "hammock",
+)
+
 CLAIM_LABELS = {
     "foldable": "foldable/collapsible",
     "charging": "USB/charging",
+}
+
+SUPPORTED_FEATURE_CLAIMS = {
+    "foldable": "Foldable",
 }
 
 DIRECT_VIDEO_EXTENSIONS = frozenset({
@@ -171,6 +197,18 @@ def _as_list(value: Any) -> list[str]:
 def _set_aspect(aspects: dict[str, Any], key: str, value: str | None) -> None:
     if value:
         aspects[key] = [_clean_text(value)]
+
+
+def _append_unique_aspect_value(aspects: dict[str, Any], key: str, value: str) -> bool:
+    cleaned_value = _clean_text(value)
+    if not cleaned_value:
+        return False
+    existing = _as_list(aspects.get(key))
+    if any(item.lower() == cleaned_value.lower() for item in existing):
+        return False
+    existing.append(cleaned_value)
+    aspects[key] = existing
+    return True
 
 
 def _plain_text(value: str) -> str:
@@ -309,6 +347,43 @@ def evaluate_source_video_urls(videos: list[str] | None = None) -> dict[str, Any
     return result
 
 
+def source_supports_foldable(
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+) -> bool:
+    """Unique arbiter: whether the GIGA/source product supports foldable claims.
+
+    Both listing_quality_gate (missing_foldable / source_facts) and
+    claim_diff_engine (unsupported foldable claim) MUST use this function so
+    the two detectors cannot disagree on the same inputs.
+
+    Semantic boundary:
+    - fold / folding / collapsible / collapse / 折叠 → supported
+    - extendable / extending / drop leaf alone → NOT supported
+    - naturally foldable product titles (umbrella, tent, …) → supported
+    """
+    title_l = _clean_text(source_title).lower()
+    if any(kw in title_l for kw in NATURALLY_FOLDABLE_TITLE_KEYWORDS):
+        return True
+
+    entries = _iter_source_entries(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    combined = " ".join(text for _, text in entries)
+    combined = re.sub(r"<[^>]+>", " ", combined)
+    combined = re.sub(r"\s+", " ", combined)
+    return any(
+        re.search(pattern, combined, flags=re.IGNORECASE)
+        for pattern in FOLDABLE_SOURCE_EVIDENCE_PATTERNS
+    )
+
+
 def build_source_facts(
     *,
     source_title: str = "",
@@ -330,6 +405,19 @@ def build_source_facts(
             "evidence": evidence,
         }
         for claim_name, patterns in CLAIM_PATTERNS.items()
+    }
+    # Foldable uses the single arbiter so title-only evidence ("Folding Mattress")
+    # and description evidence stay consistent with claim_diff_engine.
+    foldable_supported = source_supports_foldable(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    foldable_evidence = _collect_claim_evidence(entries, FOLDABLE_SOURCE_EVIDENCE_PATTERNS)
+    claims["foldable"] = {
+        "supported": foldable_supported,
+        "evidence": foldable_evidence if foldable_supported else [],
     }
     return {
         "assembly_required": infer_source_assembly_required(attributes, specs, source_description),
@@ -1158,7 +1246,19 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             room="Living Room",
         )
 
-    if any(marker in title_text for marker in ("loveseat", "sectional sofa", "l-shaped sofa", "u-shaped sofa", "modular sectional", "sofa", "couch")):
+    # "Sofa Table" / "Sofa Side Table" / "Console Table ... Behind Couch" are
+    # tables that merely mention a sofa — never classify them as sofas
+    # (live incident 2026-07-13: a nightstand and a console table were both
+    # recategorized into 38208 by this branch).
+    sofa_accessory_context = (
+        re.search(r"\b(?:sofa|couch)\s+(?:side\s+)?table\b", title_text)
+        or "console table" in title_text
+        or re.search(r"\bbehind\s+(?:the\s+)?(?:couch|sofa)\b", title_text)
+    )
+    if not sofa_accessory_context and any(
+        marker in title_text
+        for marker in ("loveseat", "sectional sofa", "l-shaped sofa", "u-shaped sofa", "modular sectional", "sofa", "couch")
+    ):
         is_sectional = any(
             marker in title_text
             for marker in ("sectional", "modular", "l-shaped", "u-shaped", "u shaped", "l shaped")
@@ -1415,6 +1515,11 @@ def normalize_generated_listing(
         specs=specs,
         videos=videos,
     )
+    claim_facts = opt["source_facts"].get("claims") if isinstance(opt["source_facts"], dict) else {}
+    for claim_name, feature_value in SUPPORTED_FEATURE_CLAIMS.items():
+        claim_state = claim_facts.get(claim_name) if isinstance(claim_facts, Mapping) else {}
+        if isinstance(claim_state, Mapping) and claim_state.get("supported"):
+            _append_unique_aspect_value(opt["aspects"], "Features", feature_value)
     opt["description"] = _ensure_key_features_block(
         opt.get("description", ""),
         title=opt.get("title", ""),
@@ -1609,6 +1714,20 @@ def validate_listing_quality(
                     f"unsupported_{claim_name}_claim",
                     f"listing mentions {label} in {', '.join(locations)} but source does not support it",
                     field=locations[0],
+                )
+            )
+
+    for claim_name, feature_value in SUPPORTED_FEATURE_CLAIMS.items():
+        claim_state = claim_facts.get(claim_name) if isinstance(claim_facts.get(claim_name), Mapping) else {}
+        if not claim_state.get("supported"):
+            continue
+        feature_values = _as_list(aspects.get("Features"))
+        if not any(value.lower() == feature_value.lower() for value in feature_values):
+            issues.append(
+                ListingQualityIssue(
+                    f"missing_supported_{claim_name}_feature",
+                    f"source supports {CLAIM_LABELS.get(claim_name, claim_name)} but Features is missing {feature_value}",
+                    field="Features",
                 )
             )
 

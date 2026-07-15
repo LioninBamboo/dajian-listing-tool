@@ -95,6 +95,9 @@ TASK_TIMEOUT = {
     'mi_snapshot': 3600,       # 1小时 (F17 机会发现, 并发查 eBay Browse)
     'listing_status_sync': 1800,  # 30分钟 (ActiveList 全量分页 + 死链协调)
     'auto_publish': 3600,      # 1小时 (READY 草稿刊登; 默认 dry-run)
+    'source_refresh': 1800,    # 30分钟 (全量 PUBLISHED 源快照刷新, 批量 detailInfo)
+    'order_recheck': 900,      # 15分钟 (出单源复核: GetOrders + 单 SKU 源重抓比对)
+    'semantic_rewrite': 3600,  # 1小时 (语义改写管线: 日审增量队列, 默认限 40)
 }
 
 # Windows execution-state flags. Do not use ES_DISPLAY_REQUIRED: the scheduler
@@ -579,6 +582,62 @@ def task_listing_audit():
     )
 
 
+def task_source_refresh():
+    """源内容刷新: 重抓 GIGA/大建源详情, 检测卖家侧内容漂移并修复本地快照。
+
+    排在 11:30 listing_audit 之前, 让当日审计对比的是供应商当前真实源数据,
+    而不是采集时的冻结快照。
+    """
+    if _task_succeeded_today('source_refresh'):
+        logger.info("↪ 跳过源内容刷新: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+
+    run_task(
+        'source_refresh',
+        [
+            str(PROJECT_ROOT / 'scripts' / 'source_content_refresh.py'),
+            '--email',
+        ],
+        timeout_sec=TASK_TIMEOUT['source_refresh'],
+    )
+
+
+def task_semantic_rewrite():
+    """语义改写闭环: 读当日最新 audit 推导增量队列, 限量 apply 并邮件摘要。
+
+    排在 11:30 listing_audit 之后 (12:30)。双闸仍要求 .env 中
+    SEMANTIC_REWRITE_APPLY_ENABLED=1, 否则脚本会拒绝 --apply 并 exit 3。
+    """
+    if _task_succeeded_today('semantic_rewrite'):
+        logger.info("↪ 跳过语义改写: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+
+    run_task(
+        'semantic_rewrite',
+        [
+            str(PROJECT_ROOT / 'scripts' / 'semantic_rewrite.py'),
+            '--from-daily-audit',
+            '--limit', '40',
+            '--apply',
+            '--email',
+        ],
+        timeout_sec=TASK_TIMEOUT['semantic_rewrite'],
+    )
+
+
+def task_order_recheck():
+    """出单源复核: 新订单 SKU 立即重抓源并比对 live listing 声明, 发货前拦退款。"""
+    run_task(
+        'order_recheck',
+        [
+            str(PROJECT_ROOT / 'scripts' / 'order_source_recheck.py'),
+            '--hours-back', '8',
+            '--email',
+        ],
+        timeout_sec=TASK_TIMEOUT['order_recheck'],
+    )
+
+
 def task_daily_full():
     """每日全量任务 (分析 + 库存同步 + 报告；智能调价仅周一/周四执行)"""
     if _task_succeeded_today('daily_tasks'):
@@ -681,11 +740,51 @@ def task_listing_status_sync():
     )
 
 
+def _latest_mi_ready_skus(limit: int, reports_dir: Path | None = None) -> list[str]:
+    """Return READY SKUs from today's latest MI opportunity snapshot."""
+    reports = Path(reports_dir) if reports_dir else PROJECT_ROOT / 'reports'
+    if not reports.is_dir():
+        return []
+    today = datetime.now().strftime('%Y%m%d')
+    snapshots = sorted(
+        reports.glob(f'mi_opportunities_{today}_*.json'),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not snapshots:
+        return []
+    try:
+        data = json.loads(snapshots[0].read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(data, list):
+        opportunities = data
+    elif isinstance(data, dict):
+        opportunities = data.get('opportunities') or []
+    else:
+        opportunities = []
+
+    skus: list[str] = []
+    seen: set[str] = set()
+    for opportunity in opportunities:
+        if not isinstance(opportunity, dict):
+            continue
+        status = str(opportunity.get('status') or '').strip().upper()
+        sku = str(opportunity.get('sku') or '').strip()
+        if status not in {'READY', 'READY_TO_PUBLISH'} or not sku or sku in seen:
+            continue
+        seen.add(sku)
+        skus.append(sku)
+        if len(skus) >= limit:
+            break
+    return skus
+
+
 def task_auto_publish():
     """MI 机会自动刊登 — 把 READY 草稿发布到 eBay (质检硬门已强制在 batch_publish 内).
 
     安全默认 dry-run: 只有 ENABLE_MI_AUTO_PUBLISH=1 才真正上架 (不可逆对外操作).
-    每次 --limit 上限由 MI_AUTO_PUBLISH_LIMIT 控制 (默认 10), 防一次性发太多.
+    每次只允许发布最新 MI 快照中的 READY SKU; --limit 由 MI_AUTO_PUBLISH_LIMIT 控制.
     依赖当日 listing_status_sync 先跑完 (清掉死链 listing_id), 故安排在其后.
     """
     if _task_succeeded_today('auto_publish'):
@@ -698,12 +797,26 @@ def task_auto_publish():
     except ValueError:
         limit = 10
 
-    cmd = [str(PROJECT_ROOT / 'batch_publish.py'), '--limit', str(limit)]
+    mi_skus = _latest_mi_ready_skus(limit)
+    if not mi_skus:
+        msg = 'Skipped (no READY MI opportunities in latest snapshot)'
+        update_health('auto_publish', 'success', msg)
+        logger.info(f"[AUTO-PUBLISH] {msg}")
+        return True, msg
+
+    cmd = [
+        str(PROJECT_ROOT / 'batch_publish.py'),
+        '--limit', str(limit),
+        '--sku-list', ','.join(mi_skus),
+    ]
     if not enable:
         cmd.append('--dry-run')
-        logger.info(f"[AUTO-PUBLISH] dry-run 预览 (ENABLE_MI_AUTO_PUBLISH 未开启), limit={limit}")
+        logger.info(
+            f"[AUTO-PUBLISH] dry-run 预览 (ENABLE_MI_AUTO_PUBLISH 未开启), "
+            f"MI SKUs={len(mi_skus)}, limit={limit}"
+        )
     else:
-        logger.info(f"[AUTO-PUBLISH] 真实刊登已启用, limit={limit}")
+        logger.info(f"[AUTO-PUBLISH] 真实刊登已启用, MI SKUs={len(mi_skus)}, limit={limit}")
     run_task('auto_publish', cmd, timeout_sec=TASK_TIMEOUT['auto_publish'])
 
 
@@ -838,6 +951,7 @@ def task_cro_title_rewrite():
     cmd = [
         str(PROJECT_ROOT / 'scripts' / 'cro_title_rewrite.py'),
         '--limit', str(limit),
+        '--email',
     ]
     if apply_enabled:
         cmd.extend(['--apply', '--yes'])
@@ -1344,8 +1458,18 @@ def setup_schedule():
     # 10:50 — CRO relist 生命周期观察评估 (本地状态转移 + 软手段入队)
     schedule.every().day.at("10:50").do(task_cro_lifecycle_evaluate).tag('daily', 'cro_lifecycle_evaluate')
 
+    # 10:55 — 源内容刷新 (重抓 GIGA 源详情, 检测卖家漂移, 修复本地快照; 供 11:30 审计使用)
+    schedule.every().day.at("10:55").do(task_source_refresh).tag('daily', 'source_refresh')
+
     # 11:30 — 只读审计 live eBay 刊登内容 vs GIGA 原文，发现 AI 幻觉/事实偏差后发邮件
     schedule.every().day.at("11:30").do(task_listing_audit).tag('daily', 'listing_audit')
+
+    # 12:30 — 语义改写闭环 (读当日 audit 增量队列, 限 40; 需 SEMANTIC_REWRITE_APPLY_ENABLED=1)
+    schedule.every().day.at("12:30").do(task_semantic_rewrite).tag('daily', 'semantic_rewrite')
+
+    # 每 6 小时 — 出单源复核 (新订单 SKU 源重抓 + live 声明比对, 发货前拦退款)
+    # 单量不高, 6h 一轮足够; lookback 8h 留重叠, order_recheck_log 去重防重复告警
+    schedule.every(6).hours.do(task_order_recheck).tag('recurring', 'order_recheck')
 
     # ⚠️ (旧) 10:00 库存同步已移除 — daily_tasks.py (09:30) 已包含库存同步
     # 之前 10:00 的 task_inventory_sync 会导致重复发送库存报告邮件 (内容不同)
@@ -1372,7 +1496,10 @@ def setup_schedule():
     logger.info("  09:50  守门员异常告警 (P8 — guard_anomaly_alert)")
     logger.info("  10:00-10:25  CRO 队列自动执行 (改价/图/specifics/推广)")
     logger.info("  10:45  CRO 标题热词优化 dry-run (显式 env 才 live apply)")
+    logger.info("  10:55  源内容刷新 (source_content_refresh --email — 卖家漂移检测)")
     logger.info("  11:30  eBay/GIGA live listing 内容审计 (audit_fix_active_listings --live --email)")
+    logger.info("  12:30  语义改写闭环 (semantic_rewrite --from-daily-audit --limit 40 --apply --email)")
+    logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 8 --email)")
     logger.info("  20:00  销售健康诊断 (health_check --auto-fix --email)")
     logger.info("  每 2h  自动分析 (daily_tasks.py --analyze-only)")
     logger.info("  每 6h  促销轮转 (auto_rotate_promotions.py)")
@@ -1608,12 +1735,28 @@ def recover_missed_tasks(log_when_clean=True):
                 'weekday': 0,
             },
             {
+                'name': 'source_refresh',
+                'scheduled_time': '10:55',
+                'recovery_grace_minutes': 20,
+                'func': task_source_refresh,
+                'label': '源内容刷新',
+                'priority': 135,   # 必须在 listing_audit(140) 之前, 审计要用新鲜源快照
+            },
+            {
                 'name': 'listing_audit',
                 'scheduled_time': '11:30',
                 'recovery_grace_minutes': 15,
                 'func': task_listing_audit,
                 'label': '刊登内容审计',
                 'priority': 140,
+            },
+            {
+                'name': 'semantic_rewrite',
+                'scheduled_time': '12:30',
+                'recovery_grace_minutes': 20,
+                'func': task_semantic_rewrite,
+                'label': '语义改写闭环',
+                'priority': 145,  # listing_audit(140) 之后
             },
             {
                 'name': 'health_check',
@@ -1797,7 +1940,7 @@ def main():
     parser.add_argument('--once', action='store_true',
                        help='立即执行全部任务一次后退出')
     parser.add_argument('--task', type=str,
-                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_snapshot', 'mi_self_check', 'listing_status_sync', 'auto_publish', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_title_rewrite', 'cro_lifecycle_evaluate', 'cro_send_offer'],
+                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_snapshot', 'mi_self_check', 'listing_status_sync', 'auto_publish', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_title_rewrite', 'cro_lifecycle_evaluate', 'cro_send_offer', 'source_refresh', 'order_recheck', 'semantic_rewrite'],
                        help='立即执行指定单个任务后退出')
     parser.add_argument('--status', action='store_true',
                        help='显示守护进程状态')
@@ -1846,6 +1989,9 @@ def main():
             'cro_title_rewrite': task_cro_title_rewrite,
             'cro_lifecycle_evaluate': task_cro_lifecycle_evaluate,
             'cro_send_offer': task_cro_send_offer,
+            'source_refresh': task_source_refresh,
+            'order_recheck': task_order_recheck,
+            'semantic_rewrite': task_semantic_rewrite,
         }
         task_map[args.task]()
         return

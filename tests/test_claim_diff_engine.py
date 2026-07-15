@@ -110,7 +110,104 @@ def test_no_false_positive_when_source_supports():
     violations = detect_claim_violations(source, "Foldable chair", "Easy to fold", {})
     assert not any(v.claim_text == "foldable" for v in violations)
 
+
+def test_foldable_title_only_folding_mattress_is_supported_not_claim_violation():
+    """Real W5532-class source: fold evidence only in title ('Folding Mattress')."""
+    title = (
+        "Convertible Sleeper Sofa Bed,two-tone blended fabric Folding Mattress "
+        "Couch with Fixed-Shape Frame, Floor Sofa Lounge Couch"
+    )
+    source = build_source_constraints({}, {}, "Comfortable sleeper sofa for living room.", title)
+    assert "foldable" in source["supported_features"]
+    violations = detect_claim_violations(
+        source,
+        "Sleeper Sofa Bed Pull Out Couch",
+        "Features Foldable design.",
+        {"Features": ["Foldable"]},
+    )
+    assert not any(v.claim_text == "foldable" for v in violations)
+
+
+def test_extendable_alone_does_not_support_foldable():
+    source = build_source_constraints(
+        {},
+        {},
+        "Rolling kitchen island with extendable tabletop and drop leaf.",
+        "Extendable Dining Table with Drop Leaf",
+    )
+    assert "foldable" not in source["supported_features"]
+    violations = detect_claim_violations(
+        source,
+        "Extendable Dining Table Foldable",
+        "Foldable top for storage.",
+        {"Features": ["Foldable"]},
+    )
+    assert any(v.claim_text == "foldable" for v in violations)
+
+
+def test_folding_top_plus_extendable_supports_foldable():
+    """Real XW000029-class source: Extendable + Extra-Long Folding Top."""
+    title = (
+        "Extendable Dining Table with Extra-Long Folding Top, Rolling Kitchen Island "
+        "with Drawers, Power Outlet and Brake lock"
+    )
+    source = build_source_constraints({}, {}, "Rolling kitchen island table.", title)
+    assert "foldable" in source["supported_features"]
+
 def test_no_false_positive_chinese_source():
     source = build_source_constraints({}, {}, "这款床带蓝牙音响功能。", "床")
     violations = detect_claim_violations(source, "Bed with Bluetooth", "Built-in speaker", {})
     assert not any(v.claim_text == "bluetooth" for v in violations)
+
+
+def test_detects_unsupported_removable_and_zippered_tent_floor():
+    source = build_source_constraints(
+        {"Material": "oxford fabric"},
+        {},
+        "600D Oxford cloth bell tent with two doors, mesh windows, stove jack, and roll-up sidewalls.",
+        "600D Oxford Bell Tent",
+    )
+
+    violations = detect_claim_violations(
+        source,
+        "Bell Tent with Stove Jack",
+        "Includes a zipped removable floor with full-length dual zipper.",
+        {
+            "Features": ["Stove Jack", "Zipped", "Removable Floor"],
+            "Closure Type": ["Zipper"],
+        },
+    )
+
+    claim_texts = {v.claim_text for v in violations}
+    assert "removable_floor" in claim_texts
+    assert "zippered_floor" in claim_texts
+
+
+def test_no_false_positive_when_source_supports_zippered_floor():
+    source = build_source_constraints(
+        {},
+        {},
+        "The tent includes a detachable floor with zipper access.",
+        "Bell Tent",
+    )
+
+    violations = detect_claim_violations(
+        source,
+        "Bell Tent",
+        "Includes a zipped removable floor.",
+        {"Features": ["Zipped", "Removable Floor"], "Closure Type": ["Zipper"]},
+    )
+
+    assert not any(v.claim_text in {"removable_floor", "zippered_floor"} for v in violations)
+
+
+def test_replace_description_measurements_numeric_weight_after_backreference():
+    """W2699P456 handoff incident: weight "19.7 lbs" after a \1 backreference
+    parsed as group \19 and raised re.PatternError."""
+    from src.utils.dimension_helpers import replace_description_measurements
+
+    description = (
+        '<div><span style="a">产品重量 (磅) :</span> <span style="b">Not specified</span></div>'
+    )
+    updated = replace_description_measurements(description, weight=19.7)
+    assert "19.7 lbs" in updated

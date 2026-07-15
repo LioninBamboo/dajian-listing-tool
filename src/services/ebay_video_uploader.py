@@ -44,6 +44,11 @@ def create_session_with_retry(retries=5, backoff_factor=1.0, status_forcelist=(5
     return session
 
 
+# Minimum download size before we treat a body as a real video file.
+# text/plain error pages and .txt share placeholders are typically << 256KB.
+MIN_DOWNLOADABLE_VIDEO_BYTES = 256 * 1024
+
+
 class EbayVideoUploader:
     """Video uploader for eBay Media API v1_beta"""
     
@@ -278,28 +283,40 @@ class EbayVideoUploader:
             
             video_data = response.content
             file_size = len(video_data)
-            content_type = response.headers.get("Content-Type", "video/mp4")
+            content_type = response.headers.get("Content-Type", "") or ""
+            content_type_main = content_type.split(";")[0].strip().lower()
             
             print(f"[Video] Downloaded {file_size} bytes, type: {content_type}")
-            
-            # Validate it's actually a video
-            if 'video' not in content_type.lower():
-                self.last_upload_error = "unsupported_source: not a direct downloadable video file"
-                raise Exception("Video source is not a direct downloadable video file")
+
+            # Content validation (HANDOFF_FOLLOWUP item 2):
+            # reject non-video Content-Type or bodies smaller than 256KB so we
+            # never push GIGA text/plain placeholders (or error pages) to eBay.
+            if not content_type_main.startswith("video/"):
+                self.last_upload_error = (
+                    f"unsupported_source: content_type={content_type!r} size={file_size}"
+                )
+                raise Exception(
+                    f"Video source is not a direct downloadable video file "
+                    f"(Content-Type={content_type!r}, size={file_size})"
+                )
+            if file_size < MIN_DOWNLOADABLE_VIDEO_BYTES:
+                self.last_upload_error = (
+                    f"unsupported_source: size={file_size} < {MIN_DOWNLOADABLE_VIDEO_BYTES}"
+                )
+                raise Exception(
+                    f"Video source too small to be a usable video file: "
+                    f"{file_size} bytes (min {MIN_DOWNLOADABLE_VIDEO_BYTES})"
+                )
             
             # Validate size (max ~150MB)
             if file_size > 157286400:
                 raise Exception(f"Video too large: {file_size} bytes (max 157,286,400)")
             
-            if file_size < 1000:
-                self.last_upload_error = "invalid_video: downloaded file is too small"
-                raise Exception(f"Video too small: {file_size} bytes (might not be valid video)")
-            
             # Create video resource
             video_id, _ = self.create_video_resource(title, description or title, file_size)
             
             # Upload content
-            self.upload_video_content(video_id, video_data, content_type)
+            self.upload_video_content(video_id, video_data, content_type or "video/mp4")
             
             return video_id
             

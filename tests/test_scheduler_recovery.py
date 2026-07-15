@@ -49,6 +49,20 @@ class FixedNoonDateTime(datetime):
         return cls(2026, 5, 11, 12, 47, 30)
 
 
+def _stub_recent_recovery_tasks(monkeypatch, record):
+    for attr, name in (
+        ('task_listing_status_sync', 'listing_status_sync'),
+        ('task_mi_snapshot', 'mi_snapshot'),
+        ('task_auto_publish', 'auto_publish'),
+        ('task_cro_send_offer', 'cro_send_offer'),
+        ('task_cro_lifecycle_detect', 'cro_lifecycle_detect'),
+        ('task_cro_lifecycle_evaluate', 'cro_lifecycle_evaluate'),
+        ('task_source_refresh', 'source_refresh'),
+        ('task_semantic_rewrite', 'semantic_rewrite'),
+    ):
+        monkeypatch.setattr(scheduler_daemon, attr, record(name))
+
+
 def test_recover_missed_tasks_catches_morning_gap_after_noon_restart(tmp_path, monkeypatch):
     health_path = tmp_path / '_scheduler_health.json'
     health_path.write_text(
@@ -115,6 +129,7 @@ def test_recover_missed_tasks_catches_morning_gap_after_noon_restart(tmp_path, m
     monkeypatch.setattr(scheduler_daemon, 'task_cro_learn_thresholds', _record('cro_learn_thresholds'))
     monkeypatch.setattr(scheduler_daemon, 'task_cro_promote_thresholds', _record('cro_promote_thresholds'))
     monkeypatch.setattr(scheduler_daemon, 'task_cro_ops_snapshot', _record('cro_ops_snapshot'))
+    _stub_recent_recovery_tasks(monkeypatch, _record)
 
     scheduler_daemon.recover_missed_tasks(log_when_clean=False)
 
@@ -170,6 +185,7 @@ def test_recover_missed_tasks_waits_for_daily_before_cro(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_daemon, 'task_cro_learn_thresholds', _record('cro_learn_thresholds'))
     monkeypatch.setattr(scheduler_daemon, 'task_cro_promote_thresholds', _record('cro_promote_thresholds'))
     monkeypatch.setattr(scheduler_daemon, 'task_cro_ops_snapshot', _record('cro_ops_snapshot'))
+    _stub_recent_recovery_tasks(monkeypatch, _record)
 
     scheduler_daemon.recover_missed_tasks(log_when_clean=False)
 
@@ -225,6 +241,7 @@ def test_recover_missed_tasks_skips_watchdog_recovery_in_progress(tmp_path, monk
     monkeypatch.setattr(scheduler_daemon, 'task_cro_learn_thresholds', _record('cro_learn_thresholds'))
     monkeypatch.setattr(scheduler_daemon, 'task_cro_promote_thresholds', _record('cro_promote_thresholds'))
     monkeypatch.setattr(scheduler_daemon, 'task_cro_ops_snapshot', _record('cro_ops_snapshot'))
+    _stub_recent_recovery_tasks(monkeypatch, _record)
 
     scheduler_daemon.recover_missed_tasks(log_when_clean=False)
 
@@ -324,3 +341,42 @@ def test_cro_monthly_gate_records_non_month_start_skip(monkeypatch):
     assert ok is True
     assert message == 'Skipped (not month start)'
     assert calls == [('cro_monthly_report', 'success', 'Skipped (not month start)')]
+
+
+def test_task_auto_publish_scopes_to_latest_mi_ready_skus(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(scheduler_daemon, '_task_succeeded_today', lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(scheduler_daemon, '_latest_mi_ready_skus', lambda limit: ['MI-1', 'MI-2'])
+    monkeypatch.setenv('ENABLE_MI_AUTO_PUBLISH', '1')
+    monkeypatch.setenv('MI_AUTO_PUBLISH_LIMIT', '10')
+    monkeypatch.setattr(scheduler_daemon, 'run_task', lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    scheduler_daemon.task_auto_publish()
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == 'auto_publish'
+    command = [str(part) for part in args[1]]
+    assert '--sku-list' in command
+    assert command[command.index('--sku-list') + 1] == 'MI-1,MI-2'
+    assert '--dry-run' not in command
+    assert kwargs['timeout_sec'] == scheduler_daemon.TASK_TIMEOUT['auto_publish']
+
+
+def test_latest_mi_ready_skus_reads_top_level_list_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    (tmp_path / 'mi_opportunities_20260511_100000.json').write_text(
+        json.dumps(
+            [
+                {'sku': 'MI-1', 'status': 'READY'},
+                {'sku': 'OLD', 'status': 'PUBLISHED'},
+                {'sku': 'MI-2', 'status': 'READY_TO_PUBLISH'},
+                {'sku': 'MI-1', 'status': 'READY'},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding='utf-8',
+    )
+
+    assert scheduler_daemon._latest_mi_ready_skus(10, tmp_path) == ['MI-1', 'MI-2']

@@ -248,6 +248,20 @@ def extract_dajian_measurements(detail: Dict[str, Any]) -> Dict[str, Any]:
     return measurements
 
 
+def source_description_marks_dimensions_unavailable(description: str) -> bool:
+    """Return True when supplier copy explicitly says product dimensions are unavailable."""
+    if not description:
+        return False
+    patterns = (
+        r'组装长度\s*\(英寸\)\s*:\s*</span>\s*<span[^>]*>\s*Not Applicable\s*</span>',
+        r'组装宽度\s*\(英寸\)\s*:\s*</span>\s*<span[^>]*>\s*Not Applicable\s*</span>',
+        r'组装高度\s*\(英寸\)\s*:\s*</span>\s*<span[^>]*>\s*Not Applicable\s*</span>',
+        r'Overall\s+Dimensions\s*\(L.?W.?H\)\s*</td>\s*<td[^>]*>\s*(?:Not Applicable|Not specified|NOT AVAILABLE)\s*</td>',
+    )
+    matches = sum(1 for pattern in patterns if re.search(pattern, description, flags=re.IGNORECASE | re.DOTALL))
+    return matches >= 2
+
+
 def replace_description_measurements(
     description: str,
     length: Optional[float] = None,
@@ -262,6 +276,22 @@ def replace_description_measurements(
         return description
 
     updated = description
+    dimension_placeholder_pattern = re.compile(
+        r'<tr[^>]*>\s*<td[^>]*>\s*Overall\s+Dimensions\s*\(L.?W.?H\)\s*</td>\s*<td[^>]*>\s*'
+        r'(?:Not specified|Not Applicable|N/A|See Description|NOT AVAILABLE)[^<]*'
+        r'</td>\s*</tr>',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    chinese_dimension_placeholder_pattern = re.compile(
+        r'<div[^>]*>\s*<span[^>]*>\s*组装(?:长度|宽度|高度)\s*\(英寸\)\s*:\s*</span>\s*'
+        r'<span[^>]*>\s*(?:Not specified|Not Applicable|N/A|See Description|NOT AVAILABLE)\s*</span>\s*</div>',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    chinese_weight_placeholder_pattern = re.compile(
+        r'<div[^>]*>\s*<span[^>]*>\s*产品重量\s*\(磅\)\s*:\s*</span>\s*'
+        r'<span[^>]*>\s*(?:Not specified|Not Applicable|N/A|See Description|NOT AVAILABLE)\s*</span>\s*</div>',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
     def _normalized_contains(html: str, snippet: str) -> bool:
         html_norm = re.sub(r'\s+', ' ', (html or '').lower().replace('×', 'x'))
@@ -290,8 +320,27 @@ def replace_description_measurements(
 
         return re.sub(pattern, _row_replacer, html, count=1, flags=re.IGNORECASE | re.DOTALL)
 
+    def _replace_placeholder_span(label_pattern: str, value: str, html: str) -> str:
+        pattern = (
+            rf'(<div[^>]*>\s*<span[^>]*>\s*{label_pattern}\s*</span>\s*<span[^>]*>)'
+            rf'\s*(?:Not specified|Not Applicable|N/A|See Description|NOT AVAILABLE)\s*'
+            rf'(</span>)'
+        )
+        return re.sub(
+            pattern,
+            lambda match: f"{match.group(1)}{value}{match.group(2)}",
+            html,
+            count=1,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
     if dimensions_text is None and length is not None and width is not None and height is not None:
         dimensions_text = f"{length} × {width} × {height} inches"
+    elif dimensions_text is None and (
+        dimension_placeholder_pattern.search(updated)
+        or chinese_dimension_placeholder_pattern.search(updated)
+    ):
+        dimensions_text = "See product dimension image"
 
     if dimensions_text:
         updated = _replace_row(
@@ -299,6 +348,18 @@ def replace_description_measurements(
             dimensions_text,
             updated,
             preserve_suffix_if_na=dimensions_text.lower() == "not specified",
+        )
+        for label_pattern in (
+            r'组装长度\s*\(英寸\)\s*:',
+            r'组装宽度\s*\(英寸\)\s*:',
+            r'组装高度\s*\(英寸\)\s*:',
+        ):
+            updated = _replace_placeholder_span(label_pattern, dimensions_text, updated)
+        updated = re.sub(
+            r'title="(?:Not specified|Not Applicable|N/A|See Description|NOT AVAILABLE)"',
+            f'title="{dimensions_text}"',
+            updated,
+            flags=re.IGNORECASE,
         )
         updated = re.sub(
             r'NOT AVAILABLE',
@@ -310,12 +371,29 @@ def replace_description_measurements(
 
     if weight_text is None and weight is not None:
         weight_text = f"{weight} lbs"
+    elif weight_text is None and (
+        dimensions_text == "See product dimension image"
+        or chinese_weight_placeholder_pattern.search(updated)
+    ):
+        weight_text = "See product dimension image"
     if weight_text:
         updated = _replace_row(
             r'(?:(?:Overall|Item|Product)\s+)?Weight(?:\s*\([^)]*\))?',
             weight_text,
             updated,
             preserve_suffix_if_na=weight_text.lower() == "not specified",
+        )
+        updated = _replace_placeholder_span(r'产品重量\s*\(磅\)\s*:', weight_text, updated)
+        updated = re.sub(
+            r'(<span[^>]*>\s*产品重量\s*\(磅\)\s*:\s*</span>\s*<span[^>]*>)'
+            r'\s*(?:Not specified|Not Applicable|N/A|See Description|NOT AVAILABLE)\s*'
+            r'(</span>)',
+            # \g<1> not \1: a numeric value like "19.7 lbs" after \1 parses as
+            # group \19 and raises "invalid group reference" (hit W2699P504456).
+            rf'\g<1>{weight_text}\g<2>',
+            updated,
+            count=1,
+            flags=re.IGNORECASE | re.DOTALL,
         )
 
     appended_blocks = []
@@ -342,6 +420,29 @@ def replace_description_measurements(
             updated += measurement_block
 
     return updated
+
+
+def insert_dimension_note_row(description: str, note_text: str) -> str:
+    """Insert a Dimension Note row after the Overall Dimensions row when absent."""
+    if not description or not note_text:
+        return description
+    if "Dimension Note" in description or note_text in description:
+        return description
+
+    row_html = (
+        '<tr style="background:#fdf8e8">'
+        '<td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72">Dimension Note</td>'
+        f'<td style="padding:10px;border-bottom:1px solid #e0e0e0;font-weight:500">{note_text}</td>'
+        '</tr>'
+    )
+
+    return re.sub(
+        r'(<tr[^>]*>\s*<td[^>]*>\s*Overall\s+Dimensions\s*\(L.?W.?H\)\s*</td>\s*<td[^>]*>.*?</td>\s*</tr>)',
+        r'\1' + row_html,
+        description,
+        count=1,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
 
 def replace_description_weight_placeholder_with_package_weight(

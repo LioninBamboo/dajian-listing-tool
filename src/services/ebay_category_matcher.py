@@ -57,18 +57,29 @@ class EbayCategoryMatcher:
             kw in text_lower
             for kw in ("frog garden stool", "garden frog", "frog statue", "frog sitting on rock")
         )
-        has_sofa = any(
-            kw in title_lower
-            for kw in (
-                "sectional sofa",
-                "l-shaped sectional",
-                "l-shaped sofa",
-                "sleeper sofa",
-                "sofa bed",
-                "pull out sofa",
-                "loveseat",
+        # "Sofa Table" / "Sofa Side Table" / "Console Table ... Behind Couch"
+        # are tables that mention a sofa — never treat them as seating
+        # (2026-07-13 live incident: nightstand + console table remapped to 38208).
+        has_sofa_accessory_table = (
+            re.search(r"\b(?:sofa|couch)\s+(?:side\s+)?table\b", title_lower) is not None
+            or "console table" in title_lower
+            or re.search(r"\bbehind\s+(?:the\s+)?(?:couch|sofa)\b", title_lower) is not None
+        )
+        has_sofa = not has_sofa_accessory_table and (
+            any(
+                kw in title_lower
+                for kw in (
+                    "sectional sofa",
+                    "l-shaped sectional",
+                    "l-shaped sofa",
+                    "sleeper sofa",
+                    "sofa bed",
+                    "pull out sofa",
+                    "loveseat",
+                )
             )
-        ) or re.search(r"\b(?:sofa|couch)\b", title_lower) is not None
+            or re.search(r"\b(?:sofa|couch)\b", title_lower) is not None
+        )
         has_bunk_bed = any(
             kw in title_lower
             for kw in (
@@ -82,8 +93,10 @@ class EbayCategoryMatcher:
                 "queen over full",
             )
         )
+        # Word-boundary match: plain substring turned "Storage Bedside Table"
+        # into "storage bed" and remapped a nightstand to Bed Frames (175758).
         has_bed_frame = any(
-            kw in title_lower
+            re.search(rf"\b{kw}\b", title_lower)
             for kw in ("platform bed", "bed frame", "house bed", "floor bed", "montessori bed", "storage bed")
         )
         has_storage_ottoman = any(

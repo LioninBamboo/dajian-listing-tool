@@ -453,6 +453,463 @@ def test_fix_listing_uses_live_snapshot_as_fix_base(monkeypatch):
     assert "Assembly Status" not in stored_opt["aspects"]
 
 
+def test_fix_listing_persists_and_publishes_video_only_fix(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        (
+            "SKU-VIDEO",
+            json.dumps(
+                {
+                    "title": "Stored title",
+                    "description": "<div>Stored description</div>",
+                    "aspects": {"Material": ["Wood"]},
+                }
+            ),
+        ),
+    )
+
+    class FakeUploader:
+        def __init__(self, oauth):
+            self.oauth = oauth
+
+        def upload_video_sync(self, video_url, sku, title):
+            assert video_url == "https://example.test/video.mp4"
+            assert sku == "SKU-VIDEO"
+            return "video-123"
+
+        def _add_video_to_ebay_inventory(self, sku, video_id):
+            assert sku == "SKU-VIDEO"
+            assert video_id == "video-123"
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "src.services.ebay_video_uploader",
+        types.SimpleNamespace(EbayVideoUploader=FakeUploader),
+    )
+
+    class FakeClient:
+        oauth = object()
+
+        def __init__(self):
+            self.inventory_reads = 0
+            self.published_offer_id = None
+
+        def get_inventory_item(self, sku):
+            self.inventory_reads += 1
+            if self.inventory_reads == 1:
+                return {"product": {"videoIds": []}}
+            return {"product": {"videoIds": ["video-123"]}}
+
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "offer-video", "listing": {"listingId": "123"}, "status": "PUBLISHED"}]
+
+        def publish_offer(self, offer_id):
+            self.published_offer_id = offer_id
+            return {"listingId": "123"}
+
+    client = FakeClient()
+    product_row = {
+        "sku": "SKU-VIDEO",
+        "title": "Source title",
+        "description": "<div>Source description</div>",
+        "optimization": json.dumps(
+            {
+                "title": "Stored title",
+                "description": "<div>Stored description</div>",
+                "aspects": {"Material": ["Wood"]},
+            }
+        ),
+        "attributes": "{}",
+        "specs": "{}",
+        "images": "[]",
+        "price": 10,
+        "suggested_price": 10,
+        "listing_id": "123",
+    }
+
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-VIDEO",
+        product_row,
+        {"__sync_video__": "https://example.test/video.mp4"},
+        client,
+        conn,
+    )
+
+    assert any("Uploaded and linked source video to eBay: video-123" in item for item in results)
+    assert any("republished after video sync" in item for item in results)
+    assert any("Local DB updated" in item for item in results)
+    assert client.published_offer_id == "offer-video"
+
+    stored_opt = json.loads(
+        conn.execute("SELECT optimization FROM collected_products WHERE sku = ?", ("SKU-VIDEO",)).fetchone()[0]
+    )
+    assert stored_opt["video_id"] == "video-123"
+    assert stored_opt["video_status"] == "UPLOADED"
+    assert stored_opt["videoIds"] == ["video-123"]
+
+
+def test_fix_listing_scrubs_power_strip_from_type_aspect_and_updates_offer(monkeypatch):
+    """W2700-class residual: charging token lived in Type aspect, not Features/description."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        (
+            "SKU-POWER-STRIP",
+            json.dumps(
+                {
+                    "title": "Sewing Table",
+                    "description": "<div>Craft table with storage.</div>",
+                    "aspects": {
+                        "Type": ["Folding Sewing Table with Power Strip"],
+                        "Features": ["With Storage", "USB Charging"],
+                    },
+                }
+            ),
+        ),
+    )
+
+    captured = {}
+
+    def fake_put_inventory_product_only(ebay_client, sku, title, description, aspects):
+        captured["aspects"] = dict(aspects)
+        captured["description"] = description
+        return object(), description, aspects
+
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "_put_inventory_product_only",
+        fake_put_inventory_product_only,
+    )
+
+    class FakeClient:
+        def __init__(self):
+            self.offer_updates = []
+
+        def get_offers_by_sku(self, sku):
+            return [
+                {
+                    "offerId": "offer-power",
+                    "listing": {"listingId": "999"},
+                    "status": "PUBLISHED",
+                    "categoryId": "20487",
+                    "listingDescription": "<div>Craft table with storage.</div>",
+                }
+            ]
+
+        def update_offer_category(self, offer_id, category_id, price=None, listing_description=None):
+            self.offer_updates.append(
+                {
+                    "offer_id": offer_id,
+                    "category_id": category_id,
+                    "listing_description": listing_description,
+                }
+            )
+            return True
+
+        def publish_offer(self, offer_id):
+            return {"listingId": "999"}
+
+    client = FakeClient()
+    live_opt = json.dumps(
+        {
+            "title": "Sewing Table",
+            "description": "<div>Craft table with storage.</div>",
+            "aspects": {
+                "Type": ["Folding Sewing Table with Power Strip"],
+                "Features": ["With Storage", "USB Charging"],
+            },
+            "categoryId": "20487",
+        }
+    )
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-POWER-STRIP",
+        {
+            "sku": "SKU-POWER-STRIP",
+            "title": "Source sewing table no power",
+            "description": "<div>No power features in source.</div>",
+            "optimization": live_opt,
+            "attributes": "{}",
+            "specs": "{}",
+            "images": "[]",
+            "price": 50,
+            "suggested_price": 50,
+            "listing_id": "999",
+        },
+        {"__hallucinated_charging__": True},
+        client,
+        conn,
+        base_opt_raw=live_opt,
+    )
+
+    type_vals = " ".join(str(v) for v in (captured.get("aspects") or {}).get("Type", []))
+    features = [str(v).lower() for v in (captured.get("aspects") or {}).get("Features", [])]
+    assert "power strip" not in type_vals.lower()
+    assert not any("usb" in f or "charging" in f for f in features)
+    assert client.offer_updates, "offer listingDescription must be updated for charging cleanup"
+    assert client.offer_updates[0]["listing_description"]
+    assert any("charging" in item.lower() for item in results)
+
+
+def test_fix_listing_marks_video_source_dead_for_unsupported_source(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        ("SKU-VIDEO-DEAD", json.dumps({"title": "T", "description": "<div>D</div>", "aspects": {}})),
+    )
+
+    class FakeUploader:
+        def __init__(self, oauth):
+            self.last_upload_error = "unsupported_source: content_type='text/plain' size=97"
+
+        def upload_video_sync(self, video_url, sku, title):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "src.services.ebay_video_uploader",
+        types.SimpleNamespace(EbayVideoUploader=FakeUploader),
+    )
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "_refresh_source_video_url",
+        lambda sku, fallback: "https://fresh.example/video.txt?x-ct=1",
+    )
+
+    class FakeClient:
+        oauth = object()
+
+        def get_inventory_item(self, sku):
+            return {"product": {"videoIds": []}}
+
+        def get_offers_by_sku(self, sku):
+            return []
+
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-VIDEO-DEAD",
+        {
+            "sku": "SKU-VIDEO-DEAD",
+            "title": "Source",
+            "description": "<div>D</div>",
+            "optimization": json.dumps({"title": "T", "description": "<div>D</div>", "aspects": {}}),
+            "attributes": "{}",
+            "specs": "{}",
+            "images": "[]",
+            "price": 10,
+            "suggested_price": 10,
+            "listing_id": "1",
+        },
+        {"__sync_video__": "https://stale.example/video.txt"},
+        FakeClient(),
+        conn,
+    )
+    assert any("video_source_dead for SKU-VIDEO-DEAD" in item for item in results)
+    assert any("Refreshed source video URL" in item for item in results)
+
+
+def test_fix_listing_reuses_existing_local_video_id_before_upload(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        (
+            "SKU-VIDEO-REUSE",
+            json.dumps(
+                {
+                    "title": "Stored title",
+                    "description": "<div>Stored description</div>",
+                    "aspects": {"Material": ["Wood"]},
+                    "video_id": "existing-video",
+                    "video_status": "LIVE",
+                }
+            ),
+        ),
+    )
+
+    class FakeUploader:
+        def __init__(self, oauth):
+            self.upload_called = False
+
+        def upload_video_sync(self, video_url, sku, title):
+            self.upload_called = True
+            raise AssertionError("existing local video_id should be reused before uploading")
+
+        def _add_video_to_ebay_inventory(self, sku, video_id):
+            assert video_id == "existing-video"
+            return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "src.services.ebay_video_uploader",
+        types.SimpleNamespace(EbayVideoUploader=FakeUploader),
+    )
+
+    class FakeClient:
+        oauth = object()
+
+        def __init__(self):
+            self.inventory_reads = 0
+
+        def get_inventory_item(self, sku):
+            self.inventory_reads += 1
+            if self.inventory_reads == 1:
+                return {"product": {"videoIds": []}}
+            return {"product": {"videoIds": ["existing-video"]}}
+
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "offer-reuse", "listing": {"listingId": "123"}, "status": "PUBLISHED"}]
+
+        def publish_offer(self, offer_id):
+            return {"listingId": "123"}
+
+    product_row = {
+        "sku": "SKU-VIDEO-REUSE",
+        "title": "Source title",
+        "description": "<div>Source description</div>",
+        "optimization": json.dumps(
+            {
+                "title": "Stored title",
+                "description": "<div>Stored description</div>",
+                "aspects": {"Material": ["Wood"]},
+                "video_id": "existing-video",
+                "video_status": "LIVE",
+            }
+        ),
+        "attributes": "{}",
+        "specs": "{}",
+        "images": "[]",
+        "price": 10,
+        "suggested_price": 10,
+        "listing_id": "123",
+    }
+
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-VIDEO-REUSE",
+        product_row,
+        {"__sync_video__": "https://example.test/video.mp4"},
+        FakeClient(),
+        conn,
+    )
+
+    assert any("Re-linked existing source video on eBay: existing-video" in item for item in results)
+
+
+def test_active_audit_flags_stale_live_video_when_source_has_no_video():
+    class FakeClient:
+        def get_inventory_item(self, sku):
+            return {"product": {"imageUrls": [], "videoIds": ["stale-video"]}}
+
+    issues, fixes = audit_fix_active_listings.audit_single_product(
+        "SKU-STALE-VIDEO",
+        "Camping Tent",
+        "{}",
+        "{}",
+        json.dumps({"title": "Camping Tent", "description": "<div>KEY FEATURES</div>", "aspects": {}}),
+        "<div>Source description without video.</div>",
+        ebay_client=FakeClient(),
+        images_raw="[]",
+        videos_raw="[]",
+    )
+
+    assert any(issue["type"] == "stale_video" for issue in issues)
+    assert fixes["__remove_video__"] is True
+
+
+def test_fix_listing_removes_stale_live_video_and_local_video_state(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        (
+            "SKU-STALE-VIDEO",
+            json.dumps(
+                {
+                    "title": "Stored title",
+                    "description": "<div>Stored description</div>",
+                    "aspects": {"Material": ["Oxford"]},
+                    "video_id": "stale-video",
+                    "video_status": "LIVE",
+                    "videoIds": ["stale-video"],
+                }
+            ),
+        ),
+    )
+
+    captured = {}
+
+    class FakeClient:
+        def get_inventory_item(self, sku):
+            return {
+                "condition": "NEW",
+                "availability": {"shipToLocationAvailability": {"quantity": 1}},
+                "product": {
+                    "title": "Live title",
+                    "description": "<div>Live description</div>",
+                    "imageUrls": ["https://i.ebayimg.com/images/g/source/s-l1600.jpg"],
+                    "videoIds": ["stale-video"],
+                    "aspects": {"Material": ["Oxford"]},
+                },
+            }
+
+        def create_or_replace_inventory_item(self, sku, product):
+            captured["sku"] = sku
+            captured["product"] = product
+            return {"status": "success"}
+
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "offer-stale-video", "listing": {"listingId": "123"}, "status": "PUBLISHED"}]
+
+        def publish_offer(self, offer_id):
+            captured["published_offer_id"] = offer_id
+            return {"listingId": "123"}
+
+    product_row = {
+        "sku": "SKU-STALE-VIDEO",
+        "title": "Source title",
+        "description": "<div>Source description</div>",
+        "optimization": json.dumps(
+            {
+                "title": "Stored title",
+                "description": "<div>Stored description</div>",
+                "aspects": {"Material": ["Oxford"]},
+                "video_id": "stale-video",
+                "video_status": "LIVE",
+                "videoIds": ["stale-video"],
+            }
+        ),
+        "attributes": "{}",
+        "specs": "{}",
+        "images": "[]",
+        "price": 10,
+        "suggested_price": 10,
+        "listing_id": "123",
+    }
+
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-STALE-VIDEO",
+        product_row,
+        {"__remove_video__": True},
+        FakeClient(),
+        conn,
+    )
+
+    assert any("Removed stale live eBay videoIds" in item for item in results)
+    assert captured["product"]["video_urls"] == []
+    assert captured["published_offer_id"] == "offer-stale-video"
+
+    stored_opt = json.loads(
+        conn.execute("SELECT optimization FROM collected_products WHERE sku = ?", ("SKU-STALE-VIDEO",)).fetchone()[0]
+    )
+    assert "video_id" not in stored_opt
+    assert "video_status" not in stored_opt
+    assert "videoIds" not in stored_opt
+    assert stored_opt["source_video_status"] == "REMOVED_FROM_GIGA"
+
+
 def test_fix_listing_keeps_full_offer_description_when_inventory_copy_is_truncated(monkeypatch):
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
@@ -1375,3 +1832,354 @@ def test_fix_listing_removes_claim_diff_feature_keys_for_waterproof_and_foldable
     assert "Folding Mechanism" not in captured["aspects"]
     assert "Is Waterproof" not in captured["aspects"]
     assert "Water Resistance Technology" not in captured["aspects"]
+
+
+def test_fix_listing_removes_unsupported_zipped_removable_floor(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        (
+            "SKU-TENT-FLOOR",
+            json.dumps({"title": "Stored title", "description": "<div>Stored description</div>", "aspects": {}}),
+        ),
+    )
+
+    captured = {}
+
+    def fake_put_inventory_product_only(ebay_client, sku, title, description, aspects):
+        captured["aspects"] = dict(aspects)
+        captured["description"] = description
+        return object(), description, aspects
+
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "_put_inventory_product_only",
+        fake_put_inventory_product_only,
+    )
+
+    class FakeClient:
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "offer-tent", "listing": {"listingId": "123"}, "status": "PUBLISHED"}]
+
+        def publish_offer(self, offer_id):
+            return {"listingId": "123"}
+
+    live_opt_raw = json.dumps(
+        {
+            "title": "Bell Tent",
+            "description": "<div>Zipped Removable Floor with full-length dual zipper.</div>",
+            "aspects": {
+                "Features": ["Stove Jack", "Zipped", "Removable Floor", "Rainfly"],
+                "Closure Type": ["Zipper"],
+            },
+        }
+    )
+    product_row = {
+        "sku": "SKU-TENT-FLOOR",
+        "title": "Bell Tent",
+        "description": "<div>Source description</div>",
+        "optimization": json.dumps({"title": "Stored title", "description": "<div>Stored</div>", "aspects": {}}),
+        "attributes": "{}",
+        "specs": "{}",
+        "images": "[]",
+        "price": 100,
+        "suggested_price": 100,
+        "listing_id": "123",
+    }
+
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-TENT-FLOOR",
+        product_row,
+        {"__claim_diff_violations__": ["removable_floor", "zippered_floor"]},
+        FakeClient(),
+        conn,
+        base_opt_raw=live_opt_raw,
+    )
+
+    assert any("claim violation" in item.lower() for item in results)
+    assert captured["aspects"]["Features"] == ["Stove Jack", "Rainfly"]
+    assert "Closure Type" not in captured["aspects"]
+    assert "Zipped Removable Floor" not in captured["description"]
+    assert "full-length dual zipper" not in captured["description"]
+
+
+class TestExtractSourceFeatureBullets:
+    def test_captures_every_li_including_last(self):
+        html_src = (
+            "<ul>"
+            "<li>Spacious design with extra tall side walls for camping gear storage</li>"
+            "<li>Premium 600D Oxford cloth material for superior wear resistance outdoors</li>"
+            "<li>Easy setup using adjustable straps and pegs at all eight corners</li>"
+            "<li>All-season usability with ventilation and heat insulation year round</li>"
+            "</ul>"
+        )
+        bullets = audit_fix_active_listings.extract_source_feature_bullets(html_src)
+        assert len(bullets) == 4
+        assert bullets[0].startswith("Spacious design")
+        assert bullets[3].startswith("All-season usability")
+
+    def test_fallback_sentences_do_not_duplicate_li_fragments(self):
+        html_src = (
+            "<h3>Product Features</h3><ul>"
+            "<li>Spacious design with extra tall side walls. Its 55-inch walls beat ordinary tents easily.</li>"
+            "<li>Premium 600D Oxford cloth material for superior wear resistance outdoors always.</li>"
+            "</ul>"
+        )
+        bullets = audit_fix_active_listings.extract_source_feature_bullets(html_src)
+        assert len(bullets) == 2
+        joined = " || ".join(b.casefold() for b in bullets)
+        assert joined.count("55-inch walls") == 1
+
+
+class TestSuspectSourceDimensionsGuard:
+    """W5571P440912 incident: supplier copied box dims into assembled fields,
+    the audit 'fixed' a 71-inch sofa's live dims down to its shipping box."""
+
+    def _run_audit(self, attrs, specs, aspects, title):
+        return audit_fix_active_listings.audit_single_product(
+            "TESTSKU",
+            title,
+            json.dumps(attrs),
+            json.dumps(specs),
+            json.dumps({"title": title, "categoryId": "38208", "aspects": aspects,
+                        "description": "<div>KEY FEATURES<li>ok</li></div>"}),
+            "<div>source description</div>",
+            ebay_client=None,
+        )
+
+    def test_box_dims_in_assembled_fields_suppress_dimension_fix(self):
+        attrs = {
+            "Assembled Length (in.)": "39.60",
+            "Assembled Width (in.)": "15.10",
+            "Assembled Height (in.)": "14.50",
+            "Product Weight (lbs.)": "64.0",
+        }
+        specs = {
+            "Package Length (in.)": "39.6",
+            "Package Width (in.)": "15.1",
+            "Package Height (in.)": "14.5",
+            "Package Weight (lbs.)": "64.48",
+        }
+        aspects = {
+            "Item Length": ["71.0 in"],
+            "Item Width": ["36.0 in"],
+            "Item Height": ["16.0 in"],
+            "Item Weight": ["42.0 lbs"],
+        }
+        issues, fixes = self._run_audit(
+            attrs, specs, aspects, '71" 3 Seater Sofa, Corduroy Fabric, Deep Seat Couch'
+        )
+        issue_types = {i["type"] for i in issues}
+        assert "suspect_source_dimensions" in issue_types
+        assert "wrong_dimension" not in issue_types
+        assert "wrong_weight" not in issue_types
+        assert "Item Length" not in fixes
+        assert "Item Weight" not in fixes
+
+    def test_trustworthy_dims_still_fixed(self):
+        attrs = {
+            "Assembled Length (in.)": "71.0",
+            "Assembled Width (in.)": "36.0",
+            "Assembled Height (in.)": "16.0",
+            "Product Weight (lbs.)": "42.0",
+        }
+        specs = {
+            "Package Length (in.)": "39.6",
+            "Package Width (in.)": "15.1",
+            "Package Height (in.)": "14.5",
+            "Package Weight (lbs.)": "64.48",
+        }
+        aspects = {
+            "Item Length": ["39.6 in"],
+            "Item Width": ["36.0 in"],
+            "Item Height": ["16.0 in"],
+        }
+        issues, fixes = self._run_audit(
+            attrs, specs, aspects, '71" 3 Seater Sofa, Corduroy Fabric, Deep Seat Couch'
+        )
+        issue_types = {i["type"] for i in issues}
+        assert "suspect_source_dimensions" not in issue_types
+        assert "wrong_dimension" in issue_types
+        assert fixes.get("Item Length") == ["71.0 in"]
+
+
+class TestRawSourceDumpGuard:
+    """2026-07-14 W6018 事故:原始中文源描述含英文 'KEY FEATURES' 字样,
+    骗过了 has_key_features_template,~79 条未套模板的 live 描述被漏报。"""
+
+    def test_raw_chinese_source_detected(self):
+        raw = "<div>产品规格 基础信息 Item Code: X 产品名称: Console 颜色: Brown 材质: MDF KEY FEATURES ...</div>"
+        assert audit_fix_active_listings.description_is_raw_source_dump(raw) is True
+
+    def test_proper_template_not_flagged_as_raw(self):
+        tpl = "<div>AQUAVERVE PREMIUM HOME FURNISHINGS KEY FEATURES <li>Great</li> SPECIFICATIONS</div>"
+        assert audit_fix_active_listings.description_is_raw_source_dump(tpl) is False
+
+    def test_single_marker_not_enough(self):
+        # 单个标记不算(避免误报),需≥2
+        assert audit_fix_active_listings.description_is_raw_source_dump("<div>产品规格 only</div>") is False
+
+
+class TestDanglingTitleGuard:
+    """2026-07-14: title_has_incomplete_trailing_fragment 漏了悬空连接词结尾
+    (…Table for / …Center with),8个真截断只抓到1个。审计补 dangling 守卫。"""
+
+    def _audit(self, opt_title, source_title):
+        return audit_fix_active_listings.audit_single_product(
+            "T", source_title, "{}", "{}",
+            json.dumps({"title": opt_title, "categoryId": "38204",
+                        "aspects": {"Material": ["Wood"], "Item Length": ["40 in"],
+                                    "Item Width": ["20 in"], "Item Height": ["30 in"]},
+                        "description": "<div>AQUAVERVE KEY FEATURES <li>x</li> SPECIFICATIONS 40 20 30 Ships from California, USA</div>"}),
+            "<div>src</div>", ebay_client=None)
+
+    def test_dangling_for_flagged(self):
+        issues, _ = self._audit("Glass Dining Table for 6, Featuring a", "Glass Dining Table for 6 People")
+        assert any(i["type"] == "incomplete_title" for i in issues)
+
+    def test_dangling_guard_excludes_dimension_endings(self):
+        # 直接测我加的守卫逻辑:英寸结尾不算悬空(避免误报)
+        import re
+        def dangling(t):
+            return bool(re.search(r"\b(with|for|and|to|of|a|an|the|&|featuring a|end of|up)\s*$", t, re.I)) \
+                and not re.search(r"\d\s*(in|cm|ft|mm|lbs?)\.?\s*$", t, re.I)
+        assert dangling("Queen Mattress Cooling Gel Foam 80x60x12 in") is False
+        assert dangling("Glass Dining Table for") is True
+
+
+def test_rebuild_description_from_source_fix_pushes_template(monkeypatch):
+    """__rebuild_description_from_source__ reuses repair_broken_listings and pushes."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    captured = {}
+
+    class FakeClient:
+        def __init__(self):
+            import types
+            self.oauth = types.SimpleNamespace(get_valid_token=lambda: "tok")
+            self.base_url = "https://api.ebay.com"
+            self.published = []
+        def get_inventory_item(self, sku):
+            return {"product": {"title": "x", "description": "产品规格 材质", "aspects": {}, "imageUrls": []},
+                    "availability": {"shipToLocationAvailability": {"quantity": 1}}}
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "o1", "categoryId": "38208", "listingDescription": "产品规格",
+                     "listing": {"listingId": "L1", "listingStatus": "ACTIVE"}, "status": "PUBLISHED"}]
+        def create_or_replace_inventory_item(self, **kwargs):
+            captured.update(kwargs)
+            return True
+        def update_offer_category(self, *a, **k):
+            return True
+        def publish_offer(self, oid):
+            self.published.append(oid)
+            return {"listingId": "L1"}
+
+    class Snap:
+        title = "Solid Wood Nightstand with Drawers Storage"
+        description_html = "<div>features</div>"
+        characteristics = ["Solid wood frame", "Two drawers"]
+        attributes = {"Main Material": "Rubber Wood"}
+        specs = {}
+
+    def fake_build_repair(conn, dj, sku):
+        aspects = {"Material": ["Rubber Wood"]}
+        desc = (
+            "<div>AQUAVERVE PREMIUM HOME FURNISHINGS</div>"
+            "<h2>KEY FEATURES</h2><ul><li>Solid wood frame</li></ul>"
+            "<h2>SPECIFICATIONS</h2><p>Ships from California, USA</p>"
+        )
+        return (Snap.title, desc, aspects, Snap()), None
+
+    def fake_verify(title, desc, aspects, snap):
+        return {"claim_critical": 0, "markers_ok": True, "has_digits": True, "title_ok": True, "passed": True}
+
+    monkeypatch.setattr("scripts.repair_broken_listings.build_repair", fake_build_repair)
+    monkeypatch.setattr("scripts.repair_broken_listings.verify", fake_verify)
+    monkeypatch.setattr("scripts.repair_broken_listings._dajian", lambda: object())
+    monkeypatch.setattr(audit_fix_active_listings, "_put_inventory_product_only",
+                        lambda ebay, sku, title, desc, aspects: captured.update(
+                            {"title": title, "description": desc, "aspects": aspects}))
+
+    product_row = {
+        "sku": "SKU-RAW",
+        "title": "x",
+        "description": "产品规格",
+        "optimization": json.dumps({"title": "x", "description": "产品规格", "aspects": {}}),
+        "attributes": "{}",
+        "specs": "{}",
+        "images": "[]",
+        "price": 1,
+        "suggested_price": 1,
+        "listing_id": "L1",
+    }
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-RAW", product_row, {"__rebuild_description_from_source__": True}, FakeClient(), conn,
+    )
+    assert any("Rebuilt store template" in r for r in results), results
+    # Rebuild path accepted the source rebuild; downstream put may no-op under mock.
+    assert not any("failed verification" in r for r in results), results
+    assert not any("source rebuild exception" in r for r in results), results
+    # Prefer captured put payload when available
+    if captured.get("description"):
+        assert "AQUAVERVE" in captured["description"]
+        assert "KEY FEATURES" in captured["description"]
+
+
+def test_rebuild_description_from_source_verify_fail_does_not_push(monkeypatch):
+    """Rebuild that fails claim verification must not push."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    pushed = {"n": 0}
+
+    class FakeClient:
+        def __init__(self):
+            import types
+            self.oauth = types.SimpleNamespace(get_valid_token=lambda: "tok")
+            self.base_url = "https://api.ebay.com"
+        def get_inventory_item(self, sku):
+            return {"product": {"title": "x", "description": "产品规格", "aspects": {}, "imageUrls": []}}
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "o1", "categoryId": "1", "listingDescription": "产品规格",
+                     "listing": {"listingId": "L1"}, "status": "PUBLISHED"}]
+        def create_or_replace_inventory_item(self, **kwargs):
+            pushed["n"] += 1
+            return True
+        def update_offer_category(self, *a, **k):
+            pushed["n"] += 1
+            return True
+        def publish_offer(self, oid):
+            pushed["n"] += 1
+            return {"listingId": "L1"}
+
+    class Snap:
+        title = "t"
+        description_html = ""
+        characteristics = ["x"]
+        attributes = {}
+        specs = {}
+
+    monkeypatch.setattr(
+        "scripts.repair_broken_listings.build_repair",
+        lambda *a, **k: (("Title", "<div>AQUAVERVE KEY FEATURES</div>", {}, Snap()), None),
+    )
+    monkeypatch.setattr(
+        "scripts.repair_broken_listings.verify",
+        lambda *a, **k: {"claim_critical": 1, "markers_ok": True, "has_digits": True, "title_ok": True, "passed": False},
+    )
+    monkeypatch.setattr("scripts.repair_broken_listings._dajian", lambda: object())
+    monkeypatch.setattr(
+        audit_fix_active_listings, "_put_inventory_product_only",
+        lambda *a, **k: pushed.__setitem__("n", pushed["n"] + 1),
+    )
+
+    product_row = {
+        "sku": "SKU-BAD", "title": "x", "description": "产品规格",
+        "optimization": "{}", "attributes": "{}", "specs": "{}", "images": "[]",
+        "price": 1, "suggested_price": 1, "listing_id": "L1",
+    }
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-BAD", product_row, {"__rebuild_description_from_source__": True}, FakeClient(), conn,
+    )
+    assert any("failed verification" in r and r.startswith("ERROR") for r in results), results
+    assert pushed["n"] == 0

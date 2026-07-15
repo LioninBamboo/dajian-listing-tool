@@ -194,6 +194,26 @@ python batch_publish.py --sku YOURSKU
 | `assembly_description_missing` | 当 item specifics 写了 `Assembly Required=Yes`，description 也必须显式说明需要 assembly；修完后 republish live offer |
 | `missing_foldable` | 这是 `hallucinated_foldable` 的反向问题：如果 GIGA 明确支持 foldable/collapsible，例如 drop leaf kitchen island，publish path 不应把该能力误清洗掉 |
 | `missing_video` | 先区分 source 是否真的有可发布视频；source 有视频而 live 没有 `videoIds` 时，修复视频补链 / 上传链路，不要只改邮件文案 |
+| `suspect_source_dimensions` | 供应商把压缩包装尺寸填进 assembled 字段（assembled == package 且标题声明更大尺寸，例：W5571P440912 的 71" 沙发）。此时源尺寸不可信，audit 自动压制尺寸/重量/描述尺寸修复，仅报告；不要手动把 live 尺寸改成源值 |
+| 类目被 "sofa table" 误触发 | "Sofa Table / Sofa Side Table / Behind Couch / Console Table" 是桌类不是沙发；`classify_listing_profile` 和 `canonicalize_category` 均已加排除（2026-07-13 事故：床头柜与玄关桌被改到 38208，"Storage Bedside" 子串还曾命中 "storage bed" 被改到 175758 床架） |
+
+## 语义事实表护栏 (Layer 2.5)
+
+规则表永远追不上幻觉长尾（真实案例 W3636P456662：source 写 `600D Oxford`，live 标题写成 `Canvas`，材质升级链里没有 oxford→canvas，规则层沉默了近三个月）。`src/utils/listing_fact_sheet.py` 用"LLM 提取 + 确定性 diff"补这个洞：
+
+- LLM 只做**提取**：把 source 和 live 内容各转成结构化事实表（materials / features / counts / capacity / certifications / dimensions）；
+- 幻觉判定是**确定性 diff**：live 声明必须能被 source 事实表支持（token 重叠 + 同义词组桥接，如 `4 season` ≈ `year-round use`）；
+- 材质词典兜底：LLM 可能把标题里的 `Canvas Bell Tent` 读成品类词，`lexical_materials()` 确定性扫描强制补全材质声明；
+- 事实表按内容 hash 缓存（`fact_sheet_cache` 表），source/live 没变就不再调 LLM；
+- 已接入 `audit_fix_active_listings.py`（Layer 2.5，报告-only，不自动改写），环境开关 `AUDIT_SEMANTIC_FACT_SHEET=0` 可关闭；
+- 已知限制：source 中的否定语（"Unlike cotton tents"）会把 cotton 计入 source 支持，v1 不做否定识别。
+
+## 源内容刷新与出单复核
+
+采集快照会过期——卖家会改标题/参数/文案/视频，甚至下架。两条新链路让审计对比的是供应商**当前**真相：
+
+- `scripts/source_content_refresh.py`（每天 10:55，排在 11:30 审计前）：批量重抓 Dajian `detailInfo`，字段级漂移检测并修复本地快照。漂移分四类：`enrichment`（采集时缺失，静默补全）、`normalize`（首刷把加工过的存量值归位成忠实源值）、`repair`（乱码快照重建）、`change`（卖家真实变更，告警 + 写入 `logs/source_drift_skus.txt` 交给审计）。视频 URL 按 path 比较（GigaB2B 签名参数轮换不算漂移），尺寸数值 0.1 容差（存储精度差异不算漂移）。漂移记录在 `source_drift_log` 表。
+- `scripts/order_source_recheck.py`（每 6 小时，lookback 8h 留重叠）：Trading `GetOrders` 拉新订单，对出单 SKU 立即重抓源 + 比对 live 声明（claim 引擎 + 尺寸容差 1in/2lbs + source 可购性），CRITICAL 不符即发邮件——发货前是拦退款的最后窗口。复核记录在 `order_recheck_log` 表（按 order_id+sku 去重）。Inventory-blind 的 Trading 老 listing 走 `GetItem` fallback 读 live 内容。
 
 ## Active Listing Audit Guardrails
 

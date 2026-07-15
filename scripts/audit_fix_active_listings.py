@@ -110,6 +110,7 @@ from src.utils.title_sanitizer import (
 
 
 _CATEGORY_MATCHER = None
+_FACT_SHEET_CONN = None
 
 
 def get_category_matcher():
@@ -117,6 +118,14 @@ def get_category_matcher():
     if _CATEGORY_MATCHER is None:
         _CATEGORY_MATCHER = create_category_matcher(os.getenv("EBAY_ENVIRONMENT", "PRODUCTION"))
     return _CATEGORY_MATCHER
+
+
+def get_fact_sheet_conn():
+    """Dedicated connection for the fact-sheet cache (semantic guard layer)."""
+    global _FACT_SHEET_CONN
+    if _FACT_SHEET_CONN is None:
+        _FACT_SHEET_CONN = sqlite3.connect(DB_PATH)
+    return _FACT_SHEET_CONN
 
 
 # ── Non-applicable aspect rules ──
@@ -201,6 +210,9 @@ CLAIM_SPECIFIC_ASPECT_KEY_PATTERNS = {
         r"\bwaterproof\b",
         r"\bwater\s+resistance\b",
         r"\bwater\s+resistant\b",
+    ),
+    "zippered_floor": (
+        r"\bclosure\s+type\b",
     ),
 }
 
@@ -291,6 +303,18 @@ def description_has_key_features_template(description: str) -> bool:
     return "key features" in lowered and "<li" in lowered
 
 
+# Raw GIGA source field labels (Chinese). Their presence means the listing is
+# showing the untemplated supplier data dump, NOT the store template — even
+# when an English "KEY FEATURES" string happens to also be in the raw source.
+_RAW_SOURCE_MARKERS = ("产品规格", "基础信息", "产品名称:", "产品类型:", "产品尺寸", "组装长度")
+
+
+def description_is_raw_source_dump(description: str) -> bool:
+    if not description:
+        return False
+    return sum(1 for m in _RAW_SOURCE_MARKERS if m in description) >= 2
+
+
 def description_has_visible_template_artifacts(description: str) -> bool:
     if not description:
         return False
@@ -325,10 +349,16 @@ def extract_source_feature_bullets(source_description: str, *, limit: int = 6) -
     source_text = strip_html_text(source_description or "")
     for sentence in re.split(r"(?<=[.!?])\s+", source_text):
         text = re.sub(r"\s+", " ", sentence).strip(" -•")
+        # Section headings glue onto the first sentence after HTML stripping.
+        text = re.sub(r"^(?:Product Features|Features|Specifications)\s+", "", text, flags=re.IGNORECASE)
         if len(re.findall(r"[A-Za-z0-9]+", text)) < 6:
             continue
         normalized = text.casefold()
         if normalized in seen:
+            continue
+        # A sentence carved out of an already-captured bullet is a fragment,
+        # not a new selling point — padding with it just duplicates copy.
+        if any(normalized in existing or existing in normalized for existing in seen):
             continue
         seen.add(normalized)
         bullets.append(text)
@@ -727,7 +757,7 @@ def audit_single_product(
         })
         fixes["__title__"] = cleaned_title
 
-    if ebay_client and (len(db_images) >= 2 or bool(db_videos)):
+    if ebay_client and (len(db_images) >= 2 or bool(db_videos) or videos_raw is not None):
         try:
             if live_inventory is None:
                 live_inventory = ebay_client.get_inventory_item(sku) or {}
@@ -761,6 +791,15 @@ def audit_single_product(
                     ),
                 })
                 fixes["__sync_video__"] = db_videos[0]
+            elif not db_videos and live_video_ids:
+                issues.append({
+                    "type": "stale_video",
+                    "severity": "HIGH",
+                    "current": len(live_video_ids),
+                    "expected": 0,
+                    "detail": "Live eBay inventory still has videoIds but current GIGA/source data has no video",
+                })
+                fixes["__remove_video__"] = True
         except Exception as exc:
             logging.warning(f"[AUDIT] {sku}: failed to inspect live listing media: {exc}")
 
@@ -774,7 +813,20 @@ def audit_single_product(
         })
         fixes["__sanitize_live_description_html__"] = True
 
-    if live_description and not description_has_key_features_template(live_description):
+    # Raw-source dump guard — checked FIRST because such a description also
+    # contains an English "KEY FEATURES" string and would otherwise pass the
+    # template check below (this gap silently shipped ~79 untemplated live
+    # descriptions; found 2026-07-14 via W6018P506376).
+    if description_is_raw_source_dump(raw_live_description):
+        issues.append({
+            "type": "description_raw_source_dump",
+            "severity": "CRITICAL",
+            "field": "description",
+            "expected": "store AQUAVERVE template rebuilt from source characteristics",
+            "detail": "Live description is the raw GIGA supplier data dump (Chinese field labels), not the store template",
+        })
+        fixes["__rebuild_description_from_source__"] = True
+    elif live_description and not description_has_key_features_template(live_description):
         issues.append({
             "type": "description_structure_missing_key_features",
             "severity": "HIGH",
@@ -847,6 +899,37 @@ def audit_single_product(
     # ── 2. Dimension Accuracy ──
     source_dims = extract_all_dimensions(attrs)
 
+    # Compressed-shipping trap: some suppliers copy the box dimensions into
+    # the assembled fields (assembled == package on every axis). When the
+    # title itself declares a much larger size, the assembled values are
+    # untrustworthy — "fixing" live dims to them would shrink a 71" sofa to
+    # its shipping box (live incident W5571P440912, 2026-07-13).
+    source_dims_trustworthy = True
+    package_axes = [
+        extract_num(specs.get(key)) if specs.get(key) else None
+        for key in ("Package Length (in.)", "Package Width (in.)", "Package Height (in.)")
+    ]
+    assembled_axes = [source_dims.get("length"), source_dims.get("width"), source_dims.get("height")]
+    if all(v is not None for v in package_axes) and all(v is not None for v in assembled_axes):
+        axes_match_package = all(
+            abs(assembled - package) <= 0.15
+            for assembled, package in zip(assembled_axes, package_axes)
+        )
+        title_inches = [
+            float(m)
+            for m in re.findall(r'(\d{2,3}(?:\.\d+)?)\s*(?:"|inch|in\b)', f"{title} {opt_title}".lower())
+        ]
+        if axes_match_package and title_inches and max(title_inches) > max(assembled_axes) + 5:
+            source_dims_trustworthy = False
+            issues.append({
+                "type": "suspect_source_dimensions",
+                "severity": "HIGH",
+                "detail": (
+                    f"Source assembled dims {assembled_axes} equal package dims but title claims "
+                    f"{max(title_inches):g}\" — supplier likely filled box dims; dimension auto-fix suppressed"
+                ),
+            })
+
     dim_checks = [
         ("Item Length", source_dims.get("length")),
         ("Item Width", source_dims.get("width")),
@@ -854,7 +937,7 @@ def audit_single_product(
     ]
 
     for aspect_key, source_val in dim_checks:
-        if source_val is None:
+        if source_val is None or not source_dims_trustworthy:
             continue
 
         current_val_str, current_issue, current_num = extract_validated_numeric_aspect(
@@ -895,7 +978,7 @@ def audit_single_product(
             source_weight = desc_weight
         else:
             source_weight = None
-    if source_weight:
+    if source_weight and source_dims_trustworthy:
         weight_key = next((wk for wk in ["Item Weight", "Product Weight"] if wk in aspects), "Item Weight")
         weight_val_str, weight_issue, weight_num = extract_validated_numeric_aspect(
             aspects,
@@ -997,7 +1080,7 @@ def audit_single_product(
         fixes["__assembly_desc_update__"] = effective_assembly
 
     # ── 4. AI-hallucinated Product Dimensions ──
-    if "Product Dimensions" in aspects and source_dims.get("length"):
+    if "Product Dimensions" in aspects and source_dims.get("length") and source_dims_trustworthy:
         pd_str = aspects["Product Dimensions"][0] if isinstance(aspects["Product Dimensions"], list) else str(aspects["Product Dimensions"])
         # Check if the Product Dimensions string matches source
         nums_in_pd = re.findall(r'(\d+\.?\d*)', pd_str)
@@ -1022,7 +1105,7 @@ def audit_single_product(
                 fixes["Product Dimensions"] = [correct_pd]
 
     # ── 5. Description dimension consistency ──
-    if live_description and source_dims.get("length") and source_dims.get("width") and source_dims.get("height"):
+    if live_description and source_dims_trustworthy and source_dims.get("length") and source_dims.get("width") and source_dims.get("height"):
         desc_clean = re.sub(r'<[^>]+>', ' ', live_description).lower()
         l_str = str(source_dims["length"])
         w_str = str(source_dims["width"])
@@ -1047,7 +1130,7 @@ def audit_single_product(
             })
             fixes["__desc_needs_update__"] = True
 
-    if live_description and source_weight:
+    if live_description and source_weight and source_dims_trustworthy:
         desc_clean = re.sub(r'<[^>]+>', ' ', live_description).lower()
         weight_variants = {
             str(source_weight),
@@ -1125,7 +1208,7 @@ def audit_single_product(
         _source_constraints = build_source_constraints(
             source_title=title,
             source_description=description or "",
-            attrs={},
+            attrs=attrs,
             specs=specs,
         )
         _claim_violations = detect_claim_violations(
@@ -1150,6 +1233,38 @@ def audit_single_product(
             fixes["__claim_diff_violations__"] = _claim_violation_texts
     except Exception as e:
         print(f"ClaimDiffEngine error for sku {sku}: {e}")
+
+    # ── Layer 2.5: Semantic fact-sheet guard (LLM extract → deterministic diff) ──
+    # Report-only net for the long tail the rule tables cannot enumerate
+    # (e.g. source "600D Oxford" published as "Canvas" — no upgrade chain
+    # existed, so Layer 2 stayed silent). Extraction results are cached by
+    # content hash, so the LLM only runs when source or live content changed.
+    if os.getenv("AUDIT_SEMANTIC_FACT_SHEET", "1") != "0" and os.getenv("QWEN_API_KEY"):
+        try:
+            from src.utils.listing_fact_sheet import compare_fact_sheets, fact_sheet_for_content
+
+            _fs_conn = get_fact_sheet_conn()
+            _source_sheet = fact_sheet_for_content(_fs_conn, title, description or "", {**attrs, **specs})
+            _live_sheet = fact_sheet_for_content(_fs_conn, opt_title, live_description, aspects)
+            if _source_sheet and _live_sheet:
+                _existing_details = " || ".join(str(i.get("detail", "")) for i in issues).lower()
+                _strip_fs = lambda h: re.sub(r"<[^>]+>", " ", str(h or ""))
+                _live_txt = " ".join([opt_title or "", _strip_fs(live_description),
+                                      " ".join(f"{k}: {v}" for k, v in (aspects or {}).items())])
+                _source_txt = " ".join([title or "", _strip_fs(description),
+                                       " ".join(f"{k}: {v}" for k, v in {**attrs, **specs}.items())])
+                for _sv in compare_fact_sheets(_source_sheet, _live_sheet, live_text=_live_txt, source_text=_source_txt):
+                    if _sv["claim_type"] == "semantic_dimension" and not source_dims_trustworthy:
+                        continue  # source dims are box dims — comparison is meaningless
+                    if _sv["claim_text"].lower() in _existing_details:
+                        continue  # already reported by a rule layer
+                    issues.append({
+                        "type": _sv["claim_type"],
+                        "severity": _sv["severity"],
+                        "detail": f"[FactSheet] {_sv['claim_text']} — source evidence: {_sv['source_evidence']}",
+                    })
+        except Exception as e:
+            print(f"FactSheet guard error for sku {sku}: {e}")
     
     giga_text = f"{giga_title_l} {giga_desc_l} " + " ".join(str(v).lower() for v in attrs.values())
     opt_text = f"{opt_title_l} {opt_desc_l} " + " ".join(" ".join(str(x).lower() for x in v) if isinstance(v, list) else str(v).lower() for v in aspects.values())
@@ -1264,11 +1379,24 @@ def audit_single_product(
         })
         fixes["__hallucinated_position_count__"] = True
 
-    # 5. Foldable Hallucination
-    is_naturally_foldable = any(kw in opt_title_l or kw in giga_title_l for kw in ["umbrella", "camping chair", "canopy", "shade sail", "tent", "hammock"])
+    # 5. Foldable Hallucination — single arbiter (source_supports_foldable)
+    from src.utils.listing_quality_gate import source_supports_foldable as _source_supports_foldable
+
+    giga_has_foldable = _source_supports_foldable(
+        source_title=title,
+        source_description=description or "",
+        attributes=attrs,
+        specs=specs,
+    )
+    # Title-only natural products still skip dual-sided oscillation (umbrella/tent/…)
+    is_naturally_foldable = any(
+        kw in opt_title_l or kw in giga_title_l
+        for kw in ["umbrella", "camping chair", "canopy", "shade sail", "tent", "hammock"]
+    )
     if not is_naturally_foldable:
-        opt_has_foldable = bool(re.search(r'\b(?:foldable|collapsible|foldaway|folding|fold)\b', opt_text)) or any(x in ["Foldable", "Collapsible"] for x in aspects.get("Features", []))
-        giga_has_foldable = any(re.search(pat, giga_text) for pat in [r'\bfold', r'\bcollapse', r'折叠'])
+        opt_has_foldable = bool(
+            re.search(r"\b(?:foldable|collapsible|foldaway|folding|fold)\b", opt_text)
+        ) or any(x in ["Foldable", "Collapsible"] for x in aspects.get("Features", []))
         if opt_has_foldable and not giga_has_foldable:
             issues.append({
                 "type": "hallucinated_foldable",
@@ -1321,11 +1449,18 @@ def audit_single_product(
             fixes["__hallucinated_tempered_glass__"] = True
 
     # 9. Incomplete title truncation cleanup
-    if title_has_incomplete_trailing_fragment(opt_title, source_title=title or ""):
+    #    Two detectors: the fragment detector (half-words) AND a dangling
+    #    connector-word ending (…Table for / …Center with / …End of). The
+    #    latter caught 7 of 8 real truncations the fragment detector missed
+    #    (2026-07-14 W6018 sweep). Exclude dimension endings ("… 80x60 in").
+    _title_dangling = bool(
+        re.search(r"\b(with|for|and|to|of|a|an|the|&|featuring a|end of|up)\s*$", opt_title or "", re.I)
+    ) and not re.search(r"\d\s*(in|cm|ft|mm|lbs?)\.?\s*$", opt_title or "", re.I)
+    if title_has_incomplete_trailing_fragment(opt_title, source_title=title or "") or _title_dangling:
         issues.append({
             "type": "incomplete_title",
             "severity": "MEDIUM",
-            "detail": f"Optimized title ends with an incomplete word/character indicating truncation: '{opt_title}'"
+            "detail": f"Optimized title ends with an incomplete word/connector indicating truncation: '{opt_title}'"
         })
         fixes["__incomplete_title__"] = True
 
@@ -1948,16 +2083,114 @@ def build_structured_description_from_source(title, source_description, attrs, s
         f'<p style="margin:0;color:#636e72">{package_includes}</p>'
         '</div>'
         '<div style="text-align:center;padding:20px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
-        '<p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">✦ Ships from California, USA ✦</p>'
-        '<p style="margin:8px 0 0;font-size:11px;color:#808080">Quality Guaranteed • Fast Shipping • Dedicated Support</p>'
+        '<p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">✦ Ships from US Warehouse ✦</p>'
+        '<p style="margin:8px 0 0;font-size:11px;color:#808080">Quality Guaranteed • Fast US Shipping • Trusted Seller</p>'
         '</div>'
         '</div>'
     )
 
 
+def _ensure_live_video_id_attached(ebay_client, uploader, sku: str, video_id: str) -> bool:
+    """Ensure the uploaded video id is present on the live inventory product."""
+    target = str(video_id or "").strip()
+    if not target:
+        return False
+
+    for attempt in range(3):
+        try:
+            live_inventory = ebay_client.get_inventory_item(sku) or {}
+            live_video_ids = parse_image_list(((live_inventory.get("product") or {}).get("videoIds") or []))
+            if target in {str(item).strip() for item in live_video_ids}:
+                return True
+        except Exception as exc:
+            logging.warning(f"[AUDIT] {sku}: failed to verify live videoIds: {exc}")
+
+        if attempt == 0:
+            try:
+                if not uploader._add_video_to_ebay_inventory(sku, target):
+                    logging.warning(f"[AUDIT] {sku}: eBay inventory video attach returned false for {target}")
+            except Exception as exc:
+                logging.warning(f"[AUDIT] {sku}: failed to attach video {target}: {exc}")
+
+        time.sleep(1)
+
+    return False
+
+
+def _refresh_source_video_url(sku: str, fallback_url: str) -> str:
+    """Fetch a freshly signed GigaB2B video URL for *sku* when possible.
+
+    DB-stored videos often carry expired ``x-ct`` signature params. Returns
+    *fallback_url* unchanged when credentials/API/snapshot are unavailable.
+    """
+    fallback = str(fallback_url or "").strip()
+    try:
+        from src.clients.dajian_client import DaJianClient
+        from src.services.source_refresh import build_source_snapshot
+
+        client_id = os.getenv("DAJIAN_API_KEY")
+        client_secret = os.getenv("DAJIAN_API_SECRET")
+        if not client_id or not client_secret:
+            return fallback
+        client = DaJianClient(client_id, client_secret)
+        detail = client.get_product_detail_by_sku(sku)
+        snapshot = build_source_snapshot(detail or {})
+        if snapshot and snapshot.videos:
+            fresh = str(snapshot.videos[0] or "").strip()
+            if fresh:
+                return fresh
+    except Exception as exc:
+        logging.warning(f"[AUDIT] {sku}: fresh video URL refresh failed: {exc}")
+    return fallback
+
+
+def _stored_video_id_from_optimization(opt: dict) -> str:
+    if not isinstance(opt, dict):
+        return ""
+    video_id = str(opt.get("video_id") or "").strip()
+    if video_id:
+        return video_id
+    video_ids = opt.get("videoIds")
+    if isinstance(video_ids, list) and video_ids:
+        return str(video_ids[0] or "").strip()
+    if isinstance(video_ids, str):
+        return video_ids.strip()
+    return ""
+
+
+def _remove_live_video_ids_from_inventory(ebay_client, sku: str) -> bool:
+    live_inventory = ebay_client.get_inventory_item(sku) or {}
+    product = live_inventory.get("product") or {}
+    if not product:
+        return False
+
+    quantity = (
+        ((live_inventory.get("availability") or {}).get("shipToLocationAvailability") or {})
+        .get("quantity")
+    )
+    from src.utils.ebay_quantity import normalize_ebay_listing_quantity
+
+    payload = {
+        "title": product.get("title") or "",
+        "description": product.get("description") or "",
+        "image_urls": list(product.get("imageUrls") or []),
+        "video_urls": [],
+        "price": 99.99,
+        "quantity": normalize_ebay_listing_quantity(quantity or 1),
+        "condition": live_inventory.get("condition") or "NEW",
+        "aspects": dict(product.get("aspects") or {}),
+    }
+    if live_inventory.get("packageWeightAndSize"):
+        payload["packageWeightAndSize"] = live_inventory.get("packageWeightAndSize")
+
+    ebay_client.create_or_replace_inventory_item(sku=sku, product=payload)
+    return True
+
+
 def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_opt_raw=None):
     """Apply fixes to a published eBay listing."""
     results = []
+    stored_opt = parse_json(product_row["optimization"])
     opt = parse_json(base_opt_raw if base_opt_raw is not None else product_row["optimization"])
     aspects = opt.get("aspects", {}) if isinstance(opt, dict) else {}
     title = opt.get("title", product_row["title"] or "")
@@ -1984,6 +2217,9 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
     product_only_update = False
     needs_inventory_update = False
     republished_listing_id = None
+    video_changed = False
+    synced_video_id = None
+    video_removed = False
 
     # Apply aspect fixes
     for key, value in fixes.items():
@@ -2005,15 +2241,43 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
             from src.services.ebay_video_uploader import EbayVideoUploader
 
             uploader = EbayVideoUploader(ebay_client.oauth)
+            existing_video_id = _stored_video_id_from_optimization(stored_opt)
+            if existing_video_id and _ensure_live_video_id_attached(ebay_client, uploader, sku, existing_video_id):
+                synced_video_id = existing_video_id
+                video_changed = True
+                results.append(f"Re-linked existing source video on eBay: {existing_video_id}")
+                continue
+
+            # Prefer a freshly signed GigaB2B video URL (DB snapshots often carry
+            # expired x-ct query params). Fall back to the stored URL on failure.
+            stored_video_url = str(value or "").strip()
+            video_url = _refresh_source_video_url(sku, stored_video_url)
+            if video_url != stored_video_url:
+                results.append(f"Refreshed source video URL for {sku} before upload")
+
             video_id = uploader.upload_video_sync(
-                str(value or "").strip(),
+                video_url,
                 sku,
                 title or source_title or "Product Video",
             )
-            if video_id:
+            if video_id and _ensure_live_video_id_attached(ebay_client, uploader, sku, video_id):
+                synced_video_id = video_id
+                video_changed = True
                 results.append(f"Uploaded and linked source video to eBay: {video_id}")
             else:
-                results.append(f"ERROR: Failed to upload/link source video for {sku}")
+                err = str(getattr(uploader, "last_upload_error", "") or "")
+                if err.startswith("unsupported_source") or "not a direct downloadable" in err:
+                    # Source is permanently unusable for eBay (e.g. .txt placeholder)
+                    results.append(f"ERROR: video_source_dead for {sku}: {err}")
+                else:
+                    results.append(f"ERROR: Failed to upload/link source video for {sku}")
+            continue
+        if key == "__remove_video__":
+            if _remove_live_video_ids_from_inventory(ebay_client, sku):
+                video_removed = True
+                results.append("Removed stale live eBay videoIds")
+            else:
+                results.append(f"ERROR: Failed to remove stale live eBay videoIds for {sku}")
             continue
         if key == "__assembly_desc_update__":
             updated_description = rewrite_assembly_copy(description, value)
@@ -2035,6 +2299,41 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
                 description = sanitized_description
                 description_changed = True
                 results.append("Live description HTML artifacts sanitized")
+            continue
+        if key == "__rebuild_description_from_source__":
+            # W6018 accident closure: rebuild store template from fresh source.
+            # Reuse repair_broken_listings (do not duplicate rebuild logic).
+            try:
+                from scripts.repair_broken_listings import _dajian, build_repair, verify
+
+                dj = _dajian()
+                built, reason = build_repair(db_conn, dj, sku)
+                if built is None:
+                    results.append(
+                        f"ERROR [{sku}]: source rebuild skipped ({reason or 'unknown'})"
+                    )
+                    continue
+                new_title, new_desc, new_aspects, snap = built
+                v = verify(new_title, new_desc, new_aspects, snap)
+                if not v.get("passed"):
+                    results.append(
+                        f"ERROR [{sku}]: source rebuild failed verification "
+                        f"(claim_critical={v.get('claim_critical')}, "
+                        f"markers_ok={v.get('markers_ok')}, title_ok={v.get('title_ok')}) — not pushed"
+                    )
+                    continue
+                title = new_title
+                title_changed = True
+                description = sanitize_generated_description_html(new_desc)
+                description_changed = True
+                aspects = dict(new_aspects or aspects)
+                aspect_changed = True
+                results.append(
+                    "Rebuilt store template + word-safe title from source "
+                    "(raw-source dump / broken listing guard)"
+                )
+            except Exception as exc:
+                results.append(f"ERROR [{sku}]: source rebuild exception: {exc}")
             continue
         if key == "__restore_live_description_from_local__":
             stored_opt = parse_json(product_row["optimization"])
@@ -2173,20 +2472,60 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
                 results.append("Description TSA lock references removed")
             continue
         if key == "__hallucinated_charging__":
-            if "Features" in aspects:
-                aspects["Features"] = [f for f in aspects["Features"] if not any(w in str(f).lower() for w in ["usb", "charger", "charging", "outlet", "power strip"])]
-                aspect_changed = True
-            new_title = re.sub(r'\b(?:usb|charging\s+station|power\s+outlet|charger)\b\s*', '', title, flags=re.IGNORECASE)
-            new_title = re.sub(r'\s+', ' ', new_title).strip()
-            if new_title != title:
+            # Strip USB/power tokens from title, description, AND all aspects
+            # (W2700 residual was Type="... with Power Strip", not Features/description).
+            charging_token_re = re.compile(
+                r"\b(?:usb(?:[-\s]?c)?|charging\s+stations?|charging\s+ports?|"
+                r"power\s+outlets?|power\s+strips?|built-in\s+outlets?|chargers?)\b",
+                flags=re.IGNORECASE,
+            )
+
+            def _scrub_charging_text(text: str) -> str:
+                cleaned = charging_token_re.sub(" ", str(text or ""))
+                cleaned = re.sub(r"\s{2,}", " ", cleaned)
+                cleaned = re.sub(r"\s+([,.;:/])", r"\1", cleaned)
+                cleaned = re.sub(r"(\s+with|\s+and|\s+or)\s*$", "", cleaned, flags=re.IGNORECASE)
+                return cleaned.strip(" -/,;|")
+
+            for aspect_key, aspect_val in list(aspects.items()):
+                vals = aspect_val if isinstance(aspect_val, list) else [aspect_val]
+                new_vals = []
+                for raw in vals:
+                    scrubbed = _scrub_charging_text(str(raw))
+                    if not scrubbed:
+                        continue
+                    # Drop pure charging feature labels
+                    if aspect_key == "Features" and re.fullmatch(
+                        r"(?:usb|charging|charger|outlet|power\s+strip|power\s+outlet)s?",
+                        scrubbed,
+                        flags=re.IGNORECASE,
+                    ):
+                        continue
+                    new_vals.append(scrubbed)
+                if new_vals != list(vals):
+                    if new_vals:
+                        aspects[aspect_key] = new_vals
+                    else:
+                        aspects.pop(aspect_key, None)
+                    aspect_changed = True
+                    results.append(f"Aspect {aspect_key} charging references removed")
+
+            new_title = _scrub_charging_text(title)
+            if new_title and new_title != title:
                 title = new_title
                 title_changed = True
                 results.append(f"Title charging references removed: {title}")
-            new_description = re.sub(r'\b(?:usb|charging\s+station|power\s+outlet|charger|power\s+strip|built-in\s+outlet)\b', 'Functional', description, flags=re.IGNORECASE)
+            new_description = charging_token_re.sub(" ", description)
+            new_description = re.sub(r"\s{2,}", " ", new_description)
             if new_description != description:
                 description = new_description
                 description_changed = True
                 results.append("Description charging station references removed")
+            # Always push buyer-visible offer listingDescription when charging cleanup runs
+            # (inventory product.description alone is truncated / secondary for audit reads).
+            if not description_changed and description:
+                description_changed = True
+                results.append("Offer listingDescription will be synced after charging cleanup")
             continue
         if key == "__hallucinated_leather__":
             if "Material" in aspects:
@@ -2485,6 +2824,8 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
         and compatibility_payload is None
         and not new_category_name
         and not image_restore_requested
+        and not video_changed
+        and not video_removed
     ):
         return results
 
@@ -2493,7 +2834,7 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
         offer_description = description
         # Read the live offer first so required-aspect completion uses the real
         # eBay category instead of a stale local category snapshot.
-        if category_changed or aspect_changed or description_changed or title_changed or image_restore_requested:
+        if category_changed or aspect_changed or description_changed or title_changed or image_restore_requested or video_changed or video_removed:
             offers = ebay_client.get_offers_by_sku(sku)
             live_offer = _select_best_offer(offers, expected_listing_id=product_row["listing_id"])
             if live_offer:
@@ -2628,6 +2969,32 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
             else:
                 results.append(f"ERROR: Offer {offer_id} republish failed after image restore")
 
+        if video_changed:
+            if live_offer and live_offer.get("offerId"):
+                offer_id = live_offer["offerId"]
+                publish_result = ebay_client.publish_offer(offer_id)
+                listing_id = publish_result.get("listingId") if publish_result else None
+                if listing_id:
+                    republished_listing_id = listing_id
+                    results.append(f"Offer {offer_id} republished after video sync")
+                else:
+                    results.append(f"ERROR: Offer {offer_id} republish failed after video sync")
+            else:
+                results.append("ERROR: No live offer found for video sync")
+
+        if video_removed:
+            if live_offer and live_offer.get("offerId"):
+                offer_id = live_offer["offerId"]
+                publish_result = ebay_client.publish_offer(offer_id)
+                listing_id = publish_result.get("listingId") if publish_result else None
+                if listing_id:
+                    republished_listing_id = listing_id
+                    results.append(f"Offer {offer_id} republished after video removal")
+                else:
+                    results.append(f"ERROR: Offer {offer_id} republish failed after video removal")
+            else:
+                results.append("ERROR: No live offer found for video removal")
+
         
         opt["aspects"] = aspects
         if new_category:
@@ -2640,6 +3007,15 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
             opt["description"] = description
         if compatibility_payload is not None:
             opt["motorsCompatibility"] = compatibility_payload
+        if synced_video_id:
+            opt["video_id"] = synced_video_id
+            opt["video_status"] = "UPLOADED"
+            opt["videoIds"] = [synced_video_id]
+        if video_removed:
+            opt.pop("video_id", None)
+            opt.pop("video_status", None)
+            opt.pop("videoIds", None)
+            opt["source_video_status"] = "REMOVED_FROM_GIGA"
         columns = _table_columns(db_conn, "collected_products")
         assignments = ["optimization = ?"]
         params = [json.dumps(opt, ensure_ascii=False)]

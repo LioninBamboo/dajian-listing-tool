@@ -50,3 +50,34 @@ def test_coffee_table_with_patio_keywords_is_not_canonicalized_to_patio_table():
     )
 
     assert matcher.canonicalize_category(title, "38204", "Coffee Tables") == ("38204", "Coffee Tables")
+
+
+def test_sofa_side_table_nightstand_not_remapped_to_sofas_or_beds():
+    """2026-07-13 live incident: 'Storage Bedside Table and Sofa Side Table'
+    was remapped 38199 -> 175758 (Bed Frames) by a substring 'storage bed'
+    match, and console tables were remapped to 38208 by the bare sofa word."""
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    title = "Solid Wood Nightstand with Two Drawers and Pull-out Panel Storage Bedside Table and Sofa Side Table"
+
+    category_id, _ = matcher.canonicalize_category(title, "38199", "Nightstands")
+
+    assert category_id in (None, "38199")
+
+
+def test_console_sofa_table_behind_couch_not_remapped_to_sofas():
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    title = "60 Inch Narrow Console Table with Built-in Power Outlet, Farmhouse Sofa Table Behind Couch, Entryway"
+
+    category_id, _ = matcher.canonicalize_category(title, "38204", "Tables")
+
+    assert category_id != "38208"
+
+
+def test_real_sofa_still_remapped_to_sofas():
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    title = "71 Inch 3 Seater Sofa Corduroy Fabric Deep Seat Couch Comfy Loveseat"
+
+    category_id, category_name = matcher.canonicalize_category(title, "38204", "Tables")
+
+    assert category_id == "38208"
+    assert category_name == "Sofas, Armchairs & Couches"

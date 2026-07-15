@@ -79,6 +79,17 @@ FEATURE_CLAIM_PATTERNS: dict[str, tuple[str, ...]] = {
     "lockable":        (r"\blockable\b", r"\bwith\s+lock\b"),
     "convertible":     (r"\bconvertible\b", r"\b(?:2|3|two|three)[\s-]*in[\s-]*(?:1|one)\b"),
     "removable_cover": (r"\bremovable\s+cover\b", r"\bwashable\s+cover\b"),
+    "removable_floor": (
+        r"\bremovable\s+(?:floor|bottom\s+cloth|groundsheet)\b",
+        r"\bdetachable\s+(?:floor|bottom\s+cloth|groundsheet)\b",
+    ),
+    "zippered_floor": (
+        r"\bzipped\b",
+        r"\bzippered\b",
+        r"\bzipper\b",
+        r"\bfull[-\s]*length\s+dual\s+zipper\b",
+        r"拉链",
+    ),
     "tsa_approved":    (r"\btsa\b", r"\btransportation\s+security\b"),
     "cushion":         (r"\bcushions?\b", r"\bcushioned\b", r"\bupholstered\b"),
 }
@@ -94,7 +105,22 @@ FEATURE_SOURCE_PATTERNS: dict[str, tuple[str, ...]] = {
     "uv_resistant":    (r"\buv[\s-]*resistant\b", r"防紫外线"),
     "weather_resistant": (r"\bweather[\s-]*resistant\b", r"\ball[\s-]*weather\b", r"耐候"),
     "fade_resistant":  (r"\bfade[\s-]*resistant\b", r"防褪色"),
-    "waterproof":      (r"\bwaterproof\b", r"防水"),
+    "waterproof":      (r"\bwaterproof\b", r"\bwater\s*proof\b", r"防水"),
+    # 2026-07-15: 补上误报的功能——源里有对应写法就不该判幻觉
+    "led_lighting":    (r"\bled\b", r"\blight(?:ing|s|ed)?\b", r"\brgb\b", r"灯", r"led灯"),
+    "convertible":     (r"\bconvertible\b", r"\bsleeper\b", r"\bpull[\s-]*out\b", r"\bsofa\s*bed\b", r"\bfold[\s-]*out\b", r"\brecline", r"变形", r"两用"),
+    "massage":         (r"\bmassage\b", r"\bmassaging\b", r"按摩"),
+    "heated":          (r"\bheated\b", r"\bheating\b", r"\bwarm(?:er|ing)?\b", r"加热", r"发热"),
+    "removable_floor": (
+        r"\bremovable\s+(?:floor|bottom\s+cloth|groundsheet)\b",
+        r"\bdetachable\s+(?:floor|bottom\s+cloth|groundsheet)\b",
+        r"可拆(?:卸)?(?:底布|地布|地垫)",
+    ),
+    "zippered_floor": (
+        r"\bzipper(?:ed)?\b",
+        r"\bzipped\b",
+        r"拉链",
+    ),
     # 其余 feature 默认用 FEATURE_CLAIM_PATTERNS 同名正则检测 source
 }
 
@@ -172,7 +198,11 @@ def build_source_constraints(
     
     materials = _extract_source_material_hint(attrs, source_description)
     
-    source_text_parts = [source_description]
+    # Include source_title: features like LED/convertible often live only in
+    # the product name ("...Desk with LED", "Convertible Sleeper Sofa"), so
+    # scanning description-only produced false unsupported_feature CRITICALs
+    # (2026-07-15). Title-based evidence must count.
+    source_text_parts = [source_description, source_title or ""]
     for m in (attrs, specs):
         for k, v in m.items():
             source_text_parts.append(f"{k}: {v}")
@@ -180,10 +210,25 @@ def build_source_constraints(
     
     supported_features = set()
     for feature_name, fallback_patterns in FEATURE_CLAIM_PATTERNS.items():
+        if feature_name == "foldable":
+            # Foldable is arbitrated solely by source_supports_foldable (includes title).
+            continue
         patterns = FEATURE_SOURCE_PATTERNS.get(feature_name, fallback_patterns)
         if any(re.search(p, source_text, re.IGNORECASE) for p in patterns):
             supported_features.add(feature_name)
-            
+
+    # Unique foldable arbiter — same inputs as listing_quality_gate / audit missing_foldable.
+    # Critical: includes source_title (previous bug: title-only "Folding …" was invisible).
+    from src.utils.listing_quality_gate import source_supports_foldable
+
+    if source_supports_foldable(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attrs,
+        specs=specs,
+    ):
+        supported_features.add("foldable")
+
     # For quantities, we simply extract numbers associated with keywords if possible,
     # but for this basic engine, we can leave counts mostly empty, relying on the source text
     # when detecting generated claims.

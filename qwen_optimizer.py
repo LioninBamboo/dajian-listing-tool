@@ -726,8 +726,8 @@ class QwenOptimizer:
    
    <!-- Footer -->
    <div style="text-align:center;padding:20px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">
-     <p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">✦ Ships from California, USA ✦</p>
-     <p style="margin:8px 0 0;font-size:11px;color:#808080">Quality Guaranteed • Fast Shipping • Dedicated Support</p>
+     <p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">✦ Ships from US Warehouse ✦</p>
+     <p style="margin:8px 0 0;font-size:11px;color:#808080">Quality Guaranteed • Fast US Shipping • Trusted Seller</p>
    </div>
    
    </div>

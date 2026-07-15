@@ -1224,6 +1224,112 @@ def test_quality_gate_blocks_unsupported_foldable_claim_from_ai_draft():
     assert any(issue.code == "unsupported_foldable_claim" for issue in issues)
 
 
+def test_normalize_generated_listing_restores_supported_foldable_feature():
+    normalized = normalize_generated_listing(
+        {
+            "title": "Pet Stroller for Dogs and Cats",
+            "description": "<div>Compact stroller for dogs and cats.</div>",
+            "categoryId": "139971",
+            "categoryName": "Pet Strollers",
+            "aspects": {"Brand": ["AquaVerve"]},
+        },
+        source_title="Pet Stroller for Dogs and Cats",
+        source_description="<div>Foldable pet stroller with storage basket.</div>",
+        attributes={
+            "Assembled Length (in.)": "30",
+            "Assembled Width (in.)": "18",
+            "Assembled Height (in.)": "39",
+        },
+        specs={},
+        images=["img1", "img2"],
+    )
+
+    assert "Foldable" in normalized["aspects"]["Features"]
+
+
+def test_quality_gate_blocks_missing_supported_foldable_feature():
+    issues = validate_listing_quality(
+        {
+            "title": "Pet Stroller for Dogs and Cats",
+            "description": "<div>Compact stroller for dogs and cats.</div>",
+            "categoryId": "139971",
+            "categoryName": "Pet Strollers",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Item Length": ["30 in"],
+                "Item Width": ["18 in"],
+                "Item Height": ["39 in"],
+            },
+        },
+        source_title="Pet Stroller for Dogs and Cats",
+        source_description="<div>Foldable pet stroller with storage basket.</div>",
+        attributes={
+            "Assembled Length (in.)": "30",
+            "Assembled Width (in.)": "18",
+            "Assembled Height (in.)": "39",
+        },
+        specs={},
+        images=["img1", "img2"],
+    )
+
+    assert any(issue.code == "missing_supported_foldable_feature" for issue in issues)
+
+
+def test_foldable_arbiter_agrees_with_claim_diff_on_real_titles():
+    """Oscillation regression: both detectors must agree on the same source inputs.
+
+    Uses real source titles from W5532P458418 / XW000029AAB handoff residual SKUs.
+    """
+    from src.utils.claim_diff_engine import build_source_constraints
+    from src.utils.listing_quality_gate import build_source_facts, source_supports_foldable
+
+    cases = [
+        (
+            "Convertible Sleeper Sofa Bed,two-tone blended fabric Folding Mattress "
+            "Couch with Fixed-Shape Frame, Floor Sofa Lounge Couch",
+            "Comfortable sleeper sofa for living room.",
+            True,
+        ),
+        (
+            "Extendable Dining Table with Extra-Long Folding Top, Rolling Kitchen Island "
+            "with Drawers, Power Outlet and Brake lock",
+            "Rolling kitchen island table.",
+            True,
+        ),
+        (
+            "Extendable Dining Table with Drop Leaf Mobile Rolling Island",
+            "Extendable tabletop with drop leaf only.",
+            False,
+        ),
+    ]
+    for source_title, source_description, expected in cases:
+        arbiter = source_supports_foldable(
+            source_title=source_title,
+            source_description=source_description,
+            attributes={},
+            specs={},
+        )
+        facts = build_source_facts(
+            source_title=source_title,
+            source_description=source_description,
+            attributes={},
+            specs={},
+        )
+        constraints = build_source_constraints(
+            {},
+            {},
+            source_description,
+            source_title,
+        )
+        assert arbiter is expected, source_title
+        assert facts["claims"]["foldable"]["supported"] is expected, source_title
+        assert ("foldable" in constraints["supported_features"]) is expected, source_title
+        # Detectors must not disagree
+        assert facts["claims"]["foldable"]["supported"] == (
+            "foldable" in constraints["supported_features"]
+        )
+
+
 def test_quality_gate_blocks_unsupported_charging_claim_from_ai_draft():
     normalized = normalize_generated_listing(
         {
@@ -1316,3 +1422,60 @@ def test_analysis_entrypoints_pass_shared_category_matcher():
     assert "category_matcher=CATEGORY_MATCHER" in (ROOT / "batch_analyze.py").read_text(encoding="utf-8-sig")
     assert "category_matcher=CATEGORY_MATCHER" in (ROOT / "daily_tasks.py").read_text(encoding="utf-8-sig")
     assert "category_matcher=_get_quality_gate_category_matcher()" in (ROOT / "server.py").read_text(encoding="utf-8-sig")
+
+
+class TestSofaAccessoryTableExclusion:
+    """2026-07-13 live incident: 'Sofa Side Table' nightstand and 'Sofa Table
+    Behind Couch' console table were recategorized into 38208 (sofas)."""
+
+    def test_nightstand_with_sofa_side_table_phrase_is_not_sofa(self):
+        from src.utils.listing_quality_gate import classify_listing_profile
+        profile = classify_listing_profile(
+            "Solid Wood Nightstand with Two Drawers and Pull-out Panel Storage Bedside Table and Sofa Side Table",
+            "", "38199",
+        )
+        assert profile.kind != "sofa"
+
+    def test_console_table_behind_couch_is_not_sofa(self):
+        from src.utils.listing_quality_gate import classify_listing_profile
+        profile = classify_listing_profile(
+            "60 Inch Narrow Console Table with Built-in Power Outlet, Farmhouse Sofa Table Behind Couch, Entryway",
+            "", "38204",
+        )
+        assert profile.kind != "sofa"
+
+    def test_real_sofa_still_classified(self):
+        from src.utils.listing_quality_gate import classify_listing_profile
+        profile = classify_listing_profile(
+            '71" 3 Seater Sofa, Corduroy Fabric, Deep Seat Couches, Comfy Loveseat Sofa',
+            "", "38208",
+        )
+        assert profile.kind == "sofa"
+        assert profile.category_id == "38208"
+
+
+class TestFoldableArbiterInflections:
+    """2026-07-14 foldable 回归:源写 'can be folded' 但 \bfold\b 漏了 -ed 词形,
+    drop-leaf kitchen island 被误判不支持折叠,改写反复卡住。"""
+
+    def test_folded_inflection_supported(self):
+        from src.utils.listing_quality_gate import source_supports_foldable
+        assert source_supports_foldable(
+            source_title="53inch Kitchen Island with Drop Leaf",
+            source_description="the drop leaf can be unfolded or folded according to needs",
+        ) is True
+
+    def test_folds_inflection_supported(self):
+        from src.utils.listing_quality_gate import source_supports_foldable
+        assert source_supports_foldable(source_description="the side leaf folds down for storage") is True
+
+    def test_extendable_alone_still_not_supported(self):
+        from src.utils.listing_quality_gate import source_supports_foldable
+        assert source_supports_foldable(
+            source_title="Extendable Dining Table with Expandable Top",
+            source_description="pull to extend the table surface",
+        ) is False
+
+    def test_folder_noun_not_false_positive(self):
+        from src.utils.listing_quality_gate import source_supports_foldable
+        assert source_supports_foldable(source_description="includes a paper folder organizer") is False
