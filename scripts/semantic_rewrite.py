@@ -91,35 +91,61 @@ def _score_audit_for_queue(data: dict) -> dict[str, int]:
     return scores
 
 
-def derive_queue_from_latest_audit(limit: int | None = None) -> list[str]:
-    """Project §8.2: latest *non-empty* listing_audit_fix_*.json → semantic CRITICAL queue.
+def pick_latest_full_corpus_audit(
+    files: list[Path],
+    *,
+    min_published: int = 500,
+) -> tuple[Path, dict[str, int]] | None:
+    """Among non-empty audits, prefer full-corpus reports and take newest mtime.
 
-    Single-SKU dry-run artifacts (0 issue rows) are skipped so the queue is not
-    accidentally wiped by a later tiny report.
+    Full-corpus = total_published > min_published (default 500). Within that set
+    (and for the non-full fallback set), always pick highest st_mtime so a newer
+    daily job cannot lose to an older fatter report ranked by issue_rows.
     """
-    logs = ROOT / "logs"
-    files = sorted(logs.glob("listing_audit_fix_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not files:
-        return []
-    # Rank candidate reports: corpus-sized first, then by mtime.
-    candidates: list[tuple[int, float, Path, dict[str, int]]] = []
+    full: list[tuple[float, Path, dict[str, int]]] = []
+    other: list[tuple[float, Path, dict[str, int]]] = []
     for path in files:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        candidate = _score_audit_for_queue(data)
-        if not candidate:
+        scores = _score_audit_for_queue(data)
+        if not scores:
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
             continue
         published = int(data.get("total_published") or 0)
-        issue_rows = len(data.get("issues") or [])
-        # score: prefer large live corpus audits
-        rank = (1 if published >= 100 or issue_rows >= 50 else 0, published, issue_rows, path.stat().st_mtime)
-        candidates.append((rank, path.stat().st_mtime, path, candidate))
-    if not candidates:
+        entry = (mtime, path, scores)
+        if published > min_published:
+            full.append(entry)
+        else:
+            other.append(entry)
+    pool = full if full else other
+    if not pool:
+        return None
+    pool.sort(key=lambda x: x[0], reverse=True)
+    _mtime, chosen, scores = pool[0]
+    return chosen, scores
+
+
+def derive_queue_from_latest_audit(limit: int | None = None) -> list[str]:
+    """Project §8.2: latest *non-empty* listing_audit_fix_*.json → semantic CRITICAL queue.
+
+    Single-SKU dry-run artifacts (0 issue rows) are skipped so the queue is not
+    accidentally wiped by a later tiny report. Full-corpus reports
+    (total_published > 500) always beat single-SKU dry-runs; among full-corpus
+    reports the newest mtime wins.
+    """
+    logs = ROOT / "logs"
+    files = list(logs.glob("listing_audit_fix_*.json"))
+    if not files:
         return []
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    _, _, chosen, scores = candidates[0]
+    picked = pick_latest_full_corpus_audit(files)
+    if not picked:
+        return []
+    chosen, scores = picked
     ordered = sorted(scores.keys(), key=lambda s: scores[s], reverse=True)
     if limit:
         ordered = ordered[:limit]
@@ -203,7 +229,8 @@ def main(argv: list[str] | None = None) -> int:
         if not args.sku and not args.sku_file and not args.apply:
             return 0
 
-    if args.from_daily_audit:
+    from_daily = bool(args.from_daily_audit)
+    if from_daily:
         skus = derive_queue_from_latest_audit(limit=None)
         skus = _exclude_done_and_human(skus)
         if args.limit:
@@ -222,10 +249,14 @@ def main(argv: list[str] | None = None) -> int:
             seen.add(s)
             ordered.append(s)
     skus = ordered
-    if args.limit and not args.from_daily_audit:
+    if args.limit and not from_daily:
         skus = skus[: args.limit]
 
     if not skus:
+        # Scheduler path: empty incremental queue is success (no false alarm).
+        if from_daily and not args.sku and not args.sku_file:
+            print("nothing to do (queue empty after exclusions)")
+            return 0
         print("No SKUs specified. Use --sku / --sku-file / --derive-queue / --from-daily-audit.")
         return 2
 

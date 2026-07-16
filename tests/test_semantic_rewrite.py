@@ -760,6 +760,77 @@ def test_cli_derive_queue(tmp_path, monkeypatch):
         path.unlink(missing_ok=True)
 
 
+def test_pick_latest_full_corpus_audit_prefers_newest_mtime(tmp_path):
+    """Among total_published>500 reports, newest mtime wins (not fatter older issue_rows)."""
+    import os
+    import time
+
+    from scripts.semantic_rewrite import pick_latest_full_corpus_audit
+
+    def _write(name: str, published: int, skus: list[str], mtime: float) -> Path:
+        path = tmp_path / name
+        issues = [
+            {
+                "sku": sku,
+                "issues": [{"type": "semantic_material", "severity": "CRITICAL"}],
+            }
+            for sku in skus
+        ]
+        path.write_text(
+            json.dumps({"total_published": published, "issues": issues}),
+            encoding="utf-8",
+        )
+        os.utime(path, (mtime, mtime))
+        return path
+
+    base = time.time()
+    older_fat = _write(
+        "listing_audit_fix_20260714_113029.json",
+        800,
+        [f"OLD{i}" for i in range(20)],  # more issue rows
+        base - 86400,
+    )
+    newer_slim = _write(
+        "listing_audit_fix_20260716_113008.json",
+        803,
+        ["NEW1", "NEW2"],  # fewer issues but newer
+        base - 10,
+    )
+    single = _write(
+        "listing_audit_fix_20260715_121738.json",
+        1,
+        ["TINY1"],
+        base,  # newest mtime but not full corpus
+    )
+
+    picked = pick_latest_full_corpus_audit([older_fat, newer_slim, single])
+    assert picked is not None
+    chosen, scores = picked
+    assert chosen.name == newer_slim.name
+    assert "NEW1" in scores
+    assert "OLD0" not in scores
+
+
+def test_from_daily_audit_empty_queue_exits_zero(monkeypatch, capsys):
+    import scripts.semantic_rewrite as cli
+
+    monkeypatch.setattr(cli, "derive_queue_from_latest_audit", lambda limit=None: ["X1", "X2"])
+    monkeypatch.setattr(cli, "_exclude_done_and_human", lambda skus: [])
+    code = cli.main(["--from-daily-audit", "--limit", "40"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "nothing to do" in out.lower()
+
+
+def test_bare_cli_without_skus_still_exits_two(capsys):
+    import scripts.semantic_rewrite as cli
+
+    code = cli.main([])
+    assert code == 2
+    out = capsys.readouterr().out
+    assert "No SKUs specified" in out
+
+
 # ── P1.5 gaps ───────────────────────────────────────────────────────────
 
 
