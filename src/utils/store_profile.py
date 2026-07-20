@@ -125,8 +125,26 @@ def _flatten_yaml(data: Dict[str, Any]) -> Dict[str, Any]:
     return flat
 
 
+class StoreProfileError(RuntimeError):
+    """A store profile file exists but could not be loaded.
+
+    Raised instead of silently falling back to defaults: on a sub-account
+    checkout the defaults are ANOTHER instance's brand/policies, so a silent
+    fallback would publish listings under the wrong store. Fail loud so the
+    misconfiguration is fixed before anything goes live.
+    """
+
+
 def load_store_profile(path: Optional[os.PathLike] = None) -> StoreProfile:
-    """Load a profile from YAML; unknown keys ignored, missing file -> defaults."""
+    """Load a profile from YAML.
+
+    Resolution order: explicit ``path`` > ``STORE_PROFILE_PATH`` env >
+    ``config/store_profile.local.yaml`` > tracked ``config/store_profile.yaml``.
+
+    No profile file present -> built-in defaults (equal to the main account).
+    A file that is present but unreadable/unparsable -> StoreProfileError.
+    Unknown keys are ignored so the tracked default can grow new fields safely.
+    """
     if path:
         profile_path = Path(path)
     elif os.getenv("STORE_PROFILE_PATH"):
@@ -137,18 +155,26 @@ def load_store_profile(path: Optional[os.PathLike] = None) -> StoreProfile:
         profile_path = _DEFAULT_PROFILE_PATH
     if not profile_path.exists():
         return StoreProfile()
+
     try:
         import yaml
+    except ImportError as exc:  # pragma: no cover - environment guard
+        raise StoreProfileError(
+            f"pyyaml is required to read store profile {profile_path}; "
+            "install requirements.txt. Refusing to fall back to default "
+            "profile, which is another instance's brand."
+        ) from exc
 
+    try:
         with open(profile_path, "r", encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
-        if not isinstance(data, dict):
-            return StoreProfile()
-        return StoreProfile(**_flatten_yaml(data))
-    except Exception:
-        # A malformed profile must never take the pipeline down; defaults are
-        # the current main-account values.
-        return StoreProfile()
+    except (OSError, yaml.YAMLError) as exc:
+        raise StoreProfileError(f"cannot read store profile {profile_path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise StoreProfileError(
+            f"store profile {profile_path} must be a mapping, got {type(data).__name__}"
+        )
+    return StoreProfile(**_flatten_yaml(data))
 
 
 def get_store_profile() -> StoreProfile:

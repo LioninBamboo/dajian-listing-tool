@@ -6,6 +6,7 @@ import pytest
 
 from src.utils.store_profile import (
     StoreProfile,
+    StoreProfileError,
     get_store_profile,
     load_store_profile,
     reset_store_profile_cache,
@@ -38,15 +39,19 @@ class TestDefaults:
         assert profile.server_base_url == "http://localhost:8000"
         assert profile.brand_name_lower == "aquaverve"
 
-    def test_malformed_yaml_falls_back_to_defaults(self, tmp_path):
+    def test_malformed_yaml_raises_not_silent_default(self, tmp_path):
+        # A present-but-broken profile must fail loud: on a sub-account the
+        # defaults are another instance's brand, so silent fallback is unsafe.
         bad = tmp_path / "bad.yaml"
         bad.write_text("store: [unclosed", encoding="utf-8")
-        assert load_store_profile(bad) == StoreProfile()
+        with pytest.raises(StoreProfileError):
+            load_store_profile(bad)
 
-    def test_non_dict_yaml_falls_back_to_defaults(self, tmp_path):
+    def test_non_dict_yaml_raises_not_silent_default(self, tmp_path):
         weird = tmp_path / "list.yaml"
         weird.write_text("- just\n- a list\n", encoding="utf-8")
-        assert load_store_profile(weird) == StoreProfile()
+        with pytest.raises(StoreProfileError):
+            load_store_profile(weird)
 
 
 class TestOverrides:
