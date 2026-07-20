@@ -10,8 +10,11 @@
 | 实例B checkout | ✅ `git clone` 自主目录,HEAD 与主目录同步;更新方式:主目录 commit → 实例B `git pull` |
 | `.env` | ✅ 从主实例复制;`EBAY_REFRESH_TOKEN` 已清空(子账号授权后由实例B自己的 `ebay_tokens.db` 管理);新增 `SERVER_PORT=8001` |
 | `config/store_profile.local.yaml` | ✅ 已创建,**全是 CHANGEME 占位符**,填好前不得刊登 |
-| venv | ✅ `python -m venv .venv` + requirements 安装 |
+| venv | ✅ `python -m venv .venv` + requirements 安装(含 pyyaml,见下) |
 | 数据隔离 | ✅ 天然:实例B目录下自己的 ebay_tokens.db / ebay_collection.db / logs |
+| profile 加载 | ✅ 已验证:实例B读到 `store_profile.local.yaml`(brand=CHANGEME-AutoBrand, port=8001) |
+
+> ⚠️ **脚手架期间踩到的坑(已修)**:`pyyaml` 原先不在 requirements.txt(主 venv 是历史遗留装上的),新实例装不到,导致 profile 加载静默回退到主账号画像。已修两处:①pyyaml 入 requirements;②加载器改为 fail-loud——profile 文件存在但加载失败时抛 `StoreProfileError`,绝不静默套用默认(默认=主账号品牌)。子账号新建 venv 后务必确认 `pip show pyyaml` 有输出。
 
 ## 1. eBay 侧五步(按顺序;🧑 = 需要你人工操作)
 
