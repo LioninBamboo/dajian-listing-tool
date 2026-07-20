@@ -49,6 +49,152 @@ class FixedNoonDateTime(datetime):
         return cls(2026, 5, 11, 12, 47, 30)
 
 
+def test_clear_stale_running_tasks_preserves_active_task_lock(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir()
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'running',
+                    'at': '2026-05-11T12:47:00',
+                    'message': 'watchdog recovery is active',
+                },
+            },
+        }),
+        encoding='utf-8',
+    )
+    (lock_dir / 'daily_tasks.lock').write_text(
+        json.dumps({
+            'task_name': 'daily_tasks',
+            'pid': 1111,
+            'worker_pid': 4242,
+            'worker_creation_marker': 'worker-4242-created-once',
+            'started_at': '2026-05-01T12:47:00',
+            'timeout_sec': 10,
+        }),
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+    monkeypatch.setattr(
+        scheduler_daemon,
+        'is_process_identity_alive',
+        lambda pid, marker: pid == 4242 and marker == 'worker-4242-created-once',
+    )
+
+    scheduler_daemon.clear_stale_running_tasks()
+
+    task = json.loads(health_path.read_text(encoding='utf-8'))['tasks']['daily_tasks']
+    assert task['status'] == 'running'
+    assert task['message'] == 'watchdog recovery is active'
+
+
+def test_clear_stale_running_tasks_interrupts_task_without_active_lock(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'running',
+                    'at': '2026-05-11T09:30:00',
+                    'message': 'old daemon task',
+                },
+            },
+        }),
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+
+    scheduler_daemon.clear_stale_running_tasks()
+
+    task = json.loads(health_path.read_text(encoding='utf-8'))['tasks']['daily_tasks']
+    assert task['status'] == 'interrupted'
+    assert 'Marked stale after daemon restart' in task['message']
+
+
+def test_run_task_uses_worker_owned_lock_and_reports_success(tmp_path, monkeypatch):
+    log_dir = tmp_path / 'logs'
+    lock_dir = log_dir / '_task_locks'
+    health_path = log_dir / '_scheduler_health.json'
+    output_path = tmp_path / 'worker-output.txt'
+    target_path = tmp_path / 'target.py'
+    log_dir.mkdir()
+    target_path.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path(sys.argv[1]).write_text('completed', encoding='utf-8')\n",
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(scheduler_daemon, 'LOG_DIR', log_dir)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, '_notify_failure', lambda *args: None)
+
+    ok, message = scheduler_daemon.run_task(
+        'integration_worker',
+        [str(target_path), str(output_path)],
+        timeout_sec=10,
+    )
+
+    health = json.loads(health_path.read_text(encoding='utf-8'))
+    assert ok is True
+    assert message.startswith('Success in ')
+    assert output_path.read_text(encoding='utf-8') == 'completed'
+    assert health['tasks']['integration_worker']['status'] == 'success'
+    assert not (lock_dir / 'integration_worker.lock').exists()
+    assert list(lock_dir.glob('*.handshake.json')) == []
+
+
+def test_run_task_timeout_kills_actual_worker_and_next_run_reaps_lock(tmp_path, monkeypatch):
+    log_dir = tmp_path / 'logs'
+    lock_dir = log_dir / '_task_locks'
+    health_path = log_dir / '_scheduler_health.json'
+    slow_target = tmp_path / 'slow.py'
+    quick_target = tmp_path / 'quick.py'
+    output_path = tmp_path / 'quick-output.txt'
+    log_dir.mkdir()
+    slow_target.write_text('import time\ntime.sleep(30)\n', encoding='utf-8')
+    quick_target.write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "Path(sys.argv[1]).write_text('recovered', encoding='utf-8')\n",
+        encoding='utf-8',
+    )
+
+    monkeypatch.setattr(scheduler_daemon, 'LOG_DIR', log_dir)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, '_notify_failure', lambda *args: None)
+
+    first_ok, first_message = scheduler_daemon.run_task(
+        'timeout_worker',
+        [str(slow_target)],
+        timeout_sec=1,
+    )
+    second_ok, second_message = scheduler_daemon.run_task(
+        'timeout_worker',
+        [str(quick_target), str(output_path)],
+        timeout_sec=10,
+    )
+
+    assert first_ok is False
+    assert first_message == 'Timeout after 1s'
+    assert second_ok is True
+    assert second_message.startswith('Success in ')
+    assert output_path.read_text(encoding='utf-8') == 'recovered'
+    assert not (lock_dir / 'timeout_worker.lock').exists()
+
+
 def _stub_recent_recovery_tasks(monkeypatch, record):
     for attr, name in (
         ('task_listing_status_sync', 'listing_status_sync'),
@@ -56,6 +202,7 @@ def _stub_recent_recovery_tasks(monkeypatch, record):
         ('task_auto_publish', 'auto_publish'),
         ('task_cro_send_offer', 'cro_send_offer'),
         ('task_cro_lifecycle_detect', 'cro_lifecycle_detect'),
+        ('task_cro_title_rewrite', 'cro_title_rewrite'),
         ('task_cro_lifecycle_evaluate', 'cro_lifecycle_evaluate'),
         ('task_source_refresh', 'source_refresh'),
         ('task_semantic_rewrite', 'semantic_rewrite'),

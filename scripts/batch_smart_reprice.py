@@ -36,6 +36,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from html import escape as html_escape
 
 PROJECT_ROOT = Path(__file__).parent.parent
+REPRICE_EMAIL_LEDGER_DB = PROJECT_ROOT / 'ebay_collection.db'
+REPRICE_EMAIL_CLAIM_TTL_SECONDS = 15 * 60
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from dotenv import load_dotenv
@@ -57,6 +59,100 @@ logging.basicConfig(
 log = logging.getLogger("batch_reprice")
 
 TRANSIENT_HTTP_STATUS = {429, 500, 502, 503, 504}
+
+
+def _ensure_reprice_email_ledger(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS task_notification_outbox (
+            notification_key TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_error TEXT
+        )
+        """
+    )
+
+
+def _reprice_email_claim_is_active(updated_at: object, now: datetime) -> bool:
+    """A recent pending row belongs to another sender and cannot be stolen."""
+    try:
+        claimed_at = datetime.fromisoformat(str(updated_at))
+        return (now - claimed_at).total_seconds() < REPRICE_EMAIL_CLAIM_TTL_SECONDS
+    except (TypeError, ValueError):
+        # A malformed legacy timestamp is not a valid lease; allow recovery.
+        return False
+
+
+def claim_reprice_email_delivery(
+    business_date: str | None = None,
+    db_path: Path | None = None,
+) -> bool:
+    """Claim the one smart-reprice summary allowed for a business day.
+
+    A completed delivery is never sent again on the same date. Failed SMTP
+    attempts remain retryable so a transient mail outage does not suppress the
+    report forever.
+    """
+
+    business_date = business_date or datetime.now().date().isoformat()
+    now_dt = datetime.now()
+    now = now_dt.isoformat()
+    key = f"smart_reprice:{business_date}"
+    target = Path(db_path) if db_path else REPRICE_EMAIL_LEDGER_DB
+    with sqlite3.connect(str(target)) as conn:
+        _ensure_reprice_email_ledger(conn)
+        conn.commit()
+        # SQLite serializes writers here. Combined with the pending lease below,
+        # two watchdog/recovery processes cannot both reach SMTP for one date.
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute(
+            "SELECT status, updated_at FROM task_notification_outbox WHERE notification_key = ?",
+            (key,),
+        ).fetchone()
+        if row and str(row[0]).lower() == 'sent':
+            conn.rollback()
+            return False
+        if row and str(row[0]).lower() == 'pending' and _reprice_email_claim_is_active(
+            row[1], now_dt
+        ):
+            conn.rollback()
+            return False
+        if row:
+            conn.execute(
+                "UPDATE task_notification_outbox SET status = ?, updated_at = ?, last_error = NULL "
+                "WHERE notification_key = ?",
+                ('pending', now, key),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO task_notification_outbox "
+                "(notification_key, status, created_at, updated_at, last_error) VALUES (?,?,?,?,NULL)",
+                (key, 'pending', now, now),
+            )
+        conn.commit()
+    return True
+
+
+def mark_reprice_email_delivery(
+    business_date: str | None = None,
+    delivered: bool = False,
+    error: str = '',
+    db_path: Path | None = None,
+) -> None:
+    business_date = business_date or datetime.now().date().isoformat()
+    key = f"smart_reprice:{business_date}"
+    target = Path(db_path) if db_path else REPRICE_EMAIL_LEDGER_DB
+    now = datetime.now().isoformat()
+    with sqlite3.connect(str(target)) as conn:
+        _ensure_reprice_email_ledger(conn)
+        conn.execute(
+            "UPDATE task_notification_outbox SET status = ?, updated_at = ?, last_error = ? "
+            "WHERE notification_key = ?",
+            ('sent' if delivered else 'failed', now, '' if delivered else str(error)[:500], key),
+        )
+        conn.commit()
 
 
 def _format_margin_pct(value) -> str:
@@ -1085,7 +1181,8 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
                            no_market, strategy_counts, total,
                            report_path=report_path,
                            changes_csv_path=changes_csv_path,
-                           changes_html_path=changes_html_path)
+                           changes_html_path=changes_html_path,
+                           dedupe=True)
 
     # Mark CRO queue items done (only successfully updated SKUs)
     if from_cro_queue and not dry_run and cro_queue_skus:
@@ -1104,10 +1201,18 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
 
 def _send_reprice_email(results, n_changes, n_up, n_down, n_errors,
                         n_no_market, strategies, total, report_path=None,
-                        changes_csv_path=None, changes_html_path=None):
+                        changes_csv_path=None, changes_html_path=None,
+                        dedupe: bool = False):
     """发送重新定价报告邮件"""
+    claimed = False
     try:
         from src.utils.email_sender import send_email
+
+        if dedupe:
+            claimed = claim_reprice_email_delivery()
+            if not claimed:
+                log.info("📧 Smart Reprice summary already sent today; suppressing duplicate email")
+                return False
 
         subject = f"📊 eBay Smart Reprice: {n_changes} price changes ({n_up}↑ / {n_down}↓)"
 
@@ -1166,12 +1271,24 @@ Changed SKU HTML: <code>{changes_html_path or ''}</code>
             str(path) for path in (report_path, changes_csv_path, changes_html_path)
             if path
         ]
-        if send_email(subject, body, attachments=attachments):
+        delivered = bool(send_email(subject, body, attachments=attachments))
+        if delivered:
+            if claimed:
+                mark_reprice_email_delivery(delivered=True)
             log.info("📧 Reprice report email sent")
         else:
+            if claimed:
+                mark_reprice_email_delivery(delivered=False, error='SMTP delivery returned false')
             log.warning("📧 Reprice report email saved locally but SMTP delivery failed")
+        return delivered
     except Exception as e:
+        if claimed:
+            try:
+                mark_reprice_email_delivery(delivered=False, error=str(e))
+            except Exception:
+                pass
         log.warning(f"Failed to send email: {e}")
+        return False
 
 
 if __name__ == "__main__":

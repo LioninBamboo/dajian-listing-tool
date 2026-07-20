@@ -185,6 +185,33 @@ def _exclude_done_and_human(skus: list[str]) -> list[str]:
     return [s for s in skus if s not in done and s not in human]
 
 
+def classify_execution_status(stats: dict[str, int]) -> str:
+    """Describe an execution outcome without conflating review work and errors."""
+    if int(stats.get('applied_fail') or 0) > 0:
+        return 'failed'
+    if int(stats.get('human') or 0) > 0:
+        if int(stats.get('applied_ok') or 0) > 0:
+            return 'completed_with_review'
+        return 'review_required'
+    if int(stats.get('applied_ok') or 0) > 0:
+        return 'completed'
+    return 'no_change'
+
+
+def scheduler_exit_code_for_status(
+    from_daily_audit: bool,
+    status: str,
+    *,
+    current_exit_code: int,
+) -> int:
+    """Let the scheduler record review work without raising a failure alarm."""
+    if current_exit_code:
+        return current_exit_code
+    if from_daily_audit and status in {'review_required', 'completed_with_review'}:
+        return 2
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Semantic rewrite pipeline (default dry-run)")
     p.add_argument("--sku", action="append", default=[], help="SKU (repeatable)")
@@ -306,6 +333,8 @@ def main(argv: list[str] | None = None) -> int:
                 exit_code = 4
 
     conn.close()
+    execution_status = classify_execution_status(stats)
+    print(f"[status] {execution_status}")
 
     if args.email:
         try:
@@ -320,17 +349,25 @@ def main(argv: list[str] | None = None) -> int:
                 f"<li>applied_ok: {stats['applied_ok']}</li>"
                 f"<li>applied_fail: {stats['applied_fail']}</li>"
                 f"<li>apply={bool(args.apply)}</li>"
+                f"<li>status: {execution_status}</li>"
                 f"</ul>"
             )
             send_email(
-                subject=f"[Semantic Rewrite] planned={stats['planned']} ok={stats['applied_ok']}",
+                subject=(
+                    f"[Semantic Rewrite] {execution_status} "
+                    f"planned={stats['planned']} ok={stats['applied_ok']}"
+                ),
                 html_body=body,
             )
             print("[email] summary sent (or saved to reports/)")
         except Exception as exc:
             print(f"[email] failed: {exc}")
 
-    return exit_code
+    return scheduler_exit_code_for_status(
+        from_daily,
+        execution_status,
+        current_exit_code=exit_code,
+    )
 
 
 if __name__ == "__main__":

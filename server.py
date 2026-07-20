@@ -12,6 +12,7 @@ import logging
 import sys
 import re
 from datetime import UTC, datetime
+from pathlib import Path
 from dotenv import load_dotenv
 
 # Note: Removed Windows encoding fix as it can cause issues with uvicorn
@@ -28,6 +29,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 # Import collection database
 from src.db.collection_db import get_db, init_db
+from src.db.database_safety import assert_runtime_not_in_maintenance, validate_runtime_database
 from src.db.collection_models import CollectedProduct
 from src.services.ebay_category_matcher import create_category_matcher
 from src.services.taxonomy_constants import PROTECTED_STORED_CATEGORY_IDS
@@ -57,6 +59,8 @@ def _get_quality_gate_category_matcher():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    assert_runtime_not_in_maintenance(Path(__file__).resolve().parent / "logs" / "_maintenance.lock")
+    validate_runtime_database(Path(__file__).resolve().parent / "ebay_collection.db")
     video_task = await startup_event()
     try:
         yield

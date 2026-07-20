@@ -51,6 +51,8 @@ from src.utils.mi_draft_origin import (
     apply_mi_draft_origin,
     append_mi_draft_log,
 )
+from src.db.database_safety import assert_runtime_not_in_maintenance, validate_runtime_database
+from src.utils.task_result_status import classify_daily_task_outcome
 
 UTC = getattr(datetime, "UTC", timezone.utc)
 from src.utils.mi_opportunity_flow import auto_prepare_mi_opportunity_drafts, empty_auto_prepare_result
@@ -1958,6 +1960,15 @@ def main():
     parser.add_argument('--mi-only', action='store_true',
                         help='仅运行 MI 自动机会发现 + 快照 (供 scheduler 独立定时任务解耦调用)')
     args = parser.parse_args()
+
+    assert_runtime_not_in_maintenance(PROJECT_ROOT / "logs" / "_maintenance.lock")
+    database_report = validate_runtime_database(PROJECT_ROOT / "ebay_collection.db")
+    logger.info(
+        "数据库启动检查通过: integrity=%s, links=%s, pages=%s",
+        database_report.integrity_check,
+        database_report.link_count,
+        database_report.page_count,
+    )
     
     logger.info("="*60)
     logger.info(f"每日任务开始 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -2069,11 +2080,23 @@ def main():
 
 
 if __name__ == "__main__":
+    exit_code = 0
     try:
-        main()
+        task_results = main()
+        outcome = classify_daily_task_outcome(task_results)
+        if outcome == 'partial_success':
+            logger.warning(
+                "任务部分完成：仅存在逐 SKU 改价失败；禁止全量补跑，应走定向重试"
+            )
+            exit_code = 2
+        elif outcome == 'failed':
+            logger.error("任务结果包含业务失败，进程将返回非零退出码")
+            exit_code = 1
     except Exception as e:
         logger.error(f"脚本异常退出: {e}")
         import traceback
         logger.error(traceback.format_exc())
+        exit_code = 1
     finally:
         logging.shutdown()
+    sys.exit(exit_code)

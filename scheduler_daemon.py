@@ -39,6 +39,7 @@ import logging
 import subprocess
 import argparse
 import atexit
+import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -61,13 +62,21 @@ for _stream_name in ("stdout", "stderr"):
 
 import schedule
 
+from src.db.database_safety import validate_runtime_database
+from src.utils.process_identity import (
+    get_process_creation_marker,
+    is_process_identity_alive,
+)
+
 # ─── 配置 ───────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).parent
 PYTHON_EXE = str(PROJECT_ROOT / '.venv' / 'Scripts' / 'python.exe')
 PID_FILE = PROJECT_ROOT / 'logs' / '_scheduler.pid'
 HEALTH_FILE = PROJECT_ROOT / 'logs' / '_scheduler_health.json'
+MAINTENANCE_FILE = PROJECT_ROOT / 'logs' / '_maintenance.lock'
 LOG_DIR = PROJECT_ROOT / 'logs'
 TASK_LOCK_DIR = LOG_DIR / '_task_locks'
+TASK_WORKER = PROJECT_ROOT / 'src' / 'utils' / 'task_worker.py'
 LOG_DIR.mkdir(exist_ok=True)
 
 # 任务超时 (秒)
@@ -290,7 +299,7 @@ def _task_succeeded_today(task_name, now=None):
 
     status = str(info.get('status', '')).lower()
     at = info.get('at')
-    if status not in {'success', 'ok'} or not at:
+    if status not in {'success', 'ok', 'partial_success', 'completed_with_errors'} or not at:
         return False
 
     try:
@@ -348,15 +357,18 @@ def _task_lock_is_stale(lock_info, timeout_sec, now=None):
     now = now or datetime.now()
     pid = 0
     try:
-        pid = int(lock_info.get('pid') or 0)
+        pid = int(lock_info.get('worker_pid') or lock_info.get('pid') or 0)
     except (TypeError, ValueError):
         pid = 0
 
     started_at = _iso_at_or_none(lock_info.get('started_at'))
-    if pid and not _is_pid_alive(pid):
-        return True
+    creation_marker = lock_info.get('worker_creation_marker')
+    if pid:
+        if creation_marker:
+            return not is_process_identity_alive(pid, creation_marker)
+        return not _is_pid_alive(pid)
     if started_at is None:
-        return not pid
+        return True
 
     max_age = timedelta(seconds=max(int(timeout_sec) + 600, 1800))
     if now - started_at > max_age:
@@ -364,60 +376,28 @@ def _task_lock_is_stale(lock_info, timeout_sec, now=None):
     return False
 
 
-def acquire_task_run_lock(task_name, timeout_sec):
-    """Acquire an atomic per-task lock so recovery races cannot launch duplicates."""
-    TASK_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+def _task_run_lock_is_active(task_name, now=None):
+    """Return True when a per-task lock still represents a live worker."""
+    now = now or datetime.now()
     lock_path = _task_lock_path(task_name)
-    lock_info = {
-        'task_name': str(task_name),
-        'pid': os.getpid(),
-        'started_at': datetime.now().isoformat(),
-        'timeout_sec': int(timeout_sec),
-    }
+    if not lock_path.exists():
+        return False
 
-    for _ in range(3):
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                json.dump(lock_info, f, ensure_ascii=False, indent=2)
-            return True
-        except FileExistsError:
-            try:
-                existing = json.loads(lock_path.read_text(encoding='utf-8'))
-            except Exception:
-                existing = {}
-            if _task_lock_is_stale(existing, timeout_sec):
-                try:
-                    lock_path.unlink()
-                    continue
-                except FileNotFoundError:
-                    continue
-                except Exception as e:
-                    logger.warning(f"无法清理陈旧任务锁 {task_name}: {e}")
-                    return False
-            logger.info(
-                f"↪ 跳过任务 {task_name}: 已有实例或补跑锁 "
-                f"(pid={existing.get('pid')}, started_at={existing.get('started_at')})"
-            )
-            return False
-        except Exception as e:
-            logger.warning(f"任务锁创建失败 {task_name}: {e}; 继续执行以避免漏跑")
-            return True
-    return False
-
-
-def release_task_run_lock(task_name):
-    lock_path = _task_lock_path(task_name)
+    timeout_sec = int(TASK_TIMEOUT.get(task_name, 3600))
     try:
-        if not lock_path.exists():
-            return
-        existing = json.loads(lock_path.read_text(encoding='utf-8'))
-        if int(existing.get('pid') or 0) == os.getpid():
-            lock_path.unlink()
-    except FileNotFoundError:
-        return
-    except Exception as e:
-        logger.warning(f"释放任务锁失败 {task_name}: {e}")
+        lock_info = json.loads(lock_path.read_text(encoding='utf-8'))
+        timeout_sec = int(lock_info.get('timeout_sec') or timeout_sec)
+        return not _task_lock_is_stale(lock_info, timeout_sec, now=now)
+    except Exception:
+        # The lock is created atomically before its JSON payload is written. A
+        # daemon can start in that tiny window, so a recent unreadable lock must
+        # fail closed instead of incorrectly interrupting the live task.
+        try:
+            age_sec = max(0.0, now.timestamp() - lock_path.stat().st_mtime)
+        except OSError:
+            return False
+        max_age_sec = max(timeout_sec + 600, 1800)
+        return age_sec <= max_age_sec
 
 
 def clear_stale_running_tasks():
@@ -433,6 +413,9 @@ def clear_stale_running_tasks():
             if name.startswith('_'):
                 continue
             if info.get('status') == 'running':
+                if _task_run_lock_is_active(name):
+                    logger.info(f"保留运行中任务状态: {name} 仍持有有效任务锁")
+                    continue
                 info['status'] = 'interrupted'
                 info['message'] = f"Marked stale after daemon restart at {now_iso}"
                 info['at'] = now_iso
@@ -454,21 +437,35 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
     - 超时自动杀死
     - 返回 (success, message)
     """
-    full_cmd = [PYTHON_EXE] + cmd_args
     cmd_str = ' '.join(cmd_args)
     logger.info(f"{'='*50}")
     logger.info(f"▶ 启动任务: {task_name}")
     logger.info(f"  命令: {cmd_str}")
     logger.info(f"  超时: {timeout_sec}s")
 
-    if not acquire_task_run_lock(task_name, timeout_sec):
-        return True, 'Skipped (already running or recovering)'
-
-    update_health(task_name, 'running', f'Started: {cmd_str}')
     start_time = time.time()
+    owner_token = uuid.uuid4().hex
+    handshake_path = TASK_LOCK_DIR / f'.{_task_lock_path(task_name).stem}.{owner_token}.handshake.json'
+    parent_creation_marker = get_process_creation_marker(os.getpid()) or ''
+    full_cmd = [
+        PYTHON_EXE,
+        str(TASK_WORKER),
+        '--task-name', str(task_name),
+        '--lock-path', str(_task_lock_path(task_name)),
+        '--handshake-path', str(handshake_path),
+        '--health-path', str(HEALTH_FILE),
+        '--owner-token', owner_token,
+        '--timeout-sec', str(int(timeout_sec)),
+        '--parent-pid', str(os.getpid()),
+        '--parent-creation-marker', parent_creation_marker,
+        '--',
+        *cmd_args,
+    ]
 
     # 任务级日志文件
     task_log = LOG_DIR / f'_task_{task_name}.log'
+    proc = None
+    worker_pid = 0
 
     try:
         with open(task_log, 'w', encoding='utf-8') as f:
@@ -481,7 +478,48 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
             )
 
-        # 轮询等待，避免长任务期间心跳和 PID 文件完全停更
+        # The actual worker atomically owns the lock before it executes target
+        # code. This avoids a Windows parent-crash leaving an untracked child.
+        handshake = None
+        handshake_deadline = time.time() + 15
+        while time.time() < handshake_deadline:
+            if handshake_path.exists():
+                try:
+                    handshake = json.loads(handshake_path.read_text(encoding='utf-8'))
+                    break
+                except Exception:
+                    pass
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+
+        if not handshake:
+            _terminate_task_worker(proc, proc.pid)
+            msg = 'Worker lock handshake timed out'
+            logger.error(f"❌ 任务启动失败: {task_name}: {msg}")
+            update_health(task_name, 'failed', msg, time.time() - start_time)
+            return False, msg
+
+        if not handshake.get('claimed'):
+            try:
+                returncode = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _terminate_task_worker(proc, proc.pid)
+                returncode = proc.returncode
+            if returncode == 75:
+                logger.info(f"↪ 跳过任务 {task_name}: 已有实际工作进程持有任务锁")
+                return True, 'Skipped (already running or recovering)'
+            msg = f'Worker lock handshake failed (exit={returncode})'
+            logger.error(f"❌ 任务启动失败: {task_name}: {msg}")
+            update_health(task_name, 'failed', msg, time.time() - start_time)
+            return False, msg
+
+        worker_pid = int(handshake.get('worker_pid') or proc.pid)
+        update_health(task_name, 'running', f'Started: {cmd_str}')
+
+        # Poll frequently for short tasks while refreshing the daemon heartbeat
+        # at the existing 30-second cadence.
+        last_heartbeat_at = 0.0
         while True:
             returncode = proc.poll()
             duration = time.time() - start_time
@@ -491,15 +529,16 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
 
             if duration >= timeout_sec:
                 logger.error(f"⏰ 任务超时 ({timeout_sec}s): {task_name}")
-                proc.kill()
-                proc.wait(timeout=10)
+                _terminate_task_worker(proc, worker_pid)
                 update_health(task_name, 'timeout', f'Killed after {timeout_sec}s', duration)
                 update_health('_daemon', 'running', f'Timeout while waiting for {task_name}')
                 _notify_failure(task_name, f'任务超时 ({timeout_sec}秒), 已强制终止')
                 return False, f'Timeout after {timeout_sec}s'
 
-            update_health('_daemon', 'running', f'Running {task_name} | elapsed {duration:.0f}s')
-            time.sleep(30)
+            if duration - last_heartbeat_at >= 30:
+                update_health('_daemon', 'running', f'Running {task_name} | elapsed {duration:.0f}s')
+                last_heartbeat_at = duration
+            time.sleep(1)
 
         duration = time.time() - start_time
 
@@ -507,6 +546,11 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
             logger.info(f"✅ 任务完成: {task_name} ({duration:.0f}s)")
             update_health(task_name, 'success', f'OK in {duration:.0f}s', duration)
             return True, f'Success in {duration:.0f}s'
+        if returncode == 2:
+            msg = 'Completed with follow-up items; targeted review or retry required'
+            logger.warning(f"⚠️ 任务部分完成: {task_name} ({duration:.0f}s)")
+            update_health(task_name, 'partial_success', msg, duration)
+            return True, msg
         else:
             # 读取最后几行日志
             tail = _tail_file(task_log, 5)
@@ -521,11 +565,37 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
         duration = time.time() - start_time
         msg = f'Exception: {e}'
         logger.error(f"❌ 任务异常: {task_name}: {e}")
+        if proc is not None and proc.poll() is None:
+            _terminate_task_worker(proc, worker_pid or proc.pid)
         update_health(task_name, 'failed', msg, duration)
         _notify_failure(task_name, msg)
         return False, msg
     finally:
-        release_task_run_lock(task_name)
+        try:
+            handshake_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _terminate_task_worker(proc, worker_pid):
+    """Terminate the actual lock-owning worker, not a venv launcher shim."""
+    if sys.platform == 'win32':
+        try:
+            subprocess.run(
+                ['taskkill', '/PID', str(int(worker_pid)), '/F', '/T'],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception as exc:
+            logger.warning(f"无法终止实际任务进程 PID {worker_pid}: {exc}")
+    try:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=10)
+    except Exception:
+        pass
 
 
 def _tail_file(path, n=5):
@@ -923,12 +993,11 @@ def task_cro_lifecycle_detect():
 
 
 def task_cro_title_rewrite():
-    """CRO title keyword enrichment — scheduled apply by default.
+    """CRO title keyword enrichment — scheduled dry-run by default.
 
-    Scheduled live title writes stay bounded:
-    ENABLE_SCHEDULED_TITLE_REWRITE_APPLY=0 disables apply and falls back to
-    dry-run mode. Apply uses SCHEDULED_TITLE_REWRITE_APPLY_LIMIT (default 50).
-    Dry-run uses SCHEDULED_TITLE_REWRITE_DRY_RUN_LIMIT (default 50).
+    Live title writes require an explicit environment opt-in:
+    ENABLE_SCHEDULED_TITLE_REWRITE_APPLY=1.  This keeps routine schedule runs
+    observable without reintroducing unreviewed factual changes.
     """
     if _task_succeeded_today('cro_title_rewrite'):
         logger.info("↪ 跳过 CRO 标题热词优化: 今日已成功执行")
@@ -937,7 +1006,7 @@ def task_cro_title_rewrite():
         return True, 'Skipped (waiting for daily_tasks)'
 
     raw_apply = os.getenv('ENABLE_SCHEDULED_TITLE_REWRITE_APPLY', '').strip().lower()
-    apply_enabled = raw_apply not in {'0', 'false', 'no', 'off'}
+    apply_enabled = raw_apply in {'1', 'true', 'yes', 'on'}
     limit_env = (
         os.getenv('SCHEDULED_TITLE_REWRITE_APPLY_LIMIT', '50')
         if apply_enabled else
@@ -1708,6 +1777,15 @@ def recover_missed_tasks(log_when_clean=True):
                 'depends_on_success': 'daily_tasks',
             },
             {
+                'name': 'cro_title_rewrite',
+                'scheduled_time': '10:45',
+                'recovery_grace_minutes': 20,
+                'func': task_cro_title_rewrite,
+                'label': 'CRO 标题热词优化',
+                'priority': 123,
+                'depends_on_success': 'daily_tasks',
+            },
+            {
                 'name': 'cro_lifecycle_evaluate',
                 'scheduled_time': '10:50',
                 'recovery_grace_minutes': 30,
@@ -1958,6 +2036,22 @@ def main():
     if args.status:
         show_status()
         return
+
+    if MAINTENANCE_FILE.exists():
+        logger.critical(f"维护锁存在，拒绝启动调度器: {MAINTENANCE_FILE}")
+        raise SystemExit(2)
+
+    try:
+        database_report = validate_runtime_database(PROJECT_ROOT / 'ebay_collection.db')
+    except Exception as exc:
+        logger.critical(f"数据库启动检查失败，拒绝运行任何任务: {exc}")
+        raise SystemExit(2) from exc
+    logger.info(
+        "数据库启动检查通过: integrity=%s, links=%s, pages=%s",
+        database_report.integrity_check,
+        database_report.link_count,
+        database_report.page_count,
+    )
 
     if args.task:
         task_map = {

@@ -47,6 +47,11 @@ from src.utils.publish_autofix import (
 from src.utils.publish_aspect_completion import complete_publish_aspects
 from src.utils.publish_validation import MEASUREMENT_ASPECT_KEYS
 from src.utils.mi_draft_origin import is_mi_draft_product
+from src.db.database_safety import (
+    DatabaseSafetyError,
+    assert_runtime_not_in_maintenance,
+    validate_runtime_database,
+)
 
 # ============================================================================
 # Page Config
@@ -57,6 +62,14 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+try:
+    assert_runtime_not_in_maintenance(root_dir / "logs" / "_maintenance.lock")
+    _database_safety_report = validate_runtime_database(root_dir / "ebay_collection.db")
+except DatabaseSafetyError as exc:
+    st.error("数据库安全检查未通过，应用已停止以防止进一步损坏。")
+    st.code(str(exc))
+    st.stop()
 
 # ============================================================================
 # Category Name Lookup

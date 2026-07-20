@@ -11,7 +11,7 @@ import pytest
 from scripts.cro_title_rewrite import (
     build_enriched_title, recently_rewritten_skus, load_candidates, run,
     default_candidate_skus, _snapshot_fallback_skus,
-    title_aspect_conflicts, render_email_html, _send_email,
+    title_aspect_conflicts, render_email_html, _send_email, main,
 )
 
 
@@ -375,10 +375,53 @@ def test_send_email_uses_attachment_and_summary(monkeypatch, tmp_path):
     report_path = tmp_path / 'cro_title_rewrite_report.json'
     report_path.write_text('{}', encoding='utf-8')
 
-    _send_email(rep, Path(report_path))
+    assert _send_email(rep, Path(report_path)) is True
 
     assert '候选12' in captured['subject']
     assert '建议1' in captured['subject']
     assert '失败1' in captured['subject']
     assert 'CRO 标题热词优化日报' in captured['html']
     assert captured['attachments'] == [str(report_path)]
+
+
+def test_send_email_returns_false_when_delivery_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        'src.utils.email_sender.send_email',
+        lambda *args, **kwargs: False,
+    )
+    report_path = tmp_path / 'cro_title_rewrite_report.json'
+    report_path.write_text('{}', encoding='utf-8')
+
+    delivered = _send_email({'input_skus': 0, 'apply': False, 'rows': []}, report_path)
+
+    assert delivered is False
+
+
+def test_cli_returns_nonzero_when_completion_email_is_not_delivered(monkeypatch, tmp_path):
+    import sys
+    import scripts.cro_title_rewrite as cli
+
+    report_path = tmp_path / 'cro_title_rewrite_report.json'
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['cro_title_rewrite.py', '--skus', 'EMAIL-1', '--email', '--out', str(report_path)],
+    )
+    monkeypatch.setattr(
+        cli,
+        'run',
+        lambda *args, **kwargs: {
+            'input_skus': 1,
+            'cooldown_skipped': 0,
+            'proposed': [],
+            'done': [],
+            'failed': [],
+            'skipped': [],
+            'rows': [],
+            'apply': False,
+        },
+    )
+    monkeypatch.setattr(cli, '_send_email', lambda *args, **kwargs: False)
+
+    assert main() == 5
+    assert report_path.exists()

@@ -511,7 +511,7 @@ def render_email_html(rep: Dict[str, Any]) -> str:
     """
 
 
-def _send_email(rep: Dict[str, Any], report_path: Path) -> None:
+def _send_email(rep: Dict[str, Any], report_path: Path) -> bool:
     from src.utils.email_sender import send_email
 
     counts = _status_counts(rep.get("rows") or [])
@@ -520,7 +520,7 @@ def _send_email(rep: Dict[str, Any], report_path: Path) -> None:
         f"成功{counts['done']} 建议{counts['proposed']} "
         f"失败{counts['failed']} 拦截{counts['skipped']}"
     )
-    send_email(subject, render_email_html(rep), attachments=[str(report_path)])
+    return bool(send_email(subject, render_email_html(rep), attachments=[str(report_path)]))
 
 
 # ── live 写路径 (--apply) ────────────────────────────────────
@@ -777,7 +777,7 @@ def run(skus: List[str], apply_changes: bool, limit: int,
     return rep
 
 
-def main():
+def main() -> int:
     p = argparse.ArgumentParser(
         description="CRO title rewrite channel (operator-only, dry-run default)")
     p.add_argument("--skus", help="Comma-separated SKUs (overrides escalation source)")
@@ -839,11 +839,16 @@ def main():
 
     if args.email:
         try:
-            _send_email(rep, out_path)
-            print("Email sent")
+            if _send_email(rep, out_path):
+                print("Email sent")
+            else:
+                print("Email delivery failed; local report was saved")
+                return 5
         except Exception as e:
             print(f"Email failed: {e}")
+            return 5
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

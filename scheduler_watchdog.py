@@ -18,6 +18,7 @@ PROJECT_ROOT = Path(__file__).parent
 PID_FILE = PROJECT_ROOT / 'logs' / '_scheduler.pid'
 HEALTH_FILE = PROJECT_ROOT / 'logs' / '_scheduler_health.json'
 WATCHDOG_LOG = PROJECT_ROOT / 'logs' / '_watchdog.log'
+MAINTENANCE_FILE = PROJECT_ROOT / 'logs' / '_maintenance.lock'
 PYTHON = str(PROJECT_ROOT / '.venv' / 'Scripts' / 'python.exe')
 PYTHONW = str(PROJECT_ROOT / '.venv' / 'Scripts' / 'pythonw.exe')
 DAEMON_SCRIPT = str(PROJECT_ROOT / 'scheduler_daemon.py')
@@ -57,6 +58,13 @@ def log(msg):
             f.write(line)
     except Exception:
         pass
+
+
+def _maintenance_active():
+    if MAINTENANCE_FILE.exists():
+        log(f"[WATCHDOG] Maintenance lock present: {MAINTENANCE_FILE}; skipping recovery")
+        return True
+    return False
 
 
 def is_pid_alive(pid):
@@ -212,6 +220,8 @@ def check_and_restart():
         pass
 
     # Restart daemon (no window)
+    if _maintenance_active():
+        return
     try:
         proc = subprocess.Popen(
             [PYTHONW, DAEMON_SCRIPT],
@@ -226,7 +236,9 @@ def check_and_restart():
 
 def _task_succeeded_today(health, task_name, today):
     info = _get_task_info(health, task_name)
-    if str(info.get('status', '')).lower() not in {'success', 'ok'}:
+    if str(info.get('status', '')).lower() not in {
+        'success', 'ok', 'partial_success', 'completed_with_errors'
+    }:
         return False
     at = info.get('at')
     if not at:
@@ -321,11 +333,8 @@ def check_overdue_critical_tasks():
             except Exception:
                 pass
         log(f"[WATCHDOG] OVERDUE: {name} 应在 {deadline_hhmm} 前完成, 主动补跑")
-        try:
-            health = read_health() or {}
-            health = _record_recovery_in_progress(health, name, deadline_hhmm)
-        except Exception as e:
-            log(f"[WATCHDOG] Failed to record recovery state for {name}: {e}")
+        if _maintenance_active():
+            continue
         try:
             subprocess.Popen(
                 _daemon_task_command(task_alias),
@@ -336,8 +345,24 @@ def check_overdue_critical_tasks():
         except Exception as e:
             log(f"[WATCHDOG] Failed to launch recovery for {name}: {e}")
             continue
+        try:
+            health = read_health() or {}
+            health = _record_recovery_in_progress(health, name, deadline_hhmm)
+        except Exception as e:
+            log(f"[WATCHDOG] Failed to record recovery state for {name}: {e}")
+
+
+def run_watchdog_tick():
+    """Run one watchdog cycle unless an operator maintenance lock is present."""
+    if _maintenance_active():
+        return False
+
+    check_and_restart()
+    if _maintenance_active():
+        return False
+    check_overdue_critical_tasks()
+    return True
 
 
 if __name__ == '__main__':
-    check_and_restart()
-    check_overdue_critical_tasks()
+    run_watchdog_tick()

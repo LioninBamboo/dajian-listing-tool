@@ -115,6 +115,30 @@ def test_audit_parser_supports_scheduled_live_email_mode():
     assert args.sku_file == "skus.txt"
 
 
+def test_audit_parser_supports_report_scoped_fix_key_filter():
+    parser = audit_fix_active_listings.create_parser()
+
+    args = parser.parse_args(
+        [
+            "--fix",
+            "--live",
+            "--source-report",
+            "prior_audit.json",
+            "--issue-type",
+            "missing_video",
+            "--fix-key",
+            "__sync_video__",
+            "--local-video-status",
+            "LIVE",
+        ]
+    )
+
+    assert args.source_report == "prior_audit.json"
+    assert args.issue_types == ["missing_video"]
+    assert args.fix_keys == ["__sync_video__"]
+    assert args.local_video_statuses == ["LIVE"]
+
+
 def test_report_source_marks_live_and_local_modes():
     parser = audit_fix_active_listings.create_parser()
 
@@ -366,6 +390,58 @@ def test_load_skus_from_file_ignores_comments_and_duplicates(tmp_path):
     sku_file.write_text("SKU1\n# note\nSKU2\nSKU1\n\nSKU3\n", encoding="utf-8")
 
     assert audit_fix_active_listings._load_skus_from_file(str(sku_file)) == ["SKU1", "SKU2", "SKU3"]
+
+
+def test_load_skus_from_audit_report_selects_only_requested_issue_type(tmp_path):
+    report_path = tmp_path / "audit.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "issues": [
+                    {"sku": "SKU-VIDEO", "issues": [{"type": "missing_video"}]},
+                    {"sku": "SKU-MIXED", "issues": [{"type": "missing_video"}, {"type": "category_mismatch"}]},
+                    {"sku": "SKU-CATEGORY", "issues": [{"type": "category_mismatch"}]},
+                    {"sku": "SKU-VIDEO", "issues": [{"type": "missing_video"}]},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert audit_fix_active_listings._load_skus_from_audit_report(
+        str(report_path), {"missing_video"}
+    ) == ["SKU-VIDEO", "SKU-MIXED"]
+
+
+def test_filter_fixes_limits_a_write_to_explicitly_allowed_keys():
+    fixes = {
+        "__sync_video__": "https://example.test/video.mp4",
+        "categoryId": "123",
+        "Material": ["Wood"],
+    }
+
+    assert audit_fix_active_listings.filter_fixes_by_key(fixes, {"__sync_video__"}) == {
+        "__sync_video__": "https://example.test/video.mp4"
+    }
+
+
+def test_filter_skus_by_local_video_status_keeps_only_reusable_media_ids(tmp_path):
+    db_path = tmp_path / "collection.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    conn.executemany(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        [
+            ("SKU-LIVE", json.dumps({"video_id": "live-id", "video_status": "LIVE"})),
+            ("SKU-UPLOADED", json.dumps({"video_id": "uploaded-id", "video_status": "UPLOADED"})),
+            ("SKU-DEAD", json.dumps({"video_status": "UNSUPPORTED_SOURCE"})),
+            ("SKU-BAD-JSON", "not-json"),
+        ],
+    )
+
+    assert audit_fix_active_listings.filter_skus_by_local_video_status(
+        conn, ["SKU-LIVE", "SKU-UPLOADED", "SKU-DEAD", "SKU-BAD-JSON", "SKU-MISSING"], {"LIVE"}
+    ) == ["SKU-LIVE"]
 
 
 def test_fix_listing_uses_live_snapshot_as_fix_base(monkeypatch):
@@ -796,6 +872,10 @@ def test_fix_listing_reuses_existing_local_video_id_before_upload(monkeypatch):
     )
 
     assert any("Re-linked existing source video on eBay: existing-video" in item for item in results)
+    stored_opt = json.loads(
+        conn.execute("SELECT optimization FROM collected_products WHERE sku = ?", ("SKU-VIDEO-REUSE",)).fetchone()[0]
+    )
+    assert stored_opt["video_status"] == "LIVE"
 
 
 def test_active_audit_flags_stale_live_video_when_source_has_no_video():
@@ -1832,6 +1912,61 @@ def test_fix_listing_removes_claim_diff_feature_keys_for_waterproof_and_foldable
     assert "Folding Mechanism" not in captured["aspects"]
     assert "Is Waterproof" not in captured["aspects"]
     assert "Water Resistance Technology" not in captured["aspects"]
+
+
+def test_fix_listing_removes_massage_functions_aspect_for_unsupported_massage_claim(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        ("SKU-MASSAGE", json.dumps({"title": "T", "description": "<div>D</div>", "aspects": {}})),
+    )
+    captured = {}
+
+    def fake_put_inventory_product_only(_client, _sku, title, description, aspects):
+        captured["title"] = title
+        captured["description"] = description
+        captured["aspects"] = dict(aspects)
+        return object(), description, aspects
+
+    monkeypatch.setattr(audit_fix_active_listings, "_put_inventory_product_only", fake_put_inventory_product_only)
+
+    class FakeClient:
+        def get_offers_by_sku(self, _sku):
+            return [{"offerId": "offer-massage", "listing": {"listingId": "123"}, "status": "PUBLISHED"}]
+
+        def publish_offer(self, _offer_id):
+            return {"listingId": "123"}
+
+    live_opt_raw = json.dumps(
+        {
+            "title": "Heated Recliner",
+            "description": "<div>Heating only.</div>",
+            "aspects": {"Massage Functions": ["Heated"], "Material": ["Fabric"]},
+        }
+    )
+    audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-MASSAGE",
+        {
+            "sku": "SKU-MASSAGE",
+            "title": "Source Recliner",
+            "description": "<div>Heating only.</div>",
+            "optimization": live_opt_raw,
+            "attributes": "{}",
+            "specs": "{}",
+            "images": "[]",
+            "price": 100,
+            "suggested_price": 100,
+            "listing_id": "123",
+        },
+        {"__claim_diff_violations__": ["massage"]},
+        FakeClient(),
+        conn,
+        base_opt_raw=live_opt_raw,
+    )
+
+    assert "Massage Functions" not in captured["aspects"]
+    assert captured["aspects"]["Material"] == ["Fabric"]
 
 
 def test_fix_listing_removes_unsupported_zipped_removable_floor(monkeypatch):

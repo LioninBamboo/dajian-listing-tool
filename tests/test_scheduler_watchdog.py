@@ -5,12 +5,23 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
 WATCHDOG_SPEC = importlib.util.spec_from_file_location('scheduler_watchdog', ROOT / 'scheduler_watchdog.py')
 scheduler_watchdog = importlib.util.module_from_spec(WATCHDOG_SPEC)
 WATCHDOG_SPEC.loader.exec_module(scheduler_watchdog)
+
+
+@pytest.fixture(autouse=True)
+def isolate_maintenance_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        scheduler_watchdog,
+        'MAINTENANCE_FILE',
+        tmp_path / '_no_maintenance.lock',
+    )
 
 
 class FixedMondayNoonDateTime(datetime):
@@ -229,3 +240,42 @@ def test_watchdog_restarts_stale_daemon_without_restoring_old_health_pid(tmp_pat
 
     assert stopped == [(stale_pid, 'stale heartbeat > 15m')]
     assert launched == [[scheduler_watchdog.PYTHONW, scheduler_watchdog.DAEMON_SCRIPT]]
+
+
+def test_watchdog_tick_skips_all_recovery_during_maintenance(tmp_path, monkeypatch):
+    maintenance_file = tmp_path / '_maintenance.lock'
+    maintenance_file.write_text('database recovery in progress', encoding='utf-8')
+    calls = []
+
+    monkeypatch.setattr(scheduler_watchdog, 'MAINTENANCE_FILE', maintenance_file, raising=False)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda message: calls.append(('log', message)))
+    monkeypatch.setattr(scheduler_watchdog, 'check_and_restart', lambda: calls.append(('restart', None)))
+    monkeypatch.setattr(
+        scheduler_watchdog,
+        'check_overdue_critical_tasks',
+        lambda: calls.append(('recover', None)),
+    )
+
+    assert scheduler_watchdog.run_watchdog_tick() is False
+    assert [name for name, _ in calls] == ['log']
+
+
+def test_watchdog_tick_stops_when_maintenance_starts_between_phases(tmp_path, monkeypatch):
+    maintenance_file = tmp_path / '_maintenance.lock'
+    calls = []
+
+    def restart_then_lock():
+        calls.append('restart')
+        maintenance_file.write_text('maintenance started', encoding='utf-8')
+
+    monkeypatch.setattr(scheduler_watchdog, 'MAINTENANCE_FILE', maintenance_file)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda message: calls.append('log'))
+    monkeypatch.setattr(scheduler_watchdog, 'check_and_restart', restart_then_lock)
+    monkeypatch.setattr(
+        scheduler_watchdog,
+        'check_overdue_critical_tasks',
+        lambda: calls.append('recover'),
+    )
+
+    assert scheduler_watchdog.run_watchdog_tick() is False
+    assert calls == ['restart', 'log']

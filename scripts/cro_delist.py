@@ -173,10 +173,8 @@ def _mark_lifecycle_confirmation(db: Path, sku: str, result: str) -> None:
                     error = ?,
                     updated_at = ?
                 WHERE sku = ?
-                  AND (
-                    (action_type = 'final_delist' AND status = 'candidate')
-                    OR status = 'fallback_delist_pending'
-                  )
+                  AND action_type = 'final_delist'
+                  AND status = 'candidate'
                 """,
                 (
                     status,
@@ -211,6 +209,68 @@ def _default_ebay_client():
     return create_real_ebay_client(os.getenv("EBAY_ENVIRONMENT", "PRODUCTION"))
 
 
+def _default_source_checker(sku: str) -> dict[str, Any]:
+    """Read current GIGA availability for a destructive delist decision.
+
+    An unavailable credential, malformed reply, or upstream exception is not
+    evidence that the source is unavailable.  Those conditions therefore fail
+    closed and leave the pending approval link usable for a later retry.
+    """
+    try:
+        from dotenv import load_dotenv
+        from src.clients.dajian_client import DaJianClient
+
+        load_dotenv(PROJECT_ROOT / '.env')
+        client_id = os.getenv('DAJIAN_API_KEY')
+        client_secret = os.getenv('DAJIAN_API_SECRET')
+        if not client_id or not client_secret:
+            return {'verified': False, 'reason': 'GIGA credentials are not configured'}
+        detail = DaJianClient(client_id, client_secret).get_product_detail_by_sku(sku)
+        if detail is None:
+            return {
+                'verified': True,
+                'sku_available': False,
+                'reason': 'SKU is absent from the GIGA response',
+            }
+        if not isinstance(detail, dict):
+            return {'verified': False, 'reason': 'malformed GIGA product response'}
+        if not isinstance(detail.get('skuAvailable'), bool):
+            return {'verified': False, 'reason': 'GIGA response omitted skuAvailable'}
+        return {
+            'verified': True,
+            'sku_available': detail['skuAvailable'],
+            'reason': 'GIGA product response checked',
+        }
+    except Exception as exc:
+        logger.warning('GIGA recheck failed for %s: %s', sku, exc)
+        return {'verified': False, 'reason': f'GIGA recheck failed: {exc}'}
+
+
+def _source_recheck_state(
+    sku: str,
+    source_checker: Optional[Callable[[str], dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Normalize injected/live source checks and fail closed on bad results."""
+    try:
+        result = (source_checker or _default_source_checker)(sku)
+    except Exception as exc:
+        return {'verified': False, 'reason': f'source checker failed: {exc}'}
+    if not isinstance(result, dict):
+        return {'verified': False, 'reason': 'source checker returned malformed result'}
+    if result.get('verified') is not True:
+        return {
+            'verified': False,
+            'reason': str(result.get('reason') or 'source check was not verified'),
+        }
+    if 'sku_available' not in result:
+        return {'verified': False, 'reason': 'source checker omitted sku availability'}
+    return {
+        'verified': True,
+        'sku_available': bool(result['sku_available']),
+        'reason': str(result.get('reason') or ''),
+    }
+
+
 def _mark_queue_done(sku: str) -> None:
     try:
         from src.services.cro_action_queue import mark_done
@@ -225,6 +285,7 @@ def execute_pending_delist(
     token: Optional[str] = None,
     ebay_client: Any = None,
     ebay_client_factory: Optional[Callable[[], Any]] = None,
+    source_checker: Optional[Callable[[str], dict[str, Any]]] = None,
     mark_queue: bool = True,
 ) -> dict:
     """Execute one human-confirmed pending delist.
@@ -279,6 +340,23 @@ def execute_pending_delist(
             ),
         }
 
+    source_state = _source_recheck_state(sku, source_checker=source_checker)
+    if not source_state.get('verified'):
+        return {
+            'sku': sku,
+            'ok': False,
+            'status': 'source_recheck_unavailable',
+            'error': str(source_state.get('reason') or 'source recheck was not verified'),
+        }
+    if source_state.get('sku_available'):
+        mark_confirmed(db, sku, 'skipped:source_still_available')
+        return {
+            'sku': sku,
+            'ok': False,
+            'status': 'source_still_available',
+            'error': 'GIGA source is currently available; delist is cancelled',
+        }
+
     try:
         client = ebay_client or (
             ebay_client_factory() if ebay_client_factory else _default_ebay_client()
@@ -311,6 +389,7 @@ def batch_confirm_pending_delists(
     db_path: Optional[Path] = None,
     ebay_client: Any = None,
     ebay_client_factory: Optional[Callable[[], Any]] = None,
+    source_checker: Optional[Callable[[str], dict[str, Any]]] = None,
     mark_queue: bool = True,
     max_count: int = 200,
 ) -> dict:
@@ -335,6 +414,7 @@ def batch_confirm_pending_delists(
             db,
             sku,
             ebay_client=client,
+            source_checker=source_checker,
             mark_queue=mark_queue,
         )
         for sku in normalized
@@ -376,10 +456,8 @@ def _load_lifecycle_delist_candidates(db: Path, limit: int,
                 """
                 SELECT id, sku, reason, priority, status, action_type
                 FROM cro_listing_lifecycle_actions
-                WHERE (
-                    action_type = 'final_delist'
-                    AND status = 'candidate'
-                ) OR status = 'fallback_delist_pending'
+                WHERE action_type = 'final_delist'
+                  AND status = 'candidate'
                 ORDER BY
                     CASE priority WHEN 'P1' THEN 1 WHEN 'P2' THEN 2
                                   WHEN 'P3' THEN 3 ELSE 9 END,

@@ -822,6 +822,36 @@ def test_from_daily_audit_empty_queue_exits_zero(monkeypatch, capsys):
     assert "nothing to do" in out.lower()
 
 
+def test_semantic_execution_status_marks_all_human_queue_as_review_required():
+    import scripts.semantic_rewrite as cli
+
+    status = cli.classify_execution_status({
+        'planned': 30,
+        'skip': 0,
+        'human': 30,
+        'applied_ok': 0,
+        'applied_fail': 0,
+    })
+
+    assert status == 'review_required'
+    assert cli.scheduler_exit_code_for_status(True, status, current_exit_code=0) == 2
+
+
+def test_semantic_execution_status_does_not_hide_apply_failures():
+    import scripts.semantic_rewrite as cli
+
+    status = cli.classify_execution_status({
+        'planned': 2,
+        'skip': 0,
+        'human': 0,
+        'applied_ok': 1,
+        'applied_fail': 1,
+    })
+
+    assert status == 'failed'
+    assert cli.scheduler_exit_code_for_status(True, status, current_exit_code=4) == 4
+
+
 def test_bare_cli_without_skus_still_exits_two(capsys):
     import scripts.semantic_rewrite as cli
 

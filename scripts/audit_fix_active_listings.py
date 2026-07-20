@@ -214,6 +214,10 @@ CLAIM_SPECIFIC_ASPECT_KEY_PATTERNS = {
     "zippered_floor": (
         r"\bclosure\s+type\b",
     ),
+    "massage": (
+        r"\bmassage\s+functions?\b",
+        r"\bmassage\s+mode(?:s)?\b",
+    ),
 }
 
 
@@ -1639,6 +1643,28 @@ def create_parser():
     parser.add_argument("--fix", action="store_true", help="Apply fixes to eBay (default: dry run)")
     parser.add_argument("--sku", type=str, help="Audit or fix a specific SKU only")
     parser.add_argument("--sku-file", help="Optional text file with one SKU per line")
+    parser.add_argument(
+        "--source-report",
+        help="Prior audit JSON used to select affected SKUs; requires --issue-type",
+    )
+    parser.add_argument(
+        "--issue-type",
+        action="append",
+        dest="issue_types",
+        help="Issue type to select from --source-report (repeatable)",
+    )
+    parser.add_argument(
+        "--fix-key",
+        action="append",
+        dest="fix_keys",
+        help="Only apply these generated fix keys (repeatable; audit remains unchanged)",
+    )
+    parser.add_argument(
+        "--local-video-status",
+        action="append",
+        dest="local_video_statuses",
+        help="For a report-scoped run, keep only SKUs with a local video ID in this status (repeatable)",
+    )
     parser.add_argument("--limit", type=int, help="Optional max number of published rows to audit")
     parser.add_argument(
         "--live",
@@ -1666,7 +1692,7 @@ def create_parser():
 
 
 def is_full_published_scope(args) -> bool:
-    return not args.sku and not args.sku_file
+    return not args.sku and not args.sku_file and not args.source_report
 
 
 def get_report_source(args) -> str:
@@ -1674,6 +1700,14 @@ def get_report_source(args) -> str:
 
 
 def validate_fix_scope(args, parser) -> None:
+    if args.source_report and (args.sku or args.sku_file):
+        parser.error("--source-report cannot be combined with --sku or --sku-file")
+    if args.source_report and not args.issue_types:
+        parser.error("--source-report requires at least one --issue-type")
+    if args.issue_types and not args.source_report:
+        parser.error("--issue-type requires --source-report")
+    if args.local_video_statuses and not args.source_report:
+        parser.error("--local-video-status requires --source-report")
     if args.fix and not args.live and is_full_published_scope(args):
         parser.error(
             "--fix on full published inventory requires --live; "
@@ -1704,6 +1738,87 @@ def _load_skus_from_file(path: str) -> list[str]:
         seen.add(sku)
         values.append(sku)
     return values
+
+
+def _load_skus_from_audit_report(path: str, issue_types: set[str]) -> list[str]:
+    """Return unique SKUs whose prior audit includes one requested issue type.
+
+    This deliberately scopes a repair run to a saved audit snapshot. The
+    listing is still read live before any update, so a resolved or changed
+    issue does not result in a blind write.
+    """
+    requested = {str(issue_type or "").strip() for issue_type in issue_types}
+    requested.discard("")
+    if not requested:
+        return []
+
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read audit report {path}: {exc}") from exc
+
+    entries = payload.get("issues", []) if isinstance(payload, dict) else []
+    if not isinstance(entries, list):
+        raise ValueError(f"audit report {path} has invalid issues payload")
+
+    skus = []
+    seen = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        sku = str(entry.get("sku") or "").strip()
+        issues = entry.get("issues") or []
+        matched = any(
+            isinstance(issue, dict) and str(issue.get("type") or "").strip() in requested
+            for issue in issues
+        )
+        if sku and matched and sku not in seen:
+            seen.add(sku)
+            skus.append(sku)
+    return skus
+
+
+def filter_fixes_by_key(fixes: dict, allowed_keys: set[str] | None) -> dict:
+    """Return only explicitly approved fixes without mutating the audit result."""
+    if not allowed_keys:
+        return dict(fixes or {})
+    allowed = {str(key) for key in allowed_keys}
+    return {key: value for key, value in (fixes or {}).items() if key in allowed}
+
+
+def filter_skus_by_local_video_status(
+    db_conn,
+    skus: list[str],
+    allowed_statuses: set[str],
+) -> list[str]:
+    """Keep report-selected SKUs with a reusable locally recorded eBay video ID."""
+    wanted = {str(status or "").strip().upper() for status in allowed_statuses}
+    wanted.discard("")
+    if not skus or not wanted:
+        return list(skus)
+
+    placeholders = ",".join("?" for _ in skus)
+    rows = db_conn.execute(
+        f"SELECT sku, optimization FROM collected_products WHERE sku IN ({placeholders})",
+        tuple(skus),
+    ).fetchall()
+    eligible = set()
+    for row in rows:
+        try:
+            sku = row["sku"]
+            optimization = row["optimization"]
+        except (IndexError, TypeError):
+            sku, optimization = row[0], row[1]
+        opt = parse_json(optimization)
+        status = str(opt.get("video_status") or opt.get("videoStatus") or "").strip().upper()
+        video_id = str(opt.get("video_id") or opt.get("videoId") or "").strip()
+        if not video_id:
+            video_ids = opt.get("videoIds")
+            if isinstance(video_ids, list) and video_ids:
+                video_id = str(video_ids[0] or "").strip()
+        if status in wanted and video_id:
+            eligible.add(sku)
+    return [sku for sku in skus if sku in eligible]
 
 
 def _render_audit_issue_items(issues, *, limit=5):
@@ -2219,6 +2334,7 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
     republished_listing_id = None
     video_changed = False
     synced_video_id = None
+    reused_existing_live_video = False
     video_removed = False
 
     # Apply aspect fixes
@@ -2245,6 +2361,7 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
             if existing_video_id and _ensure_live_video_id_attached(ebay_client, uploader, sku, existing_video_id):
                 synced_video_id = existing_video_id
                 video_changed = True
+                reused_existing_live_video = True
                 results.append(f"Re-linked existing source video on eBay: {existing_video_id}")
                 continue
 
@@ -3009,7 +3126,10 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
             opt["motorsCompatibility"] = compatibility_payload
         if synced_video_id:
             opt["video_id"] = synced_video_id
-            opt["video_status"] = "UPLOADED"
+            # A reused Media API ID was independently known to be LIVE before
+            # attachment. Do not downgrade that fact to the ambiguous local
+            # label "UPLOADED", which makes later recovery queues unreliable.
+            opt["video_status"] = "LIVE" if reused_existing_live_video else "UPLOADED"
             opt["videoIds"] = [synced_video_id]
         if video_removed:
             opt.pop("video_id", None)
@@ -3056,17 +3176,34 @@ def main(argv=None):
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
 
-    # Query published products
+    # Query published products. A report scope only supplies candidate SKUs;
+    # every candidate is re-read from live eBay below before a fix is applied.
     if args.sku:
         rows = conn.execute(
             "SELECT sku, title, attributes, specs, optimization, description, images, videos, price, suggested_price, status, listing_id "
             "FROM collected_products WHERE sku = ?",
             (args.sku,)
         ).fetchall()
-    elif args.sku_file:
-        sku_list = _load_skus_from_file(args.sku_file)
+    elif args.sku_file or args.source_report:
+        if args.sku_file:
+            sku_list = _load_skus_from_file(args.sku_file)
+        else:
+            try:
+                sku_list = _load_skus_from_audit_report(
+                    args.source_report,
+                    set(args.issue_types or []),
+                )
+            except ValueError as exc:
+                parser.error(str(exc))
+            if args.local_video_statuses:
+                sku_list = filter_skus_by_local_video_status(
+                    conn,
+                    sku_list,
+                    set(args.local_video_statuses),
+                )
         if not sku_list:
-            print(f"⚠️ SKU file is empty: {args.sku_file}")
+            scope_label = args.sku_file or args.source_report
+            print(f"⚠️ Selected SKU scope is empty: {scope_label}")
             conn.close()
             return 0
         placeholders = ",".join("?" for _ in sku_list)
@@ -3250,12 +3387,13 @@ def main(argv=None):
             print(f"   {icon} [TRANSPORT/{sev}] {issue['detail']}")
 
         fix_results = []
-        if args.fix and fixes and ebay_client:
-            print(f"   🔧 Applying {len(fixes)} fixes...")
+        selected_fixes = filter_fixes_by_key(fixes, set(args.fix_keys or []))
+        if args.fix and selected_fixes and ebay_client:
+            print(f"   🔧 Applying {len(selected_fixes)} selected fixes...")
             fix_results = fix_listing_on_ebay(
                 sku,
                 dict(row),
-                fixes,
+                selected_fixes,
                 ebay_client,
                 conn,
                 base_opt_raw=audit_opt_raw if args.live else None,
@@ -3304,6 +3442,7 @@ def main(argv=None):
                 **base_item,
                 "issues": content_issues,
                 "fix_keys": sorted(fixes.keys()),
+                "selected_fix_keys": sorted(selected_fixes.keys()) if args.fix else [],
                 "fixes_applied": fix_results if args.fix else [],
             })
         if transport_issues:

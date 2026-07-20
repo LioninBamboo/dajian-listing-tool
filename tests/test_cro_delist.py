@@ -95,6 +95,38 @@ def test_build_magic_links_includes_lifecycle_final_delist_candidates(tmp_path, 
     assert cd.lookup_pending(db, 'OLD-DEAD') is not None
 
 
+def test_build_magic_links_excludes_fallback_relist_candidates(tmp_path, monkeypatch):
+    """A relist fallback is not evidence that a live listing is safe to end."""
+    from scripts import cro_delist as cd
+    from src.services.cro_relist_lifecycle import ensure_schema
+
+    monkeypatch.setattr(cd, 'load_pending', lambda action_type: [])
+    db = tmp_path / 'd.db'
+    ensure_schema(db)
+    with __import__('sqlite3').connect(str(db)) as conn:
+        conn.execute(
+            """
+            INSERT INTO cro_listing_lifecycle_actions
+            (sku, action_type, status, priority, reason, attempt_no, created_at, source)
+            VALUES ('RELIST-FALLBACK', 'revive_relist', 'fallback_delist_pending', 'P3',
+                    'relist fallback', 1, '2026-05-13T00:00:00+00:00', 'test')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO cro_listing_lifecycle_actions
+            (sku, action_type, status, priority, reason, attempt_no, created_at, source)
+            VALUES ('FINAL-DEAD', 'final_delist', 'candidate', 'P3',
+                    'old_dead_link', 1, '2026-05-13T00:00:00+00:00', 'test')
+            """
+        )
+        conn.commit()
+
+    report = cd.build_magic_links(base_url='http://x', db_path=db, limit=10)
+
+    assert [row['sku'] for row in report['rows']] == ['FINAL-DEAD']
+
+
 def test_load_confirmation_rows_returns_unconfirmed_lifecycle_links(tmp_path, monkeypatch):
     from scripts import cro_delist as cd
     from src.services.cro_relist_lifecycle import ensure_schema
@@ -196,8 +228,13 @@ def test_execute_pending_delist_marks_success_once(tmp_path, monkeypatch):
         conn.commit()
 
     fake = FakeEbayClient()
-    res = cd.execute_pending_delist(db, 'BATCH-1', ebay_client=fake,
-                                    mark_queue=False)
+    res = cd.execute_pending_delist(
+        db,
+        'BATCH-1',
+        ebay_client=fake,
+        mark_queue=False,
+        source_checker=lambda sku: {'verified': True, 'sku_available': False},
+    )
 
     assert res['ok'] is True
     assert fake.calls == ['BATCH-1']
@@ -314,7 +351,103 @@ def test_execute_pending_delist_skips_when_latest_snapshot_has_sales(tmp_path):
     assert confirmed_result == 'skipped:sales_present_on_recheck'
 
 
+def test_execute_pending_delist_skips_when_giga_source_is_still_available(tmp_path):
+    from scripts import cro_delist as cd
+
+    class FakeEbayClient:
+        def __init__(self):
+            self.calls = []
+
+        def delist_sku(self, sku):
+            self.calls.append(sku)
+            return {'success': True}
+
+    db = tmp_path / 'd.db'
+    cd._ensure_schema(db)
+    expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    with __import__('sqlite3').connect(str(db)) as conn:
+        conn.execute(
+            """INSERT INTO cro_delist_pending (sku, token, expires_at, created_at)
+               VALUES ('SOURCE-LIVE', ?, ?, ?)""",
+            (cd.make_token('SOURCE-LIVE', expires), expires, expires),
+        )
+        conn.commit()
+
+    fake = FakeEbayClient()
+    result = cd.execute_pending_delist(
+        db,
+        'SOURCE-LIVE',
+        ebay_client=fake,
+        mark_queue=False,
+        source_checker=lambda sku: {'verified': True, 'sku_available': True},
+    )
+
+    assert result['status'] == 'source_still_available'
+    assert fake.calls == []
+    assert cd.lookup_pending(db, 'SOURCE-LIVE') is None
+
+
+def test_execute_pending_delist_fails_closed_when_giga_recheck_is_unavailable(tmp_path):
+    from scripts import cro_delist as cd
+
+    class FakeEbayClient:
+        def delist_sku(self, sku):
+            raise AssertionError('eBay must not be called when source recheck failed')
+
+    db = tmp_path / 'd.db'
+    cd._ensure_schema(db)
+    expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    with __import__('sqlite3').connect(str(db)) as conn:
+        conn.execute(
+            """INSERT INTO cro_delist_pending (sku, token, expires_at, created_at)
+               VALUES ('SOURCE-UNKNOWN', ?, ?, ?)""",
+            (cd.make_token('SOURCE-UNKNOWN', expires), expires, expires),
+        )
+        conn.commit()
+
+    result = cd.execute_pending_delist(
+        db,
+        'SOURCE-UNKNOWN',
+        ebay_client=FakeEbayClient(),
+        mark_queue=False,
+        source_checker=lambda sku: {'verified': False, 'reason': 'upstream timeout'},
+    )
+
+    assert result['status'] == 'source_recheck_unavailable'
+    assert cd.lookup_pending(db, 'SOURCE-UNKNOWN') is not None
+
+
+def test_default_giga_recheck_fails_closed_when_availability_field_is_missing(monkeypatch):
+    from scripts import cro_delist as cd
+    from src.clients import dajian_client
+
+    class FakeDajian:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_product_detail_by_sku(self, sku):
+            return {'sku': sku, 'productName': 'Ambiguous source response'}
+
+    monkeypatch.setenv('DAJIAN_API_KEY', 'test-key')
+    monkeypatch.setenv('DAJIAN_API_SECRET', 'test-secret')
+    monkeypatch.setattr(dajian_client, 'DaJianClient', FakeDajian)
+    # Keep the real .env out of os.environ: the checker's load_dotenv would
+    # otherwise leak keys (e.g. ENABLE_SCHEDULED_TITLE_REWRITE_APPLY) into
+    # later tests in the same process.
+    monkeypatch.setattr('dotenv.load_dotenv', lambda *args, **kwargs: None)
+
+    state = cd._default_source_checker('AMBIGUOUS-1')
+
+    assert state['verified'] is False
+    assert 'skuAvailable' in state['reason']
+
+
 def test_default_ebay_client_uses_configured_environment(monkeypatch):
+    # Patch BEFORE importing: real_ebay_client -> ebay_auth runs a module-level
+    # load_dotenv() on first import, which would leak real .env keys (e.g.
+    # ENABLE_SCHEDULED_TITLE_REWRITE_APPLY) into later tests in this process.
+    monkeypatch.setattr('dotenv.load_dotenv', lambda *args, **kwargs: None)
+
     from scripts import cro_delist as cd
     from src.clients import real_ebay_client
 
@@ -368,6 +501,7 @@ def test_batch_confirm_pending_delists_dedupes_and_counts(tmp_path):
         db_path=db,
         ebay_client=fake,
         mark_queue=False,
+        source_checker=lambda sku: {'verified': True, 'sku_available': False},
     )
 
     assert fake.calls == ['OK-1', 'FAIL-1']
