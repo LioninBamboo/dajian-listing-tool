@@ -21,6 +21,9 @@ from typing import Any, Dict, Optional
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _DEFAULT_PROFILE_PATH = _PROJECT_ROOT / "config" / "store_profile.yaml"
+# Untracked per-instance override: lets a sub-account checkout keep its own
+# profile without dirtying the tracked default (which would conflict on pull).
+_LOCAL_PROFILE_PATH = _PROJECT_ROOT / "config" / "store_profile.local.yaml"
 
 _lock = threading.Lock()
 _cached_profile: Optional["StoreProfile"] = None
@@ -124,9 +127,14 @@ def _flatten_yaml(data: Dict[str, Any]) -> Dict[str, Any]:
 
 def load_store_profile(path: Optional[os.PathLike] = None) -> StoreProfile:
     """Load a profile from YAML; unknown keys ignored, missing file -> defaults."""
-    profile_path = Path(path) if path else Path(
-        os.getenv("STORE_PROFILE_PATH", str(_DEFAULT_PROFILE_PATH))
-    )
+    if path:
+        profile_path = Path(path)
+    elif os.getenv("STORE_PROFILE_PATH"):
+        profile_path = Path(os.getenv("STORE_PROFILE_PATH"))
+    elif _LOCAL_PROFILE_PATH.exists():
+        profile_path = _LOCAL_PROFILE_PATH
+    else:
+        profile_path = _DEFAULT_PROFILE_PATH
     if not profile_path.exists():
         return StoreProfile()
     try:

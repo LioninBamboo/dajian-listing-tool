@@ -104,6 +104,26 @@ class TestOverrides:
         profile = load_store_profile(yaml_file)
         assert profile.brand_name == "X"
 
+    def test_local_override_beats_tracked_default(self, tmp_path, monkeypatch):
+        from src.utils import store_profile as sp
+
+        local = tmp_path / "store_profile.local.yaml"
+        local.write_text('store:\n  brand_name: "LocalBrand"\n', encoding="utf-8")
+        monkeypatch.delenv("STORE_PROFILE_PATH", raising=False)
+        monkeypatch.setattr(sp, "_LOCAL_PROFILE_PATH", local)
+        assert sp.load_store_profile().brand_name == "LocalBrand"
+
+    def test_env_var_beats_local_override(self, tmp_path, monkeypatch):
+        from src.utils import store_profile as sp
+
+        local = tmp_path / "store_profile.local.yaml"
+        local.write_text('store:\n  brand_name: "LocalBrand"\n', encoding="utf-8")
+        env_file = tmp_path / "env.yaml"
+        env_file.write_text('store:\n  brand_name: "EnvBrand"\n', encoding="utf-8")
+        monkeypatch.setattr(sp, "_LOCAL_PROFILE_PATH", local)
+        monkeypatch.setenv("STORE_PROFILE_PATH", str(env_file))
+        assert sp.load_store_profile().brand_name == "EnvBrand"
+
     def test_env_var_path_override(self, tmp_path, monkeypatch):
         yaml_file = tmp_path / "env.yaml"
         yaml_file.write_text('store:\n  brand_name: "EnvBrand"\n', encoding="utf-8")

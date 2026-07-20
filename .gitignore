@@ -155,3 +155,4 @@ READY_*.md
 INDEX.md
 auth_url*.txt
 full_flow_output*.txt
+config/store_profile.local.yaml
