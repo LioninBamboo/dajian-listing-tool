@@ -1,6 +1,6 @@
 # 子账号多实例扩展方案书 —— 汽配账号先行
 
-> 起草日期:2026-07-20 | 状态:M1(P0 配置外部化)已完成 2026-07-20,详见 §2.4 实施记录;其余待启动
+> 起草日期:2026-07-20 | 状态:M1 已完成(§2.4);M2 进行中——实例B已脚手架,eBay 侧五步见 [M2_SUBACCOUNT_ONBOARDING_RUNBOOK.md](M2_SUBACCOUNT_ONBOARDING_RUNBOOK.md);盲盒实例细化方案见 [BLINDBOX_INSTANCE_PLAN.md](BLINDBOX_INSTANCE_PLAN.md)
 > 范围:经理号主账号(家具,现行实例)之外,新增汽配子账号实例;盲盒子账号复用同一模式,本文只在架构层预留。
 
 ---
