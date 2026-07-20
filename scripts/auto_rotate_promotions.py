@@ -35,7 +35,9 @@ logger = logging.getLogger(__name__)
 DISCOUNT_PCT = 5.0       # 5% off
 DURATION_DAYS = 2         # 每期持续 2 天
 BUFFER_HOURS = 6          # 结束前 6 小时开始准备下一期
-PROMOTION_PREFIX = "AquaVerve Auto Sale"
+from src.utils.store_profile import get_store_profile
+
+PROMOTION_PREFIX = get_store_profile().promotion_prefix
 BEIJING_TZ = timezone(timedelta(hours=8))
 
 def utc_to_beijing(dt_str_or_obj):

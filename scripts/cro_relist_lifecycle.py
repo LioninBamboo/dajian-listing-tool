@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts import cro_delist  # noqa: E402
+from src.utils.store_profile import get_store_profile  # noqa: E402
 from src.services.cro_relist_lifecycle import (  # noqa: E402
     DEFAULT_DB,
     detect_candidates,
@@ -115,7 +116,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--snapshot-date")
     parser.add_argument("--min-age-days", type=int, default=30)
     parser.add_argument("--limit", type=int, default=200)
-    parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument("--base-url", default=get_store_profile().server_base_url)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--html", type=Path)
     return parser

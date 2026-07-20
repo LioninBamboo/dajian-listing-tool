@@ -7,8 +7,11 @@ import re
 from typing import Iterable, Tuple
 
 
-# Keep AquaVerve untouched (explicit user requirement).
-KEEP_BRAND_PREFIXES = ("aquaverve",)
+# Never strip our own storefront brand (explicit user requirement).
+def _keep_brand_prefixes() -> Tuple[str, ...]:
+    from src.utils.store_profile import get_store_profile
+
+    return (get_store_profile().brand_name_lower,)
 
 LEADING_TITLE_MARKERS = (
     "[VIDEO]",
@@ -209,7 +212,7 @@ def strip_supplier_brand_prefix(
         return "", False, None
 
     # Never remove our own storefront brand when it is a leading token.
-    for keep in KEEP_BRAND_PREFIXES:
+    for keep in _keep_brand_prefixes():
         if re.match(rf"^{re.escape(keep)}(?:\b|[\s:_\-|])", raw, flags=re.IGNORECASE):
             return raw, False, None
 

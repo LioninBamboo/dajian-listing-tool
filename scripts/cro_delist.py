@@ -613,7 +613,8 @@ def render_email_html(rep: dict) -> str:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--base-url', default='http://localhost:8000',
+    from src.utils.store_profile import get_store_profile
+    p.add_argument('--base-url', default=get_store_profile().server_base_url,
                    help='magic-link 前缀 (默认本地)')
     p.add_argument('--limit', type=int, default=50)
     p.add_argument('--email', action='store_true')

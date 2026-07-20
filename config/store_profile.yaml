@@ -1,0 +1,25 @@
+# 本实例的店铺画像(主账号:家具 / AquaVerve)。
+# 子账号实例各自维护一份本文件;缺省值 = 主账号现值,缺文件/缺键均回退默认。
+# 加载器:src/utils/store_profile.py(可用 STORE_PROFILE_PATH 环境变量覆盖路径)
+
+store:
+  brand_name: "AquaVerve"
+  brand_tagline: "PREMIUM HOME FURNISHINGS"
+  description_footer_line1: "✦ Ships from US Warehouse ✦"
+  description_footer_line2: "Quality Guaranteed • Fast US Shipping • Trusted Seller"
+  promotion_prefix: "AquaVerve Auto Sale"
+
+ebay:
+  # 账号私有:business policy ID 与库存位置 key,子账号必须改为自己的值
+  merchant_location_key: "DAJIAN_LA_WAREHOUSE"
+  fallback_fulfillment_policy_id: "321897899021"
+  fallback_return_policy_id: "321896608021"
+  fallback_payment_policy_id: "321896606021"
+
+quality_gate:
+  # 语义改写质量门在描述中检查的小写标记子串
+  banner_marker: "aquaverve"
+  footer_marker: "california"
+
+server:
+  port: 8000

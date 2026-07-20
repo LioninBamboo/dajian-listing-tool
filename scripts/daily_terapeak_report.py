@@ -36,6 +36,12 @@ from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
 
 
+def _brand() -> str:
+    from src.utils.store_profile import get_store_profile
+
+    return get_store_profile().brand_name
+
+
 # ========== 配置 ==========
 # 要研究的家具品类关键词（按重要性排序）
 RESEARCH_CATEGORIES = [
@@ -450,7 +456,7 @@ class DailyTerapeakReport:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AquaVerve 市场情报 - {date_str}</title>
+<title>{_brand()} 市场情报 - {date_str}</title>
 <style>
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 960px; margin: 0 auto; padding: 16px; background: #f0f2f5; color: #1a1a2e; font-size: 14px; line-height: 1.6; }}
@@ -536,7 +542,7 @@ class DailyTerapeakReport:
 <body>
 
 <div class="header">
-  <h1>AQUAVERVE MARKET INTELLIGENCE</h1>
+  <h1>{_brand().upper()} MARKET INTELLIGENCE</h1>
   <div class="subtitle">Terapeak 选品调研 · eBay Browse API 数据驱动</div>
   <div class="date-badge">📅 {date_str}</div>
 </div>
@@ -910,7 +916,7 @@ class DailyTerapeakReport:
         # Footer
         html += f"""
 <div class="footer">
-  AquaVerve Market Intelligence · {datetime.now().strftime('%Y-%m-%d %H:%M')} · eBay Browse API<br>
+  {_brand()} Market Intelligence · {datetime.now().strftime('%Y-%m-%d %H:%M')} · eBay Browse API<br>
   <span style="font-size:10px">排序依据: Best Match（eBay 内部算法综合销量、转化率、相关性等因素）· Top10均价反映畅销价位</span>
 </div>
 
@@ -956,7 +962,7 @@ class DailyTerapeakReport:
         summary = self.report_data.get('summary', {})
         high_margin_count = len([m for m in self.report_data.get('inventory_matches', []) if m.get('potential_margin', 0) >= 25])
         
-        subject = f"📊 AquaVerve 市场情报 - {self.report_data.get('date', '')} | {high_margin_count} 高利润产品 | {summary.get('categories_with_data', 0)} 品类"
+        subject = f"📊 {_brand()} 市场情报 - {self.report_data.get('date', '')} | {high_margin_count} 高利润产品 | {summary.get('categories_with_data', 0)} 品类"
         
         return send_email(
             subject=subject,

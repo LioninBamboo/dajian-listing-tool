@@ -34,6 +34,12 @@ sys.path.insert(0, str(root_dir))
 def _utcnow_naive() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
+
+def _default_brand_aspects() -> dict:
+    from src.utils.store_profile import get_store_profile
+
+    return {"Brand": [get_store_profile().brand_name]}
+
 from src.services.taxonomy_constants import (
     INVALID_CATEGORY_REMAP,
     PROTECTED_STORED_CATEGORY_IDS,
@@ -610,7 +616,7 @@ def run_ai_optimization(product: dict) -> dict:
         return {
             "title": product.get('title', '')[:80],
             "description": product.get('description', ''),
-            "aspects": {"Brand": ["AquaVerve"]},
+            "aspects": _default_brand_aspects(),
             "error": "QWEN_API_KEY not set"
         }
     
@@ -628,7 +634,7 @@ def run_ai_optimization(product: dict) -> dict:
         return {
             "title": product.get('title', '')[:80],
             "description": product.get('description', ''),
-            "aspects": {"Brand": ["AquaVerve"]},
+            "aspects": _default_brand_aspects(),
             "error": str(e)
         }
 
@@ -674,7 +680,7 @@ def publish_to_ebay(product: dict) -> dict:
             matcher = EbayCategoryMatcher(oauth)
             matched_id, _, _ = matcher.get_category_and_aspects(
                 title,
-                opt_data.get("aspects", {"Brand": ["AquaVerve"]}),
+                opt_data.get("aspects", _default_brand_aspects()),
                 description,
             )
             category_id = remap_legacy_category_id(matched_id)
@@ -682,12 +688,12 @@ def publish_to_ebay(product: dict) -> dict:
             return {"status": "error", "message": f"类目无效: {category_id or '空'}"}
         aspects = apply_compatibility_aspects(
             category_id,
-            opt_data.get("aspects", {"Brand": ["AquaVerve"]}),
+            opt_data.get("aspects", _default_brand_aspects()),
             analyze_ebay_motors_compatibility(
                 category_id=category_id,
                 title=title,
                 description=description,
-                aspects=opt_data.get("aspects", {"Brand": ["AquaVerve"]}),
+                aspects=opt_data.get("aspects", _default_brand_aspects()),
             ),
         )
         compatibility = analyze_ebay_motors_compatibility(
@@ -913,7 +919,7 @@ def publish_with_auto_category(product: dict) -> dict:
             if not final_price or final_price <= 0:
                 return {"status": "error", "message": "价格未设置"}
             
-            existing_aspects = opt_data.get("aspects", {"Brand": ["AquaVerve"]})
+            existing_aspects = opt_data.get("aspects", _default_brand_aspects())
             
             # ===== AUTO CATEGORY & ITEM SPECIFICS MATCHING =====
             category_matcher = EbayCategoryMatcher(oauth)

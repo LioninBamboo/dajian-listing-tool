@@ -621,7 +621,8 @@ def render_competition_monitor():
         else:
             # 创建新促销
             with disc_col1:
-                promo_name = st.text_input("促销名称", value=f"AquaVerve Sale {datetime.now().strftime('%m/%d')}",
+                from src.utils.store_profile import get_store_profile
+                promo_name = st.text_input("促销名称", value=f"{get_store_profile().brand_name} Sale {datetime.now().strftime('%m/%d')}",
                                            key="promo_name")
             with disc_col2:
                 disc_pct = st.number_input("折扣%", min_value=1.0, max_value=30.0,
@@ -2009,7 +2010,8 @@ def render_category_opportunity_tab(df, market_data, report):
 # ─── Tab 1 Implementation: 转化率诊断 (CRO) ─────────────────────────
 
 def _cro_delist_base_url():
-    return os.environ.get('CRO_DELIST_BASE_URL', 'http://localhost:8000')
+    from src.utils.store_profile import get_store_profile
+    return os.environ.get('CRO_DELIST_BASE_URL', get_store_profile().server_base_url)
 
 
 def _load_cro_delist_confirmation_rows(limit=500):

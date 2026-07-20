@@ -1123,7 +1123,8 @@ def task_cro_delist_email():
     """S25 — 周一 11:00: 给运营发死链下架候选 + magic-link (人工确认才下架)."""
     if _task_succeeded_today('cro_delist_email'):
         return True, 'Skipped (already succeeded today)'
-    base = os.environ.get('CRO_DELIST_BASE_URL', 'http://localhost:8000')
+    from src.utils.store_profile import get_store_profile
+    base = os.environ.get('CRO_DELIST_BASE_URL', get_store_profile().server_base_url)
     run_task(
         'cro_delist_email',
         [str(PROJECT_ROOT / 'scripts' / 'cro_delist.py'),

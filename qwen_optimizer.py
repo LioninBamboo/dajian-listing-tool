@@ -28,6 +28,7 @@ from src.utils.dimension_helpers import (
     find_dimension
 )
 from src.utils.claim_diff_engine import build_source_constraints, FEATURE_CLAIM_PATTERNS
+from src.utils.store_profile import get_store_profile
 
 
 def _safe_print(*args, **kwargs):
@@ -475,7 +476,8 @@ class QwenOptimizer:
         
         weight_str = dimensions["weight"] if dimensions["weight"] else ""
         
-        prompt = f"""You are an expert eBay SEO copywriter for AquaVerve store, focused on COMPETITIVE DIFFERENTIATION.
+        _brand = get_store_profile().brand_name
+        prompt = f"""You are an expert eBay SEO copywriter for {_brand} store, focused on COMPETITIVE DIFFERENTIATION.
 
 **Product Details:**
 - **Original Title:** {original_title}
@@ -532,8 +534,8 @@ class QwenOptimizer:
             if "aspects" not in data:
                 data["aspects"] = {}
             
-            data["aspects"]["Brand"] = ["AquaVerve"]
-            
+            data["aspects"]["Brand"] = [get_store_profile().brand_name]
+
             # Force our extracted dimensions
             if dimensions["length"]:
                 data["aspects"]["Item Length"] = [f"{dimensions['length']} in"]
@@ -645,7 +647,9 @@ class QwenOptimizer:
                 error_feedback_section += f"- {err}\n"
             error_feedback_section += "You MUST correct these errors and strictly follow the source facts. Do NOT hallucinate these claims again!\n"
 
-        prompt = f"""You are an expert eBay SEO copywriter for AquaVerve store.
+        _profile = get_store_profile()
+        _brand = _profile.brand_name
+        prompt = f"""You are an expert eBay SEO copywriter for {_brand} store.
 
 **Product Details:**
 - **Original Title:** {original_title}
@@ -665,7 +669,7 @@ class QwenOptimizer:
    - Ensure the title reads naturally (avoid random keyword salad).
    - Put the most critical search terms at the beginning.
    - Include key dimensions if space allows (e.g., "71 inch").
-   - NEVER include "AquaVerve" in title.
+   - NEVER include "{_brand}" in title.
    - Use Title Case, no special characters.
    - **IMPORTANT: Incorporate high-frequency keywords from the market intelligence above** to match what buyers actually search for. Study the competitor titles for keyword patterns.
 
@@ -677,8 +681,8 @@ class QwenOptimizer:
    
    <!-- Header -->
    <div style="text-align:center;padding:30px 15px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">
-     <h1 style="margin:0;font-size:28px;font-weight:300;letter-spacing:6px;color:#d4af37">AQUAVERVE</h1>
-     <p style="margin:8px 0 0;font-size:12px;color:#a0a0a0;letter-spacing:2px">PREMIUM HOME FURNISHINGS</p>
+     <h1 style="margin:0;font-size:28px;font-weight:300;letter-spacing:6px;color:#d4af37">{_brand.upper()}</h1>
+     <p style="margin:8px 0 0;font-size:12px;color:#a0a0a0;letter-spacing:2px">{_profile.brand_tagline}</p>
    </div>
    
    <!-- Product Title -->
@@ -726,8 +730,8 @@ class QwenOptimizer:
    
    <!-- Footer -->
    <div style="text-align:center;padding:20px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">
-     <p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">✦ Ships from US Warehouse ✦</p>
-     <p style="margin:8px 0 0;font-size:11px;color:#808080">Quality Guaranteed • Fast US Shipping • Trusted Seller</p>
+     <p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">{_profile.description_footer_line1}</p>
+     <p style="margin:8px 0 0;font-size:11px;color:#808080">{_profile.description_footer_line2}</p>
    </div>
    
    </div>
@@ -746,7 +750,7 @@ class QwenOptimizer:
    - Aim for at least 15-20 item specifics per listing
    
    Required aspects (ALWAYS include):
-   - "Brand": ["AquaVerve"]
+   - "Brand": ["{_brand}"]
    - "Type": [standard eBay value like "Coffee Table", "Dog Crate", "Office Chair", "TV Stand"]
    - "Material": ["Wood", "Metal", "MDF", "Fabric", "Leather", "Plastic"]
    - "Color": ["White"] - SINGLE VALUE ONLY, pick most dominant color
@@ -807,8 +811,8 @@ class QwenOptimizer:
 {{
     "title": "75-80 char optimized title",
     "description": "<div style=...>Compact HTML...</div>",
-    "aspects": {{ 
-        "Brand": ["AquaVerve"],
+    "aspects": {{
+        "Brand": ["{_brand}"],
         "Type": ["..."],
         "Material": ["..."],
         "Color": ["..."],
@@ -856,8 +860,8 @@ class QwenOptimizer:
             if "aspects" not in data:
                 data["aspects"] = {}
             
-            # Force Brand = AquaVerve
-            data["aspects"]["Brand"] = ["AquaVerve"]
+            # Force Brand = our storefront brand
+            data["aspects"]["Brand"] = [get_store_profile().brand_name]
             
             # CRITICAL: FORCE use our extracted dimensions, OVERRIDE AI-generated ones
             # This ensures accuracy - AI often makes up dimensions
@@ -1221,7 +1225,7 @@ class QwenOptimizer:
     def _fallback_result(self, original_title, original_description, dimensions):
         """返回降级结果"""
         aspects = {
-            "Brand": ["AquaVerve"],
+            "Brand": [get_store_profile().brand_name],
             "MPN": ["Does Not Apply"],
             "Country/Region of Manufacture": ["China"]
         }

@@ -28,6 +28,7 @@ from src.utils.publish_autofix import (
     prepare_ebay_aspects,
 )
 from src.utils.title_sanitizer import normalize_listing_title_for_ebay
+from src.utils.store_profile import get_store_profile
 
 # Suppress InsecureRequestWarning when verify=False
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -36,11 +37,6 @@ EBAY_HOSTED_IMAGE_DOMAINS = ("i.ebayimg.com",)
 EPS_MAX_IMAGE_BYTES = 10 * 1024 * 1024
 EPS_TARGET_MAX_IMAGE_BYTES = 9_500_000
 EPS_MIN_IMAGE_SIDE = 500
-FALLBACK_LISTING_POLICIES = {
-    "fulfillmentPolicyId": "321897899021",
-    "returnPolicyId": "321896608021",
-    "paymentPolicyId": "321896606021",
-}
 UNBRANDED_MARKERS = {"unbranded", "unbrand", "generic"}
 VALID_ASSEMBLY_STATUS_VALUES = {"Part Assembled", "Fully Assembled", "Ready to Assemble"}
 IDENTIFIER_PATTERNS = {
@@ -327,7 +323,7 @@ class RealEbayClient:
         except Exception:
             cached = {}
 
-        for key, fallback_value in FALLBACK_LISTING_POLICIES.items():
+        for key, fallback_value in get_store_profile().fallback_listing_policies().items():
             if policies.get(key):
                 continue
             policies[key] = cached.get(key) or fallback_value
@@ -779,7 +775,7 @@ class RealEbayClient:
             "sku": sku,
             "marketplaceId": target_marketplace,
             "format": "FIXED_PRICE",
-            "merchantLocationKey": "DAJIAN_LA_WAREHOUSE",  # Los Angeles, CA
+            "merchantLocationKey": get_store_profile().merchant_location_key,
             "pricingSummary": {
                 "price": {
                     "value": str(price),
@@ -1063,7 +1059,7 @@ class RealEbayClient:
                     "listingDescription": listing_desc,
                     "listingDuration": offer_data.get("listingDuration", "GTC"),
                     "listingPolicies": self._complete_listing_policies(offer_data.get("listingPolicies", {})),
-                    "merchantLocationKey": offer_data.get("merchantLocationKey", "DAJIAN_LA_WAREHOUSE"),
+                    "merchantLocationKey": offer_data.get("merchantLocationKey", get_store_profile().merchant_location_key),
                     "pricingSummary": offer_data.get("pricingSummary", {}),
                 }
                 if price:

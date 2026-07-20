@@ -94,7 +94,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Constants ─────────────────────────────────────────────────
-BRAND_NAME = "AquaVerve"
+from src.utils.store_profile import get_store_profile
+
+BRAND_NAME = get_store_profile().brand_name
 MAX_RETRIES = 3
 PUBLISH_DELAY_SECS = 2.0    # delay between products
 

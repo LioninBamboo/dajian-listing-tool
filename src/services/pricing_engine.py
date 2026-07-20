@@ -2,7 +2,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 class PricingEngine:
     """
-    Dajian -> eBay Pricing Calculator (AquaVerve Financial Model)
+    Dajian -> eBay Pricing Calculator (storefront financial model)
     """
 
     # --- Constants ---

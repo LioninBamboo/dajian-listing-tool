@@ -1032,11 +1032,14 @@ def validate_rewrite(
             result["fact_note"] = f"fact sheet layer error: {exc}"
 
     # Layer 3: quality gate markers
+    from src.utils.store_profile import get_store_profile
+
+    _profile = get_store_profile()
     desc_l = (new_description or "").lower()
     qg = {
         "has_key_features": "key features" in desc_l and "<li" in desc_l,
-        "has_banner": "aquaverve" in desc_l,
-        "has_footer": "california" in desc_l,
+        "has_banner": _profile.quality_banner_marker in desc_l,
+        "has_footer": _profile.quality_footer_marker in desc_l,
         "has_perfect_for": "perfect for" in desc_l,
         "has_package_includes": "package includes" in desc_l,
         "has_lwh_digits": bool(

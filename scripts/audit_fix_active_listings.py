@@ -826,7 +826,7 @@ def audit_single_product(
             "type": "description_raw_source_dump",
             "severity": "CRITICAL",
             "field": "description",
-            "expected": "store AQUAVERVE template rebuilt from source characteristics",
+            "expected": "store brand template rebuilt from source characteristics",
             "detail": "Live description is the raw GIGA supplier data dump (Chinese field labels), not the store template",
         })
         fixes["__rebuild_description_from_source__"] = True
@@ -2175,11 +2175,14 @@ def build_structured_description_from_source(title, source_description, attrs, s
         assembly_required=assembly_required,
     )
 
+    from src.utils.store_profile import get_store_profile
+
+    _profile = get_store_profile()
     return (
         '<div style="max-width:900px;margin:0 auto;font-family:Arial,sans-serif;color:#1a1a1a;line-height:1.7">'
         '<div style="text-align:center;padding:30px 15px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
-        '<h1 style="margin:0;font-size:28px;font-weight:300;letter-spacing:6px;color:#d4af37">AQUAVERVE</h1>'
-        '<p style="margin:8px 0 0;font-size:12px;color:#a0a0a0;letter-spacing:2px">PREMIUM HOME FURNISHINGS</p>'
+        f'<h1 style="margin:0;font-size:28px;font-weight:300;letter-spacing:6px;color:#d4af37">{html.escape(_profile.brand_name.upper())}</h1>'
+        f'<p style="margin:8px 0 0;font-size:12px;color:#a0a0a0;letter-spacing:2px">{html.escape(_profile.brand_tagline)}</p>'
         '</div>'
         '<div style="background:#f8f9fa;padding:25px;text-align:center;border-bottom:2px solid #d4af37">'
         f'<h2 style="margin:0;font-size:20px;color:#2d3436;font-weight:500">{html.escape(title)}</h2>'
@@ -2198,8 +2201,8 @@ def build_structured_description_from_source(title, source_description, attrs, s
         f'<p style="margin:0;color:#636e72">{package_includes}</p>'
         '</div>'
         '<div style="text-align:center;padding:20px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
-        '<p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">✦ Ships from US Warehouse ✦</p>'
-        '<p style="margin:8px 0 0;font-size:11px;color:#808080">Quality Guaranteed • Fast US Shipping • Trusted Seller</p>'
+        f'<p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">{html.escape(_profile.description_footer_line1)}</p>'
+        f'<p style="margin:8px 0 0;font-size:11px;color:#808080">{html.escape(_profile.description_footer_line2)}</p>'
         '</div>'
         '</div>'
     )

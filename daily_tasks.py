@@ -53,6 +53,7 @@ from src.utils.mi_draft_origin import (
 )
 from src.db.database_safety import assert_runtime_not_in_maintenance, validate_runtime_database
 from src.utils.task_result_status import classify_daily_task_outcome
+from src.utils.store_profile import get_store_profile
 
 UTC = getattr(datetime, "UTC", timezone.utc)
 from src.utils.mi_opportunity_flow import auto_prepare_mi_opportunity_drafts, empty_auto_prepare_result
@@ -1249,7 +1250,7 @@ def send_daily_summary_email(results: dict):
 
     html = f"""
     <html><body style="font-family:Arial,sans-serif;padding:20px;max-width:700px;">
-    <h2 style="color:#1a73e8;">📋 AquaVerve 每日任务汇总 - {date_str}</h2>
+    <h2 style="color:#1a73e8;">📋 {get_store_profile().brand_name} 每日任务汇总 - {date_str}</h2>
     <p style="color:#666;">执行时间: {now}</p>
     <hr style="border:1px solid #e0e0e0;">
 
@@ -1298,7 +1299,7 @@ def send_daily_summary_email(results: dict):
     health_problems = health.get('summary', {}).get('problems', 0) if isinstance(health, dict) else 0
     health_icon = '🔴' if health_problems > 5 else ('🟡' if health_problems > 0 else '🟢')
     smart_reprice_count = len(smart_reprice_items) if smart_reprice_status == 'ok' else 0
-    subject = (f"📋 AquaVerve 每日汇总 - {date_str} | "
+    subject = (f"📋 {get_store_profile().brand_name} 每日汇总 - {date_str} | "
                f"同步{inv.get('checked', 0)}个 缺货{len(oos_skus)} 恢复{len(ghost_restocked)} "
                f"调价{smart_reprice_count} "
                f"{health_icon}健康{health_problems}问题 "

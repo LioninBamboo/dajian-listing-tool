@@ -736,12 +736,15 @@ def send_email_report(total_processed: int, success_count: int,
         
         # 进度条
         progress_pct = round(total_in_round / total_listings * 100) if total_listings > 0 else 0
-        
+
+        from src.utils.store_profile import get_store_profile
+        _brand = get_store_profile().brand_name
+        _brand_upper = _brand.upper()
         html_content = f"""
         <html>
         <body style="font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;max-width:700px;margin:0 auto;padding:20px;background:#f5f5f5">
             <div style="background:linear-gradient(135deg,#0f0c29,#302b63);color:white;padding:20px 24px;border-radius:10px 10px 0 0">
-                <h2 style="margin:0;color:#d4af37;font-size:18px;letter-spacing:2px">AQUAVERVE TITLE OPTIMIZER</h2>
+                <h2 style="margin:0;color:#d4af37;font-size:18px;letter-spacing:2px">{_brand_upper} TITLE OPTIMIZER</h2>
                 <p style="color:#b8b8d1;font-size:12px;margin-top:4px">{datetime.now().strftime('%Y-%m-%d %H:%M')} · 第 {current_round} 轮 · Terapeak 市场数据驱动</p>
             </div>
             
@@ -778,7 +781,7 @@ def send_email_report(total_processed: int, success_count: int,
                 {samples_html}
                 
                 <p style="color:#aaa;font-size:11px;margin-top:20px;text-align:center">
-                    AquaVerve Title Optimizer · Powered by Qwen AI + eBay Market Data
+                    {_brand} Title Optimizer · Powered by Qwen AI + eBay Market Data
                 </p>
             </div>
         </body>

@@ -25,6 +25,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
 
+from src.utils.store_profile import get_store_profile
+
+_SERVER_BASE_URL = get_store_profile().server_base_url
+
 
 # ----- 缩略图辅助 -----
 # GigaB2B / 大建云仓图片 URL 带有签名参数 (x-cc/x-cu/x-ct/x-cs)，
@@ -757,7 +761,7 @@ def render_market_intelligence():
                                             with st.spinner(f"审计 + 发布 {opp['sku']} 中（可能 30-60s）..."):
                                                 try:
                                                     _r = _rq.post(
-                                                        f"http://localhost:8000/api/mi/audit-and-publish/{opp['sku']}",
+                                                        f"{_SERVER_BASE_URL}/api/mi/audit-and-publish/{opp['sku']}",
                                                         timeout=180,
                                                     )
                                                     _data = _r.json() if _r.headers.get("content-type", "").startswith("application/json") else {"raw": _r.text}
@@ -992,7 +996,7 @@ def render_market_intelligence():
                                 try:
                                     import requests as _rq
                                     _resp = _rq.post(
-                                        "http://localhost:8000/api/mi/batch-audit-and-publish",
+                                        f"{_SERVER_BASE_URL}/api/mi/batch-audit-and-publish",
                                         json={"skus": ready_skus, "max_count": int(_f8_limit)},
                                         timeout=900,  # 单批最多 50 个 × ~15s/个
                                     )
@@ -1042,7 +1046,7 @@ def render_market_intelligence():
                                 try:
                                     import requests as _rq
                                     _r = _rq.post(
-                                        "http://localhost:8000/api/mi/batch-audit-and-publish-async",
+                                        f"{_SERVER_BASE_URL}/api/mi/batch-audit-and-publish-async",
                                         json={"skus": ready_skus, "max_count": int(_f13_limit)},
                                         timeout=30,
                                     )
@@ -1066,7 +1070,7 @@ def render_market_intelligence():
                                     try:
                                         import requests as _rq
                                         _r = _rq.get(
-                                            f"http://localhost:8000/api/mi/batch-job/{_active_job}",
+                                            f"{_SERVER_BASE_URL}/api/mi/batch-job/{_active_job}",
                                             timeout=10,
                                         )
                                         if _r.status_code == 200:
@@ -1100,7 +1104,7 @@ def render_market_intelligence():
                                                         try:
                                                             import requests as _rq2
                                                             _retry_resp = _rq2.post(
-                                                                f"http://localhost:8000/api/mi/batch-job/{_active_job}/retry-errors",
+                                                                f"{_SERVER_BASE_URL}/api/mi/batch-job/{_active_job}/retry-errors",
                                                                 timeout=15,
                                                             )
                                                             if _retry_resp.status_code == 200:

@@ -719,7 +719,8 @@ class EbayDiscountService:
                 if not end_date or end_date < start_date:
                     end_date = start_date + timedelta(days=2)
 
-                restore_name = sp.get('name', 'AquaVerve Sale')
+                from src.utils.store_profile import get_store_profile
+                restore_name = sp.get('name', f"{get_store_profile().brand_name} Sale")
                 if not restore_name.endswith('(restored)'):
                     restore_name = f"{restore_name} (restored)"
 

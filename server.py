@@ -374,7 +374,9 @@ def fetch_dajian_collection_enrichment(sku: str) -> dict:
         return {}
 
 # --- Config ---
-BRAND_NAME = "AquaVerve"
+from src.utils.store_profile import get_store_profile
+
+BRAND_NAME = get_store_profile().brand_name
 
 # --- Models ---
 class ProductPayload(BaseModel):
@@ -2296,4 +2298,5 @@ def health_check():
     return {"status": "running", "service": "Ebay Copilot Server"}
 
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+    _port = int(os.getenv("SERVER_PORT", str(get_store_profile().server_port)))
+    uvicorn.run("server:app", host="0.0.0.0", port=_port, reload=False)

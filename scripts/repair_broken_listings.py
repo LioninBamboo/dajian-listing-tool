@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Repair listings whose LIVE content is broken: raw-source (untemplated)
-description and/or truncated title. Rebuilds the store's AQUAVERVE template
+description and/or truncated title. Rebuilds the store's brand template
 from fresh source characteristics + a word-safe title. Source-faithful, zero
 LLM generation (same builder as the W3636 repair).
 
@@ -44,9 +44,12 @@ from scripts.audit_fix_active_listings import (  # noqa: E402
 from src.services.source_refresh import build_source_snapshot  # noqa: E402
 from src.utils.title_sanitizer import normalize_listing_title_for_ebay  # noqa: E402
 from src.utils.claim_diff_engine import build_source_constraints, detect_claim_violations  # noqa: E402
+from src.utils.store_profile import get_store_profile  # noqa: E402
 
-TEMPLATE_MARKERS = ("AQUAVERVE", "PREMIUM HOME FURNISHINGS", "KEY FEATURES",
-                    "SPECIFICATIONS", "Ships from US Warehouse")
+_PROFILE = get_store_profile()
+_BRAND_UPPER = _PROFILE.brand_name.upper()
+TEMPLATE_MARKERS = (_BRAND_UPPER, _PROFILE.brand_tagline, "KEY FEATURES",
+                    "SPECIFICATIONS", _PROFILE.description_footer_line1.strip("✦ "))
 
 
 _ACRONYMS = {"mdf": "MDF", "pu": "PU", "pvc": "PVC", "led": "LED", "abs": "ABS",
@@ -105,7 +108,7 @@ def build_repair(conn, dj, sku):
     new_desc = build_structured_description_from_source(
         new_title, features_html, snap.attributes, snap.specs, aspects
     )
-    if not new_desc or not all(m in new_desc for m in ("AQUAVERVE", "KEY FEATURES")):
+    if not new_desc or not all(m in new_desc for m in (_BRAND_UPPER, "KEY FEATURES")):
         return None, "template_build_failed"
     return (new_title, new_desc, aspects, snap), None
 
@@ -173,7 +176,7 @@ def repair_one(conn, dj, ebay, sku, apply):
     lp = live.get("product") or {}
     off2 = ebay.get_offers_by_sku(sku)
     ld = (off2[0].get("listingDescription") if off2 else "") or lp.get("description") or ""
-    live_ok = ("AQUAVERVE" in ld and "产品规格" not in ld
+    live_ok = (_BRAND_UPPER in ld and "产品规格" not in ld
                and not re.search(r"\b(with|for|and|a|of|&)\s*$", lp.get("title", ""), re.I))
     rec["result"] = "DONE" if live_ok else "LIVE_VERIFY_FAILED"
     rec["listing_id"] = lid
