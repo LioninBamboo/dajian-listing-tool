@@ -21,5 +21,18 @@ quality_gate:
   banner_marker: "aquaverve"
   footer_marker: "california"
 
+# v2:描述模板与禁词(家具实例用默认即可,这里显式写出仅为文档)
+listing:
+  template_style: "furniture_classic"   # furniture_classic | arttoy_hype(盲盒)
+  footer_html: ""                        # 整块 footer;空则用上面的 footer_line1/2
+  banned_terms: []                       # 禁词硬校验表;家具为空=守卫不触发
+
+# v2:定价策略。cost_plus = 现有 PricingEngine 成本+毛利模型(家具/汽配)
+pricing:
+  pricing_strategy: "cost_plus"          # cost_plus | undercut(盲盒:采集价略降)
+  undercut_pct: 0.03
+  undercut_min_abs: 0.0
+  price_ends_99: false
+
 server:
   port: 8000

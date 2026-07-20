@@ -109,13 +109,22 @@ store_profile 新增字段(v2):
 
 | 阶段 | 内容 | 依赖 |
 |---|---|---|
-| B1 | store_profile v2(template_style/banned_terms/footer_html/shipping_formula)+ 禁词硬校验守卫 | 无(纯主库开发,家具/汽配同时受益) |
+| B1 ✅ | store_profile v2 + 禁词硬校验守卫 + undercut 定价 —— **已完成 2026-07-20** | 无 |
 | B2 | eBay 链接采集:browse_collector 客户端 + 粘贴链接入库(交互形态 B) | 无 |
 | B3 | 潮玩描述模板 + qwen 提示词模板化 + 中文对照字段 | B1 |
 | B4 | 盲盒子账号开店五步(复用 M2 手册)+ 实例C部署(端口 8002) | 子账号就绪 |
 | B5 | 多变体刊登(inventory_item_group)+ SpeedPAK 定价模型 | B4 |
 | B6 | 金丝雀:5-10 条真实盲盒 listing 全链路(采集→生成→人工审图/审禁词→刊登) | B2+B3+B5 |
 | B7 | (可选)扩展按钮采集、拍卖形式 | B6 后按需 |
+
+## 3.1 B1 实施记录(2026-07-20)
+
+- **store_profile v2**([store_profile.py](../src/utils/store_profile.py)):新增 `listing`(template_style / footer_html / banned_terms)和 `pricing`(pricing_strategy / undercut_pct / undercut_min_abs / price_ends_99)两段。默认值 = 家具现状(furniture_classic / cost_plus / 空禁词),现有实例零影响。`_coerce` 扩展支持 list/float/bool。
+- **禁词硬校验守卫**([banned_terms_guard.py](../src/utils/banned_terms_guard.py)):`scan_listing` / `assert_clean` 扫 title/description(先 strip HTML)/aspects(键+值);整词匹配(`(?<!\w)…(?!\w)`,OEM 不误伤 OEMs/GOEM),多词跨空白(POP MART 匹配 POP⎵⎵MART),大小写不敏感。禁词表按实例配,默认空=不触发。
+- **undercut 定价 + 竞品分析**([undercut_pricing.py](../src/services/undercut_pricing.py)):`recommend_undercut_price(source_price)` 采集价按 max(pct, 绝对额) 下调,严格 ≤ source;竞品 `price_stats`(复用 Browse API,`fetch_competitor_stats` 解耦自 qwen_optimizer)作区间 sanity——source 高于市场中位数时给出低于中位的 `market_aware_price` 替代并打标 `source_above_market_median`,低于市场最低价打 `below_market_min`;`.99` 心理定价向下取整。竞品分析纯建议,绝不把推荐价抬到 source 之上。
+- **配置样例**:[config/store_profile.blindbox.example.yaml](../config/store_profile.blindbox.example.yaml)(跟踪的样例,部署时复制为未跟踪的 `store_profile.local.yaml`);主库 `store_profile.yaml` 补了 v2 段注释。
+- **测试**:test_store_profile(v2 段)、test_banned_terms_guard、test_undercut_pricing,共 46 用例绿。
+- **未接线**:守卫与定价的模块已就绪,挂进采集/生成/刊登流程在 B2/B3/B6 做(B1 只交付能力与配置层)。
 
 ## 4. 风险清单
 

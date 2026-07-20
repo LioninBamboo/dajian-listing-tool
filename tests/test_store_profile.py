@@ -92,6 +92,50 @@ class TestOverrides:
         assert profile.server_port == 8001
         assert profile.server_base_url == "http://localhost:8001"
 
+    def test_v2_listing_and_pricing_sections(self, tmp_path):
+        yaml_file = tmp_path / "blindbox.yaml"
+        yaml_file.write_text(
+            textwrap.dedent(
+                """
+                listing:
+                  template_style: "arttoy_hype"
+                  banned_terms:
+                    - POP MART
+                    - Original
+                    - Genuine
+                pricing:
+                  pricing_strategy: "undercut"
+                  undercut_pct: 0.05
+                  undercut_min_abs: 0.5
+                  price_ends_99: true
+                """
+            ),
+            encoding="utf-8",
+        )
+        p = load_store_profile(yaml_file)
+        assert p.template_style == "arttoy_hype"
+        assert p.banned_terms == ("POP MART", "Original", "Genuine")
+        assert p.banned_terms_lower == ("pop mart", "original", "genuine")
+        assert p.pricing_strategy == "undercut"
+        assert p.undercut_pct == 0.05
+        assert p.undercut_min_abs == 0.5
+        assert p.price_ends_99 is True
+
+    def test_v2_defaults_keep_existing_instances_unchanged(self):
+        p = StoreProfile()
+        assert p.template_style == "furniture_classic"
+        assert p.banned_terms == ()
+        assert p.pricing_strategy == "cost_plus"
+        assert p.price_ends_99 is False
+
+    def test_banned_terms_from_comma_string(self, tmp_path):
+        yaml_file = tmp_path / "csv.yaml"
+        yaml_file.write_text(
+            'listing:\n  banned_terms: "POP MART, Original, OEM"\n', encoding="utf-8"
+        )
+        p = load_store_profile(yaml_file)
+        assert p.banned_terms == ("POP MART", "Original", "OEM")
+
     def test_partial_yaml_keeps_other_defaults(self, tmp_path):
         yaml_file = tmp_path / "partial.yaml"
         yaml_file.write_text('store:\n  brand_name: "MotorNest"\n', encoding="utf-8")

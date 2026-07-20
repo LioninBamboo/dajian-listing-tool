@@ -1,0 +1,46 @@
+# 盲盒实例(实例C)店铺画像样例 —— 部署时复制为 config/store_profile.local.yaml 并填 CHANGEME。
+# 这是随仓库跟踪的“样例”,不是生效文件;生效文件 store_profile.local.yaml 未被 git 跟踪。
+# 加载优先级:STORE_PROFILE_PATH env > store_profile.local.yaml > store_profile.yaml > 内置默认。
+
+store:
+  brand_name: "CHANGEME-ToyBrand"            # 盲盒店自有品牌(定店名后填;禁用 POP MART 等受限词)
+  brand_tagline: "DESIGNER ART TOYS & COLLECTIBLES"
+  promotion_prefix: "CHANGEME-ToyBrand Drop"
+
+ebay:
+  # 中国直发 SpeedPAK:location=中国仓;子账号建好后用 tools/get_policy_ids.py 查填
+  merchant_location_key: "CHANGEME_CN_WAREHOUSE"
+  fallback_fulfillment_policy_id: "CHANGEME"
+  fallback_return_policy_id: "CHANGEME"
+  fallback_payment_policy_id: "CHANGEME"
+
+quality_gate:
+  banner_marker: "changeme-toybrand"         # 与 brand_name 小写一致
+  footer_marker: "shipping & logistics"      # 潮玩模板 footer 标记(见 listing.footer_html)
+
+listing:
+  template_style: "arttoy_hype"              # 潮玩 Hypebeast 风描述模板(B3 实现)
+  # 整块 footer(系统追加,LLM 不生成)。移植自 ebay-listing-pro 的 SHIPPING & LOGISTICS 卡片。
+  footer_html: >-
+    <div style="margin-top:30px;padding:25px;background:#fff;border:3px solid #000;box-shadow:6px 6px 0 #000;border-radius:4px;font-family:'Arial Black',sans-serif;">
+    <h3 style="color:#fff;background:#000;font-size:18px;text-transform:uppercase;padding:5px 15px;display:inline-block;">⚡ SHIPPING &amp; LOGISTICS ⚡</h3>
+    <p style="color:#111;font-weight:bold;font-size:15px;line-height:1.6;">Reliable international shipping from China via SpeedPAK Standard. Processed within 5 business days; estimated delivery 8-12 business days. Times may vary with customs.</p>
+    </div>
+  # 禁词硬校验表(banned_terms_guard 扫 title/description/aspects,命中即 FAIL)
+  banned_terms:
+    - POP MART        # eBay 受限搜索词 + VeRO 活跃品牌
+    - Original
+    - Genuine
+    - Authentic
+    - Licensed
+    - Official
+    - OEM
+
+pricing:
+  pricing_strategy: "undercut"               # 采集价略降,不走成本+毛利
+  undercut_pct: 0.03                         # 比采集来源低 3%
+  undercut_min_abs: 0.50                     # 且至少低 $0.50
+  price_ends_99: true                        # 心理定价 .99 结尾(向下取整)
+
+server:
+  port: 8002

@@ -48,6 +48,18 @@ class StoreProfile:
     quality_banner_marker: str = "aquaverve"
     quality_footer_marker: str = "california"
 
+    # Listing generation (v2). Defaults keep furniture/auto instances unchanged.
+    template_style: str = "furniture_classic"   # furniture_classic | arttoy_hype
+    footer_html: str = ""                        # whole-block footer; empty => line1/line2
+    banned_terms: tuple = ()                     # hard-blocked terms (empty => guard is a no-op)
+
+    # Pricing (v2). cost_plus = existing PricingEngine model (furniture/auto).
+    # undercut = blind-box: price a hair under the collected source listing.
+    pricing_strategy: str = "cost_plus"          # cost_plus | undercut
+    undercut_pct: float = 0.03                   # fraction below the collected source price
+    undercut_min_abs: float = 0.0                # also at least this many $ below source
+    price_ends_99: bool = False                  # round to a .99 psychological price
+
     # Local server
     server_port: int = 8000
 
@@ -65,6 +77,10 @@ class StoreProfile:
             "returnPolicyId": self.fallback_return_policy_id,
             "paymentPolicyId": self.fallback_payment_policy_id,
         }
+
+    @property
+    def banned_terms_lower(self) -> tuple:
+        return tuple(t.lower() for t in self.banned_terms)
 
 
 _SECTION_FIELD_MAP = {
@@ -85,6 +101,17 @@ _SECTION_FIELD_MAP = {
         "quality_banner_marker",
         "quality_footer_marker",
     },
+    "listing": {
+        "template_style",
+        "footer_html",
+        "banned_terms",
+    },
+    "pricing": {
+        "pricing_strategy",
+        "undercut_pct",
+        "undercut_min_abs",
+        "price_ends_99",
+    },
     "server": {
         "server_port",
     },
@@ -103,9 +130,26 @@ _SECTION_KEY_ALIASES = {
 }
 
 
+_INT_FIELDS = {"server_port"}
+_FLOAT_FIELDS = {"undercut_pct", "undercut_min_abs"}
+_BOOL_FIELDS = {"price_ends_99"}
+_TUPLE_FIELDS = {"banned_terms"}
+
+
 def _coerce(field_name: str, value: Any) -> Any:
-    if field_name == "server_port":
+    if field_name in _INT_FIELDS:
         return int(value)
+    if field_name in _FLOAT_FIELDS:
+        return float(value)
+    if field_name in _BOOL_FIELDS:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    if field_name in _TUPLE_FIELDS:
+        if isinstance(value, (list, tuple)):
+            return tuple(str(v) for v in value if str(v).strip())
+        # allow a single scalar or comma-separated string
+        return tuple(t.strip() for t in str(value).split(",") if t.strip())
     return str(value)
 
 
