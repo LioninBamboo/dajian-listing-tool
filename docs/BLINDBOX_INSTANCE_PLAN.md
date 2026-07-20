@@ -110,7 +110,7 @@ store_profile 新增字段(v2):
 | 阶段 | 内容 | 依赖 |
 |---|---|---|
 | B1 ✅ | store_profile v2 + 禁词硬校验守卫 + undercut 定价 —— **已完成 2026-07-20** | 无 |
-| B2 | eBay 链接采集:browse_collector 客户端 + 粘贴链接入库(交互形态 B) | 无 |
+| B2 ✅ | eBay 链接采集:browse_collector 客户端 + /api/collect-ebay 入库 —— **已完成 2026-07-20** | 无 |
 | B3 | 潮玩描述模板 + qwen 提示词模板化 + 中文对照字段 | B1 |
 | B4 | 盲盒子账号开店五步(复用 M2 手册)+ 实例C部署(端口 8002) | 子账号就绪 |
 | B5 | 多变体刊登(inventory_item_group)+ SpeedPAK 定价模型 | B4 |
@@ -125,6 +125,14 @@ store_profile 新增字段(v2):
 - **配置样例**:[config/store_profile.blindbox.example.yaml](../config/store_profile.blindbox.example.yaml)(跟踪的样例,部署时复制为未跟踪的 `store_profile.local.yaml`);主库 `store_profile.yaml` 补了 v2 段注释。
 - **测试**:test_store_profile(v2 段)、test_banned_terms_guard、test_undercut_pricing,共 46 用例绿。
 - **未接线**:守卫与定价的模块已就绪,挂进采集/生成/刊登流程在 B2/B3/B6 做(B1 只交付能力与配置层)。
+
+## 3.2 B2 实施记录(2026-07-20)
+
+- **采集客户端**([ebay_browse_collector.py](../src/clients/ebay_browse_collector.py)):`parse_item_id`(支持 `/itm/<id>`、`/itm/<slug>/<id>`、带 query/hash、`v1|id|0`、裸 id;path 段的 item id 优先于 query 里的变体 id)→ `fetch_item`(Browse `get_item_by_legacy_id`,用 **App Token**,无需卖家授权,跨实例可用)→ `map_to_collected_fields`(title/price/图片去重/`localizedAspects`→attributes/condition/brand/category)。SKU = `EB-<legacyId>`,再采集同链接即 upsert。
+- **入库端点** `/api/collect-ebay`([server.py](../server.py)):粘贴 URL→采集→upsert CollectedProduct(status=COLLECTED,复用现有状态机与后台优化),**跳过**大建专属 enrichment 和家具前缀清洗。
+- **合规接线(B1↔B2)**:采集时跑 banned_terms_guard 扫源标题/描述/aspects,把命中的禁词(如源 listing 的 POP MART)写进 logs 作**告警不阻断**(采集是起草);并强制写一条 COMPLIANCE 日志——采集图/文案仅供起草,发布前必须换自有图、清禁词。
+- **测试**:test_ebay_browse_collector(URL 解析/映射/编排/B1 组合),18 用例;server 导入验证路由注册。
+- **未接线**:采集图转存 EPS(方案 §1.4)、扩展按钮采集(交互形态 A)留后续;当前交互形态 B(粘贴链接)已通。
 
 ## 4. 风险清单
 

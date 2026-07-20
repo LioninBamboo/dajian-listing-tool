@@ -392,6 +392,11 @@ class ProductPayload(BaseModel):
     specs: Dict[str, Any] = {}
     url: str | None = None
 
+
+class EbayCollectPayload(BaseModel):
+    """Blind-box collection: paste an eBay item link, pull images + specifics."""
+    url: str
+
 # --- Mock eBay Client (As requested) ---
 class MockEbayClient:
     def create_or_replace_inventory_item(self, sku: str, product: Dict[str, Any]):
@@ -991,6 +996,110 @@ async def collect_product(
                 "message": f"Failed to collect product: {str(e)}",
                 "error": str(e)
             }
+        )
+
+
+@app.post("/api/collect-ebay")
+async def collect_from_ebay_link(
+    payload: EbayCollectPayload,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Collect a draft from an existing eBay listing URL (blind-box instance).
+
+    Pulls images + item specifics via the Browse API and upserts a
+    CollectedProduct. Compliance: third-party images/copy are for drafting
+    only — the draft is flagged so the operator replaces images and clears any
+    banned terms before publish.
+    """
+    try:
+        from src.clients.ebay_browse_collector import collect_from_url, EbayLinkParseError
+        from src.utils.report_images import normalize_image_list
+        from src.utils.banned_terms_guard import scan_listing
+
+        try:
+            fields = collect_from_url(payload.url)
+        except EbayLinkParseError as e:
+            return JSONResponse(status_code=400, content={"status": "error", "message": str(e)})
+
+        sku = fields.get("sku")
+        if not sku:
+            return JSONResponse(
+                status_code=422,
+                content={"status": "error", "message": "could not resolve item id from URL"},
+            )
+
+        title = str(fields.get("title") or "").strip()
+        description = fields.get("description") or ""
+        attributes = dict(fields.get("attributes") or {})
+        images = normalize_image_list(fields.get("images") or [], max_images=24)
+
+        # Advisory (not blocking): surface banned terms found in the SOURCE so
+        # the operator knows what the generator must strip before publish.
+        banned_hits = scan_listing(title=title, description=description, aspects=attributes)
+        banned_summary = sorted({h.term for h in banned_hits})
+
+        compliance_note = (
+            f"COMPLIANCE: images+copy collected from third-party eBay listing "
+            f"{payload.url} — replace images with own/authorized shots and clear "
+            f"banned terms before publish."
+        )
+        logs = [
+            f"Collected from eBay link at {_utcnow_naive().isoformat()}",
+            compliance_note,
+        ]
+        if banned_summary:
+            logs.append(f"Banned terms present in source (must fix): {', '.join(banned_summary)}")
+
+        existing = db.query(CollectedProduct).filter_by(sku=sku).first()
+        if existing:
+            existing.title = title
+            existing.price = fields.get("price") or 0.0
+            existing.description = description
+            existing.images = images
+            existing.attributes = attributes
+            existing.url = fields.get("url") or payload.url
+            existing.status = "COLLECTED"
+            existing.logs = (existing.logs or []) + logs
+            flag_modified(existing, "images")
+            flag_modified(existing, "attributes")
+            flag_modified(existing, "logs")
+            db.commit()
+        else:
+            db.add(CollectedProduct(
+                sku=sku,
+                title=title,
+                price=fields.get("price") or 0.0,
+                shipping=0.0,
+                stock=99,
+                description=description,
+                images=images,
+                videos=[],
+                attributes=attributes,
+                specs={},
+                url=fields.get("url") or payload.url,
+                status="COLLECTED",
+                logs=logs,
+            ))
+            db.commit()
+
+        background_tasks.add_task(analyze_product_task, sku)
+
+        return {
+            "status": "success",
+            "sku": sku,
+            "title": title,
+            "images": len(images),
+            "item_specifics": len(attributes),
+            "banned_terms_in_source": banned_summary,
+            "compliance": "collected images/copy are draft-only; replace before publish",
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": f"Failed to collect from eBay link: {e}"},
         )
 
 
