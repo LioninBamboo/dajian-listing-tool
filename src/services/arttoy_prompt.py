@@ -135,11 +135,26 @@ def finalize_arttoy_listing(data: Mapping[str, Any], profile: Any) -> Dict[str, 
     Raises BannedTermError so the caller can retry with feedback or abort —
     never returns a listing that still carries a banned term.
     """
-    from src.utils.banned_terms_guard import assert_clean
+    from src.utils.banned_terms_guard import (
+        assert_clean,
+        clean_banned_aspects,
+        strip_banned_terms,
+    )
 
     result: Dict[str, Any] = dict(data or {})
-    title = str(result.get("title") or "").strip()
-    description = str(result.get("description") or "").strip()
+    terms = _banned_terms(profile)
+
+    # Deterministically STRIP banned terms first — the LLM is unreliable when the
+    # source is saturated with them, so we do not depend on its compliance.
+    title = strip_banned_terms(str(result.get("title") or "").strip(), terms)
+    title_cn = strip_banned_terms(str(result.get("titleCN") or "").strip(), terms)
+    description = strip_banned_terms(str(result.get("description") or "").strip(), terms)
+    description_cn = strip_banned_terms(str(result.get("descriptionCN") or "").strip(), terms)
+    aspects = clean_banned_aspects(_normalize_aspects(result.get("aspects")), terms)
+    # If a banned Brand (e.g. "pop mart") got stripped away, fall back to the
+    # instance default (art toys -> "Unbranded") rather than leaving it blank.
+    if "Brand" in _normalize_aspects(result.get("aspects")) and "Brand" not in aspects:
+        aspects["Brand"] = [getattr(profile, "default_brand", "Unbranded")]
 
     footer = _footer_block(profile)
     footer_marker = str(getattr(profile, "quality_footer_marker", "") or "").lower()
@@ -150,18 +165,16 @@ def finalize_arttoy_listing(data: Mapping[str, Any], profile: Any) -> Dict[str, 
     if description and footer and not already:
         description = f"{description}\n{footer}"
 
-    aspects = _normalize_aspects(result.get("aspects"))
-
     result["title"] = title
     result["description"] = description
     result["aspects"] = aspects
-    result["titleCN"] = str(result.get("titleCN") or "").strip()
-    result["descriptionCN"] = str(result.get("descriptionCN") or "").strip()
+    result["titleCN"] = title_cn
+    result["descriptionCN"] = description_cn
     if not isinstance(result.get("features"), list):
         result["features"] = []
 
-    # HARD backstop: the model was told to avoid banned terms; enforce it.
-    terms = _banned_terms(profile)
-    assert_clean(title=f"{title} {result['titleCN']}", description=description, aspects=aspects, terms=terms)
+    # HARD backstop: after deterministic stripping this should always pass; it
+    # stays as a fail-closed guard against a term the stripper somehow missed.
+    assert_clean(title=f"{title} {title_cn}", description=description, aspects=aspects, terms=terms)
 
     return result

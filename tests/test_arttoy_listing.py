@@ -19,6 +19,7 @@ def _arttoy_profile(**over):
     base = dataclasses.replace(
         StoreProfile(),
         template_style="arttoy_hype",
+        force_house_brand=False,  # art toys keep own IP; missing Brand -> Unbranded
         banned_terms=("POP MART", "Original", "Genuine"),
         footer_html="<div>SHIPPING &amp; LOGISTICS via SpeedPAK</div>",
         quality_footer_marker="shipping & logistics",
@@ -88,19 +89,31 @@ class TestFinalize:
         )
         assert r["aspects"] == {"Type": ["Blind Box"], "Character": ["Molly"]}
 
-    def test_hard_fails_on_banned_in_title(self):
-        with pytest.raises(BannedTermError):
-            finalize_arttoy_listing(
-                {"title": "POP MART Labubu", "description": "<div>x</div>", "aspects": {}},
-                _arttoy_profile(),
-            )
+    def test_strips_banned_from_title(self):
+        r = finalize_arttoy_listing(
+            {"title": "POP MART Labubu Figure", "description": "<div>x</div>", "aspects": {}},
+            _arttoy_profile(),
+        )
+        assert "POP MART" not in r["title"]
+        assert "Labubu" in r["title"]
 
-    def test_hard_fails_on_banned_in_aspect(self):
-        with pytest.raises(BannedTermError):
-            finalize_arttoy_listing(
-                {"title": "Toy", "description": "<div>x</div>", "aspects": {"Brand": "Original"}},
-                _arttoy_profile(),
-            )
+    def test_strips_banned_brand_to_default(self):
+        r = finalize_arttoy_listing(
+            {"title": "Toy", "description": "<div>x</div>", "aspects": {"Brand": "Original"}},
+            _arttoy_profile(),
+        )
+        # banned Brand value stripped -> falls back to default (Unbranded for art toys)
+        assert r["aspects"].get("Brand") == ["Unbranded"]
+
+    def test_output_is_clean_after_strip(self):
+        r = finalize_arttoy_listing(
+            {"title": "Genuine POP MART Toy", "description": "<div>Original design</div>",
+             "aspects": {"Type": "Blind Box"}},
+            _arttoy_profile(),
+        )
+        from src.utils.banned_terms_guard import scan_listing
+        assert scan_listing(title=r["title"], description=r["description"],
+                            aspects=r["aspects"], terms=["POP MART", "Original", "Genuine"]) == []
 
 
 # --- Dispatch tests (mock the LLM client) --------------------------------
@@ -192,23 +205,19 @@ class TestDispatch:
         assert "SHIPPING" in result["description"]  # footer appended
         assert result["aspects"]["Type"] == ["Blind Box"]
 
-    def test_retries_when_first_output_has_banned_term(self, _use_profile):
+    def test_strips_banned_in_single_call_no_retry(self, _use_profile):
         _use_profile(self.ARTTOY_YAML)
         dirty = json.dumps({
             "title": "POP MART Labubu Figure",
-            "description": "<div>x</div>",
-            "aspects": {},
-        })
-        clean = json.dumps({
-            "title": "Designer Vinyl Blind Box Figure",
             "description": "<div>clean art toy</div>",
             "aspects": {"Type": "Blind Box"},
         })
-        opt = _optimizer([dirty, clean])
+        opt = _optimizer([dirty])
         result = opt.optimize_arttoy_listing("Labubu", "vinyl")
-        assert result["title"] == "Designer Vinyl Blind Box Figure"
-        # two LLM calls: first rejected, second accepted
-        assert len(opt.client.chat.completions.calls) == 2
+        assert "POP MART" not in result["title"]
+        assert "Labubu" in result["title"]
+        # deterministic strip => clean on the first call, no retry
+        assert len(opt.client.chat.completions.calls) == 1
 
     def test_long_description_truncated_and_footer_preserved(self, _use_profile):
         _use_profile(self.ARTTOY_YAML)
@@ -224,10 +233,8 @@ class TestDispatch:
         assert len(result["description"]) <= 4000  # under eBay limit
         assert "SHIPPING" in result["description"]  # footer survived truncation
 
-    def test_falls_back_when_banned_unresolved(self, _use_profile):
+    def test_falls_back_on_unparseable_output(self, _use_profile):
         _use_profile(self.ARTTOY_YAML)
-        dirty = json.dumps({"title": "POP MART x", "description": "<div>x</div>", "aspects": {}})
-        opt = _optimizer([dirty, dirty])
+        opt = _optimizer(["this is not json", "still not json"])
         result = opt.optimize_arttoy_listing("Labubu", "vinyl")
-        assert "error" in result
-        assert "POP MART" in result["error"]
+        assert result.get("error") == "generation failed"

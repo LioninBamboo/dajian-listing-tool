@@ -5,7 +5,9 @@ import pytest
 from src.utils.banned_terms_guard import (
     BannedTermError,
     assert_clean,
+    clean_banned_aspects,
     scan_listing,
+    strip_banned_terms,
 )
 
 TERMS = ["POP MART", "Original", "Genuine", "Authentic", "OEM", "Licensed"]
@@ -79,6 +81,30 @@ class TestNoOp:
             assert scan_listing(title="Original Genuine POP MART") == []
         finally:
             sp.reset_store_profile_cache()
+
+
+class TestStrip:
+    def test_removes_whole_terms_and_tidies(self):
+        assert strip_banned_terms("Authentic Universal Monsters Figure", TERMS) == "Universal Monsters Figure"
+        assert strip_banned_terms("100% Original design", TERMS) == "100% design"
+
+    def test_case_insensitive_and_multiword(self):
+        assert strip_banned_terms("a pop mart toy", TERMS) == "a toy"
+
+    def test_does_not_touch_partial_words(self):
+        assert strip_banned_terms("Originality and OEMs", TERMS) == "Originality and OEMs"
+
+    def test_html_tags_preserved(self):
+        out = strip_banned_terms("<p>Genuine <b>vinyl</b></p>", TERMS)
+        assert "<p>" in out and "<b>vinyl</b>" in out and "Genuine" not in out
+
+    def test_empty_terms_is_noop(self):
+        assert strip_banned_terms("POP MART Original", []) == "POP MART Original"
+
+    def test_clean_aspects_drops_emptied_values(self):
+        out = clean_banned_aspects({"Brand": ["POP MART"], "Type": ["Blind Box"]}, TERMS)
+        assert "Brand" not in out          # emptied -> dropped
+        assert out["Type"] == ["Blind Box"]
 
 
 class TestAssertClean:

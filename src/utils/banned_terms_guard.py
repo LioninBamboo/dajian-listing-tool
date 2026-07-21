@@ -109,6 +109,46 @@ def scan_listing(
     return hits
 
 
+def strip_banned_terms(text: str, terms: Optional[Iterable[str]] = None) -> str:
+    """Deterministically remove banned terms (whole-token) from ``text``.
+
+    The LLM is told to avoid these but is not reliable, especially when the source
+    is saturated with them; stripping here guarantees clean output without depending
+    on LLM compliance or retries. Safe on HTML (only text tokens are removed, tags
+    stay) and on plain text. Leftover double spaces / space-before-punctuation are
+    tidied.
+    """
+    resolved = _resolve_terms(terms)
+    if not resolved or not text:
+        return text or ""
+    out = str(text)
+    for t in resolved:
+        pat = _compile_term(t)
+        if pat is not None:
+            out = pat.sub("", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\s+([,.;:!?)])", r"\1", out)
+    out = re.sub(r"\(\s+", "(", out)
+    return out.strip()
+
+
+def clean_banned_aspects(
+    aspects: Optional[Mapping[str, Any]], terms: Optional[Iterable[str]] = None
+) -> dict:
+    """Strip banned terms from aspect values; drop any value/key emptied by it."""
+    cleaned: dict = {}
+    for name, value in (aspects or {}).items():
+        values = value if isinstance(value, (list, tuple)) else [value]
+        kept = []
+        for v in values:
+            sv = strip_banned_terms(str(v), terms)
+            if sv:
+                kept.append(sv)
+        if kept and strip_banned_terms(str(name), terms):
+            cleaned[name] = kept
+    return cleaned
+
+
 def assert_clean(
     *,
     title: str = "",
