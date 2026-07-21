@@ -579,6 +579,103 @@ class QwenOptimizer:
             lines.append(f"- {name} count: {count}")
         return "\n".join(lines)
 
+    def optimize_arttoy_listing(self, original_title, original_description, attributes=None, specs=None, market_intel=None):
+        """Generate an art-toy / blind-box listing (template_style=arttoy_hype).
+
+        Parallel to optimize_product_full but with the Hypebeast prompt, Chinese
+        translation fields, and a hard banned-terms backstop. Retries once with
+        feedback if the model leaks a banned term; returns furniture-compatible
+        keys ({title, description, aspects, categoryId}) plus titleCN/descriptionCN.
+        """
+        from src.services.arttoy_prompt import (
+            build_arttoy_system_prompt,
+            build_arttoy_user_prompt,
+            finalize_arttoy_listing,
+        )
+        from src.utils.banned_terms_guard import BannedTermError
+
+        profile = get_store_profile()
+        print(f"🎨 Starting art-toy optimization for: {str(original_title)[:50]}...")
+
+        system_prompt = build_arttoy_system_prompt(profile)
+        user_prompt = build_arttoy_user_prompt(
+            title=original_title,
+            description=original_description,
+            attributes=attributes,
+            specs=specs,
+            market_intel=market_intel,
+        )
+
+        last_error = None
+        for attempt in range(2):
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            if last_error:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"Your previous attempt was REJECTED: it contained prohibited "
+                        f"term(s) {last_error}. Regenerate WITHOUT any prohibited term "
+                        f"anywhere in title, description, or item specifics."
+                    ),
+                })
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    temperature=0.4,
+                )
+                content = response.choices[0].message.content
+                try:
+                    data = json.loads(content)
+                except json.JSONDecodeError:
+                    data = json.loads(content.replace("```json", "").replace("```", "").strip())
+
+                result = finalize_arttoy_listing(data, profile)
+
+                # Keep the shared category matcher so publish-time taxonomy agrees.
+                try:
+                    from src.services.ebay_category_matcher import create_category_matcher
+                    matcher = create_category_matcher(os.getenv("EBAY_ENVIRONMENT", "PRODUCTION"))
+                    matched_id, matched_name, matched_aspects = matcher.get_category_and_aspects(
+                        original_title or result.get("title", ""),
+                        result.get("aspects", {}),
+                        result.get("description", ""),
+                    )
+                    if matched_id:
+                        result["categoryId"] = matched_id
+                        result["categoryName"] = matched_name
+                        result["aspects"] = matched_aspects or result.get("aspects", {})
+                except Exception as cat_err:
+                    print(f"   [WARN] category matcher unavailable: {cat_err}")
+
+                print(f"✅ Art-toy optimization complete. Title: {result.get('title','')[:50]}...")
+                return result
+
+            except BannedTermError as e:
+                last_error = ", ".join(sorted({h.term for h in e.hits}))
+                print(f"   [RETRY] art-toy output had banned terms: {last_error}")
+                continue
+            except Exception as e:
+                print(f"❌ Art-toy optimization failed: {e}")
+                traceback.print_exc()
+                break
+
+        # Fall back rather than publish something unvalidated.
+        print("   [FALLBACK] art-toy generation could not produce a clean listing")
+        return {
+            "title": str(original_title or "")[:80],
+            "titleCN": "",
+            "description": str(original_description or ""),
+            "descriptionCN": "",
+            "aspects": {},
+            "features": [],
+            "error": f"banned terms unresolved: {last_error}" if last_error else "generation failed",
+        }
+
     def optimize_product_full(self, original_title, original_description, attributes=None, images=None, specs=None, video_url=None, market_intel=None, previous_errors=None):
         """
         优化产品标题和描述
@@ -590,8 +687,20 @@ class QwenOptimizer:
                           'common_aspects': {...}, 'price_stats': {...}}
             previous_errors: List of error strings from previous failed attempts
         """
+        # Blind-box instance: route to the art-toy Hypebeast path. Furniture /
+        # auto instances (template_style == "furniture_classic") fall through to
+        # the existing logic below, completely unchanged.
+        if get_store_profile().template_style == "arttoy_hype":
+            return self.optimize_arttoy_listing(
+                original_title,
+                original_description,
+                attributes=attributes,
+                specs=specs,
+                market_intel=market_intel,
+            )
+
         print(f"🚀 Starting Qwen optimization for: {original_title[:50]}...")
-        
+
         # 提取尺寸信息
         dimensions = self.extract_dimensions(attributes or {}, specs or {}, original_description or "")
         

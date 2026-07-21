@@ -1,0 +1,219 @@
+"""Tests for the art-toy listing path (B3): prompt, finalize, and qwen dispatch."""
+
+import dataclasses
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from src.utils.store_profile import StoreProfile
+from src.utils.banned_terms_guard import BannedTermError
+from src.services.arttoy_prompt import (
+    build_arttoy_system_prompt,
+    build_arttoy_user_prompt,
+    finalize_arttoy_listing,
+)
+
+
+def _arttoy_profile(**over):
+    base = dataclasses.replace(
+        StoreProfile(),
+        template_style="arttoy_hype",
+        banned_terms=("POP MART", "Original", "Genuine"),
+        footer_html="<div>SHIPPING &amp; LOGISTICS via SpeedPAK</div>",
+        quality_footer_marker="shipping & logistics",
+    )
+    return dataclasses.replace(base, **over) if over else base
+
+
+class TestPromptBuilders:
+    def test_system_prompt_injects_banned_and_style(self):
+        s = build_arttoy_system_prompt(_arttoy_profile())
+        assert "POP MART" in s and "Original" in s
+        assert "Hypebeast" in s and "INLINE CSS" in s
+        assert "titleCN" in s and "descriptionCN" in s
+
+    def test_system_prompt_falls_back_to_default_banned(self):
+        p = dataclasses.replace(StoreProfile(), template_style="arttoy_hype", banned_terms=())
+        s = build_arttoy_system_prompt(p)
+        assert "POP MART" in s  # default art-toy banned list
+
+    def test_user_prompt_includes_source_and_market(self):
+        u = build_arttoy_user_prompt(
+            title="Labubu Figure",
+            description="vinyl toy",
+            attributes={"Character": "Labubu"},
+            market_intel={"top_keywords": ["art toy", "kawaii"], "price_stats": {"min": 10, "max": 40, "avg": 22}},
+        )
+        assert "Labubu Figure" in u
+        assert "art toy" in u
+        assert "$10-$40" in u
+
+
+class TestFinalize:
+    def test_appends_footer_once_even_with_escaped_amp(self):
+        p = _arttoy_profile()
+        r = finalize_arttoy_listing(
+            {"title": "Cute Art Toy", "description": "<div>fig</div>", "aspects": {}}, p
+        )
+        assert r["description"].count("SHIPPING") == 1
+        r2 = finalize_arttoy_listing(r, p)  # idempotent
+        assert r2["description"].count("SHIPPING") == 1
+
+    def test_guarantees_chinese_keys(self):
+        r = finalize_arttoy_listing(
+            {"title": "Toy", "description": "<div>x</div>", "aspects": {}}, _arttoy_profile()
+        )
+        assert "titleCN" in r and "descriptionCN" in r
+        assert r["titleCN"] == "" and r["descriptionCN"] == ""
+
+    def test_preserves_provided_chinese(self):
+        r = finalize_arttoy_listing(
+            {
+                "title": "Toy",
+                "titleCN": "玩具",
+                "description": "<div>x</div>",
+                "descriptionCN": "<p>描述</p>",
+                "aspects": {},
+            },
+            _arttoy_profile(),
+        )
+        assert r["titleCN"] == "玩具"
+        assert r["descriptionCN"] == "<p>描述</p>"
+
+    def test_normalizes_aspects_to_lists(self):
+        r = finalize_arttoy_listing(
+            {"title": "Toy", "description": "<div>x</div>", "aspects": {"Type": "Blind Box", "Character": ["Molly"], "Empty": ""}},
+            _arttoy_profile(),
+        )
+        assert r["aspects"] == {"Type": ["Blind Box"], "Character": ["Molly"]}
+
+    def test_hard_fails_on_banned_in_title(self):
+        with pytest.raises(BannedTermError):
+            finalize_arttoy_listing(
+                {"title": "POP MART Labubu", "description": "<div>x</div>", "aspects": {}},
+                _arttoy_profile(),
+            )
+
+    def test_hard_fails_on_banned_in_aspect(self):
+        with pytest.raises(BannedTermError):
+            finalize_arttoy_listing(
+                {"title": "Toy", "description": "<div>x</div>", "aspects": {"Brand": "Original"}},
+                _arttoy_profile(),
+            )
+
+
+# --- Dispatch tests (mock the LLM client) --------------------------------
+
+
+class _FakeCompletions:
+    def __init__(self, contents):
+        self._contents = list(contents)
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        content = self._contents.pop(0)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+
+def _optimizer(contents):
+    from qwen_optimizer import QwenOptimizer
+
+    opt = QwenOptimizer.__new__(QwenOptimizer)  # bypass __init__/API key
+    opt.client = SimpleNamespace(chat=SimpleNamespace(completions=_FakeCompletions(contents)))
+    opt.model = "test-model"
+    return opt
+
+
+@pytest.fixture
+def _use_profile(monkeypatch, tmp_path):
+    # Keep the shared category matcher offline: it's best-effort in the art-toy
+    # path (wrapped in try/except) and a live api.ebay.com call has no place in
+    # a unit test.
+    import src.services.ebay_category_matcher as ecm
+
+    monkeypatch.setattr(
+        ecm, "create_category_matcher",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline in tests")),
+    )
+
+    def _apply(profile_yaml):
+        from src.utils import store_profile as sp
+
+        f = tmp_path / "profile.yaml"
+        f.write_text(profile_yaml, encoding="utf-8")
+        monkeypatch.setenv("STORE_PROFILE_PATH", str(f))
+        sp.reset_store_profile_cache()
+
+    yield _apply
+    from src.utils import store_profile as sp
+
+    sp.reset_store_profile_cache()
+
+
+class TestDispatch:
+    ARTTOY_YAML = (
+        "listing:\n"
+        "  template_style: arttoy_hype\n"
+        "  footer_html: '<div>SHIPPING &amp; LOGISTICS</div>'\n"
+        "  banned_terms:\n    - POP MART\n    - Original\n"
+        "quality_gate:\n  footer_marker: 'shipping & logistics'\n"
+    )
+
+    def test_furniture_style_does_not_dispatch_to_arttoy(self, _use_profile, monkeypatch):
+        _use_profile("store:\n  brand_name: AquaVerve\n")  # template_style defaults to furniture_classic
+        opt = _optimizer([])
+        called = {"arttoy": False}
+        monkeypatch.setattr(
+            opt, "optimize_arttoy_listing",
+            lambda *a, **k: called.__setitem__("arttoy", True) or {},
+        )
+        # Force the furniture branch to stop right after dispatch check by making
+        # extract_dimensions raise — we only care that arttoy was NOT called.
+        monkeypatch.setattr(opt, "extract_dimensions", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop")))
+        with pytest.raises(RuntimeError):
+            opt.optimize_product_full("Wooden Coffee Table", "oak table")
+        assert called["arttoy"] is False
+
+    def test_arttoy_style_dispatches_and_finalizes(self, _use_profile):
+        _use_profile(self.ARTTOY_YAML)
+        clean = json.dumps({
+            "title": "Kawaii Designer Vinyl Figure Blind Box",
+            "titleCN": "可爱设计师玩具",
+            "description": "<div style='color:#000'>Collectible vinyl art toy</div>",
+            "descriptionCN": "<p>可爱</p>",
+            "aspects": {"Type": "Blind Box", "Character": "Labubu"},
+        })
+        opt = _optimizer([clean])
+        result = opt.optimize_product_full("Labubu toy", "vinyl figure")
+        assert result["title"].startswith("Kawaii")
+        assert result["titleCN"] == "可爱设计师玩具"
+        assert "SHIPPING" in result["description"]  # footer appended
+        assert result["aspects"]["Type"] == ["Blind Box"]
+
+    def test_retries_when_first_output_has_banned_term(self, _use_profile):
+        _use_profile(self.ARTTOY_YAML)
+        dirty = json.dumps({
+            "title": "POP MART Labubu Figure",
+            "description": "<div>x</div>",
+            "aspects": {},
+        })
+        clean = json.dumps({
+            "title": "Designer Vinyl Blind Box Figure",
+            "description": "<div>clean art toy</div>",
+            "aspects": {"Type": "Blind Box"},
+        })
+        opt = _optimizer([dirty, clean])
+        result = opt.optimize_arttoy_listing("Labubu", "vinyl")
+        assert result["title"] == "Designer Vinyl Blind Box Figure"
+        # two LLM calls: first rejected, second accepted
+        assert len(opt.client.chat.completions.calls) == 2
+
+    def test_falls_back_when_banned_unresolved(self, _use_profile):
+        _use_profile(self.ARTTOY_YAML)
+        dirty = json.dumps({"title": "POP MART x", "description": "<div>x</div>", "aspects": {}})
+        opt = _optimizer([dirty, dirty])
+        result = opt.optimize_arttoy_listing("Labubu", "vinyl")
+        assert "error" in result
+        assert "POP MART" in result["error"]

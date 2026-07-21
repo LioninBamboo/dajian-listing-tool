@@ -111,7 +111,7 @@ store_profile 新增字段(v2):
 |---|---|---|
 | B1 ✅ | store_profile v2 + 禁词硬校验守卫 + undercut 定价 —— **已完成 2026-07-20** | 无 |
 | B2 ✅ | eBay 链接采集:browse_collector 客户端 + /api/collect-ebay 入库 —— **已完成 2026-07-20** | 无 |
-| B3 | 潮玩描述模板 + qwen 提示词模板化 + 中文对照字段 | B1 |
+| B3 ✅ | 潮玩描述模板 + qwen 按 template_style 分流 + 中文对照字段 —— **已完成 2026-07-21** | B1 |
 | B4 | 盲盒子账号开店五步(复用 M2 手册)+ 实例C部署(端口 8002) | 子账号就绪 |
 | B5 | 多变体刊登(inventory_item_group)+ SpeedPAK 定价模型 | B4 |
 | B6 | 金丝雀:5-10 条真实盲盒 listing 全链路(采集→生成→人工审图/审禁词→刊登) | B2+B3+B5 |
@@ -133,6 +133,13 @@ store_profile 新增字段(v2):
 - **合规接线(B1↔B2)**:采集时跑 banned_terms_guard 扫源标题/描述/aspects,把命中的禁词(如源 listing 的 POP MART)写进 logs 作**告警不阻断**(采集是起草);并强制写一条 COMPLIANCE 日志——采集图/文案仅供起草,发布前必须换自有图、清禁词。
 - **测试**:test_ebay_browse_collector(URL 解析/映射/编排/B1 组合),18 用例;server 导入验证路由注册。
 - **未接线**:采集图转存 EPS(方案 §1.4)、扩展按钮采集(交互形态 A)留后续;当前交互形态 B(粘贴链接)已通。
+
+## 3.3 B3 实施记录(2026-07-21)
+
+- **潮玩提示词 + 终稿器**([arttoy_prompt.py](../src/services/arttoy_prompt.py)):`build_arttoy_system_prompt`(Hypebeast 内联 CSS 描述规范 + 禁词注入 + 中文对照要求,移植自 ebay-listing-pro)、`build_arttoy_user_prompt`、`finalize_arttoy_listing`(确定性后处理:注入 footer_html、保证 titleCN/descriptionCN、aspects 归一为 list、**禁词硬校验 raise**)。footer 幂等修了一个真实 bug——footer_html 里 `&amp;` 与 marker `&` 不匹配会重复追加,已用 `html.unescape` 归一。
+- **qwen 分流**([qwen_optimizer.py](../qwen_optimizer.py)):`optimize_product_full` 顶部按 `template_style=='arttoy_hype'` 分流到新方法 `optimize_arttoy_listing`(复用 self.client,禁词命中自动重试一次带反馈,仍失败则降级不发布)。**furniture/汽配路径零改动**(默认 furniture_classic 直接 fall through)。输出对齐 furniture 结构(title/description/aspects/categoryId)+ 附加 titleCN/descriptionCN,下游 publish 无需改。
+- **测试**:test_arttoy_listing(提示词/终稿器/分流/禁词重试/降级/furniture 不分流),13 用例;测试离线(类目匹配器打桩)。furniture+发布回归 138 绿。
+- **未接线**:多变体刊登(inventory_item_group)在 B5;当前 arttoy 生成走单 SKU,与现有 publish 一致。
 
 ## 4. 风险清单
 
