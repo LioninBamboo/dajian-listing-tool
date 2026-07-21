@@ -87,7 +87,10 @@ class TestFinalize:
             {"title": "Toy", "description": "<div>x</div>", "aspects": {"Type": "Blind Box", "Character": ["Molly"], "Empty": ""}},
             _arttoy_profile(),
         )
-        assert r["aspects"] == {"Type": ["Blind Box"], "Character": ["Molly"]}
+        assert r["aspects"]["Type"] == ["Blind Box"]
+        assert r["aspects"]["Character"] == ["Molly"]
+        assert "Empty" not in r["aspects"]
+        assert r["aspects"]["Brand"] == ["Unbranded"]  # eBay-required Brand auto-added
 
     def test_strips_banned_from_title(self):
         r = finalize_arttoy_listing(

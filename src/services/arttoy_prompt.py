@@ -151,9 +151,10 @@ def finalize_arttoy_listing(data: Mapping[str, Any], profile: Any) -> Dict[str, 
     description = strip_banned_terms(str(result.get("description") or "").strip(), terms)
     description_cn = strip_banned_terms(str(result.get("descriptionCN") or "").strip(), terms)
     aspects = clean_banned_aspects(_normalize_aspects(result.get("aspects")), terms)
-    # If a banned Brand (e.g. "pop mart") got stripped away, fall back to the
-    # instance default (art toys -> "Unbranded") rather than leaving it blank.
-    if "Brand" in _normalize_aspects(result.get("aspects")) and "Brand" not in aspects:
+    # eBay requires a Brand item-specific in many categories. If none survived
+    # (missing, or a banned brand like "pop mart" got stripped), fall back to the
+    # instance default — "Unbranded" for art toys — never leaving it blank.
+    if not aspects.get("Brand"):
         aspects["Brand"] = [getattr(profile, "default_brand", "Unbranded")]
 
     footer = _footer_block(profile)

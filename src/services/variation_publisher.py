@@ -83,7 +83,20 @@ def build_inventory_item_group_payload(
     """
     if len(variant_skus) != len(variant_values):
         raise ValueError("variant_skus and variant_values must be the same length")
-    common = {k: v for k, v in (common_aspects or {}).items() if k != varies_by_aspect}
+    # eBay rejects multi-valued single-value aspects (e.g. Theme/Type/Material) at
+    # publish; cap them to their first value, mirroring inventory-item sanitization.
+    try:
+        from src.utils.publish_autofix import SINGLE_VALUE_ASPECTS
+    except Exception:
+        SINGLE_VALUE_ASPECTS = frozenset()
+    common: Dict[str, List[str]] = {}
+    for k, v in (common_aspects or {}).items():
+        if k == varies_by_aspect:
+            continue
+        vals = list(v) if isinstance(v, (list, tuple)) else [v]
+        if k in SINGLE_VALUE_ASPECTS and len(vals) > 1:
+            vals = vals[:1]
+        common[k] = vals
     return {
         "title": str(title or "")[:80],
         "description": description or "",
