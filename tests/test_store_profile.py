@@ -127,6 +127,20 @@ class TestOverrides:
         assert p.banned_terms == ()
         assert p.pricing_strategy == "cost_plus"
         assert p.price_ends_99 is False
+        assert p.force_house_brand is True
+        assert p.default_brand == p.brand_name  # generic goods stamp house brand
+
+    def test_force_house_brand_false_defaults_to_unbranded(self, tmp_path):
+        yaml_file = tmp_path / "arttoy.yaml"
+        yaml_file.write_text(
+            "store:\n  brand_name: GrovePop\n"
+            "listing:\n  template_style: arttoy_hype\n  force_house_brand: false\n",
+            encoding="utf-8",
+        )
+        p = load_store_profile(yaml_file)
+        assert p.force_house_brand is False
+        assert p.brand_name == "GrovePop"          # store identity kept
+        assert p.default_brand == "Unbranded"       # but NOT stamped on products
 
     def test_banned_terms_from_comma_string(self, tmp_path):
         yaml_file = tmp_path / "csv.yaml"

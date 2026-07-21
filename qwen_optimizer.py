@@ -533,8 +533,9 @@ class QwenOptimizer:
             # Post-processing (same as optimize_product_full)
             if "aspects" not in data:
                 data["aspects"] = {}
-            
-            data["aspects"]["Brand"] = [get_store_profile().brand_name]
+
+            if get_store_profile().force_house_brand:
+                data["aspects"]["Brand"] = [get_store_profile().brand_name]
 
             # Force our extracted dimensions
             if dimensions["length"]:
@@ -969,8 +970,10 @@ class QwenOptimizer:
             if "aspects" not in data:
                 data["aspects"] = {}
             
-            # Force Brand = our storefront brand
-            data["aspects"]["Brand"] = [get_store_profile().brand_name]
+            # Force Brand = our storefront brand (generic-goods instances only;
+            # art-toy instances keep the item's own IP brand).
+            if get_store_profile().force_house_brand:
+                data["aspects"]["Brand"] = [get_store_profile().brand_name]
             
             # CRITICAL: FORCE use our extracted dimensions, OVERRIDE AI-generated ones
             # This ensures accuracy - AI often makes up dimensions

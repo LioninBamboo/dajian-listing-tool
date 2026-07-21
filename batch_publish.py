@@ -664,9 +664,10 @@ def enrich_aspects(product: dict) -> dict:
     title_lower = title.lower()
     cat_id = opt.get('categoryId', '')
 
-    # 1. Brand
+    # 1. Brand — generic goods stamp the house brand; art-toy instances keep
+    #    each item's own IP brand and default a missing one to "Unbranded".
     if 'Brand' not in aspects or not aspects.get('Brand'):
-        aspects['Brand'] = [BRAND_NAME]
+        aspects['Brand'] = [get_store_profile().default_brand]
 
     aspects = complete_publish_aspects(
         aspects,
@@ -761,7 +762,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
 
     # ── Category matching ──
     category_matcher = EbayCategoryMatcher(oauth)
-    existing_aspects = dict(opt.get('aspects', {'Brand': [BRAND_NAME]}))
+    existing_aspects = dict(opt.get('aspects', {'Brand': [get_store_profile().default_brand]}))
     source_title = (product.get('title') or '').strip()
     category_lookup_title = title or source_title
     title_context = title or source_title

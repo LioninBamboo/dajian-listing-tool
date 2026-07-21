@@ -54,7 +54,8 @@ def build_arttoy_system_prompt(profile: Any) -> str:
 
 **ANALYSIS RULES:**
 - Only describe features/materials explicitly supported by the provided source data. Do NOT invent counts, editions, materials, or certifications.
-- Fill relevant Item Specifics ('aspects') with accurate values; use the character name and toy type, never a prohibited brand.
+- Fill relevant Item Specifics ('aspects') with accurate values from the source.
+- BRAND aspect: art toys carry their own IP, not our store name. Set 'Brand' to the item's own series/designer/character from the source ONLY IF it is not a prohibited term; if the only available brand is prohibited or none is given, set 'Brand' to "Unbranded". NEVER put our store name in Brand.
 
 **OUTPUT FORMAT:** return a SINGLE VALID JSON object, no markdown fences, no prose. Structure:
 {{

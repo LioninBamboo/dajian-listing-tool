@@ -688,7 +688,7 @@ def analyze_product_task(sku: str):
             opt_data = {
                 "title": f"MOCK - {product.title}"[:80],
                 "description": product.description,
-                "aspects": {"Brand": [BRAND_NAME]}
+                "aspects": {"Brand": [get_store_profile().default_brand]}
             }
         else:
             qwen = QwenOptimizer(api_key=QWEN_KEY)
@@ -1364,7 +1364,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         if removed_supplier_brand:
             print(f"[TITLE] Removed supplier prefix '{removed_prefix}' for {sku}")
             opt_data["title"] = listing_title
-        existing_aspects = opt_data.get("aspects", {"Brand": [BRAND_NAME]})
+        existing_aspects = opt_data.get("aspects", {"Brand": [get_store_profile().default_brand]})
         source_title = (product.title or "").strip()
         category_lookup_title = source_title or listing_title
         title_context = " ".join(part for part in (source_title, listing_title) if part).strip() or listing_title

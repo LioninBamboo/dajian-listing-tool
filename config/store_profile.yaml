@@ -26,6 +26,7 @@ listing:
   template_style: "furniture_classic"   # furniture_classic | arttoy_hype(盲盒)
   footer_html: ""                        # 整块 footer;空则用上面的 footer_line1/2
   banned_terms: []                       # 禁词硬校验表;家具为空=守卫不触发
+  force_house_brand: true                # 通用货把店铺品牌盖为 Brand;潮玩设 false(各件保留自有 IP)
 
 # v2:定价策略。cost_plus = 现有 PricingEngine 成本+毛利模型(家具/汽配)
 pricing:

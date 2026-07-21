@@ -52,6 +52,10 @@ class StoreProfile:
     template_style: str = "furniture_classic"   # furniture_classic | arttoy_hype
     footer_html: str = ""                        # whole-block footer; empty => line1/line2
     banned_terms: tuple = ()                     # hard-blocked terms (empty => guard is a no-op)
+    # True (furniture/auto): stamp the store brand as the product Brand aspect —
+    # generic goods carry the house brand. False (art toys): each item keeps its
+    # own IP/brand from the source; a missing Brand defaults to "Unbranded".
+    force_house_brand: bool = True
 
     # Pricing (v2). cost_plus = existing PricingEngine model (furniture/auto).
     # undercut = blind-box: price a hair under the collected source listing.
@@ -82,6 +86,15 @@ class StoreProfile:
     def banned_terms_lower(self) -> tuple:
         return tuple(t.lower() for t in self.banned_terms)
 
+    @property
+    def default_brand(self) -> str:
+        """Brand to use when an item has none.
+
+        Generic-goods instances stamp the house brand; art-toy instances keep
+        per-item IP and fall back to "Unbranded" rather than the store name.
+        """
+        return self.brand_name if self.force_house_brand else "Unbranded"
+
 
 _SECTION_FIELD_MAP = {
     "store": {
@@ -105,6 +118,7 @@ _SECTION_FIELD_MAP = {
         "template_style",
         "footer_html",
         "banned_terms",
+        "force_house_brand",
     },
     "pricing": {
         "pricing_strategy",
@@ -132,7 +146,7 @@ _SECTION_KEY_ALIASES = {
 
 _INT_FIELDS = {"server_port"}
 _FLOAT_FIELDS = {"undercut_pct", "undercut_min_abs"}
-_BOOL_FIELDS = {"price_ends_99"}
+_BOOL_FIELDS = {"price_ends_99", "force_house_brand"}
 _TUPLE_FIELDS = {"banned_terms"}
 
 

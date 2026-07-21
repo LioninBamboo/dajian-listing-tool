@@ -20,6 +20,7 @@ quality_gate:
 
 listing:
   template_style: "arttoy_hype"              # 潮玩 Hypebeast 风描述模板(B3 实现)
+  force_house_brand: false                   # 潮玩各件保留自有 IP/品牌;缺失时兜底 "Unbranded"(不盖店名)
   # 整块 footer(系统追加,LLM 不生成)。移植自 ebay-listing-pro 的 SHIPPING & LOGISTICS 卡片。
   footer_html: >-
     <div style="margin-top:30px;padding:25px;background:#fff;border:3px solid #000;box-shadow:6px 6px 0 #000;border-radius:4px;font-family:'Arial Black',sans-serif;">
