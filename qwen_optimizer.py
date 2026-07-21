@@ -635,6 +635,13 @@ class QwenOptimizer:
                 except json.JSONDecodeError:
                     data = json.loads(content.replace("```json", "").replace("```", "").strip())
 
+                # Smart-truncate the body BEFORE finalize appends the footer, so
+                # the footer always survives and eBay's 4000-char description limit
+                # is respected without cutting mid-tag (broken-listing guard).
+                body = str(data.get("description") or "")
+                if len(body) > 3300:
+                    data["description"] = self._smart_truncate_html(body, 3300)
+
                 result = finalize_arttoy_listing(data, profile)
 
                 # Keep the shared category matcher so publish-time taxonomy agrees.

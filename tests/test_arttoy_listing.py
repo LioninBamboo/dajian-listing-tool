@@ -210,6 +210,20 @@ class TestDispatch:
         # two LLM calls: first rejected, second accepted
         assert len(opt.client.chat.completions.calls) == 2
 
+    def test_long_description_truncated_and_footer_preserved(self, _use_profile):
+        _use_profile(self.ARTTOY_YAML)
+        big = "<div>" + ("<p>Collectible vinyl art toy detail sentence here.</p>" * 120) + "</div>"
+        assert len(big) > 3300
+        payload = json.dumps({
+            "title": "Clean Designer Art Toy",
+            "description": big,
+            "aspects": {"Type": "Blind Box"},
+        })
+        opt = _optimizer([payload])
+        result = opt.optimize_arttoy_listing("toy", "vinyl")
+        assert len(result["description"]) <= 4000  # under eBay limit
+        assert "SHIPPING" in result["description"]  # footer survived truncation
+
     def test_falls_back_when_banned_unresolved(self, _use_profile):
         _use_profile(self.ARTTOY_YAML)
         dirty = json.dumps({"title": "POP MART x", "description": "<div>x</div>", "aspects": {}})
