@@ -900,10 +900,57 @@ class RealEbayClient:
         
         raise Exception(f"Create offer failed after {max_retries} attempts")
     
+    def create_or_replace_inventory_item_group(self, group_key: str, group: Dict) -> Dict:
+        """Define a multi-variation group (blind-box series).
+
+        PUT /sell/inventory/v1/inventory_item_group/{inventoryItemGroupKey}
+
+        ``group`` is the full payload: title/description/imageUrls/aspects plus
+        variesBy (the aspect that varies + its values) and variantSKUs. All the
+        variant inventory items must already exist.
+        """
+        url = f"{self.base_url}/sell/inventory/v1/inventory_item_group/{group_key}"
+        token = self.oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Content-Language": "en-US",
+        }
+        response = self.session.put(url, headers=headers, json=group, timeout=60)
+        if response.status_code in (200, 201, 204):
+            return {"status": "ok", "groupKey": group_key}
+        raise Exception(
+            f"inventory_item_group failed ({response.status_code}): {response.text[:400]}"
+        )
+
+    def publish_by_inventory_item_group(self, group_key: str, marketplace_id: Optional[str] = None) -> Dict:
+        """Publish all variations as ONE multi-variation listing.
+
+        POST /sell/inventory/v1/offer/publish_by_inventory_item_group
+        Returns {"listingId": ...}. Every variant SKU needs an (unpublished) offer.
+        """
+        url = f"{self.base_url}/sell/inventory/v1/offer/publish_by_inventory_item_group"
+        token = self.oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Content-Language": "en-US",
+        }
+        payload = {
+            "inventoryItemGroupKey": group_key,
+            "marketplaceId": marketplace_id or self.marketplace_id,
+        }
+        response = self.session.post(url, headers=headers, json=payload, timeout=120)
+        if response.status_code == 200:
+            return response.json()
+        raise Exception(
+            f"publish_by_inventory_item_group failed ({response.status_code}): {response.text[:400]}"
+        )
+
     def publish_offer(self, offer_id: str, max_retries: int = 3) -> Dict:
         """
         Publish offer to eBay
-        
+
         POST /sell/inventory/v1/offer/{offerId}/publish
         
         Args:
