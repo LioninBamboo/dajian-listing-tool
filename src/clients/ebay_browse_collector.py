@@ -81,6 +81,23 @@ def _first_price(item: Dict[str, Any]) -> float:
         return 0.0
 
 
+def _shipping_cost(item: Dict[str, Any]) -> float:
+    """Cheapest shipping charge from the source listing (0 if free/unknown).
+
+    Competitors in this category hide margin in shipping, so the collected
+    shipping cost is essential for undercutting the buyer's TRUE landed cost
+    (price + shipping), not the item price alone. See undercut_pricing.
+    """
+    costs = []
+    for opt in item.get("shippingOptions") or []:
+        sc = (opt or {}).get("shippingCost") or {}
+        try:
+            costs.append(float(sc.get("value", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    return round(min(costs), 2) if costs else 0.0
+
+
 def _collect_images(item: Dict[str, Any]) -> List[str]:
     urls: List[str] = []
     main = (item.get("image") or {}).get("imageUrl")
@@ -122,11 +139,15 @@ def map_to_collected_fields(item: Dict[str, Any], *, source_url: str = "") -> Di
             brand = aspects[key]
             break
 
+    price = _first_price(item)
+    shipping = _shipping_cost(item)
     return {
         "sku": sku_for_item_id(item_id) if item_id else "",
         "item_id": item_id,
         "title": str(item.get("title") or "").strip(),
-        "price": _first_price(item),
+        "price": price,
+        "shipping": shipping,
+        "total_landed": round(price + shipping, 2),
         "images": _collect_images(item),
         "description": description,
         "attributes": aspects,          # item specifics live here

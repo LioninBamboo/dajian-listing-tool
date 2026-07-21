@@ -60,9 +60,15 @@ class StoreProfile:
     # Pricing (v2). cost_plus = existing PricingEngine model (furniture/auto).
     # undercut = blind-box: price a hair under the collected source listing.
     pricing_strategy: str = "cost_plus"          # cost_plus | undercut
-    undercut_pct: float = 0.03                   # fraction below the collected source price
-    undercut_min_abs: float = 0.0                # also at least this many $ below source
+    undercut_pct: float = 0.03                   # fraction below the collected source TOTAL (price+shipping)
+    undercut_min_abs: float = 0.0                # also at least this many $ below source total
     price_ends_99: bool = False                  # round to a .99 psychological price
+    # How the undercut TOTAL is split into item price vs shipping shown to buyer.
+    # free  = list price = total, shipping $0 (Best Match friendly). fixed = charge
+    # fixed_shipping_amount, item price = total - shipping (category-norm, protects
+    # outbound cost on remorse returns).
+    shipping_model: str = "free"                 # free | fixed
+    fixed_shipping_amount: float = 8.99          # used only when shipping_model == fixed
 
     # Local server
     server_port: int = 8000
@@ -125,6 +131,8 @@ _SECTION_FIELD_MAP = {
         "undercut_pct",
         "undercut_min_abs",
         "price_ends_99",
+        "shipping_model",
+        "fixed_shipping_amount",
     },
     "server": {
         "server_port",
@@ -145,7 +153,7 @@ _SECTION_KEY_ALIASES = {
 
 
 _INT_FIELDS = {"server_port"}
-_FLOAT_FIELDS = {"undercut_pct", "undercut_min_abs"}
+_FLOAT_FIELDS = {"undercut_pct", "undercut_min_abs", "fixed_shipping_amount"}
 _BOOL_FIELDS = {"price_ends_99", "force_house_brand"}
 _TUPLE_FIELDS = {"banned_terms"}
 

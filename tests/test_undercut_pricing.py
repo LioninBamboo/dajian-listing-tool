@@ -99,14 +99,61 @@ class TestPsychologicalRounding:
         assert q.recommended_price <= 23.765 + 1e-9
 
 
+class TestTotalLanded:
+    def test_undercuts_price_plus_shipping_not_price_alone(self):
+        # competitor: $5 item + $9 shipping = $14 landed. Free-ship undercut must
+        # be ~$14 total, NOT ~$5 (which ignoring shipping would produce).
+        p = _profile(price_ends_99=False, undercut_pct=0.05, undercut_min_abs=0.0)
+        q = recommend_undercut_price(5.0, source_shipping=9.0, profile=p)
+        assert q.source_total == 14.0
+        assert q.recommended_total == pytest.approx(14.0 * 0.95, abs=0.01)  # ~13.30
+        assert q.recommended_total > 5.0  # would-be bug: undercutting price alone
+
+    def test_free_model_puts_all_in_item_price(self):
+        p = _profile(price_ends_99=False, shipping_model="free", undercut_pct=0.0, undercut_min_abs=0.0)
+        q = recommend_undercut_price(20.0, source_shipping=8.0, profile=p)
+        assert q.recommended_shipping == 0.0
+        assert q.recommended_price == 28.0
+        assert q.recommended_total == 28.0
+        assert q.shipping_model == "free"
+
+    def test_fixed_model_splits_item_and_shipping(self):
+        p = _profile(price_ends_99=False, shipping_model="fixed", fixed_shipping_amount=8.99,
+                     undercut_pct=0.0, undercut_min_abs=0.0)
+        q = recommend_undercut_price(20.0, source_shipping=8.0, profile=p)
+        assert q.recommended_shipping == 8.99
+        assert q.recommended_price == pytest.approx(28.0 - 8.99, abs=0.01)
+        assert q.recommended_total == pytest.approx(28.0, abs=0.01)
+        assert q.shipping_model == "fixed"
+
+    def test_no_shipping_matches_legacy_price_only_behavior(self):
+        p = _profile(price_ends_99=False, undercut_pct=0.05, undercut_min_abs=0.0)
+        q = recommend_undercut_price(100.0, profile=p)  # no source_shipping
+        assert q.source_shipping == 0.0
+        assert q.recommended_price == 95.0
+        assert q.recommended_total == 95.0
+
+    def test_fixed_shipping_never_makes_item_price_nonpositive(self):
+        p = _profile(price_ends_99=False, shipping_model="fixed", fixed_shipping_amount=8.99,
+                     undercut_pct=0.0, undercut_min_abs=0.0)
+        q = recommend_undercut_price(3.0, source_shipping=0.0, profile=p)  # total 3.0 < 8.99
+        assert q.recommended_price >= 0.01
+        assert q.recommended_shipping <= q.recommended_total
+
+
 class TestSerialization:
     def test_to_dict_round_trips_fields(self):
-        q = recommend_undercut_price(24.0, profile=_profile())
+        q = recommend_undercut_price(24.0, source_shipping=6.0, profile=_profile())
         d = q.to_dict()
         assert set(d) == {
             "source_price",
+            "source_shipping",
+            "source_total",
             "recommended_price",
+            "recommended_shipping",
+            "recommended_total",
             "market_aware_price",
+            "shipping_model",
             "competitor_stats",
             "flags",
             "reasoning",

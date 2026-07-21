@@ -31,9 +31,11 @@ listing:
 # v2:定价策略。cost_plus = 现有 PricingEngine 成本+毛利模型(家具/汽配)
 pricing:
   pricing_strategy: "cost_plus"          # cost_plus | undercut(盲盒:采集价略降)
-  undercut_pct: 0.03
+  undercut_pct: 0.03                     # undercut 按【总到手价=卖价+运费】计
   undercut_min_abs: 0.0
   price_ends_99: false
+  shipping_model: "free"                 # free=免邮 | fixed=固定运费(仅 undercut 用)
+  fixed_shipping_amount: 8.99
 
 server:
   port: 8000

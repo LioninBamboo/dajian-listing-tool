@@ -54,6 +54,10 @@ _SAMPLE_ITEM = {
     ],
     "description": "<p>Collectible vinyl figure</p>",
     "condition": "New",
+    "shippingOptions": [
+        {"shippingCost": {"value": "9.00", "currency": "USD"}},
+        {"shippingCost": {"value": "12.50", "currency": "USD"}},
+    ],
     "localizedAspects": [
         {"name": "Brand", "value": "POP MART"},
         {"name": "Type", "value": "Blind Box"},
@@ -104,6 +108,18 @@ class TestMapping:
         item = dict(_SAMPLE_ITEM)
         item.pop("price")
         assert map_to_collected_fields(item)["price"] == 0.0
+
+    def test_captures_cheapest_shipping_and_total_landed(self):
+        m = map_to_collected_fields(_SAMPLE_ITEM)
+        assert m["shipping"] == 9.00  # cheapest of 9.00 / 12.50
+        assert m["total_landed"] == round(29.99 + 9.00, 2)
+
+    def test_missing_shipping_is_free(self):
+        item = dict(_SAMPLE_ITEM)
+        item.pop("shippingOptions")
+        m = map_to_collected_fields(item)
+        assert m["shipping"] == 0.0
+        assert m["total_landed"] == 29.99
 
     def test_short_description_fallback(self):
         item = dict(_SAMPLE_ITEM)

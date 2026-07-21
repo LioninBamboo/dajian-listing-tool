@@ -39,9 +39,11 @@ listing:
 
 pricing:
   pricing_strategy: "undercut"               # 采集价略降,不走成本+毛利
-  undercut_pct: 0.03                         # 比采集来源低 3%
+  undercut_pct: 0.03                         # 比采集来源【总到手价=卖价+运费】低 3%
   undercut_min_abs: 0.50                     # 且至少低 $0.50
   price_ends_99: true                        # 心理定价 .99 结尾(向下取整)
+  shipping_model: "free"                     # free=免邮(Best Match 友好) | fixed=固定运费
+  fixed_shipping_amount: 8.99                # 仅 shipping_model=fixed 时生效
 
 server:
   port: 8002

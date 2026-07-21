@@ -108,6 +108,8 @@ class TestOverrides:
                   undercut_pct: 0.05
                   undercut_min_abs: 0.5
                   price_ends_99: true
+                  shipping_model: "free"
+                  fixed_shipping_amount: 8.99
                 """
             ),
             encoding="utf-8",
@@ -120,6 +122,8 @@ class TestOverrides:
         assert p.undercut_pct == 0.05
         assert p.undercut_min_abs == 0.5
         assert p.price_ends_99 is True
+        assert p.shipping_model == "free"
+        assert p.fixed_shipping_amount == 8.99
 
     def test_v2_defaults_keep_existing_instances_unchanged(self):
         p = StoreProfile()
