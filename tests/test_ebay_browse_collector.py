@@ -5,8 +5,10 @@ import pytest
 from src.clients.ebay_browse_collector import (
     EbayLinkParseError,
     collect_from_url,
+    collect_group_from_url,
     map_to_collected_fields,
     parse_item_id,
+    parse_variation_id,
     sku_for_item_id,
 )
 
@@ -132,8 +134,9 @@ class TestCollectFromUrl:
     def test_orchestrates_parse_fetch_map(self, monkeypatch):
         seen = {}
 
-        def fake_fetch(item_id, *, token=None, environment=None):
+        def fake_fetch(item_id, *, variation_id=None, token=None, environment=None):
             seen["item_id"] = item_id
+            seen["variation_id"] = variation_id
             return _SAMPLE_ITEM
 
         monkeypatch.setattr(
@@ -144,6 +147,72 @@ class TestCollectFromUrl:
         assert result["sku"] == "EB-256123456789"
         assert result["url"] == "https://www.ebay.com/itm/Slug/256123456789?hash=x"
 
+class TestVariations:
+    def test_parse_variation_id(self):
+        assert parse_variation_id("https://www.ebay.com/itm/376378065234?var=645018887706") == "645018887706"
+        assert parse_variation_id("https://www.ebay.com/itm/376378065234") is None
+        assert parse_variation_id("376378065234") is None
+
+    def test_sku_includes_variation(self):
+        assert sku_for_item_id("376378065234", "645018887706") == "EB-376378065234-645018887706"
+        assert sku_for_item_id("376378065234") == "EB-376378065234"
+
+    def test_mapping_extracts_variation_from_resource_id(self):
+        item = {"itemId": "v1|376378065234|645018887706", "title": "Fig", "price": {"value": "5.0"}}
+        m = map_to_collected_fields(item)
+        assert m["variation_id"] == "645018887706"
+        assert m["sku"] == "EB-376378065234-645018887706"
+
+    def test_no_variation_when_group_id_zero(self):
+        m = map_to_collected_fields(_SAMPLE_ITEM)  # itemId ...|0
+        assert m["variation_id"] == ""
+        assert m["sku"] == "EB-256123456789"
+
+
+class TestGroupCollection:
+    def _group_items(self, n=3):
+        return [
+            {
+                "itemId": f"v1|376378065234|{645018887705 + i}",
+                "legacyItemId": "376378065234",
+                "title": "Universal Monsters Series",
+                "price": {"value": str(10 + i)},
+                "shippingOptions": [{"shippingCost": {"value": "11.99"}}],
+                "image": {"imageUrl": f"https://i.ebayimg.com/{i}.jpg"},
+                "localizedAspects": [{"name": "Character", "value": f"Figure {i}"}],
+            }
+            for i in range(n)
+        ]
+
+    def test_collects_all_variations(self, monkeypatch):
+        items = self._group_items(10)
+        monkeypatch.setattr(
+            "src.clients.ebay_browse_collector.fetch_item_group",
+            lambda item_id, **kw: {"items": items, "commonDescriptions": [{"description": "shared desc"}]},
+        )
+        g = collect_group_from_url("https://www.ebay.com/itm/376378065234?var=645018887706")
+        assert g["variation_count"] == 10
+        assert len(g["variations"]) == 10
+        assert g["description"] == "shared desc"
+        assert len(g["images"]) == 10  # union, deduped
+        assert g["variations"][0]["sku"] == "EB-376378065234-645018887705"
+        assert g["variations"][0]["shipping"] == 11.99
+
+    def test_falls_back_to_single_when_not_a_group(self, monkeypatch):
+        monkeypatch.setattr(
+            "src.clients.ebay_browse_collector.fetch_item_group",
+            lambda item_id, **kw: {"items": []},
+        )
+        monkeypatch.setattr(
+            "src.clients.ebay_browse_collector.fetch_item",
+            lambda item_id, **kw: _SAMPLE_ITEM,
+        )
+        g = collect_group_from_url("https://www.ebay.com/itm/256123456789")
+        assert g["variation_count"] == 1
+        assert g["variations"][0]["sku"] == "EB-256123456789"
+
+
+class TestCollectFromUrlBanned:
     def test_collected_source_banned_terms_are_detectable(self, monkeypatch):
         # B2 + B1 compose: a collected listing carrying "POP MART" must be
         # surfaced by the guard so the operator fixes it before publish.
