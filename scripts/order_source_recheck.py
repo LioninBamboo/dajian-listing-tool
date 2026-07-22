@@ -20,6 +20,7 @@ import json
 import re
 import sqlite3
 import sys
+import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -304,11 +305,22 @@ def main() -> int:
         targets = [{"order_id": f"manual-{datetime.now():%Y%m%d%H%M%S}", "sku": sku} for sku in args.sku]
     else:
         trading = _make_trading_client()
-        try:
-            orders = fetch_recent_orders(trading, args.hours_back)
-        except Exception as exc:
-            print(f"[ERROR] GetOrders failed: {exc}")
-            return 1
+        # A single 30s read timeout used to fail the whole run with exit 1 and
+        # raise a ❌ that looked like a real defect (2026-07-22 08:22). The task
+        # runs every 6h over an 8h window, so coverage self-heals — but the
+        # alarm did not, and real failures drown in that noise. Retry the flake.
+        orders = None
+        for attempt in range(3):
+            try:
+                orders = fetch_recent_orders(trading, args.hours_back)
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    print(f"[ERROR] GetOrders failed after 3 attempts: {exc}")
+                    return 1
+                delay = 5 * (attempt + 1)
+                print(f"[WARN] GetOrders attempt {attempt + 1}/3 failed ({exc}); retrying in {delay}s")
+                time.sleep(delay)
         print(f"Orders in the last {args.hours_back:g}h: {len(orders)} line item(s)")
         targets = [o for o in orders if not already_checked(conn, o["order_id"], o["sku"])]
         print(f"New (unchecked) line items: {len(targets)}")
