@@ -2087,7 +2087,8 @@ if __name__ == "__main__":
         outcome = classify_daily_task_outcome(task_results)
         if outcome == 'partial_success':
             logger.warning(
-                "任务部分完成：仅存在逐 SKU 改价失败；禁止全量补跑，应走定向重试"
+                "任务部分完成：仅存在逐 SKU 级失败（改价/库存同步）；"
+                "禁止全量补跑，应走定向重试"
             )
             exit_code = 2
         elif outcome == 'failed':

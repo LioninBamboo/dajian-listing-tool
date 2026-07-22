@@ -34,7 +34,11 @@ class TestDefaults:
             "paymentPolicyId": "321896606021",
         }
         assert profile.quality_banner_marker == "aquaverve"
-        assert profile.quality_footer_marker == "california"
+        # 2026-07-22: 原断言为 "california"。7/15 footer 文案改成
+        # "✦ Ships from US Warehouse ✦" 后该默认值未同步,导致重建描述一律
+        # has_footer=False、改写管线 100% 拒推(7/17-7/22 零推送)。默认值已改为
+        # footer 中稳定不变的片段,断言随之更新。
+        assert profile.quality_footer_marker == "ships from"
         assert profile.server_port == 8000
         assert profile.server_base_url == "http://localhost:8000"
         assert profile.brand_name_lower == "aquaverve"

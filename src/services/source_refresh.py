@@ -296,6 +296,42 @@ def ensure_source_drift_table(conn) -> None:
     conn.commit()
 
 
+def drift_signature(drift: Mapping[str, Any]) -> str:
+    """Stable identity of a change: same field settling on the same new value."""
+    return f"{_clean_text(drift.get('field'))}={_clean_text(drift.get('new'))}"
+
+
+def load_alerted_signatures(conn, skus: Iterable[str]) -> set[tuple[str, str]]:
+    """Signatures of ``change`` drifts already reported in an earlier run.
+
+    Needed because several drift kinds are recomputed from scratch every run
+    rather than against stored state — a delisted source re-derives
+    ``sku_available True->False`` forever. Without this the daily mail repeated
+    the same SKUs indefinitely and genuinely new seller edits were invisible
+    inside the noise (2026-07-20..22).
+    """
+    ensure_source_drift_table(conn)
+    wanted = {s for s in skus if s}
+    if not wanted:
+        return set()
+    seen: set[tuple[str, str]] = set()
+    for sku, drift_json in conn.execute(
+        "SELECT sku, drift_json FROM source_drift_log"
+    ).fetchall():
+        if sku not in wanted:
+            continue
+        try:
+            entries = json.loads(drift_json)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if isinstance(entry, Mapping) and entry.get("kind") == "change":
+                seen.add((sku, drift_signature(entry)))
+    return seen
+
+
 def record_source_drift(conn, sku: str, drifts: list[dict[str, Any]], context: str) -> None:
     if not drifts:
         return
@@ -372,11 +408,13 @@ def refresh_skus(
     summary: dict[str, Any] = {
         "checked": 0,
         "drifted": {},      # every SKU with any drift entry (full detail, all kinds)
-        "alerts": {},       # SKUs with kind=change entries only — seller genuinely changed something
+        "alerts": {},       # NEW kind=change entries — seller genuinely changed something
+        "ongoing": {},      # kind=change already reported in an earlier run (do not re-alert)
         "unavailable": [],
         "fetch_failed": [],
         "applied": [],
     }
+    already_alerted = load_alerted_signatures(conn, sku_list)
 
     for start in range(0, len(sku_list), chunk_size):
         chunk = sku_list[start : start + chunk_size]
@@ -412,7 +450,20 @@ def refresh_skus(
                 summary["drifted"][sku] = drifts
                 changes = [d for d in drifts if d.get("kind") == "change"]
                 if changes:
-                    summary["alerts"][sku] = changes
+                    # Only alert on drifts not already reported. A delisted SKU
+                    # re-reports sku_available True→False every single run (the
+                    # diff compares against a hardcoded True), so without this
+                    # the daily mail repeated the same ~20 SKUs indefinitely and
+                    # new seller edits were lost in the noise (2026-07-20..22).
+                    fresh, ongoing = [], []
+                    for change in changes:
+                        key = (sku, drift_signature(change))
+                        (ongoing if key in already_alerted else fresh).append(change)
+                        already_alerted.add(key)
+                    if fresh:
+                        summary["alerts"][sku] = fresh
+                    if ongoing:
+                        summary["ongoing"][sku] = ongoing
                 record_source_drift(conn, sku, drifts, context)
                 if apply and apply_snapshot(conn, sku, snapshot, drifts):
                     summary["applied"].append(sku)

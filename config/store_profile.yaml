@@ -19,7 +19,10 @@ ebay:
 quality_gate:
   # 语义改写质量门在描述中检查的小写标记子串
   banner_marker: "aquaverve"
-  footer_marker: "california"
+  # 2026-07-22: 原为 "california"。7/15 footer 改成 "✦ Ships from US Warehouse ✦"
+  # 后此标记未同步,导致每条重建都过不了 has_footer、改写管线 100% 拒推
+  # (7/17-7/22 零推送)。改用 footer 里稳定不变的片段。
+  footer_marker: "ships from"
 
 # v2:描述模板与禁词(家具实例用默认即可,这里显式写出仅为文档)
 listing:

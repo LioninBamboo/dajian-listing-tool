@@ -75,6 +75,37 @@ def _is_reprice_item_level_failure(result: Any) -> bool:
         return False
 
 
+def _is_inventory_item_level_failure(result: Any) -> bool:
+    """Return True for a completed inventory sync with per-SKU error rows.
+
+    The sync reports ``checked`` (total SKUs) alongside an ``errors`` counter of
+    individual Dajian/eBay lookup failures (dead links, API flakes). A run that
+    checked hundreds of SKUs and updated prices has already done its work and
+    had side effects; counting those per-SKU errors as a task failure made the
+    scheduler alarm ❌ every single day and buried real failures in noise
+    (2026-07-18..22: daily_tasks "failed" on 18/873 error rows).
+    """
+
+    if not isinstance(result, Mapping):
+        return False
+    if str(result.get("status") or "").strip().lower() in _FAILURE_STATUSES:
+        return False
+    try:
+        checked = int(result.get("checked") or 0)
+        errors = int(result.get("errors") or 0)
+    except (TypeError, ValueError):
+        return False
+    return checked > 0 and errors > 0
+
+
+# Sub-task name -> recognizer for "completed run with item-level errors only".
+_ITEM_LEVEL_FAILURE_RECOGNIZERS = {
+    "smart_reprice": _is_reprice_item_level_failure,
+    "inventory": _is_inventory_item_level_failure,
+    "inventory_sync": _is_inventory_item_level_failure,
+}
+
+
 def classify_daily_task_outcome(results: Any) -> str:
     """Classify a daily run without turning per-SKU reprice errors into reruns.
 
@@ -88,13 +119,15 @@ def classify_daily_task_outcome(results: Any) -> str:
     if not isinstance(results, Mapping):
         return "failed"
 
-    reprice = results.get("smart_reprice")
-    if not _is_reprice_item_level_failure(reprice):
-        return "failed"
-
+    # Every failing sub-task must be a completed run whose only errors are
+    # item-level; one genuine task failure still makes the whole run "failed".
+    saw_item_level = False
     for task_name, payload in results.items():
-        if task_name == "smart_reprice":
+        if not has_task_failure(payload):
             continue
-        if has_task_failure(payload):
-            return "failed"
-    return "partial_success"
+        recognizer = _ITEM_LEVEL_FAILURE_RECOGNIZERS.get(task_name)
+        if recognizer is not None and recognizer(payload):
+            saw_item_level = True
+            continue
+        return "failed"
+    return "partial_success" if saw_item_level else "failed"

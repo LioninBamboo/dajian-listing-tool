@@ -46,7 +46,12 @@ class StoreProfile:
 
     # Quality-gate description markers (lowercase substrings)
     quality_banner_marker: str = "aquaverve"
-    quality_footer_marker: str = "california"
+    # 2026-07-22: was "california" — the store footer was changed to
+    # "✦ Ships from US Warehouse ✦" on 7/15 but this marker was not updated,
+    # so every rebuilt description failed has_footer and the rewrite pipeline
+    # rejected 100% of candidates (zero pushes 7/17–7/22). Match on the stable
+    # part of the footer instead of a city name.
+    quality_footer_marker: str = "ships from"
 
     # Listing generation (v2). Defaults keep furniture/auto instances unchanged.
     template_style: str = "furniture_classic"   # furniture_classic | arttoy_hype

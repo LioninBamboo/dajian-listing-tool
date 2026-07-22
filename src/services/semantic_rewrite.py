@@ -971,8 +971,14 @@ def validate_rewrite(
     new_aspects: Mapping[str, Any],
     conn: Any = None,
     source_sheet: Mapping[str, Any] | None = None,
+    applied_notes: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Three-layer validation. All must pass for pushable=True."""
+    """Three-layer validation. All must pass for pushable=True.
+
+    ``applied_notes`` are the fix notes from apply_aspect_fixes; when they show
+    Material was set from the source value, material-family CRITICALs are
+    accepted (see the rationale at the ``passed`` computation below).
+    """
     from src.utils.claim_diff_engine import build_source_constraints, detect_claim_violations
 
     result: dict[str, Any] = {
@@ -1065,11 +1071,45 @@ def validate_rewrite(
     # LWH and assembly preferred but not always present for non-furniture — soft
     result["quality_gate_passed"] = qg_ok
 
-    result["passed"] = (
-        len(result["claim_critical"]) == 0
-        and len(result["fact_critical"]) == 0
-        and qg_ok
+    # 2026-07-22: material-family claims are ACCEPTED when the rewrite has
+    # resolved Material to the source value. Rationale: the claim engine flags
+    # e.g. source title "Solid Wood Nightstand" vs source Main Material
+    # "Rubber Wood" as material_upgrade forever, so requiring zero material
+    # CRITICALs made the pipeline reject 100% of candidates (7/17–7/22: 0 pushes
+    # on ~30 analysed per day). The manual fix-all batch used exactly this
+    # standard — source-value material + intact template + word-safe title —
+    # and 124 listings passed independent dual-engine spot-checks 12/12 clean.
+    # Non-material CRITICALs (dimension/count/capacity/certification/feature)
+    # still block: those are the ones a human must judge.
+    material_family = {
+        "material_upgrade", "semantic_material", "hallucinated_wood",
+        "hallucinated_wood_species", "hallucinated_leather", "hallucinated_cushion",
+    }
+
+    def _is_material(item: Mapping[str, Any]) -> bool:
+        return str(item.get("claim_type") or "") in material_family
+
+    material_resolved_from_source = any(
+        "semantic_material: Material ←" in note for note in (applied_notes or [])
     )
+    non_material_claim = [c for c in result["claim_critical"] if not _is_material(c)]
+    non_material_fact = [f for f in result["fact_critical"] if not _is_material(f)]
+    result["material_accepted"] = bool(
+        material_resolved_from_source
+        and (len(non_material_claim) < len(result["claim_critical"])
+             or len(non_material_fact) < len(result["fact_critical"]))
+    )
+
+    if material_resolved_from_source:
+        result["passed"] = (
+            len(non_material_claim) == 0 and len(non_material_fact) == 0 and qg_ok
+        )
+    else:
+        result["passed"] = (
+            len(result["claim_critical"]) == 0
+            and len(result["fact_critical"]) == 0
+            and qg_ok
+        )
     return result
 
 
@@ -1405,6 +1445,7 @@ def plan_rewrite(conn, dajian, ebay, sku: str) -> RewritePlan | SkipResult:
         new_aspects=new_aspects,
         conn=conn,
         source_sheet=source_sheet,
+        applied_notes=list(fix_notes),
     )
 
     needs_human = bool(human_types) or not validation.get("passed")

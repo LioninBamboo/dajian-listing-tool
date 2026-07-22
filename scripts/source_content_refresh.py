@@ -82,14 +82,23 @@ def build_email_html(summary: dict) -> str:
         if rows
         else "<p>无卖家侧内容变更。</p>"
     )
+    ongoing = summary.get("ongoing", {})
+    ongoing_note = (
+        f"<p style='color:#888;font-size:12px;'>另有 {len(ongoing)} 个 SKU 的变更为历史已报告项"
+        f"（如源长期下架），不再重复告警：{', '.join(sorted(ongoing)[:30]) or '无'}"
+        f"{' …' if len(ongoing) > 30 else ''}</p>"
+        if ongoing
+        else ""
+    )
     return f"""
     <h2>源内容刷新报告</h2>
     <p>检查 {summary.get('checked', 0)} 个 PUBLISHED SKU：
-       卖家内容变更 {len(alerts)}，基线补全/归位 {len(summary.get('drifted', {})) - len(alerts)}，
+       <b>新增</b>卖家内容变更 {len(alerts)}，基线补全/归位 {len(summary.get('drifted', {})) - len(alerts) - len(ongoing)}，
        快照已更新 {len(summary.get('applied', []))}，
        源不可购 {len(summary.get('unavailable', []))}，抓取失败 {len(summary.get('fetch_failed', []))}。</p>
-    <h3>卖家侧变更（需跟进 live listing）</h3>
+    <h3>卖家侧变更（新增，需跟进 live listing）</h3>
     {table}
+    {ongoing_note}
     <p>源不可购: {', '.join(summary.get('unavailable', [])) or '无'}</p>
     <p style="color:#999;font-size:12px;">来自 scripts/source_content_refresh.py</p>
     """
@@ -128,16 +137,18 @@ def main() -> int:
 
     drifted = summary.get("drifted", {})
     alerts = summary.get("alerts", {})
+    ongoing = summary.get("ongoing", {})
     print(
-        f"checked={summary['checked']} seller_changes={len(alerts)} "
-        f"baseline_updates={len(drifted) - len(alerts)} applied={len(summary['applied'])} "
+        f"checked={summary['checked']} new_seller_changes={len(alerts)} "
+        f"already_reported={len(ongoing)} "
+        f"baseline_updates={len(drifted) - len(alerts) - len(ongoing)} applied={len(summary['applied'])} "
         f"unavailable={len(summary['unavailable'])} fetch_failed={len(summary['fetch_failed'])}"
     )
     for sku, changes in sorted(alerts.items()):
         fields = ", ".join(sorted({c["field"] for c in changes}))
         print(f"  SELLER-CHANGE {sku}: {fields}")
     for sku, drifts in sorted(drifted.items()):
-        if sku in alerts:
+        if sku in alerts or sku in ongoing:
             continue
         fields = ", ".join(sorted({d["field"] for d in drifts}))
         print(f"  baseline {sku}: {fields}")

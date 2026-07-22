@@ -298,3 +298,35 @@ def test_record_source_drift_skips_empty(db_conn):
         "SELECT name FROM sqlite_master WHERE type='table' AND name='source_drift_log'"
     ).fetchall()
     assert tables == []
+
+
+def test_refresh_skus_repeat_change_moves_to_ongoing(db_conn):
+    """2026-07-20..22: 源长期下架的 SKU 每天重复告警(sku_available 与硬编码 True
+    比,没有已报告记忆),真正的新变更被淹没。第二次跑必须进 ongoing 而非 alerts。"""
+    detail = dict(W3636_DETAIL, videoUrls=["https://cdn.example.com/tent.mp4"])
+    client = FakeDajianClient(details=[detail])
+
+    first = refresh_skus(db_conn, client, ["W3636P456662"], apply=False, context="test")
+    assert "W3636P456662" in first["alerts"]
+    assert first.get("ongoing", {}) == {}
+
+    second = refresh_skus(db_conn, client, ["W3636P456662"], apply=False, context="test")
+    assert second["alerts"] == {}
+    assert "W3636P456662" in second["ongoing"]
+    assert "W3636P456662" in second["drifted"]  # 明细仍完整保留
+
+
+def test_refresh_skus_new_change_still_alerts_after_earlier_one(db_conn):
+    """去重只压已报告过的同一签名,新字段的新变更必须照常告警。"""
+    db_conn.execute(
+        "UPDATE collected_products SET logs = ? WHERE sku = ?",
+        ("Source refresh at 2026-07-21", "W3636P456662"),  # 非首刷,title 变更才算 change
+    )
+    client = FakeDajianClient(details=[dict(W3636_DETAIL, videoUrls=["https://cdn.example.com/tent.mp4"])])
+    refresh_skus(db_conn, client, ["W3636P456662"], apply=False, context="test")
+
+    changed = dict(W3636_DETAIL, videoUrls=["https://cdn.example.com/tent.mp4"], productName="Totally New Product Name")
+    summary = refresh_skus(db_conn, FakeDajianClient(details=[changed]), ["W3636P456662"], apply=False, context="test")
+    alerted_fields = {c["field"] for c in summary["alerts"].get("W3636P456662", [])}
+    assert "title" in alerted_fields
+    assert "videos" not in alerted_fields  # 老变更不再重复
