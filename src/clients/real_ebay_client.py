@@ -308,7 +308,9 @@ class RealEbayClient:
         self.oauth = oauth_service
         self.policy_manager = policy_manager
         self.base_url = oauth_service.api_base
-        self.marketplace_id = "EBAY_US"
+        # Per-instance: auto-parts instances list on EBAY_MOTORS_US, everything
+        # else on EBAY_US (the default).
+        self.marketplace_id = get_store_profile().ebay_marketplace_id
         self.session = create_ebay_session()
 
     def _complete_listing_policies(self, existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1423,7 +1425,7 @@ class RealEbayClient:
             List of category suggestions
         """
         # EBAY_US category tree ID
-        category_tree_id = "0"
+        category_tree_id = get_store_profile().category_tree_id
         url = f"{self.base_url}/commerce/taxonomy/v1/category_tree/{category_tree_id}/get_category_suggestions"
         
         # Use Application Token for Taxonomy API (public API, doesn't need user auth)

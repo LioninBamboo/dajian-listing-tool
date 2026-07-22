@@ -38,6 +38,12 @@ class StoreProfile:
     description_footer_line2: str = "Quality Guaranteed • Fast US Shipping • Trusted Seller"
     promotion_prefix: str = "AquaVerve Auto Sale"
 
+    # Which eBay marketplace this instance lists on. Auto parts live ONLY in the
+    # eBay Motors catalog: EBAY_US uses category tree 0, EBAY_MOTORS_US uses tree
+    # 100, and Motors category ids (e.g. 33651 Roof Racks, 33653 Trailer Hitches)
+    # do not exist in tree 0 at all. Default keeps furniture/main on EBAY_US.
+    ebay_marketplace_id: str = "EBAY_US"
+
     # eBay account-owned identifiers
     merchant_location_key: str = "DAJIAN_LA_WAREHOUSE"
     fallback_fulfillment_policy_id: str = "321897899021"
@@ -97,6 +103,22 @@ class StoreProfile:
     def banned_terms_lower(self) -> tuple:
         return tuple(t.lower() for t in self.banned_terms)
 
+    # eBay's default category tree per marketplace (verified via
+    # get_default_category_tree_id). Anything not listed falls back to "0".
+    _CATEGORY_TREE_BY_MARKETPLACE = {
+        "EBAY_US": "0",
+        "EBAY_MOTORS_US": "100",
+    }
+
+    @property
+    def category_tree_id(self) -> str:
+        """Taxonomy category tree for this instance's marketplace."""
+        return self._CATEGORY_TREE_BY_MARKETPLACE.get(self.ebay_marketplace_id, "0")
+
+    @property
+    def is_motors(self) -> bool:
+        return self.ebay_marketplace_id == "EBAY_MOTORS_US"
+
     @property
     def default_brand(self) -> str:
         """Brand to use when an item has none.
@@ -116,6 +138,7 @@ _SECTION_FIELD_MAP = {
         "promotion_prefix",
     },
     "ebay": {
+        "ebay_marketplace_id",
         "merchant_location_key",
         "fallback_fulfillment_policy_id",
         "fallback_return_policy_id",
@@ -147,6 +170,9 @@ _SECTION_FIELD_MAP = {
 # YAML keys inside each section may omit the section-derived prefix,
 # e.g. quality_gate.banner_marker -> quality_banner_marker.
 _SECTION_KEY_ALIASES = {
+    "ebay": {
+        "marketplace_id": "ebay_marketplace_id",
+    },
     "quality_gate": {
         "banner_marker": "quality_banner_marker",
         "footer_marker": "quality_footer_marker",

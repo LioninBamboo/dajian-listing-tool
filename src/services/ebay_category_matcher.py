@@ -12,6 +12,7 @@ import requests
 import logging
 from typing import Dict, List, Optional, Any, Tuple
 from src.services.ebay_auth import EbayOAuthService
+from src.utils.store_profile import get_store_profile
 
 
 class EbayCategoryMatcher:
@@ -596,7 +597,11 @@ class EbayCategoryMatcher:
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json"
             }
-            url = f"{self.base_url}/commerce/taxonomy/v1/category_tree/0/get_category_suggestions"
+            # Auto parts only exist in the Motors tree (100); EBAY_US uses 0.
+            url = (
+                f"{self.base_url}/commerce/taxonomy/v1/category_tree/"
+                f"{get_store_profile().category_tree_id}/get_category_suggestions"
+            )
             params = {"q": title[:100]}
             resp = requests.get(url, headers=headers, params=params, timeout=30)
             if resp.status_code == 200:
@@ -1585,20 +1590,31 @@ class EbayCategoryMatcher:
             recommended = [a for a in cached if not a.get("required")]
             return required, recommended
         
+        # Taxonomy is public catalog data: prefer the APPLICATION token. Sub-account
+        # tokens carry only sell.* scopes (the keyset does not grant
+        # commerce.taxonomy in the user-consent flow), so a user token returns 403
+        # here and every aspect lookup silently degrades.
+        token = None
         try:
-            token = self.oauth.get_valid_token()
-        except Exception as e:
-            logging.warning(f"[WARN] Failed to get token for aspects: {e}")
-            return [], []
-        
+            token = self.oauth.get_application_token()
+        except Exception as app_err:
+            logging.warning(f"[WARN] App token for aspects failed, trying user token: {app_err}")
+            try:
+                token = self.oauth.get_valid_token()
+            except Exception as e:
+                logging.warning(f"[WARN] Failed to get token for aspects: {e}")
+                return [], []
+
+        profile = get_store_profile()
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"
+            "X-EBAY-C-MARKETPLACE-ID": profile.ebay_marketplace_id,
         }
-        
-        # Use Taxonomy API (category_tree_id=0 for EBAY_US)
-        url = f"{self.base_url}/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category"
+
+        # Auto parts live in the Motors tree (100); furniture/EBAY_US in tree 0.
+        tree_id = profile.category_tree_id
+        url = f"{self.base_url}/commerce/taxonomy/v1/category_tree/{tree_id}/get_item_aspects_for_category"
         params = {"category_id": category_id}
         
         try:

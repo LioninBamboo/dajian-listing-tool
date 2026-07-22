@@ -314,8 +314,11 @@ def _is_sellable_leaf_category(oauth, category_id: str) -> bool:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
+        # Validate against THIS instance's tree: Motors ids (33651 Roof Racks,
+        # 33653 Trailer Hitches, ...) exist only in tree 100 and 400 in tree 0.
         resp = requests.get(
-            f"{oauth.api_base}/commerce/taxonomy/v1/category_tree/0/get_category_subtree",
+            f"{oauth.api_base}/commerce/taxonomy/v1/category_tree/"
+            f"{get_store_profile().category_tree_id}/get_category_subtree",
             headers=headers,
             params={"category_id": cid},
             timeout=30,
