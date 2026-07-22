@@ -25,7 +25,12 @@ from src.utils.dimension_helpers import (
     extract_all_dimensions,
     extract_product_weight_from_text,
     find_weight,
-    find_dimension
+    find_dimension,
+    # Called at the description-normalization step below but never imported, so
+    # every optimization silently logged "name ... is not defined" and skipped
+    # measurement normalization — descriptions could keep numbers that disagree
+    # with the forced Item Length/Width/Height aspects.
+    replace_description_measurements,
 )
 from src.utils.claim_diff_engine import build_source_constraints, FEATURE_CLAIM_PATTERNS
 from src.utils.store_profile import get_store_profile
