@@ -1405,14 +1405,18 @@ class QwenOptimizer:
             (["hitch", "carrier"], "174021"),       # Hitch Carriers
             (["hitch", "basket"], "174021"),        # Hitch Baskets
             
-            # Car & Truck Racks. 2026-07-22: was 262216, which the EBAY_US
-            # taxonomy rejects outright ("category ID does not belong to
-            # specified category tree", errorId 62005) — publishes using it
-            # fail category validation. 177849 is a verified sellable leaf.
-            (["roof", "rack"], "177849"),           # Roof Racks
-            (["roof", "basket"], "177849"),         # Roof Baskets
-            (["roof", "carrier"], "177849"),        # Roof Carriers
-            (["cargo", "basket"], "177849"),        # Cargo Baskets (roof-mounted)
+            # Roof Racks & Cross Bars — eBay Motors > Parts & Accessories >
+            # Car & Truck Parts & Accessories > Racks & Cargo Carriers.
+            # 2026-07-22: was 262216, which exists in NEITHER usable sense —
+            # tree 0 (EBAY_US) rejects it (errorId 62005) and in tree 100 it is
+            # actually "Anchors". The correct id is 33651 in the MOTORS tree.
+            # ⚠️ REQUIRES Motors support: auto-parts categories live only in
+            # category tree 100 / EBAY_MOTORS_US. The publish path validates
+            # against tree 0, so these still fail until that lands.
+            (["roof", "rack"], "33651"),            # Roof Racks
+            (["roof", "basket"], "33651"),          # Roof Baskets
+            (["roof", "carrier"], "33651"),         # Roof Carriers
+            (["cargo", "basket"], "33651"),         # Cargo Baskets (roof-mounted)
             
             # Tailgate Parts (eBay Motors > Truck Parts)
             (["tailgate", "assist"], "262093"),     # Tailgate Assist
