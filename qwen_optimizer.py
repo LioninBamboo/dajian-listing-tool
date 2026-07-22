@@ -1390,38 +1390,45 @@ class QwenOptimizer:
         # NOTE: Category IDs verified against eBay Taxonomy API 2026-02-05
         CATEGORY_MAP = [
             # ==================== AUTO PARTS & ACCESSORIES ====================
-            # Running Boards & Nerf Bars (eBay Motors > Exterior Parts & Accessories)
-            (["running", "board"], "262210"),       # Running Boards & Nerf Bars
-            (["nerf", "bar"], "262210"),            # Nerf Bars
-            (["side", "step"], "262210"),           # Side Steps → Running Boards
-            
-            # Trailer Hitches (eBay Motors > Towing & Hauling)
-            (["trailer", "hitch"], "174020"),       # Trailer Hitches
-            (["tow", "hitch"], "174020"),           # Tow Hitches
-            (["hitch", "receiver"], "174020"),      # Hitch Receivers
-            
-            # Hitch Cargo Carriers (eBay Motors > Towing & Hauling)
-            (["hitch", "cargo"], "174021"),         # Hitch Cargo Carriers
-            (["hitch", "carrier"], "174021"),       # Hitch Carriers
-            (["hitch", "basket"], "174021"),        # Hitch Baskets
-            
-            # Roof Racks & Cross Bars — eBay Motors > Parts & Accessories >
-            # Car & Truck Parts & Accessories > Racks & Cargo Carriers.
-            # 2026-07-22: was 262216, which exists in NEITHER usable sense —
-            # tree 0 (EBAY_US) rejects it (errorId 62005) and in tree 100 it is
-            # actually "Anchors". The correct id is 33651 in the MOTORS tree.
-            # ⚠️ REQUIRES Motors support: auto-parts categories live only in
-            # category tree 100 / EBAY_MOTORS_US. The publish path validates
-            # against tree 0, so these still fail until that lands.
-            (["roof", "rack"], "33651"),            # Roof Racks
-            (["roof", "basket"], "33651"),          # Roof Baskets
-            (["roof", "carrier"], "33651"),         # Roof Carriers
-            (["cargo", "basket"], "33651"),         # Cargo Baskets (roof-mounted)
-            
-            # Tailgate Parts (eBay Motors > Truck Parts)
-            (["tailgate", "assist"], "262093"),     # Tailgate Assist
-            (["tailgate", "lift"], "262093"),       # Tailgate Lift
-            (["tailgate", "ramp"], "262093"),       # Tailgate Ramp
+            # ⚠️ These are eBay MOTORS ids (category tree 100, EBAY_MOTORS_US).
+            # They do NOT exist in tree 0 — an instance must set
+            # ebay_marketplace_id: EBAY_MOTORS_US for them to validate.
+            #
+            # 2026-07-22 remap: the previous ids were written against the right
+            # category NAMES but wrong numbers. In tree 100 they actually mean:
+            #   262210 = Sockets, Connectors & Wiring   (was "running boards")
+            #   174020 = Brake Pad Wear Sensors         (was "trailer hitches")
+            #   174021 = Brake Boosters                 (was "hitch carriers")
+            #   262093 = Air Conditioner Compressors    (was "tailgate")
+            #   262216 = Anchors                        (was "roof racks")
+            # i.e. tow hitches were being listed as brake sensors. Verified
+            # replacements below via get_category_suggestions on tree 100.
+
+            # Racks & Cargo Carriers (parent 262215). Specific basket/carrier
+            # terms come first so they win over the generic "rack" match.
+            (["cargo", "basket"], "121984"),        # Cargo Boxes, Bags & Baskets
+            (["roof", "basket"], "121984"),         # Rooftop cargo baskets
+            (["roof", "carrier"], "121984"),        # Rooftop cargo carriers
+            (["hitch", "cargo"], "121984"),         # Hitch-mount cargo carriers
+            (["hitch", "carrier"], "121984"),
+            (["hitch", "basket"], "121984"),
+            (["roof", "rack"], "33651"),            # Roof Racks & Cross Bars
+
+            # Exterior Parts & Accessories
+            (["running", "board"], "33650"),        # Running Boards & Step Bars
+            (["nerf", "bar"], "33650"),
+            (["side", "step"], "33650"),
+
+            # Towing Parts & Accessories
+            (["trailer", "hitch"], "33653"),        # Trailer Hitches
+            (["tow", "hitch"], "33653"),
+            (["hitch", "receiver"], "33653"),
+
+            # Doors, Trunk Lids & Hoods — a tailgate assist is a lift support,
+            # not the liftgate panel itself (33647).
+            (["tailgate", "assist"], "262150"),     # Lift Supports, Latches, Hinges
+            (["tailgate", "lift"], "262150"),
+            (["tailgate", "ramp"], "262150"),
             
             # Bike Trailers (Sporting Goods > Cycling > Bicycle Accessories > Trailers)
             (["bike", "trailer"], "85040"),         # Bike Trailers
