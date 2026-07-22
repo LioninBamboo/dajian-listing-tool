@@ -668,7 +668,7 @@ class EbayCategoryMatcher:
             "trailer hitch", "tailgate assist", "tailgate ladder", "tailgate handle", "silverado", "sierra", "wrangler",
             "f-150", "f150", "tacoma", "ram 1500", "glc", "glb", "pickup",
         ]
-        motors_categories = {"33650", "33653", "121984", "33651", "262150", "85040"}
+        motors_categories = {"262210", "174020", "174021", "262216", "262093", "85040"}
         outdoor_chair_categories = {"79682", "79684", "138996"}
         porch_swing_categories = {"79694"}
         sofa_categories = {"38208"}
@@ -1312,11 +1312,11 @@ class EbayCategoryMatcher:
         
         mappings = [
             # ==================== MOTORS ====================
-            (["running board", "running boards", "nerf bar", "nerf bars", "side step", "side steps", "step bar", "truck step"], "33650", "Running Boards & Step Bars"),
-            (["trailer hitch", "receiver hitch"], "33653", "Trailer Hitches"),
-            (["hitch cargo carrier", "cargo carrier hitch", "hitch carrier"], "121984", "Cargo Boxes, Bags & Baskets"),
-            (["roof rack", "cross bar", "cross bars", "crossbar", "cargo rack"], "33651", "Roof Racks & Cross Bars"),
-            (["tailgate ladder", "tailgate handle", "tailgate assist", "tailgate utility"], "262150", "Lift Supports, Latches, Hinges"),
+            (["running board", "running boards", "nerf bar", "nerf bars", "side step", "side steps", "step bar", "truck step"], "262210", "Running Boards & Nerf Bars"),
+            (["trailer hitch", "receiver hitch"], "174020", "Trailer Hitches"),
+            (["hitch cargo carrier", "cargo carrier hitch", "hitch carrier"], "174021", "Hitch Cargo Carriers"),
+            (["roof rack", "cross bar", "cross bars", "crossbar", "cargo rack"], "262216", "Roof Racks & Cross Bars"),
+            (["tailgate ladder", "tailgate handle", "tailgate assist", "tailgate utility"], "262093", "Tailgate Parts"),
             (["bike trailer"], "85040", "Bike Trailers"),
 
             # ==================== SPORTING GOODS ====================

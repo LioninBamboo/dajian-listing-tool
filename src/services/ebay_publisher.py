@@ -89,7 +89,7 @@ class EbayPublisher:
     
     # eBay Motors categories (category tree 100, require EBAY_MOTORS marketplace)
     EBAY_MOTORS_CATEGORIES = {
-        "33653", "121984", "33650", "33651", "262150",  # Auto parts
+        "174020", "174021", "262210", "262216", "262093",  # Auto parts
     }
     
     # 类目必填 Item Specifics 完整映射
@@ -377,8 +377,8 @@ class EbayPublisher:
             }
         },
         # ==================== AUTO PARTS & ACCESSORIES ====================
-        # Running Boards & Step Bars (262210) — eBay Motors > Exterior Parts
-        "33650": {
+        # Running Boards & Nerf Bars (262210) — eBay Motors > Exterior Parts
+        "262210": {
             "required": ["Brand", "Placement on Vehicle", "Fitment Type", "Color", "Material"],
             "defaults": {
                 "Brand": "Unbranded",
@@ -389,7 +389,7 @@ class EbayPublisher:
             }
         },
         # Trailer Hitches (174020) — eBay Motors > Towing & Hauling
-        "33653": {
+        "174020": {
             "required": ["Brand", "Hitch Class", "Receiver Size", "Fitment Type", "Color", "Material"],
             "defaults": {
                 "Brand": "Unbranded",
@@ -400,8 +400,8 @@ class EbayPublisher:
                 "Material": "Steel"
             }
         },
-        # Cargo Boxes, Bags & Baskets (174021) — eBay Motors > Towing & Hauling
-        "121984": {
+        # Hitch Cargo Carriers (174021) — eBay Motors > Towing & Hauling
+        "174021": {
             "required": ["Brand", "Type", "Material", "Color", "Maximum Load Capacity"],
             "defaults": {
                 "Brand": "Unbranded",
@@ -412,7 +412,7 @@ class EbayPublisher:
             }
         },
         # Roof Racks & Cross Bars (262216) — eBay Motors > Exterior Parts
-        "33651": {
+        "262216": {
             "required": ["Brand", "Type", "Material", "Color", "Fitment Type"],
             "defaults": {
                 "Brand": "Unbranded",
@@ -422,8 +422,8 @@ class EbayPublisher:
                 "Fitment Type": "Universal"
             }
         },
-        # Lift Supports, Latches, Hinges (262093) — eBay Motors > Truck Parts
-        "262150": {
+        # Tailgate Parts (262093) — eBay Motors > Truck Parts
+        "262093": {
             "required": ["Brand", "Type", "Color", "Material", "Fitment Type"],
             "defaults": {
                 "Brand": "Unbranded",
@@ -1625,22 +1625,22 @@ class EbayPublisher:
     # Format: (category_id, category_name, keywords, exclude_patterns)
     CATEGORY_RULES = [
         # ---- Auto Parts & Accessories (match before everything else) ----
-        ("33650", "Running Boards & Step Bars", [
+        ("262210", "Running Boards & Nerf Bars", [
             "running board", "nerf bar", "side step", "step bar",
         ], ["dog step", "pet step", "baby step"]),
-        ("33653", "Trailer Hitches", [
+        ("174020", "Trailer Hitches", [
             "trailer hitch", "tow hitch", "hitch receiver", "class 3 hitch", "class 2 hitch",
             "class 4 hitch", "tow receiver",
         ], []),
-        ("121984", "Cargo Boxes, Bags & Baskets", [
+        ("174021", "Hitch Cargo Carriers", [
             "hitch cargo", "hitch carrier", "hitch basket", "hitch mount cargo",
             "hitch mounted cargo", "folding hitch",
         ], []),
-        ("33651", "Roof Racks & Cross Bars", [
+        ("262216", "Roof Racks & Cross Bars", [
             "roof rack", "roof basket", "roof carrier", "rooftop cargo", "cargo basket",
             "cross bar", "crossbar",
         ], ["bookshelf", "shelf", "shoe rack", "wine rack", "coat rack", "towel rack", "baker rack"]),
-        ("262150", "Lift Supports, Latches, Hinges", [
+        ("262093", "Tailgate Parts", [
             "tailgate assist", "tailgate lift", "tailgate ramp", "liftgate ramp",
             "tailgate utility", "gate ramp lift",
         ], []),

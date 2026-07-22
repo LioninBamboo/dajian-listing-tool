@@ -83,11 +83,11 @@ except DatabaseSafetyError as exc:
 
 CATEGORY_NAMES = {
     # Auto Parts & Accessories
-    "33650": "Running Boards & Step Bars",
-    "33653": "Trailer Hitches",
-    "121984": "Cargo Boxes, Bags & Baskets",
-    "33651": "Roof Racks & Cross Bars",
-    "262150": "Lift Supports, Latches, Hinges",
+    "262210": "Running Boards & Nerf Bars",
+    "174020": "Trailer Hitches",
+    "174021": "Hitch Cargo Carriers",
+    "262216": "Roof Racks & Cross Bars",
+    "262093": "Tailgate Parts",
     "85040": "Bike Trailers",
     # Furniture
     "38208": "Sofas & Couches",
@@ -827,7 +827,7 @@ def pre_publish_qc(product: dict) -> list:
         issues.append("⚠️ 缺少产品描述")
 
     # 7. Motors compatibility check
-    if cat_id in {"33653", "121984", "33650", "33651", "262150"}:
+    if cat_id in {"174020", "174021", "262210", "262216", "262093"}:
         aspects = apply_compatibility_aspects(
             cat_id,
             opt.get('aspects', {}),
