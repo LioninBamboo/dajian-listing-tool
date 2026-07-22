@@ -19,6 +19,10 @@ load_dotenv()
 # 使用绝对路径，避免计划任务工作目录不同导致找不到数据库
 _PROJECT_ROOT = Path(__file__).parent.parent.parent
 _TOKEN_DB_PATH = str(_PROJECT_ROOT / "ebay_tokens.db")
+# How early to refresh before the stored expiry. Absorbs clock skew between this
+# machine and eBay's auth servers (see get_valid_token).
+TOKEN_REFRESH_SAFETY_MINUTES = 30
+
 _REDIRECT_PLACEHOLDERS = {
     "",
     "NOT SET",
@@ -306,9 +310,14 @@ class EbayOAuthService:
         # Check if token is expired
         expires_at = datetime.fromisoformat(stored_token["expires_at"])
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        
-        # Refresh if expired or expiring in next 5 minutes
-        if expires_at <= now + timedelta(minutes=5):
+
+        # Refresh if expired or expiring within the safety window.
+        # 2026-07-22: widened 5 -> 30 minutes. A local clock running behind eBay's
+        # made this check say "valid for 4 more minutes" while eBay already
+        # rejected the token ("Invalid access token", errorId 1001), stalling a
+        # publish run. Refresh is cheap and the refresh_token is long-lived, so
+        # erring early costs nothing and absorbs clock skew.
+        if expires_at <= now + timedelta(minutes=TOKEN_REFRESH_SAFETY_MINUTES):
             print("[>] Token expired or expiring soon, refreshing...")
             token_data = self.refresh_access_token()
             return token_data["access_token"]
