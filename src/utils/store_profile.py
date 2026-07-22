@@ -38,11 +38,16 @@ class StoreProfile:
     description_footer_line2: str = "Quality Guaranteed • Fast US Shipping • Trusted Seller"
     promotion_prefix: str = "AquaVerve Auto Sale"
 
-    # Which eBay marketplace this instance lists on. Auto parts live ONLY in the
-    # eBay Motors catalog: EBAY_US uses category tree 0, EBAY_MOTORS_US uses tree
-    # 100, and Motors category ids (e.g. 33651 Roof Racks, 33653 Trailer Hitches)
-    # do not exist in tree 0 at all. Default keeps furniture/main on EBAY_US.
+    # The Sell-API marketplace for offers/policies. US selling is always EBAY_US —
+    # the Inventory API rejects EBAY_MOTORS_US here ("Could not serialize field
+    # [marketplaceId]", errorId 2004). Motors is a *catalog*, not a marketplace.
     ebay_marketplace_id: str = "EBAY_US"
+
+    # Taxonomy category tree for category/aspect lookups. Independent of the
+    # marketplace above: eBay Motors Parts & Accessories are listed ON EBAY_US
+    # but their category ids (33651 Roof Racks, 33653 Trailer Hitches, ...) live
+    # only in tree 100 and 400 in tree 0. Auto-parts instances set "100".
+    category_tree_id: str = "0"
 
     # eBay account-owned identifiers
     merchant_location_key: str = "DAJIAN_LA_WAREHOUSE"
@@ -103,21 +108,10 @@ class StoreProfile:
     def banned_terms_lower(self) -> tuple:
         return tuple(t.lower() for t in self.banned_terms)
 
-    # eBay's default category tree per marketplace (verified via
-    # get_default_category_tree_id). Anything not listed falls back to "0".
-    _CATEGORY_TREE_BY_MARKETPLACE = {
-        "EBAY_US": "0",
-        "EBAY_MOTORS_US": "100",
-    }
-
-    @property
-    def category_tree_id(self) -> str:
-        """Taxonomy category tree for this instance's marketplace."""
-        return self._CATEGORY_TREE_BY_MARKETPLACE.get(self.ebay_marketplace_id, "0")
-
     @property
     def is_motors(self) -> bool:
-        return self.ebay_marketplace_id == "EBAY_MOTORS_US"
+        """True when this instance lists against the eBay Motors catalog."""
+        return str(self.category_tree_id) == "100"
 
     @property
     def default_brand(self) -> str:
@@ -139,6 +133,7 @@ _SECTION_FIELD_MAP = {
     },
     "ebay": {
         "ebay_marketplace_id",
+        "category_tree_id",
         "merchant_location_key",
         "fallback_fulfillment_policy_id",
         "fallback_return_policy_id",
