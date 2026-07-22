@@ -1405,11 +1405,14 @@ class QwenOptimizer:
             (["hitch", "carrier"], "174021"),       # Hitch Carriers
             (["hitch", "basket"], "174021"),        # Hitch Baskets
             
-            # Roof Racks & Cross Bars (eBay Motors > Exterior Parts)
-            (["roof", "rack"], "262216"),           # Roof Racks
-            (["roof", "basket"], "262216"),         # Roof Baskets
-            (["roof", "carrier"], "262216"),        # Roof Carriers
-            (["cargo", "basket"], "262216"),        # Cargo Baskets (roof-mounted)
+            # Car & Truck Racks. 2026-07-22: was 262216, which the EBAY_US
+            # taxonomy rejects outright ("category ID does not belong to
+            # specified category tree", errorId 62005) — publishes using it
+            # fail category validation. 177849 is a verified sellable leaf.
+            (["roof", "rack"], "177849"),           # Roof Racks
+            (["roof", "basket"], "177849"),         # Roof Baskets
+            (["roof", "carrier"], "177849"),        # Roof Carriers
+            (["cargo", "basket"], "177849"),        # Cargo Baskets (roof-mounted)
             
             # Tailgate Parts (eBay Motors > Truck Parts)
             (["tailgate", "assist"], "262093"),     # Tailgate Assist
