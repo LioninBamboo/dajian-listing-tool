@@ -60,6 +60,8 @@ _AUTO_FALSE_FRIENDS = (
     "race car bed", "car bed", "toy car", "bike trailer", "bicycle trailer",
     "treadmill", "exercise bike", "rowing machine",
     "golf bag", "golf club", "golf clubs", "golf cart",
+    # An outdoor kitchen island has a "splash guard" (backsplash), not a mud flap.
+    "kitchen island", "outdoor kitchen", "countertop", "backsplash", "sink cabinet",
 )
 
 _ARTTOY_TERMS = (

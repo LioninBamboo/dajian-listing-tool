@@ -903,12 +903,41 @@ async def collect_product(
                 "categoryId": str(hint_category_id),
                 "categoryName": hint_category_name or "",
             }
+        # Which store should sell this? One codebase serves furniture / auto parts
+        # / blind box, so record the routing decision at collection time. Advisory:
+        # nothing is moved automatically — tools/route_products.py acts on it.
+        route_note = ""
+        try:
+            from src.services.product_router import classify_product
+            from src.utils.store_profile import get_store_profile as _gsp
+
+            routing = classify_product(
+                title=title,
+                description=description,
+                attributes=attributes,
+                supplier_category=str((specs or {}).get("category") or ""),
+            )
+            this_store = "arttoy" if _gsp().template_style == "arttoy_hype" else "furniture"
+            if routing["target"] not in (this_store, "unknown"):
+                route_note = (
+                    f"ROUTING: looks like '{routing['target']}' "
+                    f"({routing['reason']}: {routing['matched']}) but this instance is "
+                    f"'{this_store}' — belongs in the {routing['target']} store."
+                )
+                logging.warning("[ROUTE] %s %s", payload.sku, route_note)
+            else:
+                route_note = f"Routing: {routing['target']} ({routing['reason']})"
+        except Exception as route_err:  # routing must never block collection
+            logging.warning("[ROUTE] %s classification failed: %s", payload.sku, route_err)
+
         issue_flags = _collection_issue_flags(
             payload,
             normalized_images,
             normalized_videos,
             source_facts=source_facts,
         )
+        if route_note:
+            issue_flags = list(issue_flags) + [route_note]
         _append_collection_issue_log(
             payload,
             issue_flags,

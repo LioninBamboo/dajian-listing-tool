@@ -64,6 +64,13 @@ class TestFalseFriends:
         )
         assert out["target"] != AUTO
 
+    def test_outdoor_kitchen_splash_guard_is_not_auto(self):
+        # Real misroute: an outdoor kitchen island's backsplash matched "splash guard".
+        out = classify_product(
+            title='39.4" Outdoor Kitchen Island with Stainless Table Top and Splash Guard'
+        )
+        assert out["target"] != AUTO
+
     def test_golf_organizer_is_not_auto(self):
         # Real misroute: a golf caddy matched "trunk organizer".
         out = classify_product(
