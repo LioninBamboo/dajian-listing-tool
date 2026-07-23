@@ -668,7 +668,16 @@ class EbayCategoryMatcher:
             "trailer hitch", "tailgate assist", "tailgate ladder", "tailgate handle", "silverado", "sierra", "wrangler",
             "f-150", "f150", "tacoma", "ram 1500", "glc", "glb", "pickup",
         ]
-        motors_categories = {"262210", "174020", "174021", "262216", "262093", "85040"}
+        # eBay Motors ids plus tree-0 equivalents. An account without eBay Motors
+        # selling privileges is refused those categories at publish (errorId 25005)
+        # even though they are correct, so a rack/carrier may legitimately be
+        # listed under 177849 "Car & Truck Racks", which lives in the normal
+        # EBAY_US tree. Additive — the Motors ids stay valid for accounts that
+        # do have the privilege.
+        motors_categories = {
+            "262210", "174020", "174021", "262216", "262093", "85040",
+            "177849",  # Car & Truck Racks (tree 0)
+        }
         outdoor_chair_categories = {"79682", "79684", "138996"}
         porch_swing_categories = {"79694"}
         sofa_categories = {"38208"}
