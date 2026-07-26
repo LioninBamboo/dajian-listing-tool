@@ -1248,8 +1248,18 @@ def audit_single_product(
             from src.utils.listing_fact_sheet import compare_fact_sheets, fact_sheet_for_content
 
             _fs_conn = get_fact_sheet_conn()
+            # Aspects are eBay category ENUMS, not our prose. eBay requires
+            # picking from a fixed option list ("Features: With Cushions /
+            # Upholstered", "Style: Modern", "Room: Living Room"), and the
+            # source never phrases things that way — so feeding them to the
+            # hallucination check flagged 1934 of 3177 feature rows (61%) as
+            # fake "claims" (2026-07-26 audit). Item-specifics correctness is
+            # already covered by the aspect-validation layer; this guard is for
+            # copy the source can actually contradict. Structured values that
+            # ARE falsifiable (materials/dimensions) still reach the sheet via
+            # the description and the dedicated dimension/material rules.
             _source_sheet = fact_sheet_for_content(_fs_conn, title, description or "", {**attrs, **specs})
-            _live_sheet = fact_sheet_for_content(_fs_conn, opt_title, live_description, aspects)
+            _live_sheet = fact_sheet_for_content(_fs_conn, opt_title, live_description, {})
             if _source_sheet and _live_sheet:
                 _existing_details = " || ".join(str(i.get("detail", "")) for i in issues).lower()
                 _strip_fs = lambda h: re.sub(r"<[^>]+>", " ", str(h or ""))

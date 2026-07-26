@@ -71,6 +71,28 @@ _GENERIC_MATERIAL_MEMBERS: dict[str, frozenset[str]] = {
     "plastic": frozenset({
         "abs", "pvc", "acrylic", "polypropylene", "hdpe", "resin",
     }),
+    # 2026-07-26: "engineered wood" is the US retail umbrella term for exactly
+    # these panel products — a source listing "MDF / particle board / melamine"
+    # genuinely IS engineered wood, so flagging it wasted 12 CRITICAL slots.
+    # Membership is still required: a chenille-and-foam sofa whose copy claims
+    # an "engineered wood frame" has no member here and keeps flagging, which
+    # is correct — the source never states a frame material at all.
+    "engineered wood": frozenset({
+        "mdf", "particle board", "particleboard", "melamine", "plywood",
+        "chipboard", "fiberboard", "osb", "veneer", "composite wood",
+    }),
+    "engineered wood frame": frozenset({
+        "mdf", "particle board", "particleboard", "melamine", "plywood",
+        "chipboard", "fiberboard", "osb", "veneer", "composite wood",
+    }),
+    # HDPE/polyethylene is what "PE rattan" is made of. Requiring a PE member
+    # keeps a polyester+PU tent claiming HDPE flagged (W2505P427760).
+    "hdpe": frozenset({
+        "pe rattan", "polyethylene", "pe wicker", "hdpe",
+    }),
+    "polyethylene": frozenset({
+        "pe rattan", "polyethylene", "pe wicker", "hdpe",
+    }),
 }
 
 _CAPACITY_UNIT_WORDS = ("person", "people", "seat", "seater", "occupant")
@@ -84,6 +106,46 @@ _HIGH_RISK_FEATURE_PATTERN = re.compile(
     r"reclin|swivel|fold|convert|adjust",
     re.IGNORECASE,
 )
+
+# Subjective/aesthetic claims that are not falsifiable against a source spec.
+# 2026-07-26: these produced ~2.9k MEDIUM rows per audit ("comfortable",
+# "modern", "sturdy", "ergonomic"), burying the ~200 real CRITICAL findings
+# and making every report read as "still thousands of problems". A buyer
+# cannot be refunded for a sofa that is insufficiently "modern"; a claim only
+# belongs in the fact sheet if the source could contradict it.
+#
+# Deliberately NOT listed here (they stay checked because they are verifiable
+# and refund-relevant): waterproof, foldable, adjustable, reclining, locking,
+# portable, expandable, reversible, and anything _HIGH_RISK_FEATURE_PATTERN
+# matches — that pattern is applied first and always wins.
+_SUBJECTIVE_FEATURE_PATTERN = re.compile(
+    r"^(?:"
+    r"comfort\w*|cozy|cosy|relax\w*|soft|plush|luxur\w*|elegant|stylish|"
+    r"modern|contemporary|classic|traditional|rustic|minimalist|chic|sleek|"
+    r"beautiful|attractive|premium|high[\s-]*quality|quality|durable|sturdy|"
+    r"robust|strong|reliable|versatile|multi[\s-]*functional|practical|"
+    r"convenient|ergonomic|spacious|roomy|generous|compact|space[\s-]*saving|"
+    r"lightweight|easy[\s-]*(?:to[\s-]*)?(?:clean|assemble|use|move|maintain)|"
+    r"easy[\s-]*assembly|hassle[\s-]*free\s*\w*|simple\s*\w*|"
+    r"perfect\s*\w*|ideal\s*\w*|great\s*\w*|excellent\s*\w*|"
+    r"indoor|outdoor|indoor\s*/?\s*outdoor|home|office|living\s*room|bedroom"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def is_subjective_feature(feature: str) -> bool:
+    """Aesthetic/comfort wording a source spec can never contradict.
+
+    High-risk (safety/function) wording always wins, so "easy to clean
+    waterproof cover" is still checked.
+    """
+    text = re.sub(r"[\s-]+", " ", str(feature or "").strip().lower())
+    if not text:
+        return True
+    if _HIGH_RISK_FEATURE_PATTERN.search(text):
+        return False
+    return bool(_SUBJECTIVE_FEATURE_PATTERN.match(text))
 
 _EXTRACTION_PROMPT = """You are a strict information extractor. Read the product listing content below and output ONLY a JSON object with the factual claims it makes. Do not infer, do not normalize beyond lowercasing, do not add claims that are not explicitly stated.
 
@@ -428,6 +490,8 @@ def compare_fact_sheets(
             )
 
     for feature in live["features"]:
+        if is_subjective_feature(feature):
+            continue
         if not _supported_by_any(feature, source["features"], source_blob_tokens, source_blob_text):
             violations.append(
                 {

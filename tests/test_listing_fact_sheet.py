@@ -4,6 +4,8 @@ import sqlite3
 import pytest
 
 from src.utils.listing_fact_sheet import (
+    _generic_material_supported,
+    is_subjective_feature,
     compare_fact_sheets,
     fact_sheet_content_hash,
     fact_sheet_for_content,
@@ -334,3 +336,57 @@ class TestGroundingGuard:
         live = {**self.BASE, "materials": ["foam"]}
         v = compare_fact_sheets(src, live)
         assert any(x["claim_type"] == "semantic_material" for x in v)
+
+
+class TestEngineeredWoodAndPolyethyleneFamilies:
+    """2026-07-26 审计:207 条 CRITICAL 里 21 条是材质家族统称被误判。
+    "engineered wood" 就是 MDF/刨花板/三聚氰胺板的美式零售统称,HDPE 就是
+    PE rattan 的材质。但放行必须要求源里确有该家族的**具体成员**——纯软体
+    沙发(chenille/foam)claim "engineered wood frame" 是真幻觉,必须继续拦。"""
+
+    @pytest.mark.parametrize("claimed,source_materials", [
+        ("engineered wood", ["glass", "mdf", "particle board", "particleboard"]),
+        ("engineered wood", ["mdf", "melamine", "particle board"]),
+        ("engineered wood", ["mdf"]),
+        ("hdpe", ["foam", "iron", "pe rattan", "polyester"]),
+        ("polyethylene", ["pe rattan", "steel"]),
+    ])
+    def test_family_umbrella_backed_by_member_is_supported(self, claimed, source_materials):
+        assert _generic_material_supported(claimed, source_materials) is True
+
+    @pytest.mark.parametrize("claimed,source_materials,why", [
+        ("engineered wood", ["chenille"], "W2519P486547 纯软体沙发,源无任何板材"),
+        ("engineered wood", ["chenille", "foam"], "W2519P486112"),
+        ("engineered wood", ["corduroy", "foam"], "W714S01469"),
+        ("engineered wood frame", ["boucle", "foam"], "W5532P458419 编造框架材质"),
+        ("hdpe", ["300d polyester fabric", "polyester", "pu"], "W2505P427760 涤纶帐篷"),
+        ("polyethylene", ["polyester", "pu"], "同上"),
+    ])
+    def test_family_umbrella_without_member_still_flags(self, claimed, source_materials, why):
+        assert _generic_material_supported(claimed, source_materials) is False, why
+
+
+class TestSubjectiveFeatureFilter:
+    """2026-07-26:审计每轮报 2896 条 MEDIUM,真 CRITICAL 只有 207,被淹没。
+    其中一批是无法证伪的主观词——源规格永远不可能反驳"modern"/"sturdy"。
+    但安全/功能类措辞必须继续检查(买家会因此退款)。"""
+
+    @pytest.mark.parametrize("feature", [
+        "comfortable", "modern", "sturdy", "ergonomic", "space-saving",
+        "lightweight", "easy clean", "easy to assemble", "multi-functional",
+        "indoor", "premium", "elegant", "compact",
+    ])
+    def test_unfalsifiable_wording_is_skipped(self, feature):
+        assert is_subjective_feature(feature) is True
+
+    @pytest.mark.parametrize("feature", [
+        "waterproof", "foldable", "adjustable", "reclining", "locking",
+        "usb charging port", "with storage", "buckle connection",
+        "scratch resistant", "800 lbs capacity", "stove jack",
+    ])
+    def test_verifiable_claims_still_checked(self, feature):
+        assert is_subjective_feature(feature) is False
+
+    def test_high_risk_wording_wins_over_subjective_prefix(self):
+        # "easy to clean waterproof cover" 含主观前缀但核心是可证伪的防水声明
+        assert is_subjective_feature("easy to clean waterproof cover") is False
