@@ -339,10 +339,20 @@ def title_triggers_category_change(
 
 
 def title_contains_violation(title: str, violations: list[dict[str, Any]]) -> bool:
+    """Does the title itself carry a claim serious enough to justify rebuilding it?
+
+    MEDIUM entries are marketing-phrase noise and must not reach here: a
+    "with cabinet" MEDIUM matched "Storage Cabinet" in a keyword-rich title and
+    triggered a full source rebuild, trading real search terms for a bare
+    supplier product name (2026-07-27 canary, 3 listings). Only CRITICAL/HIGH
+    claims — the ones that actually mislead a buyer — may rewrite a live title.
+    """
     t = (title or "").lower()
     if not t:
         return False
     for v in violations:
+        if str(v.get("severity") or "").upper() not in {"CRITICAL", "HIGH"}:
+            continue
         claim = str(v.get("claim_text") or "").lower()
         if not claim:
             continue

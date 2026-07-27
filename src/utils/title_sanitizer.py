@@ -241,6 +241,24 @@ def strip_supplier_brand_prefix(
     return raw, False, None
 
 
+# Supplier bookkeeping that must never reach a buyer-facing title. GIGA keeps
+# the retired code in the product name after a re-SKU, e.g.
+# "Full Size Murphy Bed with Large Drawers,Gray (OLD SKU:N708P336203E)".
+# Rebuilding a title from source shipped that verbatim to eBay on 3 canary
+# listings (2026-07-27), replacing real search keywords with internal codes.
+_SUPPLIER_INTERNAL_CODE_RE = re.compile(
+    r"[\(\[\{]?\s*(?:OLD|NEW|ORIG(?:INAL)?|PREV(?:IOUS)?)\s*SKU\s*[:：#]?\s*[A-Za-z0-9._\-]*\s*[\)\]\}]?",
+    re.IGNORECASE,
+)
+
+
+def _strip_supplier_internal_codes(title: str) -> tuple[str, bool]:
+    """Drop "(OLD SKU: XXX)"-style supplier bookkeeping from a title."""
+    cleaned = _SUPPLIER_INTERNAL_CODE_RE.sub(" ", str(title or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:|_/,")
+    return cleaned, cleaned != str(title or "").strip()
+
+
 def sanitize_listing_title(
     title: str,
     extra_prefixes: Iterable[str] | None = None,
@@ -256,9 +274,10 @@ def sanitize_listing_title(
 
     cleaned, marker_changed = _strip_leading_title_markers(raw)
     cleaned, prefix_changed, _ = strip_supplier_brand_prefix(cleaned, extra_prefixes=extra_prefixes)
+    cleaned, internal_changed = _strip_supplier_internal_codes(cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:|_/")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned, bool(marker_changed or prefix_changed or cleaned != raw)
+    return cleaned, bool(marker_changed or prefix_changed or internal_changed or cleaned != raw)
 
 
 def title_has_incomplete_trailing_fragment(

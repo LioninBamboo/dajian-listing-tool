@@ -1405,3 +1405,42 @@ def test_maps_missing_file_and_disabled_degrade(tmp_path, monkeypatch):
     assert maps2.get("compound_material_map") == {}
     assert srmod.lookup_compound_material_primary("Polyester,Rubber Wood")[0] is None
     srmod.reset_semantic_rewrite_maps_cache()
+
+
+class TestOnlySeriousClaimsMayRewriteLiveTitle:
+    """2026-07-27 金丝雀验收:MEDIUM 的 "with cabinet" 命中标题里的
+    "Storage Cabinet"、"wall mounted" 命中 "Wall Bed",触发整条标题按源重建,
+    把关键词丰富的 SEO 标题换成裸的供应商品名(还带出了内部编号)。
+    交接反复声明"只处理 CRITICAL 不碰 MEDIUM",MEDIUM 却在暗中改标题。"""
+
+    TITLE = "Full Size Murphy Bed with Large Drawers Storage Cabinet Wall Bed 77x53.5x43.4 in"
+
+    def test_medium_marketing_noise_does_not_trigger_rebuild(self):
+        violations = [
+            {"claim_text": "with cabinet", "claim_type": "semantic_feature", "severity": "MEDIUM"},
+            {"claim_text": "wall mounted", "claim_type": "semantic_feature", "severity": "MEDIUM"},
+            {"claim_text": "with shelves", "claim_type": "semantic_feature", "severity": "MEDIUM"},
+        ]
+        assert sr.title_contains_violation(self.TITLE, violations) is False
+
+    def test_critical_absent_from_title_does_not_trigger_rebuild(self):
+        violations = [
+            {"claim_text": "glossy", "claim_type": "semantic_material", "severity": "CRITICAL"}
+        ]
+        assert sr.title_contains_violation(self.TITLE, violations) is False
+
+    def test_critical_present_in_title_still_triggers_rebuild(self):
+        violations = [
+            {"claim_text": "leather", "claim_type": "semantic_material", "severity": "CRITICAL"}
+        ]
+        assert sr.title_contains_violation("Brown Leather Sectional Sofa", violations) is True
+
+    def test_high_present_in_title_still_triggers_rebuild(self):
+        violations = [
+            {"claim_text": "leather", "claim_type": "semantic_material", "severity": "HIGH"}
+        ]
+        assert sr.title_contains_violation("Brown Leather Sectional Sofa", violations) is True
+
+    def test_missing_severity_is_treated_as_not_serious(self):
+        violations = [{"claim_text": "cabinet", "claim_type": "semantic_feature"}]
+        assert sr.title_contains_violation(self.TITLE, violations) is False

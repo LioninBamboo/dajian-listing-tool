@@ -46,3 +46,47 @@ def test_normalize_listing_title_for_ebay_removes_dangling_dimension_connector()
 
     assert changed is True
     assert cleaned == "Extendable Dining Table with Folding Tabletop Bar Table 57.7"
+
+
+class TestSupplierInternalCodesNeverReachBuyers:
+    """2026-07-27 金丝雀验收:按源重建标题时,GIGA 留在品名里的退役编号
+    被原样推到 eBay，3 条 live 标题变成
+    "Full Size Murphy Bed with Large Drawers,Gray (OLD SKU:N708P336203E)"——
+    真实搜索关键词被内部编号顶掉。全库 24 条源标题带此标记。"""
+
+    def test_parenthesised_old_sku_is_removed(self):
+        cleaned, changed = sanitize_listing_title(
+            "Full Size Murphy Bed with Large Drawers,Gray (OLD SKU:N708P336203E)"
+        )
+        assert changed is True
+        assert "OLD SKU" not in cleaned.upper()
+        assert "N708P336203E" not in cleaned
+        assert cleaned == "Full Size Murphy Bed with Large Drawers,Gray"
+
+    def test_spaced_and_unparenthesised_variants(self):
+        for raw in [
+            "Queen Murphy Bed with Large Drawers,Green (OLD SKU: LP000678AAF)",
+            "Twin Race Car Platform Bed with Wheels,Blue(OLD SKU:WF311965AAC)",
+            "Console Table 63 in Long with Drawers OLD SKU: N715P372052",
+            "Dining Set Espresso [ORIGINAL SKU: ABC123]",
+        ]:
+            cleaned, _ = sanitize_listing_title(raw)
+            assert "SKU" not in cleaned.upper(), raw
+
+    def test_normal_title_is_untouched(self):
+        raw = '4 Pack Metal Garden Trellis 71" x 19.7" Rustproof Trellis for Climbing'
+        cleaned, changed = sanitize_listing_title(raw)
+        assert cleaned == raw
+        assert changed is False
+
+    def test_normalize_entrypoint_also_strips(self):
+        out, _ = normalize_listing_title_for_ebay(
+            "Queen Murphy Bed with Large Drawers,Green (OLD SKU: LP000678AAF)",
+            source_title="Queen Murphy Bed with Large Drawers,Green (OLD SKU: LP000678AAF)",
+        )
+        assert "SKU" not in out.upper()
+
+    def test_word_sku_alone_is_not_stripped(self):
+        # 只清"OLD/NEW/ORIG/PREV SKU"这类簿记标记,不能误伤正常措辞
+        cleaned, _ = sanitize_listing_title("Storage Bed Frame with Skudo Coating")
+        assert "Skudo" in cleaned
