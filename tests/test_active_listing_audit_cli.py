@@ -2318,3 +2318,66 @@ def test_rebuild_description_from_source_verify_fail_does_not_push(monkeypatch):
     )
     assert any("failed verification" in r and r.startswith("ERROR") for r in results), results
     assert pushed["n"] == 0
+
+
+class TestPerfectForCopyNeverInventsBenefits:
+    """2026-07-27 验收发现:PERFECT FOR 兜底句给每个产品硬套
+    "adds practical seating and everyday comfort"——圆锯、割草机、花园雕像、
+    雨伞、鸡舍都被说成提供座椅(存量预览 87 条里 28 条中招)。
+    以消除幻觉为目的的管线绝不能自己制造幻觉:无源据时返回空串。"""
+
+    def _copy(self, title, desc, aspects):
+        return audit_fix_active_listings._build_perfect_for_copy(title, desc, aspects)
+
+    def test_no_source_use_case_returns_empty_not_seating_claim(self):
+        out = self._copy(
+            "Circular Saw",
+            "7-1/4 Inch circular saw with laser guide. Cuts wood and metal.",
+            {"Type": ["Circular Saw"]},
+        )
+        assert out == ""
+
+    def test_non_seating_product_never_claims_seating(self):
+        for title, type_name in [
+            ("Push Reel Lawn Mower", "Push Reel Lawn Mower"),
+            ("Garden Statue", "Garden Statue"),
+            ("Chicken Coop", "Chicken Coop"),
+            ("Patio Umbrella", "Umbrella"),
+        ]:
+            out = self._copy(title, "Durable outdoor build.", {"Type": [type_name]})
+            assert "seating" not in out.lower()
+            assert "comfort" not in out.lower()
+
+    def test_genuine_source_use_case_is_preserved(self):
+        out = self._copy(
+            "Modern Sofa",
+            "Modern sofa. Ideal for living room and small apartments.",
+            {"Type": ["Sofa"]},
+        )
+        assert out == "Ideal for living room and small apartments."
+
+    def test_glued_section_heading_is_stripped(self):
+        # HTML 剥离后段标题会粘在句首,未防护时整块功能文案被当成场景文案输出
+        out = self._copy(
+            "Platform Bed",
+            "Product Features Built-In Storage Solution:Features four drawers, ideal for storing bedding.",
+            {"Type": ["Bed"]},
+        )
+        assert not out.lower().startswith("product features")
+        assert out.startswith("Built-In Storage Solution")
+
+    def test_description_omits_block_entirely_when_no_use_case(self):
+        html_out = audit_fix_active_listings.build_structured_description_from_source(
+            title="Circular Saw",
+            source_description=(
+                "7-1/4 Inch circular saw with laser guide for accurate straight cuts. "
+                "Powerful motor cuts through wood and metal quickly and cleanly. "
+                "Ergonomic grip reduces fatigue during extended cutting sessions."
+            ),
+            attrs={},
+            specs={},
+            aspects={"Type": ["Circular Saw"]},
+        )
+        assert html_out, "builder returned empty; test needs >=1 usable feature bullet"
+        assert "PERFECT FOR" not in html_out
+        assert "seating" not in html_out.lower()

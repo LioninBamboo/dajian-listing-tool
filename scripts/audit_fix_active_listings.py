@@ -373,19 +373,36 @@ def extract_source_feature_bullets(source_description: str, *, limit: int = 6) -
 
 
 def _build_perfect_for_copy(title: str, source_description: str, aspects: dict) -> str:
+    """Use-case copy for the PERFECT FOR block, or "" when the source has none.
+
+    Returns "" rather than inventing a benefit. The old fallback appended
+    "...adds practical seating and everyday comfort" to EVERY product whose
+    source lacked a use-case sentence, which fabricated a seating claim for a
+    circular saw, a push reel lawn mower, a garden statue, an umbrella and a
+    chicken coop among others (28 listings in the 2026-07-27 backlog preview).
+    A pipeline that exists to remove hallucinations must not manufacture them.
+    """
     source_text = strip_html_text(source_description or "")
     for sentence in re.split(r"(?<=[.!?])\s+", source_text):
         cleaned = re.sub(r"\s+", " ", sentence).strip()
+        # Section headings glue onto the following sentence once HTML is
+        # stripped, so an unguarded match emitted the whole feature blob
+        # ("Product Features Built-In Storage Solution:...") as use-case copy.
+        cleaned = re.sub(
+            r"^(?:Product Features|Features|Specifications|Key Features)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        if not cleaned:
+            continue
         if any(
             marker in cleaned.lower()
             for marker in ("ideal", "living room", "bedroom", "office", "reading", "application", "interior spaces")
         ):
             return cleaned
 
-    room = first_aspect_text(aspects, "Room")
-    type_name = first_aspect_text(aspects, "Type") or title or "furniture piece"
-    room_text = room.lower() if room else "everyday indoor spaces"
-    return f"Ideal for {room_text} where a compact {type_name.lower()} adds practical seating and everyday comfort."
+    return ""
 
 
 def _build_package_includes_copy(title: str, source_description: str, aspects: dict, assembly_required: str) -> str:
@@ -2201,10 +2218,16 @@ def build_structured_description_from_source(title, source_description, attrs, s
         '<h3 style="margin:0 0 15px;font-size:16px;color:#0d1b2a;border-left:4px solid #d4af37;padding-left:12px">KEY FEATURES</h3>'
         f'<ul style="margin:0;padding-left:20px;color:#4a4a4a">{bullet_html}</ul>'
         '</div>'
-        '<div style="padding:20px 25px;background:#f0f4f8">'
-        '<h3 style="margin:0 0 12px;font-size:14px;color:#0d1b2a">PERFECT FOR</h3>'
-        f'<p style="margin:0;color:#636e72">{perfect_for}</p>'
-        '</div>'
+        # Whole block is conditional: with no source-grounded use-case copy the
+        # section is omitted rather than rendered empty or padded with invention.
+        + (
+            '<div style="padding:20px 25px;background:#f0f4f8">'
+            '<h3 style="margin:0 0 12px;font-size:14px;color:#0d1b2a">PERFECT FOR</h3>'
+            f'<p style="margin:0;color:#636e72">{perfect_for}</p>'
+            '</div>'
+            if perfect_for
+            else ''
+        ) +
         f'{specifications_html}'
         '<div style="padding:20px 25px;background:#f8f9fa;border-top:1px solid #e0e0e0">'
         '<h3 style="margin:0 0 10px;font-size:14px;color:#0d1b2a">PACKAGE INCLUDES</h3>'
