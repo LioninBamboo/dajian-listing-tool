@@ -334,14 +334,40 @@ def _tokens(text: str) -> set[str]:
     return {w.rstrip("s") if len(w) > 3 else w for w in words if w not in _STOPWORDS}
 
 
+# Spelled-out counts: "two-seater" carries the same claim as "2 person" but has
+# no digit, so it used to fall through to token equality and report a conflict.
+_WORD_NUMBERS: dict[str, int] = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "twelve": 12,
+}
+
+# Standard US mattress occupancy. Only sizes with an unambiguous count are
+# listed: "king" is deliberately mapped to 2 sleepers, so a live "king size"
+# against a source "4 person" still reports — sofa-bed occupancy is a judgment
+# call that belongs to a human, not to this table.
+_BED_SIZE_OCCUPANCY: dict[str, int] = {
+    "twin": 1, "single": 1, "twin xl": 1,
+    "full": 2, "double": 2, "queen": 2, "king": 2, "california king": 2,
+}
+
+# Noise words that carry no capacity information ("queen size" == "queen").
+_CAPACITY_NOISE = re.compile(r"\b(?:size|sized|bed|mattress)\b")
+
+
 def _capacity_numbers(text: str) -> tuple[int, int] | None:
     """Parse a capacity claim into an inclusive (low, high) range.
 
-    "8 person" → (8, 8); "4-8 person" → (4, 8); "seats 6" → (6, 6).
+    "8 person" → (8, 8); "4-8 person" → (4, 8); "seats 6" → (6, 6);
+    "two-seater" → (2, 2); "queen size" → (2, 2).
     Unit words (person/seat/seater/occupant) are treated as equivalent.
-    Returns None when no number is present.
+    Returns None when no count can be derived.
     """
     normalized = str(text or "").lower()
+    if not normalized:
+        return None
+    normalized = _CAPACITY_NOISE.sub(" ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
     if not normalized:
         return None
     range_match = re.search(r"(\d+)\s*(?:-|to|~)\s*(\d+)", normalized)
@@ -352,6 +378,15 @@ def _capacity_numbers(text: str) -> tuple[int, int] | None:
     if single:
         value = int(single.group(1))
         return (value, value)
+    # Spelled-out count, e.g. "two-seater".
+    for word, value in _WORD_NUMBERS.items():
+        if re.search(rf"\b{word}\b", normalized):
+            return (value, value)
+    # Mattress size implies occupancy; longest name first so "california king"
+    # and "twin xl" win over the bare "king"/"twin" they contain.
+    for name in sorted(_BED_SIZE_OCCUPANCY, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(name)}\b", normalized):
+            return (_BED_SIZE_OCCUPANCY[name],) * 2
     return None
 
 

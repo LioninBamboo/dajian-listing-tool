@@ -81,3 +81,47 @@ def test_real_sofa_still_remapped_to_sofas():
 
     assert category_id == "38208"
     assert category_name == "Sofas, Armchairs & Couches"
+
+
+def test_bell_tent_with_cooler_weather_copy_stays_in_tents():
+    """2026-07-27: the rebuilt description said "cozy even in cooler weather".
+    A bare \bcooler\b match set has_cooler and wanted to move 4 bell tents from
+    Tents (179010) to Ice Chests & Coolers (79691). category_mismatch carries a
+    categoryId fix key, so a --fix run would have re-categorised them on live."""
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    title = "Luxury 4 Season Bell Tent 13.1FT with Stove Jack Waterproof Glamping Yurt"
+    description = (
+        "Whether spring, autumn, or winter, you can stay warm and enjoy a cozy "
+        "atmosphere even in cooler weather. Outstanding ventilation with mesh windows."
+    )
+
+    assert matcher.canonicalize_category(title, "179010", "Tents", description) == (
+        "179010",
+        "Tents",
+    )
+
+
+def test_comparative_cooler_phrases_do_not_imply_a_cooler_product():
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    for phrase in (
+        "ideal for cooler months on the patio",
+        "keeps the room comfortable in cooler temperatures",
+        "breathable mesh promotes cooler air circulation",
+        "great for cooler evenings outdoors",
+    ):
+        assert matcher.canonicalize_category(
+            "Outdoor Patio Sofa Set with Cushions", "139849", "Patio & Garden Furniture Sets", phrase
+        ) != ("79691", "Ice Chests & Coolers"), phrase
+
+
+def test_real_cooler_products_are_still_detected():
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    for title in (
+        "52QT Rotomolded Hard Cooler with Wheels and Bottle Opener",
+        "Portable Cooler for Camping and Tailgating, 45 Can Capacity",
+        "Insulated Cooler Bag Holds 30 Cans, Leakproof Liner",
+    ):
+        assert matcher.canonicalize_category(title, "20518", "Other") == (
+            "79691",
+            "Ice Chests & Coolers",
+        ), title

@@ -270,10 +270,24 @@ class EbayCategoryMatcher:
             not has_pantry_cabinet
             and any(kw in text_lower for kw in ("display cabinet", "curio cabinet", "glass cabinet"))
         )
+        # "cooler" is also the comparative of "cool", and outdoor copy is full of
+        # it ("cozy even in cooler weather", "ideal for cooler months"). The bare
+        # \bcooler\b match therefore wanted to move 4 bell tents into
+        # "Ice Chests & Coolers" — and category_mismatch carries a categoryId fix
+        # key, so a --fix run would have done it on live (2026-07-27).
+        # Only count "cooler" when it is not modifying a temperature/time noun.
         has_cooler = any(
             kw in text_lower
             for kw in ("hard cooler", "insulated cooler", "ice chest", "portable cooler", "cooler can")
-        ) or re.search(r"\bcooler\b", text_lower) is not None
+        ) or (
+            re.search(r"\bcooler\b", text_lower) is not None
+            and re.search(
+                r"\bcooler\s+(?:weather|temperatures?|months?|days?|nights?|evenings?|"
+                r"seasons?|climates?|air|conditions?|environments?|areas?|regions?)\b",
+                text_lower,
+            )
+            is None
+        )
         excluded_bench_context = (
             has_storage_ottoman
             or any(

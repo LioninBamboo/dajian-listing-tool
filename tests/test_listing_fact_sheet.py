@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import src.utils.listing_fact_sheet as lfs
 
 import pytest
 
@@ -390,3 +391,38 @@ class TestSubjectiveFeatureFilter:
     def test_high_risk_wording_wins_over_subjective_prefix(self):
         # "easy to clean waterproof cover" 含主观前缀但核心是可证伪的防水声明
         assert is_subjective_feature("easy to clean waterproof cover") is False
+
+
+class TestCapacityEquivalentPhrasings:
+    """2026-07-27 存量分析:12 条 semantic_capacity CRITICAL 里 8 条是同义表述
+    被当成矛盾——"2 person" vs 源 "two-seater"、"queen size" vs 源 "queen"。
+    拼写数字解析不出数值就退化成 token 比对,"size" 是纯噪声词。"""
+
+    def test_spelled_out_count_equals_digit(self):
+        assert lfs._capacity_supported("2 person", "two-seater") is True
+        assert lfs._capacity_supported("two-seater", "2 person") is True
+
+    def test_size_is_a_noise_word(self):
+        assert lfs._capacity_supported("queen size", "queen") is True
+        assert lfs._capacity_supported("full size", "full") is True
+
+    def test_mattress_size_implies_occupancy(self):
+        assert lfs._capacity_supported("queen", "2 person") is True
+        assert lfs._capacity_supported("full", "2 person") is True
+        assert lfs._capacity_supported("twin", "1 person") is True
+
+    def test_longest_size_name_wins(self):
+        # "california king"/"twin xl" 必须胜过它们内含的 "king"/"twin"
+        assert lfs._capacity_numbers("california king") == (2, 2)
+        assert lfs._capacity_numbers("twin xl") == (1, 1)
+
+    def test_genuine_capacity_conflicts_still_report(self):
+        # 这 4 条用户明确要留给人工,不许被同义词表吞掉
+        assert lfs._capacity_supported("6 seater", "4 person") is False
+        assert lfs._capacity_supported("king size", "4 person") is False
+        assert lfs._capacity_supported("king size", "4 seater") is False
+        assert lfs._capacity_supported("8 person", "4 person") is False
+
+    def test_range_containment_unchanged(self):
+        assert lfs._capacity_supported("6 person", "4-8 person") is True
+        assert lfs._capacity_supported("10 person", "4-8 person") is False
