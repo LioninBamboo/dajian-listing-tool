@@ -90,10 +90,20 @@ def build_repair(conn, dj, sku):
     if not snap.characteristics:
         return None, "thin_source_characteristics"
 
-    # Title: rebuild word-safe from source product name
+    # Title: rebuild word-safe from source product name. A source name too thin
+    # to be a title (GIGA sometimes stores just "chicken coop") must NOT abandon
+    # the repair — the description is the serious defect here (a live listing
+    # showing raw Chinese supplier data), and a short title is the lesser evil.
+    # Keep the current live title in that case and still fix the description.
+    # W3166P455683 sat broken on live because this bailed out (2026-07-27).
     new_title, _ = normalize_listing_title_for_ebay(snap.title, source_title=snap.title)
     if not new_title or len(new_title) < 15:
-        return None, "title_rebuild_failed"
+        current_title, _ = normalize_listing_title_for_ebay(
+            re.sub(r"\s+", " ", str(row[0] or "")).strip(), source_title=snap.title
+        )
+        new_title = current_title or new_title
+        if not new_title:
+            return None, "title_rebuild_failed"
 
     # Material from source (fixes Wood→MDF style mismatches)
     if snap.attributes.get("Main Material"):
