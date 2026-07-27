@@ -372,8 +372,17 @@ def extract_source_feature_bullets(source_description: str, *, limit: int = 6) -
     return bullets
 
 
-def _build_perfect_for_copy(title: str, source_description: str, aspects: dict) -> str:
+def _build_perfect_for_copy(
+    title: str,
+    source_description: str,
+    aspects: dict,
+    used_bullets: "list[str] | None" = None,
+) -> str:
     """Use-case copy for the PERFECT FOR block, or "" when the source has none.
+
+    ``used_bullets`` are the sentences already rendered under KEY FEATURES.
+    Both sections mine the same source sentences, so without this the block
+    repeated a bullet verbatim in 46 of 68 rewrite candidates (2026-07-27).
 
     Returns "" rather than inventing a benefit. The old fallback appended
     "...adds practical seating and everyday comfort" to EVERY product whose
@@ -383,6 +392,7 @@ def _build_perfect_for_copy(title: str, source_description: str, aspects: dict) 
     A pipeline that exists to remove hallucinations must not manufacture them.
     """
     source_text = strip_html_text(source_description or "")
+    used = {re.sub(r"\s+", " ", b).strip().casefold() for b in (used_bullets or [])}
     for sentence in re.split(r"(?<=[.!?])\s+", source_text):
         cleaned = re.sub(r"\s+", " ", sentence).strip()
         # Section headings glue onto the following sentence once HTML is
@@ -395,6 +405,10 @@ def _build_perfect_for_copy(title: str, source_description: str, aspects: dict) 
             flags=re.IGNORECASE,
         ).strip()
         if not cleaned:
+            continue
+        normalized = cleaned.casefold()
+        # Already shown as a KEY FEATURES bullet, or a fragment of one.
+        if any(normalized in b or b in normalized for b in used):
             continue
         if any(
             marker in cleaned.lower()
@@ -2191,7 +2205,9 @@ def build_structured_description_from_source(title, source_description, attrs, s
         f'<li style="margin-bottom:10px">{html.escape(bullet)}</li>'
         for bullet in feature_bullets
     )
-    perfect_for = html.escape(_build_perfect_for_copy(title, source_description, aspects))
+    perfect_for = html.escape(
+        _build_perfect_for_copy(title, source_description, aspects, used_bullets=feature_bullets)
+    )
     package_includes = html.escape(
         _build_package_includes_copy(title, source_description, aspects, assembly_required)
     )

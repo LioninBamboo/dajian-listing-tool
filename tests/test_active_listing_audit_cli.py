@@ -2381,3 +2381,46 @@ class TestPerfectForCopyNeverInventsBenefits:
         assert html_out, "builder returned empty; test needs >=1 usable feature bullet"
         assert "PERFECT FOR" not in html_out
         assert "seating" not in html_out.lower()
+
+
+class TestPerfectForNotDuplicateOfFeatures:
+    """2026-07-27 验收:PERFECT FOR 与 KEY FEATURES 从同一批源句子里挑,
+    68 条待推里 46 条把功能条目原样重复了一遍。内容不假但是冗余文案。"""
+
+    def test_sentence_already_used_as_bullet_is_skipped(self):
+        desc = (
+            "One-Click Foldable Design: Quickly collapse the stroller with one hand, "
+            "ideal for car trips and vet visits. "
+            "Breathable Mesh Windows keep airflow steady on warm days for pets inside."
+        )
+        bullets = audit_fix_active_listings.extract_source_feature_bullets(desc)
+        assert bullets, "fixture needs at least one bullet"
+        out = audit_fix_active_listings._build_perfect_for_copy(
+            "Pet Stroller", desc, {"Type": ["Pet Stroller"]}, used_bullets=bullets
+        )
+        for bullet in bullets:
+            assert out != bullet
+
+    def test_independent_use_case_sentence_still_returned(self):
+        desc = (
+            "Sturdy steel frame supports up to 300 lbs without wobbling during use. "
+            "Ideal for living room and small apartments."
+        )
+        bullets = ["Sturdy steel frame supports up to 300 lbs without wobbling during use."]
+        out = audit_fix_active_listings._build_perfect_for_copy(
+            "Sofa", desc, {"Type": ["Sofa"]}, used_bullets=bullets
+        )
+        assert out == "Ideal for living room and small apartments."
+
+    def test_omitted_when_only_candidate_is_already_a_bullet(self):
+        desc = "Compact design, ideal for bedroom and dorm rooms with limited floor space."
+        bullets = ["Compact design, ideal for bedroom and dorm rooms with limited floor space."]
+        out = audit_fix_active_listings._build_perfect_for_copy(
+            "Desk", desc, {"Type": ["Desk"]}, used_bullets=bullets
+        )
+        assert out == ""
+
+    def test_used_bullets_optional_keeps_old_callers_working(self):
+        desc = "Modern sofa. Ideal for living room and small apartments."
+        out = audit_fix_active_listings._build_perfect_for_copy("Sofa", desc, {"Type": ["Sofa"]})
+        assert out == "Ideal for living room and small apartments."
