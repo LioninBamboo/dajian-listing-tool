@@ -1047,7 +1047,12 @@ def test_gap2_required_upholstery_fabric_preserved():
         srmod.get_required_aspect_names = original
 
 
-def test_gap3_publish_failure_triggers_auto_rollback(monkeypatch):
+def test_gap3_publish_failure_triggers_auto_rollback(monkeypatch, tmp_path):
+    # BACKUP_DIR is a module-level constant; without this redirect the test
+    # wrote a fake "SKU-PARTIAL.json" into the real logs/semantic_rewrite_backups/,
+    # where backups double as the record of which SKUs were actually pushed
+    # (2026-07-27 acceptance had to rule it out as a live push).
+    monkeypatch.setattr(sr, "BACKUP_DIR", tmp_path / "backups")
     conn = _mem_db()
     _insert_sku(conn, "SKU-PARTIAL")
     plan = RewritePlan(
