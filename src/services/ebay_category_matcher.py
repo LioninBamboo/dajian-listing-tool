@@ -11,6 +11,8 @@ import re
 import requests
 import logging
 from typing import Dict, List, Optional, Any, Tuple
+
+from src.utils.product_context_signals import mentions_cooler_product, outdoor_context
 from src.services.ebay_auth import EbayOAuthService
 from src.utils.store_profile import get_store_profile
 
@@ -176,18 +178,7 @@ class EbayCategoryMatcher:
         # balcony" — one incidental word outweighed four named indoor rooms
         # (2026-07-27). Require the outdoor signal in the TITLE whenever the copy
         # explicitly places the item indoors.
-        names_indoor_room = any(
-            kw in text_lower
-            for kw in (
-                "living room", "bedroom", "entryway", "dormitory", "dorm room",
-                "study", "home office", "hallway", "foyer", "nursery",
-            )
-        )
-        outdoor_in_title = any(
-            kw in title_lower
-            for kw in ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "balcony", "porch")
-        )
-        daybed_outdoor_signal = outdoor_in_title if names_indoor_room else has_outdoor_context
+        daybed_outdoor_signal = outdoor_context(title_lower, text_lower)
 
         has_outdoor_daybed = any(kw in title_lower for kw in ("outdoor daybed", "patio daybed", "sunbed")) or (
             "daybed" in title_lower
@@ -296,18 +287,10 @@ class EbayCategoryMatcher:
         # "Ice Chests & Coolers" — and category_mismatch carries a categoryId fix
         # key, so a --fix run would have done it on live (2026-07-27).
         # Only count "cooler" when it is not modifying a temperature/time noun.
-        has_cooler = any(
-            kw in text_lower
-            for kw in ("hard cooler", "insulated cooler", "ice chest", "portable cooler", "cooler can")
-        ) or (
-            re.search(r"\bcooler\b", text_lower) is not None
-            and re.search(
-                r"\bcooler\s+(?:weather|temperatures?|months?|days?|nights?|evenings?|"
-                r"seasons?|climates?|air|conditions?|environments?|areas?|regions?)\b",
-                text_lower,
-            )
-            is None
-        )
+        # Shared with listing_quality_gate via product_context_signals: a bare
+        # cooler match sent 4 bell tents to Ice Chests & Coolers because the
+        # copy said "cozy even in cooler weather" (2026-07-27).
+        has_cooler = mentions_cooler_product(text_lower)
         excluded_bench_context = (
             has_storage_ottoman
             or any(

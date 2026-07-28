@@ -18,6 +18,10 @@ from src.utils.dimension_helpers import (
     extract_product_weight_from_text,
     replace_description_measurements,
 )
+from src.utils.product_context_signals import (
+    has_outdoor_marker,
+    outdoor_context as strict_outdoor_context,
+)
 from src.utils.publish_aspect_completion import infer_number_of_items_in_set
 from src.utils.publish_autofix import sanitize_placeholder_aspects, sanitize_single_value_aspects
 from src.utils.publish_validation import (
@@ -856,23 +860,11 @@ def _seed_attributes_from_description(
 def classify_listing_profile(title: str, description: str = "", category_id: str = "") -> ListingProfile:
     title_text = _text_context(title)
     text = _text_context(title, description)
-    _OUTDOOR_MARKERS = ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "balcony", "porch")
-    outdoor_context = any(marker in text for marker in _OUTDOOR_MARKERS)
-    # A product the copy explicitly places indoors is not outdoor furniture just
-    # because one sentence names a balcony. Two upholstered storage benches sold
-    # "For Living Room, Entryway, Dormitory, Bedroom" were classified
-    # outdoor_daybed and re-categorised on live, because their copy ended with
-    # "or a leisure bench on the balcony" (2026-07-27). Mirrors the same guard in
-    # ebay_category_matcher; both paths run, so both need it.
-    names_indoor_room = any(
-        marker in text
-        for marker in (
-            "living room", "bedroom", "entryway", "dormitory", "dorm room",
-            "study", "home office", "hallway", "foyer", "nursery",
-        )
-    )
-    outdoor_in_title = any(marker in title_text for marker in _OUTDOOR_MARKERS)
-    outdoor_context_strict = outdoor_in_title if names_indoor_room else outdoor_context
+    outdoor_context = has_outdoor_marker(text)
+    # Shared with ebay_category_matcher via product_context_signals: one passing
+    # mention of a balcony must not outweigh four named indoor rooms. Both
+    # engines classify categories, so a guard fixed in only one leaves live wrong.
+    outdoor_context_strict = strict_outdoor_context(title_text, text)
     sofa_context = any(
         marker in title_text
         for marker in (
