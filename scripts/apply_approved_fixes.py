@@ -74,7 +74,10 @@ def check_guarded(rows: list[dict], allow_category: bool) -> None:
 
 
 def build_command(sku: str, fix_keys: list[str], apply: bool) -> list[str]:
-    cmd = [sys.executable, str(AUDIT), "--sku", sku, "--live"]
+    # --ignore-clean-freeze is not optional here: a listing fixed earlier gets
+    # frozen as "clean" and the audit then skips it entirely, so a scoped repair
+    # run silently finds nothing to do (2026-07-28, W3098P470268).
+    cmd = [sys.executable, str(AUDIT), "--sku", sku, "--live", "--ignore-clean-freeze"]
     for key in fix_keys:
         cmd += ["--fix-key", key]
     if apply:

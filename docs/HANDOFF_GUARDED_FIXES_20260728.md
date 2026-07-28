@@ -55,7 +55,12 @@ W5678,categoryId|categoryName,approved by <人名> 2026-07-28
 
 匹配器缺陷已修（`d69f684`）：描述里一句 "or a leisure bench on the balcony"
 压过了同一段明写的四个室内房间（Living Room / Entryway / Dormitory / Bedroom），
-叠加标题里的 "Bench Daybed" 就判成户外。修复后这两条正确归到 **Benches (262980)**。
+叠加标题里的 "Bench Daybed" 就判成户外。
+
+> ⚠️ 该判定在代码里有**两份独立实现**：`ebay_category_matcher.py` 和
+> `listing_quality_gate.classify_listing_profile`。上一轮只修了前者，
+> 而审计走的是后者，所以 live 上的错误类目当时依旧不报。两处现已都修
+> （`d69f684` + 本轮）。再遇到"改了匹配器却没生效"，先确认走的是哪条路径。
 
 第三行 `WF319383AAK` 是另一个情况：**live 是 139849，本地库是 79694，两者不一致**，
 下次审计还会继续报。本行的目的是让两边重新对齐。
@@ -65,13 +70,24 @@ W5678,categoryId|categoryName,approved by <人名> 2026-07-28
 PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/apply_approved_fixes.py logs/manifest_revert_categories.csv --allow-category
 ```
 
-dry-run 输出里逐条确认 **目标类目是 262980 Benches**（前两行）。确认后：
+dry-run 输出里逐条确认目标类目与下表一致：
+
+| SKU | 当前（错） | 目标 |
+|---|---|---|
+| W3098P470268 | 138996 Outdoor Daybeds | **262980 Benches** |
+| W3098P470275 | 138996 Outdoor Daybeds | **20490 Ottomans, Footstools & Poufs** |
+| WF319383AAK | live 139849 / db 79694 不一致 | 以审计判定为准 |
+
+> 两条的目标**不一样**——470275 的标题是 "Bed End Foot Stool"，审计判它是脚凳
+> 而非长凳。这是审计的真实判定，不是笔误。
+
+确认后：
 
 ```bash
 PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/apply_approved_fixes.py logs/manifest_revert_categories.csv --allow-category --apply
 ```
 
-> 🔴 dry-run 里如果前两行的目标**不是 262980**，说明匹配器还有问题 → 停止报告，不许 apply。
+> 🔴 dry-run 目标与上表任一行不符 → 停止报告，不许 apply。
 
 ### Step 2 — 补齐 A 档漏掉的 2 条组装标志
 
@@ -125,7 +141,7 @@ PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts
 ## 3. 红线（只能触发停止，执行方无权重新解释）
 
 - **绕过 `apply_approved_fixes.py` 直接 `--fix`** → 停止
-- Step 1 dry-run 目标类目不是 262980 → 停止
+- Step 1 dry-run 目标类目与第 2 节表格任一行不符 → 停止
 - Step 3 / Step 4 出现任何 live 写入 → 停止
 - 单批回滚 > 2 条 → 停止
 - 任何 end-listing / relist（必须原位更新 listing_id/offer_id）→ 停止
@@ -147,7 +163,7 @@ PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts
 - 验证描述看 **offer 的 `listingDescription`**，不是 inventory 那份（后者截断到 4000 字符）。
 - `EbayOAuthService()` 默认是 **SANDBOX**，生产一律传
   `os.getenv('EBAY_ENVIRONMENT','PRODUCTION')`，否则 401。
-- 测试基线 **2154 passed**：
+- 测试基线 **2158 passed**：
   `$env:PYTHONPATH='C:\Users\poonx\Dajian_Listing_Tool'; .\.venv\Scripts\python.exe -m pytest tests/ -q`
 
 ---

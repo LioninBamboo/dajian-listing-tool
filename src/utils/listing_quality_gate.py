@@ -856,9 +856,23 @@ def _seed_attributes_from_description(
 def classify_listing_profile(title: str, description: str = "", category_id: str = "") -> ListingProfile:
     title_text = _text_context(title)
     text = _text_context(title, description)
-    outdoor_context = any(
-        marker in text for marker in ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "balcony", "porch")
+    _OUTDOOR_MARKERS = ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "balcony", "porch")
+    outdoor_context = any(marker in text for marker in _OUTDOOR_MARKERS)
+    # A product the copy explicitly places indoors is not outdoor furniture just
+    # because one sentence names a balcony. Two upholstered storage benches sold
+    # "For Living Room, Entryway, Dormitory, Bedroom" were classified
+    # outdoor_daybed and re-categorised on live, because their copy ended with
+    # "or a leisure bench on the balcony" (2026-07-27). Mirrors the same guard in
+    # ebay_category_matcher; both paths run, so both need it.
+    names_indoor_room = any(
+        marker in text
+        for marker in (
+            "living room", "bedroom", "entryway", "dormitory", "dorm room",
+            "study", "home office", "hallway", "foyer", "nursery",
+        )
     )
+    outdoor_in_title = any(marker in title_text for marker in _OUTDOOR_MARKERS)
+    outdoor_context_strict = outdoor_in_title if names_indoor_room else outdoor_context
     sofa_context = any(
         marker in title_text
         for marker in (
@@ -1056,7 +1070,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
 
     if any(marker in title_text for marker in ("outdoor daybed", "patio daybed", "sunbed")) or (
         "daybed" in title_text
-        and outdoor_context
+        and outdoor_context_strict
         and "porch swing" not in title_text
         and "swing bed" not in title_text
         and not any(marker in title_text for marker in ("sofa", "couch", "loveseat", "sectional"))

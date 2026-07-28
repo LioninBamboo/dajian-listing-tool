@@ -1479,3 +1479,55 @@ class TestFoldableArbiterInflections:
     def test_folder_noun_not_false_positive(self):
         from src.utils.listing_quality_gate import source_supports_foldable
         assert source_supports_foldable(source_description="includes a paper folder organizer") is False
+
+
+class TestIndoorCopyBeatsAnIncidentalOutdoorMention:
+    """2026-07-27 live 误伤:两条软包储物凳被判 outdoor_daybed 并改到 138996。
+    源标题写明 For Living Room, Entryway, Dormitory, Bedroom,描述末尾一句
+    "or a leisure bench on the balcony" 就使 outdoor_context 成立,叠加标题里的
+    "Bench Daybed" 即命中。
+
+    注意:ebay_category_matcher 里有同一判定的第二份实现。上一轮只修了那份,
+    而审计走的是本函数,所以 live 上的错误类目依旧不报——两处都得修。"""
+
+    TITLE = (
+        '65.75" Wide Modern Upholstered Storage Bench With Double Lids, '
+        "Napped fabric Foot Stool With Rolled Armrest, Bench Daybed With Rubberwood Legs "
+        "For Living Room, Entryway, Dormitory, Bedroom"
+    )
+    DESC = "Use it as a temporary seat in the study, or a leisure bench on the balcony."
+
+    def test_indoor_bench_is_not_an_outdoor_daybed(self):
+        from src.utils.listing_quality_gate import classify_listing_profile
+
+        profile = classify_listing_profile(self.TITLE, self.DESC, "138996")
+        assert profile.kind != "outdoor_daybed"
+        assert profile.category_id != "138996"
+
+    def test_audit_would_now_report_the_mismatch(self):
+        from src.utils.listing_quality_gate import classify_listing_profile
+
+        profile = classify_listing_profile(self.TITLE, self.DESC, "138996")
+        assert profile.category_id and profile.category_id != "138996"
+
+    def test_genuine_outdoor_daybed_still_classified(self):
+        from src.utils.listing_quality_gate import classify_listing_profile
+
+        for title, desc in (
+            ("Patio Rattan Daybed with Canopy and Cushions", "Weather resistant wicker."),
+            ("Outdoor Daybed Round Rattan Sun Lounger", "Poolside lounging."),
+            ("Rattan Daybed with Canopy", "Perfect for the patio and poolside."),
+        ):
+            profile = classify_listing_profile(title, desc, "38204")
+            assert profile.kind == "outdoor_daybed", title
+            assert profile.category_id == "138996", title
+
+    def test_outdoor_word_in_title_wins_even_with_indoor_rooms(self):
+        from src.utils.listing_quality_gate import classify_listing_profile
+
+        profile = classify_listing_profile(
+            "Outdoor Patio Daybed with Canopy",
+            "Also works in the living room or bedroom.",
+            "38204",
+        )
+        assert profile.kind == "outdoor_daybed"
