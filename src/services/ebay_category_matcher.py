@@ -169,9 +169,29 @@ class EbayCategoryMatcher:
                 and not any(kw in text_lower for kw in ("cat ", "dog ", "pet ", "kitten", "puppy"))
             )
         )
+        # An indoor product that merely mentions one outdoor placement is not an
+        # outdoor product. "65.75\" Upholstered Storage Bench ... Bench Daybed ...
+        # For Living Room, Entryway, Dormitory, Bedroom" was moved to Outdoor
+        # Daybeds on live because the copy said "or a leisure bench on the
+        # balcony" — one incidental word outweighed four named indoor rooms
+        # (2026-07-27). Require the outdoor signal in the TITLE whenever the copy
+        # explicitly places the item indoors.
+        names_indoor_room = any(
+            kw in text_lower
+            for kw in (
+                "living room", "bedroom", "entryway", "dormitory", "dorm room",
+                "study", "home office", "hallway", "foyer", "nursery",
+            )
+        )
+        outdoor_in_title = any(
+            kw in title_lower
+            for kw in ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "balcony", "porch")
+        )
+        daybed_outdoor_signal = outdoor_in_title if names_indoor_room else has_outdoor_context
+
         has_outdoor_daybed = any(kw in title_lower for kw in ("outdoor daybed", "patio daybed", "sunbed")) or (
             "daybed" in title_lower
-            and has_outdoor_context
+            and daybed_outdoor_signal
             and not has_porch_swing
             and not any(kw in title_lower for kw in ("sofa", "couch", "loveseat", "sectional"))
         )

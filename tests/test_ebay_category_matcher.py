@@ -125,3 +125,35 @@ def test_real_cooler_products_are_still_detected():
             "79691",
             "Ice Chests & Coolers",
         ), title
+
+
+def test_indoor_bench_mentioning_a_balcony_is_not_an_outdoor_daybed():
+    """2026-07-27 live 误伤:两条软包储物凳被改判到 Outdoor Daybeds(138996)。
+    描述明写 For Living Room, Entryway, Dormitory, Bedroom,只因末尾一句
+    "or a leisure bench on the balcony" 触发 has_outdoor_context,叠加标题里的
+    "Bench Daybed" 就成立。一个顺带提到的摆放场所不该压过四个室内房间。"""
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    title = (
+        '65.75" Wide Modern Upholstered Storage Bench With Double Lids, '
+        "Napped fabric Foot Stool With Rolled Armrest, Bench Daybed With Rubberwood Legs"
+    )
+    description = (
+        "For Living Room, Entryway, Dormitory, Bedroom. Use it as a temporary seat "
+        "in the study, or a leisure bench on the balcony."
+    )
+
+    category_id, _ = matcher.canonicalize_category(title, "38204", "Benches", description)
+
+    assert category_id != "138996"
+    assert category_id == "262980"  # Benches
+
+
+def test_genuine_outdoor_daybeds_still_classified():
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    for title, description in (
+        ("Patio Rattan Daybed with Canopy and Cushions", "Weather resistant wicker for your garden."),
+        ("Outdoor Daybed Round Rattan Sun Lounger", "Poolside lounging all summer."),
+        ("Rattan Daybed with Canopy", "Perfect for the patio and poolside."),
+    ):
+        category_id, _ = matcher.canonicalize_category(title, "38204", "Benches", description)
+        assert category_id == "138996", title
