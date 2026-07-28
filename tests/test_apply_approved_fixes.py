@@ -121,3 +121,27 @@ class TestCommandConstruction:
         """The failure mode being prevented: `--fix` with no `--fix-key`."""
         cmd = aaf.build_command("W1", ["Assembly Required"], apply=True)
         assert "--fix-key" in cmd, "an apply command must always carry a key scope"
+
+
+class TestExitCodeSemantics:
+    """audit_fix_active_listings 的退出码是"发现的问题数",不是成败。
+    2026-07-28 执行方发现:runner 把非零当命令失败,于是每一行都"失败"、
+    第一条就停,整个清单形同虚设。--exit-zero-on-issues 把退出码还原成
+    真正的成败信号,真失败(异常/鉴权/abort)仍返回非零。"""
+
+    def test_command_always_neutralises_issue_count_exit_code(self):
+        for apply in (False, True):
+            cmd = aaf.build_command("W1", ["Assembly Required"], apply=apply)
+            assert "--exit-zero-on-issues" in cmd, (
+                "without this the runner aborts on any SKU that has findings"
+            )
+
+    def test_clean_freeze_is_always_ignored(self):
+        # 修过的 listing 会被冻结成 clean,审计直接跳过,定向修复静默无事可做
+        cmd = aaf.build_command("W1", ["categoryId"], apply=True)
+        assert "--ignore-clean-freeze" in cmd
+
+    def test_scoping_flags_survive_alongside_the_exit_code_flag(self):
+        cmd = aaf.build_command("W1", ["categoryId"], apply=True)
+        assert cmd.count("--fix-key") == 1
+        assert "--fix" in cmd and "--sku" in cmd
