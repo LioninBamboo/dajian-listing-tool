@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -85,6 +86,33 @@ def build_command(sku: str, fix_keys: list[str], apply: bool) -> list[str]:
     return cmd
 
 
+def _keys_not_offered(sku: str, requested: list[str]) -> list[str]:
+    """Which requested keys does the audit not actually offer for this SKU?
+
+    A manifest key that no fix generates is filtered to nothing and the run
+    reports success having changed exactly nothing — which is how three
+    dimension rows were recorded as applied while live never moved
+    (2026-07-28: the keys "Item Height"/"Item Width" do not exist; the real one
+    is "Product Dimensions", and these SKUs offered no dimension fix at all).
+    """
+    reports = sorted(
+        (ROOT / "logs").glob("listing_audit_fix_*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for report in reports[:5]:
+        try:
+            data = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        for item in data.get("issues", []):
+            if item.get("sku") != sku:
+                continue
+            offered = {str(k) for k in (item.get("fix_keys") or [])}
+            return [k for k in requested if k not in offered]
+    return []  # no report to check against; leave the run to its own exit code
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", help="CSV manifest: sku,fix_keys,note")
@@ -96,6 +124,16 @@ def main() -> int:
     )
     parser.add_argument("--stop-on-error", action="store_true", default=True)
     args = parser.parse_args()
+
+    # The audit's output carries the store footer (✦), emoji severity markers and
+    # Chinese summaries. On Windows both the subprocess decode AND this process's
+    # stdout default to cp936 and raise on them — the first silently lost the
+    # child's output, the second crashed mid-report (2026-07-28).
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # non-reconfigurable stream
+            pass
 
     rows = load_manifest(Path(args.manifest))
     check_guarded(rows, args.allow_category)
@@ -110,10 +148,27 @@ def main() -> int:
         sku, keys = row["sku"], row["fix_keys"]
         print(f"[{index}/{len(rows)}] {sku}  keys={keys}" + (f"  # {row['note']}" if row["note"] else ""))
         cmd = build_command(sku, keys, args.apply)
-        result = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
+        # encoding is explicit: the audit prints the store footer (✦) and Chinese
+        # summaries, and Windows' default cp936 decode raised inside subprocess's
+        # reader thread — the output was lost and every row still reported OK.
+        result = subprocess.run(
+            cmd, cwd=str(ROOT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+        )
         tail = (result.stdout or "").strip().splitlines()[-6:]
         for line in tail:
             print(f"      {line}")
+        unavailable = _keys_not_offered(sku, keys)
+        if unavailable:
+            failures += 1
+            print(f"      ! manifest names fix keys the audit does not offer: {unavailable}")
+            print(f"      ! nothing was applied for {sku} — fix the manifest, do not retry as-is")
+            if args.stop_on_error:
+                print(f"\n[STOP] {sku}: unusable manifest row.")
+                return 1
+            print()
+            continue
+
         if result.returncode != 0:
             failures += 1
             err = (result.stderr or "").strip().splitlines()[-4:]

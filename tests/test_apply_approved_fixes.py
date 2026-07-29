@@ -145,3 +145,40 @@ class TestExitCodeSemantics:
         cmd = aaf.build_command("W1", ["categoryId"], apply=True)
         assert cmd.count("--fix-key") == 1
         assert "--fix" in cmd and "--sku" in cmd
+
+
+class TestManifestKeysMustActuallyExist:
+    """2026-07-28:清单写了 "Item Height"/"Item Width",审计里没有这两个 key
+    (真名是 "Product Dimensions",而这几条压根没有尺寸修复项)。
+    filter_fixes_by_key 过滤成空,runner 报 "3 rows, 0 failures",
+    live 一个字节没动 —— 静默成功比失败更危险。"""
+
+    def _report(self, tmp_path, sku, fix_keys):
+        import json
+
+        logs = tmp_path / "logs"
+        logs.mkdir(exist_ok=True)
+        (logs / "listing_audit_fix_20260728_999999.json").write_text(
+            json.dumps({"issues": [{"sku": sku, "fix_keys": fix_keys}]}), encoding="utf-8"
+        )
+        return logs
+
+    def test_key_absent_from_audit_is_reported(self, tmp_path, monkeypatch):
+        self._report(tmp_path, "W1", ["Product Dimensions"])
+        monkeypatch.setattr(aaf, "ROOT", tmp_path)
+        assert aaf._keys_not_offered("W1", ["Item Height"]) == ["Item Height"]
+
+    def test_key_present_in_audit_passes(self, tmp_path, monkeypatch):
+        self._report(tmp_path, "W1", ["Product Dimensions", "Assembly Required"])
+        monkeypatch.setattr(aaf, "ROOT", tmp_path)
+        assert aaf._keys_not_offered("W1", ["Product Dimensions"]) == []
+
+    def test_sku_with_no_offered_fixes_rejects_every_key(self, tmp_path, monkeypatch):
+        self._report(tmp_path, "W1", [])
+        monkeypatch.setattr(aaf, "ROOT", tmp_path)
+        assert aaf._keys_not_offered("W1", ["Product Dimensions"]) == ["Product Dimensions"]
+
+    def test_no_report_available_does_not_block(self, tmp_path, monkeypatch):
+        (tmp_path / "logs").mkdir(exist_ok=True)
+        monkeypatch.setattr(aaf, "ROOT", tmp_path)
+        assert aaf._keys_not_offered("W1", ["Product Dimensions"]) == []
