@@ -260,6 +260,24 @@ def check_sku_against_fresh_source(conn, ebay_client, sku: str) -> list[dict]:
     return issues
 
 
+def build_clean_html(targets: list[dict]) -> str:
+    """Positive confirmation that new orders were checked and matched source."""
+    rows = "".join(
+        f"<tr><td>{t.get('order_id','')}</td><td>{t.get('sku','')}</td></tr>" for t in targets
+    )
+    return f"""
+    <h2>出单源复核 — 未发现问题</h2>
+    <p>本次复核了 <b>{len(targets)}</b> 个新订单，重抓源数据并与 live listing 声明比对，
+       未发现 CRITICAL 级不符。</p>
+    <table border="1" cellpadding="6" style="border-collapse:collapse;">
+      <tr><th>订单号</th><th>SKU</th></tr>{rows}
+    </table>
+    <p style="color:#999;font-size:12px;">来自 scripts/order_source_recheck.py —
+       这封"无问题"回执是刻意发送的：没有邮件应当只意味着没有新订单，
+       而不是复核跑失败了。</p>
+    """
+
+
 def build_alert_html(alerts: list[dict]) -> str:
     blocks = []
     for alert in alerts:
@@ -350,10 +368,24 @@ def main() -> int:
             )
             conn.commit()
 
-    if alerts and args.email and not args.dry_run:
+    # Mail on every order actually checked, not only on conflicts. Silence used
+    # to mean three different things — "checked, clean", "never checked", and
+    # "the task is broken" — and on 2026-07-27..29 three orders shipped with no
+    # mail at all: one run was skipped, another died on a DNS failure, and the
+    # clean one sent nothing by design. A clean run must be visibly clean.
+    if targets and args.email and not args.dry_run:
         from src.utils.email_sender import send_email
 
-        send_email(f"⚠ 出单源复核: {len(alerts)} 个订单的 listing 与源不符", build_alert_html(alerts))
+        if alerts:
+            send_email(
+                f"⚠ 出单源复核: {len(alerts)} 个订单的 listing 与源不符",
+                build_alert_html(alerts),
+            )
+        else:
+            send_email(
+                f"✅ 出单源复核: {len(targets)} 个新订单已复核，未发现与源不符",
+                build_clean_html(targets),
+            )
     elif alerts:
         print(f"{len(alerts)} critical alert(s) (email suppressed: use --email without --dry-run)")
 

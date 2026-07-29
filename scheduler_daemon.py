@@ -701,7 +701,12 @@ def task_order_recheck():
         'order_recheck',
         [
             str(PROJECT_ROOT / 'scripts' / 'order_source_recheck.py'),
-            '--hours-back', '8',
+            # Wider than the 6h cadence on purpose. A skipped run (2026-07-27
+            # 21:xx) and a DNS failure (2026-07-28 09:26) each left a ~12h gap,
+            # and an 8h lookback simply never saw the orders inside it. Rechecks
+            # are deduped by (order_id, sku), so a wide window costs one extra
+            # GetOrders page and re-examines nothing.
+            '--hours-back', '48',
             '--email',
         ],
         timeout_sec=TASK_TIMEOUT['order_recheck'],
@@ -1569,7 +1574,7 @@ def setup_schedule():
     logger.info("  10:55  源内容刷新 (source_content_refresh --email — 卖家漂移检测)")
     logger.info("  11:30  eBay/GIGA live listing 内容审计 (audit_fix_active_listings --live --email)")
     logger.info("  12:30  语义改写闭环 (semantic_rewrite --from-daily-audit --limit 40 --apply --email)")
-    logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 8 --email)")
+    logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 48 --email)")
     logger.info("  20:00  销售健康诊断 (health_check --auto-fix --email)")
     logger.info("  每 2h  自动分析 (daily_tasks.py --analyze-only)")
     logger.info("  每 6h  促销轮转 (auto_rotate_promotions.py)")

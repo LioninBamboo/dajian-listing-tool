@@ -261,3 +261,28 @@ def test_ensure_and_dedupe_recheck_table(recheck, db_conn):
     )
     db_conn.commit()
     assert recheck.already_checked(db_conn, "110001-000001", "W3636P456662")
+
+
+class TestCleanRunIsVisiblyClean:
+    """2026-07-27..29 出了 3 单,一封邮件都没收到。三个原因叠加:
+    一次调度漏跑、一次 DNS 失败、剩下那单干净所以按设计静默。
+    静默同时代表"查过没问题""从没查过""任务挂了",运营无法分辨。"""
+
+    def test_clean_html_lists_every_checked_order(self, recheck):
+        html = recheck.build_clean_html(
+            [
+                {"order_id": "06-14965-44302", "sku": "W2263P412380"},
+                {"order_id": "17-14946-06631", "sku": "W2699P504459"},
+            ]
+        )
+        assert "06-14965-44302" in html and "W2263P412380" in html
+        assert "17-14946-06631" in html and "W2699P504459" in html
+        assert "2" in html
+
+    def test_clean_html_states_no_conflict_found(self, recheck):
+        html = recheck.build_clean_html([{"order_id": "X", "sku": "Y"}])
+        assert "未发现" in html
+
+    def test_clean_html_handles_missing_fields(self, recheck):
+        html = recheck.build_clean_html([{}])
+        assert "<table" in html
