@@ -85,9 +85,26 @@
 
 ---
 
+## 3.5 汽配的"站点"层（重要概念，先厘清）
+
+eBay 把汽配归到独立站点 **eBay Motors US（SiteID = 100）**，它是"车辆与配件专站"，不是另一个国家——就是美国站，但和综合站 eBay.com US（SiteID = 0）是**两个站/两棵类目树**：
+
+| | 综合站 eBay.com US | **eBay Motors US** |
+|---|---|---|
+| SiteID | 0 | **100** |
+| 类目树 | 0 | **100** |
+| Marketplace（Sell API） | EBAY_US | EBAY_US（**没有可用的 EBAY_MOTORS_US marketplace**，见 gotcha 2） |
+| 汽配类目在这 | ❌（只有边缘的 Sporting Goods>Cycling 里几个） | ✅ 拖车钩33653/车顶架33651/… |
+
+**结论：真·汽配 listing 的站点必须是 eBay Motors（SiteID 100），只能用 Trading API 指定（`X-EBAY-API-SITEID: 100`）。** Inventory API 没有"站点"概念、只有 marketplaceId，进不了 Motors。
+
+⚠️ **当前 AquaRides 金丝雀 `188683585596` 不在 Motors** —— 它用的 `177849 Car & Truck Racks` 其实挂在综合站的 `Sporting Goods > Cycling` 下（GetItem 实证）。这只是"Inventory 通道下能凑合发的位置",**买拖车钩的人不会去自行车类目搜**。要进买家真正逛的汽配类目，走 §5 P0-A 的 Trading + SiteID 100。
+
+---
+
 ## 4. 关键技术发现 / 血泪 gotchas（务必先读）
 
-1. **汽配类目只在 eBay Motors 树（100），EBAY_US 树（0）没有**。`get_default_category_tree_id`：EBAY_US=0、EBAY_MOTORS_US=100。33653/33651 在树0 查 400。
+1. **汽配类目只在 eBay Motors 站/树（SiteID 100 / 树 100），综合站 EBAY_US（树 0）没有**。`get_default_category_tree_id`：EBAY_US=0、EBAY_MOTORS_US=100。33653/33651 在树0 查 400。见 §3.5。
 2. **`marketplace_id` ≠ `category_tree_id`**：Inventory offer 的 marketplaceId **必须 EBAY_US**（`EBAY_MOTORS_US` 报 errorId 2004 "Could not serialize field [marketplaceId]"）；Motors 是"目录"不是"市场"。
 3. **🔴Inventory API 发不了 Motors 类目**：offer 建得成，publish 报 **errorId 25005 "invalid category"**，即便带完整 fitment 也一样。主账号、AquaRides 都拒。3 月还能发（老 listing 262216/174020 为证），eBay 之后收紧了。
 4. **✅Trading API 能发 Motors**：`AddFixedPriceItem`（`X-EBAY-API-SITEID: 100`）接受 Motros 类目 + `ItemCompatibilityList`。**卡点是退货政策**：eBay Motors 配件(P&A)硬性要求**卖家承担退货运费**。
@@ -106,8 +123,8 @@
 
 ### 🔴 P0-A：Trading API 汽配刊登通道（汽配真正跑起来的前提，已实证可行）
 把已验证成功的 `AddFixedPriceItem`+`ItemCompatibilityList` 封装进管线：
-1. `real_ebay_client` 加 `add_fixed_price_item_motors(product, compatibility, policies, location)`（封装 §4.4 那套 XML；见 §6 字段清单）。
-2. `store_profile` 加 `listing_channel: inventory | trading`（汽配=trading）。
+1. `real_ebay_client` 加 `add_fixed_price_item_motors(...)`（封装 §6 那套 XML，**`X-EBAY-API-SITEID: 100` = eBay Motors 站**；见 §3.5）。
+2. `store_profile` 加 `listing_channel: inventory | trading`（汽配=trading）+ `ebay_site_id`（汽配=100/Motors，其余=0）。汽配实例配置改：`listing_channel: trading`、`ebay_site_id: "100"`、`category_tree_id: "100"`（现为 0 的临时凑合值）。
 3. `batch_publish` 按 channel 分流（家具/盲盒走 Inventory，汽配走 Trading）。
 4. 汽配用 Motors 退货政策 `262619354013`（回填 AquaRides 的 return policy）。
 5. Motros 类目重映射——**这次逐个实发验证**（拖车钩 33653、车顶架 33651、货筐 121984 或 262220、踏板 33650、尾门 33647/262150…；先查 taxonomy 建议再实发）。
