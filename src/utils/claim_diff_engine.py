@@ -108,7 +108,7 @@ FEATURE_SOURCE_PATTERNS: dict[str, tuple[str, ...]] = {
     "waterproof":      (r"\bwaterproof\b", r"\bwater\s*proof\b", r"防水"),
     # 2026-07-15: 补上误报的功能——源里有对应写法就不该判幻觉
     "led_lighting":    (r"\bled\b", r"\blight(?:ing|s|ed)?\b", r"\brgb\b", r"灯", r"led灯"),
-    "convertible":     (r"\bconvertible\b", r"\bsleeper\b", r"\bpull[\s-]*out\b", r"\bsofa\s*bed\b", r"\bfold[\s-]*out\b", r"\brecline", r"变形", r"两用"),
+    "convertible":     (r"\bconvertible\b", r"\bsleeper\b", r"\bpull[\s-]*out\b", r"\bsofa\s*bed\b", r"\bfold[\s-]*out\b", r"\b(?:2|3|two|three)[\s-]*in[\s-]*(?:1|one)\b", r"\brecline", r"变形", r"两用"),
     "massage":         (r"\bmassage\b", r"\bmassaging\b", r"按摩"),
     "heated":          (r"\bheated\b", r"\bheating\b", r"\bwarm(?:er|ing)?\b", r"加热", r"发热"),
     "removable_floor": (

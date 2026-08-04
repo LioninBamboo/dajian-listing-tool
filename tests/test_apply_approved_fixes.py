@@ -182,3 +182,32 @@ class TestManifestKeysMustActuallyExist:
         (tmp_path / "logs").mkdir(exist_ok=True)
         monkeypatch.setattr(aaf, "ROOT", tmp_path)
         assert aaf._keys_not_offered("W1", ["Product Dimensions"]) == []
+
+
+class TestApplyReportErrors:
+    def test_reported_fix_error_is_exposed_to_manifest_runner(self, tmp_path, monkeypatch):
+        import json
+
+        logs = tmp_path / "logs"
+        logs.mkdir(exist_ok=True)
+        (logs / "listing_audit_fix_20260803_999999.json").write_text(
+            json.dumps(
+                {
+                    "issues": [
+                        {
+                            "sku": "W1",
+                            "fixes_applied": [
+                                "Fixed Item Weight",
+                                "ERROR [W1]: inventory update failed",
+                            ],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(aaf, "ROOT", tmp_path)
+
+        assert aaf._apply_errors_for_sku("W1") == [
+            "ERROR [W1]: inventory update failed"
+        ]

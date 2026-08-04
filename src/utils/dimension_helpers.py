@@ -91,9 +91,9 @@ def extract_product_dimensions_from_text(text: str) -> Dict[str, Optional[float]
 
     contextual_patterns = [
         (
-            r'(?:product|overall|item)\s+dimensions?\s*[:：]?\s*'
-            r'(\d+\.?\d*)\s*(?:["”]|in(?:ches?)?)?\s*(?:\([lL]\))?\s*[x×]\s*'
-            r'(\d+\.?\d*)\s*(?:["”]|in(?:ches?)?)?\s*(?:\([wW]\))?\s*[x×]\s*'
+            r'(?:product|overall|item|luggage)\s+(?:dimensions?|size)\s*[:：]?\s*'
+            r'(\d+\.?\d*)\s*(?:["”]|in(?:ches?)?)?\s*(?:\([lL]\))?\s*[x×*]\s*'
+            r'(\d+\.?\d*)\s*(?:["”]|in(?:ches?)?)?\s*(?:\([wW]\))?\s*[x×*]\s*'
             r'(\d+\.?\d*)\s*(?:["”]|in(?:ches?)?)?\s*(?:\([hH]\))?'
         ),
         (
@@ -473,12 +473,15 @@ def replace_description_weight_placeholder_with_package_weight(
 def find_weight(attrs: Dict[str, Any]) -> Optional[float]:
     """Find product weight from attributes dict (tries multiple keys)."""
     weight_keys = [
+        # When a source record exposes both values, the explicitly labeled
+        # product/item weight is the sellable item's weight.  Overall Product
+        # Weight can be a supplier-level aggregate and must not shadow it.
+        'Product Weight (lbs.)',
+        'Product Weight',
         'Weight of Overrall Product',
         'Weight of Overall Product',
         'Overall Product Weight',
         'Overall Product Weight (with cushion)',
-        'Product Weight (lbs.)',
-        'Product Weight',
         'Net Weight',
         'Net  Weight',       # double-space variant
         'Overall Weight',

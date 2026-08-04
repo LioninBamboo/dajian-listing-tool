@@ -522,6 +522,8 @@ def test_fix_listing_uses_live_snapshot_as_fix_base(monkeypatch):
     assert any("Removed non-applicable aspect: Assembly Status" in item for item in results)
     assert "Assembly Status" not in captured["aspects"]
     assert captured["published_offer_id"] == "offer-1"
+    assert "Local DB updated" in results
+    assert not any("ERROR" in item for item in results)
 
     stored_opt = json.loads(
         conn.execute("SELECT optimization FROM collected_products WHERE sku = ?", ("SKU-LIVE",)).fetchone()[0]
@@ -897,6 +899,34 @@ def test_active_audit_flags_stale_live_video_when_source_has_no_video():
 
     assert any(issue["type"] == "stale_video" for issue in issues)
     assert fixes["__remove_video__"] is True
+
+
+def test_active_audit_does_not_require_unpublishable_source_video():
+    class FakeClient:
+        def get_inventory_item(self, sku):
+            return {"product": {"imageUrls": [], "videoIds": []}}
+
+    issues, fixes = audit_fix_active_listings.audit_single_product(
+        "SKU-UNSUPPORTED-VIDEO",
+        "Garden Planter",
+        "{}",
+        "{}",
+        json.dumps(
+            {
+                "title": "Garden Planter",
+                "description": "<div><h3>KEY FEATURES</h3><ul><li>Outdoor planter.</li></ul></div>",
+                "aspects": {},
+                "video_status": "UNSUPPORTED_SOURCE",
+            }
+        ),
+        "<div>Source description with an unusable video file.</div>",
+        ebay_client=FakeClient(),
+        images_raw="[]",
+        videos_raw=json.dumps(["https://example.test/too-small.mp4"]),
+    )
+
+    assert not any(issue["type"] == "missing_video" for issue in issues)
+    assert "__sync_video__" not in fixes
 
 
 def test_fix_listing_removes_stale_live_video_and_local_video_state(monkeypatch):
@@ -2138,6 +2168,28 @@ class TestSuspectSourceDimensionsGuard:
         assert "wrong_dimension" in issue_types
         assert fixes.get("Item Length") == ["71.0 in"]
 
+    def test_product_weight_mismatch_above_semantic_tolerance_is_fixed(self):
+        attrs = {
+            "Assembled Length (in.)": "77.56",
+            "Assembled Width (in.)": "42.52",
+            "Assembled Height (in.)": "43.31",
+            "Product Weight (lbs.)": "102.52",
+            "Overall Product Weight": "106.52",
+        }
+        aspects = {
+            "Item Length": ["77.6 in"],
+            "Item Width": ["42.5 in"],
+            "Item Height": ["43.3 in"],
+            "Item Weight": ["106.52 lbs"],
+        }
+
+        issues, fixes = self._run_audit(
+            attrs, {}, aspects, "Twin Low Loft Bed with Multi-storage Spaces"
+        )
+
+        assert any(issue["type"] == "wrong_weight" for issue in issues)
+        assert fixes["Item Weight"] == ["102.52 lbs"]
+
 
 class TestRawSourceDumpGuard:
     """2026-07-14 W6018 事故:原始中文源描述含英文 'KEY FEATURES' 字样,
@@ -2318,6 +2370,100 @@ def test_rebuild_description_from_source_verify_fail_does_not_push(monkeypatch):
     )
     assert any("failed verification" in r and r.startswith("ERROR") for r in results), results
     assert pushed["n"] == 0
+
+
+def test_semantic_rebuild_backup_uses_utf8_for_unicode_snapshot(monkeypatch, tmp_path):
+    """Semantic backups must not use Windows' GBK default encoding."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "logs").mkdir()
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    stored_opt = {"title": "Stored title", "description": "✦", "aspects": {}}
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        ("SKU-UNICODE", json.dumps(stored_opt, ensure_ascii=False)),
+    )
+    conn.commit()
+
+    class Snap:
+        title = "Solid Wood Storage Bench"
+        description_html = "<div>source</div>"
+        characteristics = ["Solid wood frame"]
+        attributes = {"Main Material": "Wood"}
+        specs = {}
+
+    class FakeClient:
+        def get_inventory_item(self, sku):
+            return {"product": {"title": "Live title", "description": "Live description", "aspects": {}}}
+
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "offer-1", "categoryId": "38208", "listing": {"listingId": "L1"}}]
+
+        def update_offer_category(self, offer_id, category_id, listing_description=None):
+            return True
+
+        def publish_offer(self, offer_id):
+            return {"listingId": "L1"}
+
+    monkeypatch.setattr("scripts.repair_broken_listings._dajian", lambda: object())
+    monkeypatch.setattr(
+        "scripts.repair_broken_listings.build_repair",
+        lambda *args, **kwargs: (
+            ("Solid Wood Storage Bench", "<div>AQUAVERVE KEY FEATURES ✦</div>", {"Material": ["Wood"]}, Snap()),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        "scripts.repair_broken_listings.verify",
+        lambda *args, **kwargs: {"claim_critical": 0, "markers_ok": True, "has_digits": True, "title_ok": True, "passed": True},
+    )
+    monkeypatch.setattr(
+        "src.utils.listing_fact_sheet.check_fact_sheet_violations",
+        lambda **kwargs: {
+            "status": "violations",
+            "violations": [
+                {
+                    "claim_type": "semantic_feature",
+                    "claim_text": "decorative",
+                    "severity": "MEDIUM",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(audit_fix_active_listings, "get_fact_sheet_conn", lambda: conn)
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "_put_inventory_product_only",
+        lambda ebay, sku, title, desc, aspects: (object(), desc, aspects),
+    )
+
+    product_row = {
+        "sku": "SKU-UNICODE",
+        "title": "Source title",
+        "description": "Source description",
+        "optimization": json.dumps(stored_opt, ensure_ascii=False),
+        "attributes": "{}",
+        "specs": "{}",
+        "images": "[]",
+        "price": 1,
+        "suggested_price": 1,
+        "listing_id": "L1",
+    }
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "SKU-UNICODE",
+        product_row,
+        {"__semantic_rebuild_from_source__": True},
+        FakeClient(),
+        conn,
+    )
+
+    assert not any("ERROR" in item for item in results), results
+    assert "Local DB updated" in results
+    assert any("non-blocking MEDIUM" in item for item in results)
+    backup = tmp_path / "logs" / "semantic_rewrite_backups" / "SKU-UNICODE.json"
+    assert "✦" in backup.read_text(encoding="utf-8")
 
 
 class TestPerfectForCopyNeverInventsBenefits:

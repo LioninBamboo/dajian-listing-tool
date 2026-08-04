@@ -1414,8 +1414,11 @@ def test_generation_and_publish_entrypoints_call_quality_gate():
         source = (ROOT / relative_path).read_text(encoding="utf-8-sig")
 
         assert "normalize_generated_listing" in source or "_normalize_generated_listing" in source
-        assert "validate_listing_quality" in source or "_validate_listing_quality" in source
-        assert "blocking_issue_messages" in source or "_quality_blocking_messages" in source
+        if relative_path in {"daily_tasks.py", "batch_publish.py"}:
+            assert "run_listing_qc" in source
+        else:
+            assert "validate_listing_quality" in source or "_validate_listing_quality" in source
+            assert "blocking_issue_messages" in source or "_quality_blocking_messages" in source
 
 
 def test_analysis_entrypoints_pass_shared_category_matcher():
@@ -1443,6 +1446,16 @@ class TestSofaAccessoryTableExclusion:
             "", "38204",
         )
         assert profile.kind != "sofa"
+
+    def test_side_table_with_room_couch_reference_is_a_table(self):
+        from src.utils.listing_quality_gate import classify_listing_profile
+        profile = classify_listing_profile(
+            '23" Mid-Century Side Table with Woven Shelf for Living Room Couch',
+            "", "38208",
+        )
+        assert profile.kind == "side_table"
+        assert profile.category_id == "38204"
+        assert profile.type_value == "End & Side Tables"
 
     def test_real_sofa_still_classified(self):
         from src.utils.listing_quality_gate import classify_listing_profile
@@ -1479,6 +1492,53 @@ class TestFoldableArbiterInflections:
     def test_folder_noun_not_false_positive(self):
         from src.utils.listing_quality_gate import source_supports_foldable
         assert source_supports_foldable(source_description="includes a paper folder organizer") is False
+
+    def test_cushion_will_not_collapse_is_not_foldable_evidence(self):
+        from src.utils.listing_quality_gate import source_supports_foldable
+        assert source_supports_foldable(
+            source_description="The high-density sponge cushion will not collapse after long-term sitting."
+        ) is False
+
+
+def test_bedside_table_profile_is_nightstand_not_side_table():
+    from src.utils.listing_quality_gate import classify_listing_profile
+
+    profile = classify_listing_profile(
+        'Set of 2 with 2 Drawers, 15.4" Modern Storage Bedside Table with Handles',
+        "Bedroom storage",
+        "38199",
+    )
+
+    assert profile.kind == "nightstand"
+    assert profile.category_id == "38199"
+
+
+def test_plain_ottoman_bench_is_not_invented_as_storage_ottoman():
+    from src.utils.listing_quality_gate import classify_listing_profile
+
+    profile = classify_listing_profile(
+        "Upholstered Ottoman Bench with Solid Wood Legs",
+        "A padded footrest and extra seat for the living room or bedroom.",
+        "20490",
+    )
+
+    assert profile.kind == "ottoman_bench"
+    assert profile.category_id == "20490"
+    assert profile.type_value == "Ottoman"
+
+
+def test_indoor_armchair_with_balcony_in_room_list_stays_indoor():
+    from src.utils.listing_quality_gate import classify_listing_profile
+
+    profile = classify_listing_profile(
+        "Foil Fabric Wood Armchair",
+        "Suitable for the living room, bedroom, office, or balcony.",
+        "38208",
+    )
+
+    assert profile.kind != "outdoor_chair"
+    assert profile.category_id != "79684"
+    assert profile.type_value == "Armchair"
 
 
 class TestIndoorCopyBeatsAnIncidentalOutdoorMention:

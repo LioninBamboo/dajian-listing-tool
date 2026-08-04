@@ -44,6 +44,10 @@ IDENTIFIER_PATTERNS = {
     "ean": r"(?:\d{8}|\d{13})",
     "isbn": r"(?:\d{9}[\dXx]|\d{13})",
 }
+# eBay US requires this exact substitute when a category requires a product
+# identifier but the product genuinely has none.
+# https://developer.ebay.com/api-docs/sell/static/inventory/product-identifier-text.html
+PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT = "Does not apply"
 
 
 def _first_text_value(value: Any) -> str:
@@ -84,7 +88,11 @@ def _sanitize_inventory_identifiers(
         raw_values = identifier if isinstance(identifier, list) else [identifier]
         valid_values: list[str] = []
         for raw_value in raw_values:
-            normalized = re.sub(r"[-\s]", "", str(raw_value or "").strip())
+            raw_text = str(raw_value or "").strip()
+            if raw_text.casefold() == PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT.casefold():
+                valid_values = [PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT]
+                break
+            normalized = re.sub(r"[-\s]", "", raw_text)
             if not normalized or normalized.upper() == str(sku or "").strip().upper():
                 continue
             if not re.fullmatch(pattern, normalized):

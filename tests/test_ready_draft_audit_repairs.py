@@ -101,3 +101,108 @@ def test_ready_draft_audit_seeds_measurement_normalization_with_repaired_aspects
     source = (ROOT / "scripts" / "audit_fix_ready_drafts.py").read_text(encoding="utf-8-sig")
     assert "seed_aspects = dict(opt.get(\"aspects\") or {})" in source
     assert "draft_desc,\n            seed_aspects," in source
+
+
+def test_rocking_egg_chair_keeps_rocking_type():
+    aspects = audit_fix_ready_drafts.normalize_semantic_aspects(
+        "Papasan Rocking Egg Chair Outdoor Rocker",
+        "79682",
+        {"Type": ["Hanging Chair"]},
+    )
+
+    assert aspects["Type"] == ["Rocking Chair"]
+
+
+def test_category_defaults_use_supported_upholstery_material_before_polyester():
+    aspects = audit_fix_ready_drafts.apply_category_defaults(
+        "38208",
+        {"Upholstery Material": ["Chenille"]},
+    )
+
+    assert aspects["Upholstery Fabric"] == ["Chenille"]
+
+
+def test_targeted_rocker_repair_removes_unsupported_assembly_and_hanging_type():
+    opt = {
+        "description": (
+            '<table><tr data-assembly-note="true"><td>Assembly Required</td>'
+            '<td>No - Ready for use without assembly.</td></tr></table>'
+        ),
+        "aspects": {"Type": ["Hanging Chair"], "Assembly Required": ["No"]},
+    }
+
+    audit_fix_ready_drafts.apply_targeted_copy_repairs("W2887P511377", opt)
+
+    assert opt["aspects"]["Type"] == ["Rocking Chair"]
+    assert "Assembly Required" not in opt["aspects"]
+    assert "assembly required" not in opt["description"].lower()
+
+
+def test_targeted_bench_repair_removes_collapse_wording_and_floor_standing():
+    opt = {
+        "description": "<li>The cushion will not collapse after long-term sitting.</li>",
+        "aspects": {"Features": ["Foldable"], "Mounting": ["Floor Standing"]},
+    }
+
+    audit_fix_ready_drafts.apply_targeted_copy_repairs("W5368P503714", opt)
+
+    assert "Foldable" not in opt["aspects"]["Features"]
+    assert "Mounting" not in opt["aspects"]
+    assert "collapse" not in opt["description"].lower()
+
+
+def test_targeted_nightstand_repair_uses_category_explicit_title():
+    opt = {
+        "title": 'Set of 2 with 2 Drawers, 15.4" Modern Storage Bedside Table with Handles',
+        "description": "<li>Two bedside tables in the supplier-listed Natural Wood color.</li>",
+        "aspects": {},
+    }
+
+    audit_fix_ready_drafts.apply_targeted_copy_repairs("W5368P460480", opt)
+
+    assert "Nightstands" in opt["title"]
+    assert len(opt["title"]) <= 80
+
+
+def test_targeted_game_table_repair_avoids_conflicted_material_sentence():
+    opt = {
+        "description": (
+            '<li style="margin-bottom:10px">Crafted from particle board, the gaming table '
+            "features a sturdy structure and long lasting durability.</li>"
+        ),
+        "aspects": {},
+    }
+
+    audit_fix_ready_drafts.apply_targeted_copy_repairs("W3393S00009", opt)
+
+    lowered = opt["description"].lower()
+    assert "particle board" not in lowered
+    assert "iron" not in lowered
+    assert "removable top" in lowered
+
+
+def test_targeted_ottoman_and_armchair_types_do_not_regress():
+    ottoman = {"aspects": {"Type": ["Storage Ottoman"]}}
+    armchair = {"aspects": {"Type": ["Outdoor Chair"], "Indoor/Outdoor": ["Outdoor"]}}
+
+    audit_fix_ready_drafts.apply_targeted_copy_repairs("W5368P517797", ottoman)
+    audit_fix_ready_drafts.apply_targeted_copy_repairs("W5568P506758", armchair)
+
+    assert ottoman["aspects"]["Type"] == ["Ottoman"]
+    assert armchair["aspects"]["Type"] == ["Armchair"]
+    assert armchair["aspects"]["Indoor/Outdoor"] == ["Indoor"]
+
+
+def test_targeted_trunk_repair_removes_unsupported_assembly_claim():
+    opt = {
+        "description": (
+            '<table><tr data-assembly-note="true"><td>Assembly Required</td>'
+            "<td>No</td></tr></table>"
+        ),
+        "aspects": {"Type": ["Trunk"], "Assembly Required": ["No"]},
+    }
+
+    audit_fix_ready_drafts.apply_targeted_copy_repairs("B2765P523551", opt)
+
+    assert "Assembly Required" not in opt["aspects"]
+    assert "assembly required" not in opt["description"].lower()

@@ -24,6 +24,7 @@ import queue as queue_module
 from src.utils.dimension_helpers import (
     extract_all_dimensions,
     extract_product_weight_from_text,
+    extract_product_dimensions_from_text,
     find_weight,
     find_dimension,
     # Called at the description-normalization step below but never imported, so

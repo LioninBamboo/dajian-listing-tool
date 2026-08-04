@@ -10,6 +10,7 @@ from src.utils.listing_fact_sheet import (
     compare_fact_sheets,
     fact_sheet_content_hash,
     fact_sheet_for_content,
+    get_fact_sheet_cache_record,
     get_cached_fact_sheet,
     lexical_materials,
     store_fact_sheet,
@@ -138,6 +139,125 @@ def test_dimension_within_tolerance_not_flagged():
     assert compare_fact_sheets(SOURCE_SHEET, live) == []
 
 
+def test_count_claim_present_in_source_copy_is_not_source_contradiction():
+    source = dict(SOURCE_SHEET, counts={"shelves": 6})
+    live = dict(SOURCE_SHEET, counts={"shelves": 3})
+
+    violations = compare_fact_sheets(
+        source,
+        live,
+        live_text="3 shelves",
+        source_text="3-TIER corner cabinet with six cubbies",
+    )
+
+    assert not any(v["claim_type"] == "semantic_count" for v in violations)
+
+
+def test_qualified_source_count_is_not_source_contradiction():
+    source = dict(SOURCE_SHEET, counts={"nets": 3})
+    live = dict(SOURCE_SHEET, counts={"nets": 1})
+
+    violations = compare_fact_sheets(
+        source,
+        live,
+        source_text="Complete set includes 1 main net and 2 side triangular nets",
+    )
+
+    assert not any(v["claim_type"] == "semantic_count" for v in violations)
+
+
+def test_check_fact_sheet_ignores_package_dimensions_for_item_semantics(monkeypatch):
+    monkeypatch.setenv("QWEN_API_KEY", "test")
+    monkeypatch.setenv("AUDIT_SEMANTIC_FACT_SHEET", "1")
+    source_with_package_dims = dict(
+        SOURCE_SHEET,
+        dimensions={"length": 29.1, "width": 7.0, "height": 16.9, "weight": 32.0},
+    )
+    source_without_item_dims = dict(SOURCE_SHEET, dimensions={})
+    live_item_dims = dict(
+        SOURCE_SHEET,
+        dimensions={"length": 19.7, "width": 22.0, "height": 37.5, "weight": None},
+    )
+    calls = []
+    descriptions = []
+
+    def fake_fact_sheet_for_content(conn, title, description, structured):
+        calls.append(dict(structured))
+        descriptions.append(description)
+        if len(calls) == 1:
+            return source_with_package_dims if any(
+                str(key).lower().startswith("package") for key in structured
+            ) else source_without_item_dims
+        return live_item_dims
+
+    monkeypatch.setattr(lfs, "fact_sheet_for_content", fake_fact_sheet_for_content)
+
+    result = lfs.check_fact_sheet_violations(
+        conn=object(),
+        source_title="Counter Stools",
+        source_description=(
+            "Two stools <ul><li>Package Length (in.): 29.1</li>"
+            "<li>Package Width (in.): 7</li></ul>"
+        ),
+        source_attributes={},
+        source_specs={
+            "Package Length (in.)": "29.1",
+            "Package Width (in.)": "7",
+            "Package Height (in.)": "16.9",
+            "Package Weight (lbs.)": "32",
+        },
+        candidate_title="Counter Stools",
+        candidate_description="19.7 x 22 x 37.5 in",
+        candidate_aspects={
+            "Item Length": ["19.7 in"],
+            "Item Width": ["22.0 in"],
+            "Item Height": ["37.5 in"],
+        },
+    )
+
+    assert result["status"] == "pass"
+    assert not any(str(key).lower().startswith("package") for key in calls[0])
+    assert "Package Length" not in descriptions[0]
+
+
+def test_check_fact_sheet_ignores_labeled_seat_height_for_item_semantics(monkeypatch):
+    monkeypatch.setenv("QWEN_API_KEY", "test")
+    monkeypatch.setenv("AUDIT_SEMANTIC_FACT_SHEET", "1")
+    source_with_seat_height = dict(SOURCE_SHEET, dimensions={"height": 26.0})
+    source_without_item_dims = dict(SOURCE_SHEET, dimensions={})
+    live_item_dims = dict(SOURCE_SHEET, dimensions={"height": 37.5})
+    titles = []
+    descriptions = []
+
+    def fake_fact_sheet_for_content(conn, title, description, structured):
+        titles.append(title)
+        descriptions.append(description)
+        if len(titles) == 1:
+            return (
+                source_with_seat_height
+                if "seat height" in f"{title} {description}".lower()
+                else source_without_item_dims
+            )
+        return live_item_dims
+
+    monkeypatch.setattr(lfs, "fact_sheet_for_content", fake_fact_sheet_for_content)
+
+    result = lfs.check_fact_sheet_violations(
+        conn=object(),
+        source_title="Swivel Counter Stools, 26 Inch Seat Height",
+        source_description="Two stools with a 26-inch seat height.",
+        source_attributes={},
+        source_specs={},
+        candidate_title="Swivel Counter Stools",
+        candidate_description="Overall height 37.5 in",
+        candidate_aspects={"Item Height": ["37.5 in"]},
+    )
+
+    assert result["status"] == "pass"
+    assert "Seat Height" not in titles[0]
+    assert "seat height" not in descriptions[0].lower()
+
+
 def test_identical_sheets_no_violations():
     assert compare_fact_sheets(SOURCE_SHEET, dict(SOURCE_SHEET)) == []
 
@@ -152,6 +272,12 @@ def test_four_season_unsupported_without_source_evidence():
     live = dict(SOURCE_SHEET, features=["4 season"])
     violations = compare_fact_sheets(SOURCE_SHEET, live)
     assert any(v["claim_type"] == "semantic_feature" and "4 season" in v["claim_text"] for v in violations)
+
+
+def test_hydraulic_adjustment_supports_adjustable_height():
+    source = dict(SOURCE_SHEET, features=["hydraulic adjustment"])
+    live = dict(SOURCE_SHEET, features=["adjustable height"])
+    assert compare_fact_sheets(source, live) == []
 
 
 def test_capacity_person_vs_seat_equivalent():
@@ -171,6 +297,17 @@ def test_capacity_above_source_range_flagged():
     live = dict(SOURCE_SHEET, capacity="10 person")
     violations = compare_fact_sheets(source, live)
     assert any(v["claim_type"] == "semantic_capacity" and v["severity"] == "CRITICAL" for v in violations)
+
+
+def test_explicit_source_bed_size_claim_suppresses_capacity_conflict():
+    """A source bed-size claim can conflict with a structured occupancy field."""
+    source = dict(SOURCE_SHEET, capacity="2 person")
+    live = dict(SOURCE_SHEET, capacity="twin size")
+    assert compare_fact_sheets(
+        source,
+        live,
+        source_text="Outdoor twin size swing bed",
+    ) == []
 
 
 def test_generic_fabric_backed_by_specific_source_material():
@@ -238,6 +375,50 @@ def test_cache_round_trip(cache_conn):
     assert get_cached_fact_sheet(cache_conn, key) == SOURCE_SHEET
 
 
+def test_cache_round_trip_records_current_versions_and_provenance(cache_conn):
+    key = fact_sheet_content_hash("T-provenance", "D", {})
+    store_fact_sheet(
+        cache_conn,
+        key,
+        SOURCE_SHEET,
+        source_kind="supplier_source",
+        model_status="extracted",
+    )
+
+    record = get_fact_sheet_cache_record(cache_conn, key)
+
+    assert record["sheet"] == SOURCE_SHEET
+    assert record["fact_sheet_version"] == lfs.FACT_SHEET_VERSION
+    assert record["ruleset_version"] == lfs.FACT_SHEET_RULESET_VERSION
+    assert record["source_kind"] == "supplier_source"
+    assert record["model_status"] == "extracted"
+
+
+def test_cache_ignores_records_from_an_old_ruleset(cache_conn, monkeypatch):
+    key = fact_sheet_content_hash("T-version", "D", {})
+    store_fact_sheet(cache_conn, key, SOURCE_SHEET)
+    monkeypatch.setattr(lfs, "FACT_SHEET_RULESET_VERSION", "fact-sheet-rules-v2")
+
+    assert get_cached_fact_sheet(cache_conn, key) is None
+
+
+def test_cache_migrates_legacy_table_without_treating_legacy_rows_as_current(cache_conn):
+    cache_conn.execute(
+        "CREATE TABLE fact_sheet_cache (content_hash TEXT PRIMARY KEY, sheet_json TEXT NOT NULL, created_at TEXT)"
+    )
+    key = fact_sheet_content_hash("T-legacy", "D", {})
+    cache_conn.execute(
+        "INSERT INTO fact_sheet_cache (content_hash, sheet_json) VALUES (?, ?)",
+        (key, json.dumps(SOURCE_SHEET)),
+    )
+    cache_conn.commit()
+
+    assert get_cached_fact_sheet(cache_conn, key) is None
+    store_fact_sheet(cache_conn, key, SOURCE_SHEET, source_kind="legacy-migrated")
+    record = get_fact_sheet_cache_record(cache_conn, key)
+    assert record["source_kind"] == "legacy-migrated"
+
+
 def test_fact_sheet_for_content_uses_cache(cache_conn, monkeypatch):
     key = fact_sheet_content_hash("T", "D", {"A": "1"})
     store_fact_sheet(cache_conn, key, SOURCE_SHEET)
@@ -259,6 +440,188 @@ def test_fact_sheet_for_content_extracts_and_stores_on_miss(cache_conn, monkeypa
     assert sheet["materials"] == ["600d oxford fabric"]
     key = fact_sheet_content_hash("T2", "D2", {})
     assert get_cached_fact_sheet(cache_conn, key) is not None
+
+
+def test_fact_sheet_for_content_uses_explicit_item_aspects_for_dimensions(cache_conn, monkeypatch):
+    extracted = dict(
+        SOURCE_SHEET,
+        dimensions={"length": 33.86, "width": 33.86, "height": 15.16, "weight": None},
+    )
+    monkeypatch.setattr(
+        "src.utils.listing_fact_sheet.extract_fact_sheet",
+        lambda *args, **kwargs: extracted,
+    )
+
+    sheet = fact_sheet_for_content(
+        cache_conn,
+        "Nesting Coffee Tables",
+        "33.86 x 18.9 x 15.16 in",
+        {
+            "Item Length": ["33.86 in"],
+            "Item Width": ["18.9 in"],
+            "Item Height": ["15.16 in"],
+        },
+    )
+
+    assert sheet["dimensions"] == {
+        "length": 33.86,
+        "width": 18.9,
+        "height": 15.16,
+        "weight": None,
+    }
+
+
+def test_fact_sheet_for_content_uses_assembled_source_dimensions_when_title_has_no_size(
+    cache_conn, monkeypatch
+):
+    extracted = dict(
+        SOURCE_SHEET,
+        dimensions={"length": 18.9, "width": 33.86, "height": 15.16, "weight": None},
+    )
+    monkeypatch.setattr(
+        "src.utils.listing_fact_sheet.extract_fact_sheet",
+        lambda *args, **kwargs: extracted,
+    )
+
+    sheet = fact_sheet_for_content(
+        cache_conn,
+        "Nesting Coffee Tables",
+        "33.86 x 18.9 x 15.16 in",
+        {
+            "Assembled Length (in.)": "33.86",
+            "Assembled Width (in.)": "18.90",
+            "Assembled Height (in.)": "15.16",
+        },
+    )
+
+    assert sheet["dimensions"]["length"] == 33.86
+    assert sheet["dimensions"]["width"] == 18.9
+
+
+def test_fact_sheet_for_content_keeps_conflicting_title_length_for_review(cache_conn, monkeypatch):
+    extracted = dict(
+        SOURCE_SHEET,
+        dimensions={"length": 100.0, "width": 91.34, "height": 34.65, "weight": None},
+    )
+    monkeypatch.setattr(
+        "src.utils.listing_fact_sheet.extract_fact_sheet",
+        lambda *args, **kwargs: extracted,
+    )
+
+    sheet = fact_sheet_for_content(
+        cache_conn,
+        "100-inch Dining Table",
+        "Large dining table",
+        {
+            "Assembled Length (in.)": "114.57",
+            "Assembled Width (in.)": "91.34",
+            "Assembled Height (in.)": "34.65",
+        },
+    )
+
+    assert sheet["dimensions"] == {
+        "length": 100.0,
+        "width": 91.34,
+        "height": 34.65,
+        "weight": None,
+    }
+
+
+def test_fact_sheet_for_content_uses_assembled_sofa_length_over_size_class_title(
+    cache_conn, monkeypatch
+):
+    extracted = dict(
+        SOURCE_SHEET,
+        dimensions={"length": 100.0, "width": 91.34, "height": 34.65, "weight": None},
+    )
+    monkeypatch.setattr(
+        "src.utils.listing_fact_sheet.extract_fact_sheet",
+        lambda *args, **kwargs: extracted,
+    )
+
+    sheet = fact_sheet_for_content(
+        cache_conn,
+        "100-inch Pull-Out Sofa",
+        "Large sectional sofa",
+        {
+            "Assembled Length (in.)": "114.57",
+            "Assembled Width (in.)": "91.34",
+            "Assembled Height (in.)": "34.65",
+        },
+    )
+
+    assert sheet["dimensions"]["length"] == 114.57
+
+
+def test_explicit_dimensions_normalize_hall_tree_source_axes():
+    values = lfs._explicit_fact_sheet_dimensions(
+        {
+            "Product Type": "Hall Tree",
+            "Assembled Length (in.)": "76.70",
+            "Assembled Width (in.)": "59.00",
+            "Assembled Height (in.)": "15.70",
+        },
+        "Hall Tree with Storage Bench",
+    )
+
+    assert values == {"length": 15.7, "width": 59.0, "height": 76.7}
+
+
+def test_explicit_dimensions_keep_hall_tree_title_height_axis():
+    values = lfs._explicit_fact_sheet_dimensions(
+        {
+            "Product Type": "Hall Tree",
+            "Assembled Length (in.)": "76.70",
+            "Assembled Width (in.)": "59.00",
+            "Assembled Height (in.)": "15.70",
+        },
+        'Farmhouse Wooden Hall Tree, 76.7"H',
+    )
+
+    assert values == {"length": 15.7, "width": 59.0, "height": 76.7}
+
+
+def test_zero_cached_source_counts_are_treated_as_missing():
+    source = dict(SOURCE_SHEET, counts={"shelves": 0, "drawers": 0})
+    live = dict(SOURCE_SHEET, counts={"shelves": 3, "drawers": 2})
+
+    violations = compare_fact_sheets(source, live)
+
+    assert not any(v["claim_type"] == "semantic_count" for v in violations)
+
+
+def test_explicit_zero_source_count_is_still_compared():
+    source = dict(SOURCE_SHEET, counts={"drawers": 0})
+    live = dict(SOURCE_SHEET, counts={"drawers": 2})
+
+    violations = compare_fact_sheets(source, live, source_text="The unit has 0 drawers.")
+
+    assert any(v["claim_type"] == "semantic_count" for v in violations)
+
+
+def test_structured_capacity_wins_over_conflicting_source_copy(monkeypatch):
+    monkeypatch.setenv("QWEN_API_KEY", "test")
+    monkeypatch.setenv("AUDIT_SEMANTIC_FACT_SHEET", "1")
+    calls = []
+
+    def fake_fact_sheet_for_content(conn, title, description, structured):
+        calls.append(dict(structured))
+        return dict(SOURCE_SHEET, capacity="5 person" if len(calls) == 1 else "4 person")
+
+    monkeypatch.setattr(lfs, "fact_sheet_for_content", fake_fact_sheet_for_content)
+
+    result = lfs.check_fact_sheet_violations(
+        conn=object(),
+        source_title="Modern Sectional Sofa",
+        source_description="The source copy says it can seat up to 5 people.",
+        source_attributes={"Seats": "4 Seat"},
+        source_specs={},
+        candidate_title="Modern Sectional Sofa",
+        candidate_description="The sectional offers generous seating space.",
+        candidate_aspects={"Seating Capacity": ["4"]},
+    )
+
+    assert result["status"] == "pass"
 
 
 def test_fact_sheet_for_content_returns_none_when_llm_fails(cache_conn, monkeypatch):
@@ -291,6 +654,19 @@ class TestGroundingGuard:
         live = {**self.BASE, "materials": ["foam"]}
         v = compare_fact_sheets(src, live, live_text="Comfortable cushioned sofa with wood legs")
         assert not any(x["claim_type"] == "semantic_material" for x in v)
+
+    def test_C_extractor_inferred_feature_not_in_live_text_suppressed(self):
+        # FactSheet may infer foldable from a swing/rope design, but an inferred
+        # feature is not a live claim unless it appears in copy or aspects.
+        src = self._src(["acacia wood"])
+        live = {**self.BASE, "features": ["foldable"]}
+        v = compare_fact_sheets(
+            src,
+            live,
+            live_text="Acacia wood swing bed with hanging ropes",
+            source_text="Acacia wood, two person seating group",
+        )
+        assert not any(x["claim_type"] == "semantic_feature" for x in v)
 
     def test_C_real_hallucination_in_live_text_still_flagged(self):
         # canvas 真在描述里、源是 rubberwood → 必须仍报(不可被 grounding 放过)

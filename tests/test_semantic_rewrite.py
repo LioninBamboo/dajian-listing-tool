@@ -322,6 +322,97 @@ def test_aspect_fix_count_sets_source_value():
     assert new_a.get("Number of Blades") == ["4"]
 
 
+def test_deterministic_count_guard_reads_explicit_source_tokens():
+    from src.services.semantic_rewrite import _deterministic_source_counts
+
+    counts = _deterministic_source_counts(
+        "Kids Table and Chair Set, 3-Piece Toddler Table",
+        "Includes 2 folding middle shelves and 2 drawers.",
+        {"Number of Drawers": "2 Drawers"},
+        {},
+    )
+    assert counts["piece"] == 3
+    assert counts["shelf"] == 2
+    assert counts["drawer"] == 2
+
+
+def test_deterministic_count_guard_reads_word_and_tier_shelf_counts():
+    from src.services.semantic_rewrite import _deterministic_source_counts
+
+    assert _deterministic_source_counts(
+        "Pantry Cabinet",
+        "This cabinet features three upper shelves and two drawers.",
+        {},
+        {},
+    )["shelf"] == 3
+    assert _deterministic_source_counts(
+        "Metal Loft Bed",
+        "Includes 4-tier open storage shelves and a built-in desk.",
+        {},
+        {},
+    )["shelf"] == 4
+
+
+def test_aspect_fix_material_removes_unlisted_materialish_keys():
+    aspects = {
+        "Material": ["Resin"],
+        "MaterialType": ["Metal"],
+        "Handle Material": ["Metal"],
+        "Battery": ["Yes"],
+        "Features": ["Comfort Foam Padded Top", "Assembly Required"],
+    }
+    violations = [
+        {
+            "claim_type": "semantic_material",
+            "claim_text": "metal",
+            "severity": "CRITICAL",
+        },
+        {
+            "claim_type": "semantic_material",
+            "claim_text": "foam",
+            "severity": "CRITICAL",
+        },
+    ]
+    new_a, _notes, human = apply_aspect_fixes(
+        aspects,
+        violations=violations,
+        source_attrs={"Main Material": "Resin"},
+        source_sheet={"materials": ["resin"]},
+        source_dims_trustworthy=True,
+        source_dims={},
+    )
+    assert new_a.get("Material") == ["Resin"]
+    assert "MaterialType" not in new_a
+    assert "Handle Material" not in new_a
+    assert "Battery" not in new_a
+    assert new_a.get("Features") == ["Assembly Required"]
+    assert not human
+
+
+def test_aspect_fix_compound_source_allows_matching_primary_secondary_cleanup():
+    aspects = {
+        "Material": ["Solid Wood+P2 MDF"],
+        "Handle Material": ["Metal"],
+    }
+    violations = [{
+        "claim_type": "semantic_material",
+        "claim_text": "metal",
+        "severity": "CRITICAL",
+    }]
+    new_a, notes, human = apply_aspect_fixes(
+        aspects,
+        violations=violations,
+        source_attrs={"Main Material": "Solid Wood+P2 MDF"},
+        source_sheet={"materials": ["solid wood", "p2 mdf"]},
+        source_dims_trustworthy=True,
+        source_dims={},
+    )
+    assert new_a.get("Material") == ["Solid Wood+P2 MDF"]
+    assert "Handle Material" not in new_a
+    assert not human
+    assert any("secondary cleanup only" in note for note in notes)
+
+
 def test_aspect_fix_feature_drops_unsupported_and_degrades_waterproof():
     aspects = {"Features": ["Waterproof", "Stove Jack"]}
     violations = [{"claim_type": "semantic_feature", "claim_text": "waterproof", "severity": "HIGH"}]
@@ -336,6 +427,27 @@ def test_aspect_fix_feature_drops_unsupported_and_degrades_waterproof():
     feats = [str(x).lower() for x in new_a.get("Features", [])]
     assert any("water resistant" in f for f in feats)
     assert not any(f == "waterproof" for f in feats)
+
+
+def test_aspect_fix_feature_drops_unlisted_high_claim():
+    aspects = {"Features": ["Adjustable", "Walk-In"]}
+    violations = [{
+        "claim_type": "semantic_feature",
+        "claim_text": "adjustable",
+        "severity": "HIGH",
+        "source_evidence": "four skylights, two shelves",
+    }]
+    new_a, _notes, human = apply_aspect_fixes(
+        aspects,
+        violations=violations,
+        source_attrs={},
+        source_sheet={"features": ["four skylights", "two shelves", "walk-in"]},
+        source_dims_trustworthy=True,
+        source_dims={},
+    )
+    assert "Adjustable" not in new_a.get("Features", [])
+    assert "Walk-In" in new_a.get("Features", [])
+    assert not human
 
 
 def test_aspect_fix_dimension_respects_suspect_guard():
@@ -541,6 +653,175 @@ def test_validation_fails_on_injected_unsupported_claim():
     assert result["passed"] is False or len(result["claim_critical"]) >= 0
     # quality gate fails (no KEY FEATURES template)
     assert result["quality_gate"]["has_key_features"] is False
+
+
+def test_validation_blocks_current_fact_sheet_critical(monkeypatch):
+    """The publish gate must use the same FactSheet guard as live audits."""
+    from src.utils import listing_fact_sheet as lfs
+
+    monkeypatch.setattr(lfs, "fact_sheet_for_content", lambda *a, **k: None)
+    monkeypatch.setattr(
+        lfs,
+        "check_fact_sheet_violations",
+        lambda **kwargs: {
+            "status": "violations",
+            "violations": [
+                {
+                    "claim_type": "semantic_material",
+                    "claim_text": "fabric",
+                    "severity": "CRITICAL",
+                    "source_evidence": "solid wood",
+                }
+            ],
+        },
+    )
+
+    result = validate_rewrite(
+        source_title="Solid Wood Table",
+        source_description="A solid wood table.",
+        source_attrs={"Main Material": "Solid Wood"},
+        source_specs={},
+        new_title="Solid Wood Table",
+        new_description=(
+            "<div><h3>KEY FEATURES</h3><ul><li>Solid wood table</li></ul>"
+            "<p>AQUAVERVE</p><p>Ships from US Warehouse</p></div>"
+        ),
+        new_aspects={"Upholstery Fabric": ["Fabric"]},
+        conn=_mem_db(),
+        source_sheet={"materials": ["solid wood"]},
+    )
+
+    assert any(
+        item.get("claim_text") == "fabric"
+        for item in result["fact_critical"]
+    )
+    assert result["passed"] is False
+
+
+def test_validation_blocks_when_current_fact_sheet_unavailable(monkeypatch):
+    """A semantic rewrite must not publish without the current guard result."""
+    from src.utils import listing_fact_sheet as lfs
+
+    monkeypatch.setattr(lfs, "fact_sheet_for_content", lambda *a, **k: None)
+    monkeypatch.setattr(
+        lfs,
+        "check_fact_sheet_violations",
+        lambda **kwargs: {
+            "status": "unavailable",
+            "violations": [],
+        },
+    )
+
+    result = validate_rewrite(
+        source_title="Solid Wood Table",
+        source_description="A solid wood table.",
+        source_attrs={"Main Material": "Solid Wood"},
+        source_specs={},
+        new_title="Solid Wood Table",
+        new_description=(
+            "<div><h3>KEY FEATURES</h3><ul><li>Solid wood table</li></ul>"
+            "<p>AQUAVERVE</p><p>Ships from US Warehouse</p></div>"
+        ),
+        new_aspects={"Material": ["Solid Wood"]},
+        conn=_mem_db(),
+        source_sheet={"materials": ["solid wood"]},
+    )
+
+    assert result["fact_unavailable"] is True
+    assert result["passed"] is False
+
+
+def test_plan_merges_current_guard_even_when_legacy_diff_exists(monkeypatch):
+    """Current live guard claims must reach the fixer even beside legacy claims."""
+    conn = _mem_db()
+    _insert_sku(
+        conn,
+        "SKU-MERGE",
+        title="Steel Chair",
+        attributes=json.dumps({"Main Material": "Steel"}),
+        optimization=json.dumps(
+            {
+                "title": "Steel Chair",
+                "description": "<div>Steel chair</div>",
+                "aspects": {
+                    "Material": ["Steel"],
+                    "Handle Material": ["Metal"],
+                },
+                "categoryId": "54235",
+            }
+        ),
+    )
+    snap = FakeSnapshot(
+        sku="SKU-MERGE",
+        title="Steel Chair",
+        description_html="<div><h3>Product Features</h3><ul><li>Steel chair</li></ul></div>",
+        attributes={"Main Material": "Steel"},
+    )
+    monkeypatch.setattr(sr, "_fetch_source_snapshot", lambda _d, _s: (snap, {}))
+    import src.services.source_refresh as sref
+
+    monkeypatch.setattr(sref, "refresh_skus", lambda *a, **k: {})
+
+    ebay = FakeEbay()
+    ebay.inventory["product"]["title"] = "Steel Chair"
+    ebay.inventory["product"]["description"] = "<div>Steel chair</div>"
+    ebay.inventory["product"]["aspects"] = {
+        "Material": ["Steel"],
+        "Handle Material": ["Metal"],
+    }
+    ebay.offers[0]["listingDescription"] = "<div>Steel chair</div>"
+
+    from src.utils import listing_fact_sheet as lfs
+
+    sheet = {
+        "materials": ["steel"],
+        "features": ["steel chair"],
+        "counts": {},
+        "capacity": None,
+        "certifications": [],
+        "dimensions": {"length": None, "width": None, "height": None, "weight": None},
+    }
+    monkeypatch.setattr(lfs, "fact_sheet_for_content", lambda *a, **k: sheet)
+    monkeypatch.setattr(
+        lfs,
+        "compare_fact_sheets",
+        lambda _source, _live: [{
+            "claim_type": "semantic_feature",
+            "claim_text": "legacy feature",
+            "severity": "MEDIUM",
+            "source_evidence": "steel chair",
+        }],
+    )
+    monkeypatch.setattr(
+        lfs,
+        "check_fact_sheet_violations",
+        lambda **kwargs: {
+            "status": "violations",
+            "violations": [{
+                "claim_type": "semantic_material",
+                "claim_text": "metal",
+                "severity": "CRITICAL",
+                "source_evidence": "steel",
+            }],
+        },
+    )
+    monkeypatch.setattr(
+        sr,
+        "validate_rewrite",
+        lambda **kwargs: {
+            "claim_critical": [],
+            "fact_critical": [],
+            "fact_blocking": [],
+            "fact_unavailable": False,
+            "quality_gate": {},
+            "passed": True,
+            "quality_gate_passed": True,
+        },
+    )
+
+    result = plan_rewrite(conn, FakeDajian(snap), ebay, "SKU-MERGE")
+    assert isinstance(result, RewritePlan), getattr(result, "reason", result)
+    assert "Handle Material" not in result.after["aspects"]
 
 
 # ── W3636-style end-to-end simulation ───────────────────────────────────

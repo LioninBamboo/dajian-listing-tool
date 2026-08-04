@@ -100,6 +100,7 @@ _CERT_PATTERNS = (
 )
 
 _COUNT_NOUN_ASPECTS = {
+    "piece": ("Number of Pieces", "Number of Items in Set"),
     "tier": ("Number of Tiers", "Number of Shelves"),
     "shelf": ("Number of Shelves", "Number of Tiers"),
     "drawer": ("Number of Drawers",),
@@ -108,6 +109,21 @@ _COUNT_NOUN_ASPECTS = {
     "blade": ("Number of Blades",),
     "nozzle": ("Number of Nozzles",),
     "wheel": ("Number of Wheels",),
+}
+
+_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
 }
 
 
@@ -534,10 +550,27 @@ def _is_simple_material_value(raw: str) -> bool:
     text = re.sub(r"\s+", " ", (raw or "").strip())
     if not text or len(text) > 40:
         return False
-    if re.search(r"[,;/|]| and | or ", text, re.I):
+    if re.search(r"[+,;/|]| and | or ", text, re.I):
         primary, _entry = lookup_compound_material_primary(text)
         return bool(primary)
     return True
+
+
+def _material_signature(raw: object) -> str:
+    """Normalize a material value for exact primary-material comparisons."""
+    return re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
+
+
+def _is_materialish_aspect_key(key: object) -> bool:
+    """Whether an aspect key can introduce a material-family claim."""
+    text = re.sub(r"\s+", " ", str(key or "").strip().lower())
+    return (
+        text in _MATERIAL_ASPECT_KEYS
+        or text.startswith("material")
+        or bool(re.search(r"\bmaterial\b|fabric|filler|filling|foam|wood\s*type", text))
+        or "steel tube" in text
+        or text in {"battery", "battery type", "battery included"}
+    )
 
 
 def resolve_material_value(raw: str) -> str:
@@ -549,7 +582,7 @@ def resolve_material_value(raw: str) -> str:
     text = re.sub(r"\s+", " ", (raw or "").strip())
     if not text:
         return ""
-    if re.search(r"[,;/|]| and | or ", text, re.I):
+    if re.search(r"[+,;/|]| and | or ", text, re.I):
         primary, _entry = lookup_compound_material_primary(text)
         if primary:
             return primary
@@ -765,10 +798,22 @@ def apply_aspect_fixes(
         if not main and source_sheet.get("materials"):
             main = str(source_sheet["materials"][0])
         if main and not _is_simple_material_value(main):
-            # Compound materials (e.g. "Polyester,rubber Wood") → human
-            # (unless curated compound_material_map resolves primary — then simple)
-            needs_human.append("semantic_material_compound")
-            notes.append(f"semantic_material: compound source value kept for human: {main!r}")
+            # Compound materials (e.g. "Polyester,rubber Wood") normally stay
+            # human-gated.  A narrow exception is safe secondary cleanup when
+            # the live primary Material already exactly matches the compound
+            # source value; no primary-material judgment is then required.
+            live_primary = [
+                _material_signature(v)
+                for v in _aspect_list(new_aspects.get("Material"))
+            ]
+            if _material_signature(main) and _material_signature(main) in live_primary:
+                notes.append(
+                    "semantic_material: compound source matches live primary; "
+                    "secondary cleanup only"
+                )
+            else:
+                needs_human.append("semantic_material_compound")
+                notes.append(f"semantic_material: compound source value kept for human: {main!r}")
         elif main:
             resolved = resolve_material_value(main)
             label = _normalize_material_label(resolved)
@@ -779,12 +824,20 @@ def apply_aspect_fixes(
                 )
             else:
                 notes.append(f"semantic_material: Material ← {label}")
-        # Drop unsupported material-type aspects — never drop required/protected
-        drop_keys = set(_MATERIAL_ASPECT_KEYS) - {"material"} - protected
+        # Drop unsupported material-type aspects — never drop required/protected.
+        # Some eBay aspect names are not in the curated set (e.g. MaterialType,
+        # Handle Material, Battery, or Dia of Steel Tube) but still create a
+        # material-family claim in the live FactSheet audit.
+        materialish_keys = {
+            str(k).lower()
+            for k in new_aspects
+            if _is_materialish_aspect_key(k)
+        }
+        drop_keys = materialish_keys - {"material"} - protected
         # For protected material-ish keys that are still present: replace with source value
         for k in list(new_aspects.keys()):
             kl = str(k).lower()
-            if kl in protected and kl in _MATERIAL_ASPECT_KEYS and kl != "material":
+            if kl in protected and _is_materialish_aspect_key(k) and kl != "material":
                 src = _source_upholstery_or_material(source_attrs, source_sheet)
                 if src and _is_simple_material_value(src):
                     resolved_src = resolve_material_value(src)
@@ -797,6 +850,38 @@ def apply_aspect_fixes(
             _set_aspect(new_aspects, "Material", _normalize_material_label(resolved))
         if removed:
             notes.append(f"semantic_material: removed aspects {removed}")
+
+        # Material claims can also hide inside generic feature values (for
+        # example ``Comfort Foam Padded Top``).  Remove only values that
+        # contain a blocked material token with no matching source evidence;
+        # source-backed feature copy remains untouched.
+        source_material_blob = " ".join(
+            [
+                *(str(v) for v in (source_attrs or {}).values()),
+                *(str(v) for v in (source_sheet or {}).get("materials") or []),
+                *(str(v) for v in (source_sheet or {}).get("features") or []),
+            ]
+        ).lower()
+        material_claims = [
+            str(v.get("claim_text") or "").lower()
+            for v in violations
+            if v.get("claim_type") == "semantic_material"
+        ]
+        for key, value in list(new_aspects.items()):
+            if str(key).lower() != "features":
+                continue
+            kept = []
+            for item in _aspect_list(value):
+                item_l = item.lower()
+                blocked = any(
+                    claim and claim in item_l and claim not in source_material_blob
+                    for claim in material_claims
+                )
+                if blocked:
+                    notes.append(f"semantic_material: removed unsupported feature {item!r}")
+                    continue
+                kept.append(item)
+            _set_aspect(new_aspects, key, kept if kept else None)
 
     # semantic_capacity
     if "semantic_capacity" in types_seen:
@@ -873,6 +958,12 @@ def apply_aspect_fixes(
     if "semantic_feature" in types_seen:
         source_features = {str(f).lower() for f in (source_sheet or {}).get("features") or []}
         source_blob = " ".join(source_features)
+        high_feature_claims = [
+            str(v.get("claim_text") or "").strip().lower()
+            for v in violations
+            if v.get("claim_type") == "semantic_feature"
+            and str(v.get("severity") or "").upper() in {"CRITICAL", "HIGH"}
+        ]
         for key, val in list(new_aspects.items()):
             if str(key).lower() != "features":
                 continue
@@ -883,6 +974,14 @@ def apply_aspect_fixes(
                 if "waterproof" in il and "water resistant" in source_blob and "waterproof" not in source_blob:
                     kept.append("Water Resistant")
                     notes.append("semantic_feature: waterproof → Water Resistant")
+                    continue
+                if any(
+                    claim
+                    and claim in il
+                    and claim not in source_blob
+                    for claim in high_feature_claims
+                ):
+                    notes.append(f"semantic_feature: drop Features item {item!r}")
                     continue
                 # drop if clearly unsupported high-risk and not in source
                 if any(tok in il for tok in ("waterproof", "usb", "bluetooth", "foldable", "collapsible")):
@@ -994,6 +1093,12 @@ def validate_rewrite(
     result: dict[str, Any] = {
         "claim_critical": [],
         "fact_critical": [],
+        # ``fact_blocking`` mirrors the live audit's CRITICAL/HIGH semantic
+        # guard.  Keep ``fact_critical`` as the public CRITICAL-only view for
+        # existing reports, but make the publish decision from the complete
+        # blocking set.
+        "fact_blocking": [],
+        "fact_unavailable": False,
         "quality_gate": {},
         "passed": False,
     }
@@ -1017,35 +1122,60 @@ def validate_rewrite(
         if getattr(v, "severity", "") == "CRITICAL"
     ]
 
-    # Layer 2: fact sheet diff (new content vs source)
-    if conn is not None and source_sheet is not None:
+    # Layer 2: use the same semantic FactSheet guard as the live audit.
+    #
+    # The previous implementation called the legacy two-sheet comparison
+    # directly.  That allowed a rewrite to pass its own validation while the
+    # daily audit still found a CRITICAL claim (for example, a fabricated
+    # upholstery fabric).  The current guard is authoritative for this layer;
+    # its unavailable state is also fail-closed because publishing without a
+    # semantic check is not safe.
+    if conn is not None:
         try:
-            from src.utils.listing_fact_sheet import compare_fact_sheets, fact_sheet_for_content
-
-            new_sheet = fact_sheet_for_content(
-                conn,
-                new_title or "",
-                new_description or "",
-                structured={"aspects": dict(new_aspects or {}), "attributes": dict(source_attrs or {})},
+            from src.utils.listing_fact_sheet import (
+                check_fact_sheet_violations,
             )
-            if new_sheet:
-                _strip = lambda h: re.sub(r"<[^>]+>", " ", str(h or ""))
-                _live_text = " ".join((
-                    new_title or "", _strip(new_description),
-                    " ".join(f"{k}: {v}" for k, v in (new_aspects or {}).items()),
-                ))
-                _source_text = " ".join((
-                    source_title or "", _strip(source_description),
-                    " ".join(f"{k}: {v}" for k, v in (source_attrs or {}).items()),
-                ))
-                diffs = compare_fact_sheets(
-                    source_sheet, new_sheet, live_text=_live_text, source_text=_source_text
-                )
-                result["fact_critical"] = [d for d in diffs if d.get("severity") == "CRITICAL"]
+
+            current = check_fact_sheet_violations(
+                conn=conn,
+                source_title=source_title or "",
+                source_description=source_description or "",
+                source_attributes=dict(source_attrs or {}),
+                source_specs=dict(source_specs or {}),
+                candidate_title=new_title or "",
+                candidate_description=new_description or "",
+                candidate_aspects=dict(new_aspects or {}),
+            ) or {}
+            current_status = str(current.get("status") or "unavailable").lower()
+            current_violations = [
+                dict(item)
+                for item in (current.get("violations") or [])
+                if isinstance(item, Mapping)
+            ]
+
+            if current_status == "violations":
+                result["fact_critical"] = [
+                    item for item in current_violations
+                    if str(item.get("severity") or "").upper() == "CRITICAL"
+                ]
+                result["fact_blocking"] = [
+                    item for item in current_violations
+                    if str(item.get("severity") or "").upper() in {"CRITICAL", "HIGH"}
+                ]
+                result["fact_note"] = "current FactSheet guard"
+            elif current_status == "pass":
+                result["fact_note"] = "current FactSheet guard passed"
             else:
-                result["fact_note"] = "fact_sheet_for_content returned None (skipped layer 2)"
+                result["fact_unavailable"] = True
+                result["fact_note"] = "current FactSheet guard unavailable"
+
+            if current_status not in {"violations", "pass"}:
+                # Do not fall back to a legacy comparison: it is not the same
+                # gate used by the live audit and cannot make this publishable.
+                result["fact_note"] += "; legacy comparison not authoritative"
         except Exception as exc:
-            result["fact_note"] = f"fact sheet layer error: {exc}"
+            result["fact_unavailable"] = True
+            result["fact_note"] = f"current FactSheet guard error: {exc}"
 
     # Layer 3: quality gate markers
     from src.utils.store_profile import get_store_profile
@@ -1103,7 +1233,10 @@ def validate_rewrite(
         "semantic_material: Material ←" in note for note in (applied_notes or [])
     )
     non_material_claim = [c for c in result["claim_critical"] if not _is_material(c)]
-    non_material_fact = [f for f in result["fact_critical"] if not _is_material(f)]
+    non_material_fact = [
+        f for f in (result.get("fact_blocking") or result["fact_critical"])
+        if not _is_material(f)
+    ]
     result["material_accepted"] = bool(
         material_resolved_from_source
         and (len(non_material_claim) < len(result["claim_critical"])
@@ -1112,12 +1245,16 @@ def validate_rewrite(
 
     if material_resolved_from_source:
         result["passed"] = (
-            len(non_material_claim) == 0 and len(non_material_fact) == 0 and qg_ok
+            len(non_material_claim) == 0
+            and len(non_material_fact) == 0
+            and not result["fact_unavailable"]
+            and qg_ok
         )
     else:
         result["passed"] = (
             len(result["claim_critical"]) == 0
-            and len(result["fact_critical"]) == 0
+            and len(result.get("fact_blocking") or result["fact_critical"]) == 0
+            and not result["fact_unavailable"]
             and qg_ok
         )
     return result
@@ -1239,6 +1376,78 @@ def _source_dims(attrs: Mapping[str, Any], specs: Mapping[str, Any]) -> dict[str
         return {}
 
 
+def _deterministic_source_counts(
+    title: str,
+    description: str,
+    attrs: Mapping[str, Any],
+    specs: Mapping[str, Any],
+) -> dict[str, int]:
+    """Extract only explicit source counts for the count repair table.
+
+    The LLM FactSheet extractor is intentionally a verification layer, but it
+    can miss a plainly stated ``3-Piece``/``2 Drawers`` claim on one pass.  A
+    deterministic source token is safe to use for the corresponding numeric
+    aspect and prevents a planner from treating a known count mismatch as a
+    no-op.  Ambiguous prose (for example a generic "storage shelves") is
+    ignored.
+    """
+    text_parts = [str(title or ""), _strip_html(description or "")]
+    for key, value in {**dict(attrs or {}), **dict(specs or {})}.items():
+        text_parts.append(f"{key}: {value}")
+    text = " ".join(text_parts)
+    counts: dict[str, int] = {}
+
+    count_token = r"(?:\d+|" + "|".join(_COUNT_WORDS) + r")"
+    patterns = {
+        "piece": rf"\b({count_token})\s*[- ]?pieces?\b",
+        "shelf": rf"\b({count_token})(?:-[a-z]+)?\s+(?:[a-z-]+\s+){{0,4}}shelves?\b",
+        "drawer": rf"\b({count_token})\s+drawers?\b",
+        "door": rf"\b({count_token})\s*[- ]?doors?\b",
+        "blade": rf"\b({count_token})\s*[- ]?blades?\b",
+        "wheel": rf"\b({count_token})\s*[- ]?wheels?\b",
+        "seat": rf"\b({count_token})\s*[- ]?seats?\b",
+    }
+
+    def _count_value(raw: str) -> int:
+        token = str(raw or "").casefold()
+        return _COUNT_WORDS[token] if token in _COUNT_WORDS else int(token)
+
+    for noun, pattern in patterns.items():
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            counts[noun] = _count_value(match.group(1))
+
+    # Prefer explicit structured source fields over title/description tokens.
+    for key, value in {**dict(attrs or {}), **dict(specs or {})}.items():
+        key_l = str(key or "").lower()
+        match = re.search(r"(?<!\d)(\d+)(?:\.0+)?", str(value or ""))
+        if not match:
+            continue
+        number = int(match.group(1))
+        for noun, labels in (
+            ("shelf", ("shelf", "tier")),
+            ("drawer", ("drawer",)),
+            ("door", ("door",)),
+            ("blade", ("blade",)),
+            ("wheel", ("wheel",)),
+            ("seat", ("seat",)),
+            ("piece", ("piece", "item", "quantity")),
+        ):
+            if any(label in key_l for label in labels):
+                counts[noun] = number
+                break
+    return counts
+
+
+def _current_count(aspects: Mapping[str, Any], aspect_keys: tuple[str, ...]) -> int | None:
+    for key in aspect_keys:
+        raw = _first_aspect(aspects, key)
+        match = re.search(r"(?<!\d)(\d+)(?:\.0+)?", raw)
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def plan_rewrite(conn, dajian, ebay, sku: str) -> RewritePlan | SkipResult:
     """Build a pushable or blocked rewrite plan. Never writes eBay or collected_products."""
     sku = str(sku or "").strip()
@@ -1311,7 +1520,11 @@ def plan_rewrite(conn, dajian, ebay, sku: str) -> RewritePlan | SkipResult:
     live_sheet = None
     violations: list[dict[str, Any]] = []
     try:
-        from src.utils.listing_fact_sheet import compare_fact_sheets, fact_sheet_for_content
+        from src.utils.listing_fact_sheet import (
+            check_fact_sheet_violations,
+            compare_fact_sheets,
+            fact_sheet_for_content,
+        )
 
         source_sheet = fact_sheet_for_content(
             conn,
@@ -1327,6 +1540,86 @@ def plan_rewrite(conn, dajian, ebay, sku: str) -> RewritePlan | SkipResult:
         )
         if source_sheet and live_sheet:
             violations = compare_fact_sheets(source_sheet, live_sheet)
+
+        # The daily live audit uses the unified guard below, not just the
+        # legacy sheet diff above.  Always feed current CRITICAL/HIGH claims
+        # into the repair table before generating the candidate; otherwise a
+        # listing can have a legacy MEDIUM diff while the current guard has a
+        # material/count violation that the fixer never sees.
+        try:
+            current_before = check_fact_sheet_violations(
+                conn=conn,
+                source_title=source_title,
+                source_description=source_desc,
+                source_attributes=source_attrs,
+                source_specs=source_specs,
+                candidate_title=before_title,
+                candidate_description=before_desc,
+                candidate_aspects=before_aspects,
+            ) or {}
+        except Exception:
+            # A supplementary guard failure must not discard legacy violations
+            # that were already extracted and remain actionable.
+            current_before = {}
+        if str(current_before.get("status") or "").lower() == "violations":
+            existing_keys = {
+                (
+                    str(item.get("claim_type") or ""),
+                    str(item.get("claim_text") or "").casefold(),
+                    str(item.get("severity") or "").upper(),
+                )
+                for item in violations
+                if isinstance(item, Mapping)
+            }
+            for item in current_before.get("violations") or []:
+                if not isinstance(item, Mapping):
+                    continue
+                severity = str(item.get("severity") or "").upper()
+                if severity not in {"CRITICAL", "HIGH"}:
+                    continue
+                key = (
+                    str(item.get("claim_type") or ""),
+                    str(item.get("claim_text") or "").casefold(),
+                    severity,
+                )
+                if key not in existing_keys:
+                    violations.append(dict(item))
+                    existing_keys.add(key)
+
+        # Deterministic count reconciliation supplements (never replaces) the
+        # FactSheet result.  This covers explicit source phrases that the LLM
+        # extractor may omit on a particular pass.
+        source_counts = _deterministic_source_counts(
+            source_title,
+            source_desc,
+            source_attrs,
+            source_specs,
+        )
+        if source_counts:
+            source_sheet = dict(source_sheet or {})
+            merged_counts = dict(source_sheet.get("counts") or {})
+            merged_counts.update(source_counts)
+            source_sheet["counts"] = merged_counts
+            for noun, source_count in source_counts.items():
+                aspect_keys = _COUNT_NOUN_ASPECTS.get(noun) or ()
+                current_count = _current_count(before_aspects, aspect_keys)
+                if current_count is None or current_count == source_count:
+                    continue
+                claim = f"{current_count} {noun}s (source: {source_count})"
+                if not any(
+                    str(item.get("claim_type") or "") == "semantic_count"
+                    and str(item.get("claim_text") or "").casefold() == claim.casefold()
+                    for item in violations
+                    if isinstance(item, Mapping)
+                ):
+                    violations.append(
+                        {
+                            "claim_type": "semantic_count",
+                            "claim_text": claim,
+                            "severity": "CRITICAL",
+                            "source_evidence": str(source_count),
+                        }
+                    )
     except Exception as exc:
         violations = []
         # continue — claim engine still used in validation
@@ -1494,6 +1787,10 @@ def plan_rewrite(conn, dajian, ebay, sku: str) -> RewritePlan | SkipResult:
             "specs": source_specs,
             "characteristics": characteristics,
             "sku_available": sku_available,
+            # Preserve the exact sheet used during planning so the final
+            # required-aspect guard cannot silently produce a different
+            # candidate immediately before the live write.
+            "fact_sheet": source_sheet,
         },
     )
     return plan
@@ -1552,12 +1849,13 @@ def apply_rewrite(ebay, conn, plan: RewritePlan, *, cli_apply: bool = False) -> 
     aspects = copy.deepcopy(plan.after.get("aspects") or {})
     category_id = plan.after.get("category_id") or plan.before.get("category_id")
     # Final required-aspect guard before push
+    planned_aspects = copy.deepcopy(aspects)
     aspects, _, req_human = protect_and_fill_required_aspects(
         aspects,
         category_id=str(category_id or ""),
         title=title,
         source_attrs=(plan.source or {}).get("attributes") or {},
-        source_sheet=None,
+        source_sheet=(plan.source or {}).get("fact_sheet"),
         before_aspects=plan.before.get("aspects") or {},
     )
     if req_human:
@@ -1565,6 +1863,18 @@ def apply_rewrite(ebay, conn, plan: RewritePlan, *, cli_apply: bool = False) -> 
             ok=False,
             sku=plan.sku,
             reason=f"apply_blocked_required_missing: {req_human}",
+            backup_path=str(backup_path),
+            stage="required_guard",
+        )
+    if aspects != planned_aspects:
+        # Required-aspect protection is allowed to run as a final safety
+        # check, but any mutation after validation would invalidate the
+        # current FactSheet result.  Re-plan instead of publishing an
+        # unvalidated candidate.
+        return ApplyResult(
+            ok=False,
+            sku=plan.sku,
+            reason="apply_blocked_aspects_changed_after_validation",
             backup_path=str(backup_path),
             stage="required_guard",
         )

@@ -88,6 +88,14 @@ logger = logging.getLogger(__name__)
 def _utcnow_naive() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
+
+def _open_listing_qc_connection():
+    """Open the local connection used by the semantic pre-publish guard."""
+    import sqlite3
+
+    return sqlite3.connect(str(PROJECT_ROOT / "ebay_collection.db"), timeout=30)
+
+
 SMART_REPRICE_RUN_DAYS = {0, 3}  # Monday / Thursday
 SMART_REPRICE_RUN_DAY_LABELS = "周一、周四"
 
@@ -104,11 +112,8 @@ def analyze_collected_products(
     from src.services.pricing_engine import PricingEngine
     from sqlalchemy.orm.attributes import flag_modified
     from qwen_optimizer import QwenOptimizer, optimize_product_full_with_timeout
-    from src.utils.listing_quality_gate import (
-        blocking_issue_messages,
-        normalize_generated_listing,
-        validate_listing_quality,
-    )
+    from src.utils.listing_quality_gate import normalize_generated_listing
+    from src.services.listing_qc import run_listing_qc
 
     normalized_statuses = tuple(
         str(status).strip().upper() for status in eligible_statuses if str(status).strip()
@@ -128,12 +133,20 @@ def analyze_collected_products(
     logger.info("="*60)
     
     db = SessionLocal()
+    fact_sheet_conn = None
     try:
         QWEN_KEY = os.getenv("QWEN_API_KEY")
         
         if not QWEN_KEY:
             logger.error("QWEN_API_KEY 未设置")
             return {'success': 0, 'failed': 0, 'error': 'QWEN_API_KEY 未设置'}
+
+        try:
+            fact_sheet_conn = _open_listing_qc_connection()
+        except Exception as fact_conn_error:
+            # The shared gate will classify candidates as unavailable rather
+            # than silently skipping the semantic check.
+            logger.warning(f"FactSheet connection unavailable: {fact_conn_error}")
         
         qwen = QwenOptimizer(api_key=QWEN_KEY)
         
@@ -186,45 +199,60 @@ def analyze_collected_products(
                 except Exception as mi_err:
                     logger.warning(f"  ⚠️ Market intel failed: {mi_err}")
                 
-                opt_data = optimize_product_full_with_timeout(
-                    api_key=QWEN_KEY,
-                    original_title=product.title,
-                    original_description=product.description or '',
-                    attributes=attributes,
-                    specs=specs,
-                    images=product.images or [],
-                    market_intel=market_intel
-                )
-                if draft_origin == MI_DRAFT_ORIGIN:
-                    opt_data = apply_mi_draft_origin(
-                        opt_data,
-                        detected_at=_utcnow_naive().isoformat(),
+                max_retries = 2
+                previous_errors = None
+                for attempt in range(max_retries):
+                    opt_data = optimize_product_full_with_timeout(
+                        api_key=QWEN_KEY,
+                        original_title=product.title,
+                        original_description=product.description or '',
+                        attributes=attributes,
+                        specs=specs,
+                        images=product.images or [],
+                        market_intel=market_intel,
+                        previous_errors=previous_errors
                     )
-                opt_data = normalize_generated_listing(
-                    opt_data,
-                    source_title=product.title,
-                    source_description=product.description or '',
-                    attributes=attributes,
-                    specs=specs,
-                    images=product.images or [],
-                    videos=product.videos or [],
-                    category_matcher=CATEGORY_MATCHER,
-                )
-                quality_issues = validate_listing_quality(
-                    opt_data,
-                    source_title=product.title,
-                    source_description=product.description or '',
-                    attributes=attributes,
-                    specs=specs,
-                    images=product.images or [],
-                    videos=product.videos or [],
-                    category_matcher=CATEGORY_MATCHER,
-                )
-                blockers = blocking_issue_messages(quality_issues)
-                if blockers:
-                    raise ValueError("Listing quality gate failed: " + "; ".join(blockers[:8]))
+                    if draft_origin == MI_DRAFT_ORIGIN:
+                        opt_data = apply_mi_draft_origin(
+                            opt_data,
+                            detected_at=_utcnow_naive().isoformat(),
+                        )
+                    opt_data = normalize_generated_listing(
+                        opt_data,
+                        source_title=product.title,
+                        source_description=product.description or '',
+                        attributes=attributes,
+                        specs=specs,
+                        images=product.images or [],
+                        videos=product.videos or [],
+                        category_matcher=CATEGORY_MATCHER,
+                    )
+                    qc_result = run_listing_qc(
+                        sku=product.sku,
+                        candidate=opt_data,
+                        source_title=product.title,
+                        source_description=product.description or '',
+                        source_attributes=attributes,
+                        source_specs=specs,
+                        images=product.images or [],
+                        videos=product.videos or [],
+                        category_matcher=CATEGORY_MATCHER,
+                        fact_sheet_conn=fact_sheet_conn,
+                    )
+                    blockers = qc_result["blockers"]
+                    
+                    if not blockers:
+                        break  # Passed gate
+                        
+                    is_pure_missing_measurement = all("missing measurement aspect" in b for b in blockers)
+                    if is_pure_missing_measurement or attempt == max_retries - 1:
+                        raise ValueError("Listing QC failed: " + "; ".join(blockers[:8]))
+                        
+                    logger.warning(f"  ⚠️ Quality gate failed, retrying ({attempt+1}/{max_retries-1}). Errors: {blockers}")
+                    previous_errors = blockers
                 
                 # 3. 保存
+                opt_data["_listing_qc"] = qc_result
                 product.optimization = opt_data
                 product.cost_breakdown = dajian_costs
                 product.suggested_price = safe_price['selling_price']
@@ -268,6 +296,8 @@ def analyze_collected_products(
             'prepared_skus': prepared_skus,
         }
     finally:
+        if fact_sheet_conn is not None:
+            fact_sheet_conn.close()
         db.close()
 
 

@@ -29,10 +29,9 @@ from src.utils.publish_autofix import sanitize_placeholder_aspects
 from src.utils.report_images import normalize_image_list
 from src.utils.publish_validation import first_aspect_text, measurement_issue
 from src.utils.listing_quality_gate import (
-    blocking_issue_messages,
     normalize_generated_listing,
-    validate_listing_quality,
 )
+from src.services.listing_qc import run_listing_qc
 from src.utils.title_sanitizer import sanitize_listing_title
 
 DB_PATH = ROOT / "ebay_collection.db"
@@ -169,6 +168,98 @@ DIMENSION_IMAGE_NOTES = {
 }
 
 TARGETED_COPY_REPAIRS = {
+    "B2765P523551": {
+        "aspects_remove": ["Assembly Required"],
+        "description_subs": [{
+            "pattern": r'(?is)<tr[^>]*data-assembly-note="true"[^>]*>.*?</tr>',
+            "repl": "",
+            "note": "removed unsupported assembly row from trunk copy",
+        }],
+    },
+    "W2887P511374": {
+        "aspects_set": {"Type": "Rocking Chair"},
+        "aspects_remove": ["Assembly Required"],
+        "description_subs": [
+            {
+                "pattern": r'(?is)<tr[^>]*data-assembly-note="true"[^>]*>.*?</tr>',
+                "repl": "",
+                "note": "removed unsupported assembly row from rocker copy",
+            },
+            {
+                "pattern": r"(?i)fits your body curve perfectly to make you sink in and release all muscle tension after long hours of work\.?",
+                "repl": "provides full-body cushioned support for everyday seating.",
+                "note": "removed unsupported muscle-tension benefit wording",
+            },
+            {
+                "pattern": r"(?i)helps you calm down and melt away daily fatigue slowly\.?",
+                "repl": "supports gentle rocking for everyday relaxation.",
+                "note": "removed unsupported fatigue-reduction wording",
+            },
+        ],
+    },
+    "W2887P511377": {
+        "aspects_set": {"Type": "Rocking Chair"},
+        "aspects_remove": ["Assembly Required"],
+        "description_subs": [
+            {"pattern": r'(?is)<tr[^>]*data-assembly-note="true"[^>]*>.*?</tr>', "repl": "", "note": "removed unsupported assembly row from rocker copy"},
+            {"pattern": r"(?i)fits your body curve perfectly to make you sink in and release all muscle tension after long hours of work\.?", "repl": "provides full-body cushioned support for everyday seating.", "note": "removed unsupported muscle-tension benefit wording"},
+            {"pattern": r"(?i)helps you calm down and melt away daily fatigue slowly\.?", "repl": "supports gentle rocking for everyday relaxation.", "note": "removed unsupported fatigue-reduction wording"},
+        ],
+    },
+    "W2887P511379": {
+        "aspects_set": {"Type": "Rocking Chair"},
+        "aspects_remove": ["Assembly Required"],
+        "description_subs": [
+            {"pattern": r'(?is)<tr[^>]*data-assembly-note="true"[^>]*>.*?</tr>', "repl": "", "note": "removed unsupported assembly row from rocker copy"},
+            {"pattern": r"(?i)fits your body curve perfectly to make you sink in and release all muscle tension after long hours of work\.?", "repl": "provides full-body cushioned support for everyday seating.", "note": "removed unsupported muscle-tension benefit wording"},
+            {"pattern": r"(?i)helps you calm down and melt away daily fatigue slowly\.?", "repl": "supports gentle rocking for everyday relaxation.", "note": "removed unsupported fatigue-reduction wording"},
+        ],
+    },
+    "W2887P511381": {
+        "aspects_set": {"Type": "Rocking Chair"},
+        "aspects_remove": ["Assembly Required"],
+        "description_subs": [
+            {"pattern": r'(?is)<tr[^>]*data-assembly-note="true"[^>]*>.*?</tr>', "repl": "", "note": "removed unsupported assembly row from rocker copy"},
+            {"pattern": r"(?i)fits your body curve perfectly to make you sink in and release all muscle tension after long hours of work\.?", "repl": "provides full-body cushioned support for everyday seating.", "note": "removed unsupported muscle-tension benefit wording"},
+            {"pattern": r"(?i)helps you calm down and melt away daily fatigue slowly\.?", "repl": "supports gentle rocking for everyday relaxation.", "note": "removed unsupported fatigue-reduction wording"},
+        ],
+    },
+    "W3835P484072": {
+        "aspects_set": {"Upholstery Fabric": "Chenille", "Indoor/Outdoor": "Indoor"},
+        "aspects_remove": ["Mounting", "Leg Style"],
+    },
+    "W5568P524450": {"aspects_set": {"Upholstery Fabric": "Fabric"}},
+    "W5568P524830": {"aspects_set": {"Upholstery Fabric": "Fabric"}},
+    "W5568P524834": {"aspects_set": {"Upholstery Fabric": "Fabric"}},
+    "W5368P517797": {"aspects_set": {"Type": "Ottoman"}},
+    "W5568P506758": {
+        "aspects_set": {"Type": "Armchair", "Indoor/Outdoor": "Indoor"},
+    },
+    "W5368P503714": {
+        "features_remove": ["Foldable"],
+        "aspects_remove": ["Mounting"],
+        "description_subs": [{
+            "pattern": r"(?i)will not collapse after long-term sitting",
+            "repl": "is designed to retain its shape during everyday seating",
+            "note": "removed collapse wording that was misread as foldable",
+        }],
+    },
+    "W5368P460480": {
+        "title": "Set of 2 Modern Nightstands with 2 Drawers, Natural Wood Color, Bedroom Storage",
+        "aspects_remove": ["Mounting Type"],
+        "description_subs": [{
+            "pattern": r"(?i)natural wood-tone bedside tables",
+            "repl": "bedside tables in the supplier-listed Natural Wood color",
+            "note": "clarified Natural Wood as a color rather than solid-wood material",
+        }],
+    },
+    "W3393S00009": {
+        "description_subs": [{
+            "pattern": r"(?is)<li[^>]*>\s*Crafted from particle board.*?</li>",
+            "repl": '<li style="margin-bottom:10px">Gaming and Dining Use: The removable top switches between dining and gaming configurations, with an included game mat.</li>',
+            "note": "removed material sentence from supplier-conflicted game-table copy",
+        }],
+    },
     "N707S185531B": {
         "features_remove": ["Foldable"],
         "description_subs": [
@@ -326,6 +417,15 @@ def apply_targeted_copy_repairs(sku: str, opt: dict):
             notes.append(f"title -> {desired_title}")
 
     aspects = dict(opt.get("aspects") or {})
+    for key in repairs.get("aspects_remove") or []:
+        if key in aspects:
+            aspects.pop(key, None)
+            notes.append(f"removed aspect: {key}")
+    for key, value in (repairs.get("aspects_set") or {}).items():
+        desired = ensure_list_value(value)
+        if aspects.get(key) != desired:
+            aspects[key] = desired
+            notes.append(f"{key} -> {', '.join(desired)}")
     features = ensure_list_value(aspects.get("Features"))
     if repairs.get("features_keep") is not None:
         desired_features = [str(value).strip() for value in repairs.get("features_keep") or [] if str(value).strip()]
@@ -685,6 +785,12 @@ def apply_category_defaults(category_id, aspects):
         if aspects.get(key):
             continue
         default = defaults.get(key)
+        if key == "Upholstery Fabric":
+            supported_upholstery = first_aspect_value(aspects, "Upholstery Material")
+            if supported_upholstery and supported_upholstery.lower() not in {
+                "does not apply", "not applicable", "n/a", "unknown"
+            }:
+                default = supported_upholstery
         if default is not None:
             aspects[key] = ensure_list_value(default)
     return aspects
@@ -712,7 +818,9 @@ def normalize_semantic_aspects(title, category_id, aspects):
         token in title_lower for token in ("sofa", "couch", "loveseat", "sectional", "futon", "recliner")
     )
 
-    if any(token in title_lower for token in ("egg chair", "hanging egg chair", "hanging swing chair", "swing chair")):
+    if any(token in title_lower for token in ("rocking chair", "rocker")):
+        set_aspect_value(aspects, "Type", "Rocking Chair")
+    elif any(token in title_lower for token in ("egg chair", "hanging egg chair", "hanging swing chair", "swing chair")):
         set_aspect_value(aspects, "Type", "Hanging Chair")
         if str(category_id) == "79682" and not first_aspect_value(aspects, "Room"):
             set_aspect_value(aspects, "Room", "Outdoor")
@@ -794,6 +902,7 @@ def audit_and_fix_ready_drafts(
         "changed": [],
         "unresolved": [],
         "marked_ready": [],
+        "qc_results": [],
     }
 
     for row in rows:
@@ -926,18 +1035,21 @@ def audit_and_fix_ready_drafts(
             unresolved["missing_measurements"] = missing_measurements
         if len(normalized_images) <= 1:
             unresolved["image_count"] = len(normalized_images)
-        quality_blockers = blocking_issue_messages(
-            validate_listing_quality(
-                opt,
-                source_title=source_title,
-                source_description=row["description"] or "",
-                attributes=attrs,
-                specs=specs,
-                images=normalized_images,
-                videos=original_videos,
-                category_matcher=matcher,
-            )
+        qc_result = run_listing_qc(
+            sku=sku,
+            candidate=opt,
+            source_title=source_title,
+            source_description=row["description"] or "",
+            source_attributes=attrs,
+            source_specs=specs,
+            images=normalized_images,
+            videos=original_videos,
+            category_matcher=matcher,
+            fact_sheet_conn=conn,
         )
+        quality_blockers = list(qc_result["blockers"])
+        report["qc_results"].append(qc_result)
+
         if quality_blockers:
             unresolved["quality_gate"] = quality_blockers
         if unresolved:

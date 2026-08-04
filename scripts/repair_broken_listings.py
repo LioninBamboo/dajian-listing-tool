@@ -12,6 +12,7 @@ Usage:
   python scripts/repair_broken_listings.py --sku-file logs/repair_queue.txt --apply
 """
 import argparse
+import copy
 import io
 import json
 import os
@@ -44,6 +45,7 @@ from scripts.audit_fix_active_listings import (  # noqa: E402
 from src.services.source_refresh import build_source_snapshot  # noqa: E402
 from src.utils.title_sanitizer import normalize_listing_title_for_ebay  # noqa: E402
 from src.utils.claim_diff_engine import build_source_constraints, detect_claim_violations  # noqa: E402
+from src.utils.dimension_helpers import find_dimension, find_weight  # noqa: E402
 from src.utils.store_profile import get_store_profile  # noqa: E402
 
 _PROFILE = get_store_profile()
@@ -55,6 +57,119 @@ TEMPLATE_MARKERS = (_BRAND_UPPER, _PROFILE.brand_tagline, "KEY FEATURES",
 _ACRONYMS = {"mdf": "MDF", "pu": "PU", "pvc": "PVC", "led": "LED", "abs": "ABS",
              "hdpe": "HDPE", "tv": "TV", "usb": "USB", "pe": "PE", "pp": "PP",
              "eva": "EVA", "mgo": "MGO"}
+
+
+def _claim_tokens(value: object) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(value or "").lower())
+        if token not in {"a", "an", "and", "for", "in", "of", "or", "the", "to", "with"}
+    }
+
+
+def _claim_matches_value(claim: object, value: object) -> bool:
+    claim_tokens = _claim_tokens(claim)
+    value_tokens = _claim_tokens(value)
+    return bool(claim_tokens) and claim_tokens <= value_tokens
+
+
+def _aspect_values(value: object) -> list[str]:
+    values = value if isinstance(value, list) else [value]
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def reconcile_semantic_aspects(
+    aspects: dict,
+    snap,
+    violations: list[dict] | None = None,
+) -> dict:
+    """Remove stale semantic claims before rebuilding source-faithful copy.
+
+    The live optimizer can retain old aspects after a source refresh. A
+    description rebuilt from GIGA is not enough if those aspects are then
+    reused to generate the package/specification sections. This helper only
+    changes fields implicated by the current FactSheet violations and uses an
+    explicit source upholstery value when one is available.
+    """
+    out = copy.deepcopy(aspects or {})
+    violations = violations or []
+    material_claims = [
+        str(v.get("claim_text") or "").strip()
+        for v in violations
+        if v.get("claim_type") == "semantic_material"
+    ]
+    feature_claims = [
+        str(v.get("claim_text") or "").strip()
+        for v in violations
+        if v.get("claim_type") == "semantic_feature"
+    ]
+    has_capacity_violation = any(
+        v.get("claim_type") == "semantic_capacity" for v in violations
+    )
+    source_attrs = dict(getattr(snap, "attributes", {}) or {})
+    source_upholstery = str(
+        source_attrs.get("Upholstery Material")
+        or source_attrs.get("Upholstery Fabric")
+        or ""
+    ).strip()
+    material_key_fragments = (
+        "material",
+        "fabric",
+        "filler",
+        "filling",
+        "foam",
+        "wood type",
+    )
+
+    for key in list(out):
+        key_text = str(key)
+        key_lower = key_text.lower()
+        values = _aspect_values(out.get(key))
+
+        if has_capacity_violation and (
+            "seating capacity" in key_lower
+            or "number of seats" in key_lower
+            or "accommodates" in key_lower
+        ):
+            out.pop(key, None)
+            continue
+
+        if feature_claims and any(
+            _claim_matches_value(claim, value)
+            for claim in feature_claims
+            for value in values
+        ):
+            kept = [
+                value
+                for value in values
+                if not any(_claim_matches_value(claim, value) for claim in feature_claims)
+            ]
+            if kept:
+                out[key] = kept
+            else:
+                out.pop(key, None)
+            continue
+
+        matched_material = any(
+            _claim_matches_value(claim, value)
+            for claim in material_claims
+            for value in values
+        )
+        is_material_field = any(fragment in key_lower for fragment in material_key_fragments)
+        is_wrong_type = key_lower == "type" and matched_material
+        if not matched_material and not is_wrong_type:
+            continue
+
+        if (
+            source_upholstery
+            and "upholstery" in key_lower
+            and ("fabric" in key_lower or "material" in key_lower)
+        ):
+            out[key] = [source_upholstery]
+        elif is_material_field or is_wrong_type or matched_material:
+            out.pop(key, None)
+
+    return out
 
 
 def _material_case(raw: str) -> str:
@@ -73,15 +188,115 @@ def _dajian():
     return DaJianClient(cid, sec) if cid and sec else None
 
 
+def _merge_missing_source_measurements(snap, stored_attributes):
+    """Retain source measurements when a fresh GIGA snapshot is sparse.
+
+    Source refreshes can return current material/characteristic fields while
+    omitting assembled dimensions that were present in the stored source
+    snapshot. Only measurement values are eligible for this fallback; stale
+    material or marketing claims are intentionally never copied back.
+    """
+    fresh_attributes = dict(getattr(snap, "attributes", {}) or {})
+    stored_attributes = dict(stored_attributes or {})
+    merged = dict(fresh_attributes)
+
+    def _raw_value(keys):
+        for key in keys:
+            value = stored_attributes.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return None
+
+    for axis in ("Length", "Width", "Height"):
+        if find_dimension(fresh_attributes, axis) is not None:
+            continue
+        value = find_dimension(stored_attributes, axis)
+        if value is not None:
+            merged[f"Assembled {axis} (in.)"] = _raw_value(
+                (
+                    f"Assembled {axis} (in.)",
+                    f"Overall {axis}",
+                    f"Product {axis}",
+                    axis,
+                )
+            ) or str(value)
+
+    if find_weight(fresh_attributes) is None:
+        value = find_weight(stored_attributes)
+        if value is not None:
+            merged["Product Weight (lbs.)"] = _raw_value(
+                (
+                    "Product Weight (lbs.)",
+                    "Product Weight",
+                    "Weight of Overrall Product",
+                    "Weight of Overall Product",
+                    "Overall Product Weight",
+                    "Overall Product Weight (with cushion)",
+                )
+            ) or str(value)
+
+    if merged == fresh_attributes:
+        return snap
+    merged_snap = copy.copy(snap)
+    merged_snap.attributes = merged
+    return merged_snap
+
+
+def build_description_from_snapshot(title, snap, aspects):
+    """Build the shared store template from a source snapshot and aspects."""
+    features_html = (
+        "<div><h3>Product Features</h3><ul>"
+        + "".join(f"<li>{c}</li>" for c in snap.characteristics)
+        + "</ul></div>"
+    )
+    # Some GIGA snapshots omit one assembled axis from ``attributes`` while
+    # the already stored, source-derived aspects still carry it (W1586135449
+    # omitted width). Feed that trusted aspect into the shared table builder.
+    description_attrs = dict(snap.attributes or {})
+    for axis in ("Length", "Width", "Height"):
+        if any(
+            description_attrs.get(key)
+            for key in (
+                f"Assembled {axis} (in.)",
+                f"Overall {axis}",
+                f"Product {axis}",
+                axis,
+            )
+        ):
+            continue
+        values = (aspects or {}).get(f"Item {axis}")
+        value = values[0] if isinstance(values, list) and values else values
+        if value:
+            description_attrs[f"Product {axis}"] = value
+    return build_structured_description_from_source(
+        title, features_html, description_attrs, snap.specs, aspects
+    )
+
+
 def build_repair(conn, dj, sku):
     """Return (new_title, new_description, new_aspects, snapshot) or (None, reason)."""
-    row = conn.execute(
-        "SELECT title, optimization FROM collected_products WHERE sku=?", (sku,)
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT title, optimization, attributes FROM collected_products WHERE sku=?", (sku,)
+        ).fetchone()
+        stored_attributes_raw = row[2] if row else None
+    except sqlite3.OperationalError:
+        # Small unit-test/legacy databases may not have the source snapshot
+        # column. The repair remains usable; it simply has no fallback data.
+        row = conn.execute(
+            "SELECT title, optimization FROM collected_products WHERE sku=?", (sku,)
+        ).fetchone()
+        stored_attributes_raw = None
     if not row:
         return None, "not_in_db"
     opt = json.loads(row[1] or "{}")
     aspects = dict(opt.get("aspects") or {})
+    try:
+        stored_attributes = json.loads(stored_attributes_raw or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        stored_attributes = {}
+    if not isinstance(stored_attributes, dict):
+        stored_attributes = {}
 
     detail = dj.get_product_detail_by_sku(sku) if dj else None
     snap = build_source_snapshot(detail) if detail else None
@@ -89,6 +304,7 @@ def build_repair(conn, dj, sku):
         return None, "no_source"
     if not snap.characteristics:
         return None, "thin_source_characteristics"
+    snap = _merge_missing_source_measurements(snap, stored_attributes)
 
     # Title: rebuild word-safe from source product name. A source name too thin
     # to be a title (GIGA sometimes stores just "chicken coop") must NOT abandon
@@ -97,6 +313,10 @@ def build_repair(conn, dj, sku):
     # Keep the current live title in that case and still fix the description.
     # W3166P455683 sat broken on live because this bailed out (2026-07-27).
     new_title, _ = normalize_listing_title_for_ebay(snap.title, source_title=snap.title)
+    # The word-safe truncator can legally cut immediately before the next
+    # source fragment, leaving a dangling connector (W1580S00647: ``...,with``).
+    # Trim only the incomplete tail; do not invent a replacement title.
+    new_title = re.sub(r"\s*(?:with|for|and|a|of|&)\s*$", "", new_title, flags=re.IGNORECASE).strip(" ,-/|")
     if not new_title or len(new_title) < 15:
         current_title, _ = normalize_listing_title_for_ebay(
             re.sub(r"\s+", " ", str(row[0] or "")).strip(), source_title=snap.title
@@ -109,15 +329,8 @@ def build_repair(conn, dj, sku):
     if snap.attributes.get("Main Material"):
         aspects["Material"] = [_material_case(snap.attributes["Main Material"])]
 
-    # Description: store template rebuilt from source characteristics
-    features_html = (
-        "<div><h3>Product Features</h3><ul>"
-        + "".join(f"<li>{c}</li>" for c in snap.characteristics)
-        + "</ul></div>"
-    )
-    new_desc = build_structured_description_from_source(
-        new_title, features_html, snap.attributes, snap.specs, aspects
-    )
+    # Description: store template rebuilt from source characteristics.
+    new_desc = build_description_from_snapshot(new_title, snap, aspects)
     if not new_desc or not all(m in new_desc for m in (_BRAND_UPPER, "KEY FEATURES")):
         return None, "template_build_failed"
     return (new_title, new_desc, aspects, snap), None

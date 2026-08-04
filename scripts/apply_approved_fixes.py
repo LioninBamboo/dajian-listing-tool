@@ -86,15 +86,8 @@ def build_command(sku: str, fix_keys: list[str], apply: bool) -> list[str]:
     return cmd
 
 
-def _keys_not_offered(sku: str, requested: list[str]) -> list[str]:
-    """Which requested keys does the audit not actually offer for this SKU?
-
-    A manifest key that no fix generates is filtered to nothing and the run
-    reports success having changed exactly nothing — which is how three
-    dimension rows were recorded as applied while live never moved
-    (2026-07-28: the keys "Item Height"/"Item Width" do not exist; the real one
-    is "Product Dimensions", and these SKUs offered no dimension fix at all).
-    """
+def _latest_report_item(sku: str) -> dict | None:
+    """Return the newest audit item for ``sku``, if a report exists."""
     reports = sorted(
         (ROOT / "logs").glob("listing_audit_fix_*.json"),
         key=lambda path: path.stat().st_mtime,
@@ -106,11 +99,42 @@ def _keys_not_offered(sku: str, requested: list[str]) -> list[str]:
         except (OSError, ValueError):
             continue
         for item in data.get("issues", []):
-            if item.get("sku") != sku:
-                continue
-            offered = {str(k) for k in (item.get("fix_keys") or [])}
-            return [k for k in requested if k not in offered]
+            if item.get("sku") == sku:
+                return item
+    return None
+
+
+def _keys_not_offered(sku: str, requested: list[str]) -> list[str]:
+    """Which requested keys does the audit not actually offer for this SKU?
+
+    A manifest key that no fix generates is filtered to nothing and the run
+    reports success having changed exactly nothing — which is how three
+    dimension rows were recorded as applied while live never moved
+    (2026-07-28: the keys "Item Height"/"Item Width" do not exist; the real one
+    is "Product Dimensions", and these SKUs offered no dimension fix at all).
+    """
+    item = _latest_report_item(sku)
+    if item is not None:
+        offered = {str(k) for k in (item.get("fix_keys") or [])}
+        return [k for k in requested if k not in offered]
     return []  # no report to check against; leave the run to its own exit code
+
+
+def _apply_errors_for_sku(sku: str) -> list[str]:
+    """Extract errors recorded inside a successful audit process exit.
+
+    ``--exit-zero-on-issues`` intentionally neutralizes issue-count exits, but
+    an apply can still fail after the audit has completed. The JSON report is
+    the authoritative result for that case.
+    """
+    item = _latest_report_item(sku)
+    if item is None:
+        return []
+    return [
+        str(result)
+        for result in (item.get("fixes_applied") or [])
+        if str(result).lstrip().startswith("ERROR")
+    ]
 
 
 def main() -> int:
@@ -168,6 +192,15 @@ def main() -> int:
                 return 1
             print()
             continue
+
+        apply_errors = _apply_errors_for_sku(sku) if args.apply else []
+        if apply_errors:
+            failures += 1
+            for error in apply_errors:
+                print(f"      ! {error}")
+            if args.stop_on_error:
+                print(f"\n[STOP] {sku}: audit report recorded an apply error.")
+                return 1
 
         if result.returncode != 0:
             failures += 1

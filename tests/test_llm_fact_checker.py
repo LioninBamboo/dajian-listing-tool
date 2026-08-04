@@ -88,3 +88,81 @@ def test_llm_fact_check_invalid_json(monkeypatch):
     )
 
     assert violations == []
+
+
+def test_llm_fact_check_ignores_configured_store_boilerplate(monkeypatch):
+    monkeypatch.setenv("QWEN_API_KEY", "fake_key")
+
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = '''
+    [
+        {
+            "quote": "AQUAVERVE",
+            "reason": "Not present in supplier facts",
+            "severity": "MEDIUM"
+        },
+        {
+            "quote": "✦ Ships from US Warehouse ✦",
+            "reason": "Not present in supplier facts",
+            "severity": "MEDIUM"
+        },
+        {
+            "quote": "Quality Guaranteed • Fast US Shipping • Trusted Seller",
+            "reason": "Not present in supplier facts",
+            "severity": "MEDIUM"
+        },
+        {
+            "quote": "NASA certified foam",
+            "reason": "Not present in supplier facts",
+            "severity": "HIGH"
+        }
+    ]
+    '''
+    mock_client.chat.completions.create.return_value = mock_response
+
+    class MockOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = mock_client.chat
+
+    monkeypatch.setattr("src.utils.llm_fact_checker.OpenAI", MockOpenAI)
+
+    violations = llm_fact_check(
+        source_title="Foam Chair",
+        source_description="A foam chair",
+        source_specs={},
+        generated_title="Foam Chair",
+        generated_description="AQUAVERVE NASA certified foam",
+    )
+
+    assert [violation["quote"] for violation in violations] == ["NASA certified foam"]
+
+
+def test_llm_fact_check_drops_quote_not_present_in_generated_copy(monkeypatch):
+    monkeypatch.setenv("QWEN_API_KEY", "fake_key")
+    mock_client = MagicMock()
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = '''
+    [{
+        "quote": "Crafted from high quality Iron",
+        "reason": "Contradicts the source",
+        "severity": "HIGH"
+    }]
+    '''
+    mock_client.chat.completions.create.return_value = mock_response
+
+    class MockOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = mock_client.chat
+
+    monkeypatch.setattr("src.utils.llm_fact_checker.OpenAI", MockOpenAI)
+
+    violations = llm_fact_check(
+        source_title="Gaming Table",
+        source_description="Conflicted supplier description",
+        source_specs={"Material": "Particle Board"},
+        generated_title="Dining Gaming Table",
+        generated_description="The removable top switches between dining and gaming configurations.",
+    )
+
+    assert violations == []

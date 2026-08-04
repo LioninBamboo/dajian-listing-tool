@@ -382,6 +382,15 @@ def source_supports_foldable(
     combined = " ".join(text for _, text in entries)
     combined = re.sub(r"<[^>]+>", " ", combined)
     combined = re.sub(r"\s+", " ", combined)
+    # Cushion durability copy such as "will not collapse after long-term
+    # sitting" describes resistance to deformation, not a foldable product.
+    combined = re.sub(
+        r"\b(?:will|does|do|can)\s+not\s+collaps(?:e|es|ed|ing|ible)\b|"
+        r"\bwon['’]?t\s+collaps(?:e|es|ed|ing|ible)\b",
+        " ",
+        combined,
+        flags=re.IGNORECASE,
+    )
     return any(
         re.search(pattern, combined, flags=re.IGNORECASE)
         for pattern in FOLDABLE_SOURCE_EVIDENCE_PATTERNS
@@ -1075,7 +1084,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         )
 
     if (
-        outdoor_context
+        outdoor_context_strict
         and not any(marker in title_text for marker in ("sofa", "couch", "loveseat", "sectional"))
         and re.search(r"\btable\b", title_text) is None
         and any(
@@ -1141,7 +1150,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
 
     if (
         not sofa_context
-        and any(marker in title_text for marker in ("storage ottoman", "ottoman bench", "lift top ottoman", "storage footstool"))
+        and any(marker in title_text for marker in ("storage ottoman", "lift top ottoman", "storage footstool"))
     ) or (
         not sofa_context
         and "ottoman" in title_text and "storage" in title_text
@@ -1151,6 +1160,17 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             category_id="20490",
             category_name="Ottomans, Footstools & Poufs",
             type_value="Storage Ottoman",
+            set_includes="Ottoman",
+            room="Living Room",
+            remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
+        )
+
+    if not sofa_context and "ottoman bench" in title_text:
+        return ListingProfile(
+            kind="ottoman_bench",
+            category_id="20490",
+            category_name="Ottomans, Footstools & Poufs",
+            type_value="Ottoman",
             set_includes="Ottoman",
             room="Living Room",
             remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
@@ -1240,6 +1260,26 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             type_value="Coffee Table",
             set_includes="Table",
             room="Living Room",
+        )
+
+    if any(marker in title_text for marker in ("nightstand", "bedside table")):
+        return ListingProfile(
+            kind="nightstand",
+            category_id="38199",
+            category_name="Nightstands",
+            type_value="Nightstand",
+            room="Bedroom",
+            remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
+        )
+
+    if any(marker in title_text for marker in ("side table", "end table", "accent table", "lamp table")):
+        return ListingProfile(
+            kind="side_table",
+            category_id="38204",
+            category_name="Tables",
+            type_value="End & Side Tables",
+            room="Living Room",
+            remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
         )
 
     if any(marker in title_text for marker in ("armchair", "reading chair", "single seat sofa", "accent chair")) and "dining" not in title_text:

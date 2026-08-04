@@ -1,6 +1,24 @@
 import batch_publish
 
 
+def test_publish_image_limit_defaults_and_honors_sku_override(monkeypatch):
+    monkeypatch.delenv("PUBLISH_IMAGE_LIMIT", raising=False)
+    monkeypatch.delenv("PUBLISH_IMAGE_LIMIT_SKU1", raising=False)
+    assert batch_publish._publish_image_limit("SKU1") == 24
+
+    monkeypatch.setenv("PUBLISH_IMAGE_LIMIT", "12")
+    monkeypatch.setenv("PUBLISH_IMAGE_LIMIT_SKU1", "8")
+    assert batch_publish._publish_image_limit("SKU1") == 8
+
+
+def test_publish_image_limit_rejects_invalid_values(monkeypatch):
+    monkeypatch.setenv("PUBLISH_IMAGE_LIMIT_SKU1", "0")
+    assert batch_publish._publish_image_limit("SKU1") == 24
+
+    monkeypatch.setenv("PUBLISH_IMAGE_LIMIT_SKU1", "not-a-number")
+    assert batch_publish._publish_image_limit("SKU1") == 24
+
+
 def test_publish_uploads_source_video_before_inventory_put(monkeypatch):
     captured = {}
 
@@ -41,22 +59,47 @@ def test_publish_uploads_source_video_before_inventory_put(monkeypatch):
 
     class _FakeEbayClient:
         def __init__(self, oauth, policy_manager):
-            pass
+            self.published = False
 
         def _prepare_inventory_image_urls(self, sku, raw_images, max_images=24):
-            return ["https://i.ebayimg.com/images/g/AAA/s-l1600.jpg"]
+            return [
+                "https://i.ebayimg.com/images/g/AAA/s-l1600.jpg",
+                "https://i.ebayimg.com/images/g/BBB/s-l1600.jpg",
+            ]
 
         def create_or_replace_inventory_item(self, sku, product):
             captured["inventory_product"] = product
             return {"status": "success"}
 
+        def get_inventory_item(self, sku):
+            product = captured["inventory_product"]
+            return {
+                "condition": product["condition"],
+                "availability": {"shipToLocationAvailability": {"quantity": product["quantity"]}},
+                "product": {
+                    "title": product["title"],
+                    "description": product["description"],
+                    "imageUrls": product["image_urls"],
+                    "videoIds": product.get("video_urls", []),
+                    "packageWeightAndSize": product.get("packageWeightAndSize"),
+                },
+            }
+
         def create_offer(self, sku, price, category_id=None, listing_description=None, marketplace_id=None):
             return {"offerId": "offer-1"}
 
         def get_offer(self, offer_id):
-            return {"status": "DRAFT"}
+            if not self.published:
+                return {"status": "DRAFT"}
+            return {
+                "offerId": "offer-1",
+                "categoryId": "38204",
+                "status": "PUBLISHED",
+                "listing": {"listingId": "listing-1", "listingStatus": "ACTIVE"},
+            }
 
         def publish_offer(self, offer_id):
+            self.published = True
             return {"listingId": "listing-1"}
 
     monkeypatch.setattr(batch_publish, "fetch_market_price", lambda title: None)
@@ -66,6 +109,19 @@ def test_publish_uploads_source_video_before_inventory_put(monkeypatch):
     monkeypatch.setattr(batch_publish, "_sync_motors_compatibility", lambda *args, **kwargs: None)
     monkeypatch.setattr(batch_publish, "update_product_status", lambda *args, **kwargs: None)
     monkeypatch.setattr(batch_publish, "resolve_publish_quantity", lambda sku, logger=None: 1)
+    monkeypatch.setattr(
+        batch_publish,
+        "run_listing_qc",
+        lambda **kwargs: {
+            "status": "pass",
+            "blockers": [],
+            "warnings": [],
+            "source_fingerprint": "source",
+            "candidate_fingerprint": "candidate",
+            "ruleset_version": "listing-qc-v1",
+            "fact_sheet_version": 4,
+        },
+    )
     monkeypatch.setattr("src.services.ebay_auth.EbayOAuthService", _FakeOAuth)
     monkeypatch.setattr("src.services.ebay_category_matcher.EbayCategoryMatcher", _FakeCategoryMatcher)
     monkeypatch.setattr("src.services.ebay_policy_manager.EbayPolicyManager", _FakePolicyManager)

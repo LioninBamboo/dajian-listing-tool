@@ -51,10 +51,9 @@ from src.utils.publish_validation import (
     measurement_validation_errors as _measurement_validation_errors,
 )
 from src.utils.listing_quality_gate import (
-    blocking_issue_messages as _quality_blocking_messages,
     normalize_generated_listing as _normalize_generated_listing,
-    validate_listing_quality as _validate_listing_quality,
 )
+from src.services.listing_qc import run_listing_qc
 from src.utils.publish_autofix import (
     is_invalid_category_error,
     sanitize_placeholder_aspects,
@@ -78,6 +77,11 @@ from src.services.vehicle_compatibility import (
     apply_compatibility_aspects,
     serialize_compatibility_analysis,
 )
+from src.services.listing_publish_readback import (
+    build_publish_readback_expectation,
+    verify_publish_readback,
+)
+from src.clients.real_ebay_client import PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT
 # ─── Logging ───────────────────────────────────────────────────
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -99,6 +103,18 @@ from src.utils.store_profile import get_store_profile
 BRAND_NAME = get_store_profile().brand_name
 MAX_RETRIES = 3
 PUBLISH_DELAY_SECS = 2.0    # delay between products
+
+
+def _publish_image_limit(sku: str) -> int:
+    """Return an explicit per-run image cap, bounded by eBay's 24-image limit."""
+    raw = os.getenv(f"PUBLISH_IMAGE_LIMIT_{sku}") or os.getenv("PUBLISH_IMAGE_LIMIT")
+    if raw is None:
+        return 24
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 24
+    return value if 1 <= value <= 24 else 24
 
 _CATEGORY_VALIDITY_CACHE = {}
 KNOWN_PUBLISHABLE_CATEGORY_IDS = {
@@ -422,7 +438,7 @@ def enrich_product_dimensions(product: dict) -> dict:
     if suspect_product_weight and 'Product Weight (lbs.)' not in missing_keys:
         missing_keys.append('Product Weight (lbs.)')
 
-    missing_description_context = "Product Information" not in current_description
+    missing_description_context = not current_description.strip()
 
     if not missing_keys and not missing_description_context:
         logger.info(f"  [{sku}] Dimensions and description context already present")
@@ -478,8 +494,7 @@ def enrich_product_dimensions(product: dict) -> dict:
     dajian_description = dajian_dims.get('description') or ''
     if (
         dajian_description
-        and "Product Information" in dajian_description
-        and "Product Information" not in current_description
+        and missing_description_context
     ):
         product['description'] = dajian_description
         current_description = dajian_description
@@ -711,6 +726,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
 
     sku = product['sku']
     environment = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    publish_image_limit = _publish_image_limit(sku)
 
     # ── Step 0: Enrich missing dimensions from Dajian API ──
     enrich_product_dimensions(product)
@@ -924,23 +940,38 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     publish_blockers = []
     publish_blockers.extend(_measurement_validation_errors(completed_aspects))
     publish_blockers.extend(_category_validation_errors(category_matcher, title_context, category_id, category_name))
-    quality_issues = _validate_listing_quality(
-        {
-            "title": title,
-            "description": description,
-            "categoryId": category_id,
-            "categoryName": category_name,
-            "aspects": completed_aspects,
-        },
-        source_title=source_title or product.get('title', ''),
-        source_description=product.get('description', ''),
-        attributes=product.get('attributes', {}) or {},
-        specs=product.get('specs', {}) or {},
-        images=product.get('images', []) or [],
-        videos=product.get('videos', []) or [],
-        category_matcher=category_matcher,
-    )
-    publish_blockers.extend(_quality_blocking_messages(quality_issues))
+    qc_candidate = {
+        "title": title,
+        "description": description,
+        "categoryId": category_id,
+        "categoryName": category_name,
+        "aspects": completed_aspects,
+    }
+    fs_conn = None
+    try:
+        fs_conn = sqlite3.connect(str(PROJECT_ROOT / "ebay_collection.db"), timeout=30)
+    except Exception as fact_conn_error:
+        logger.warning(f"FactSheet connection unavailable for {sku}: {fact_conn_error}")
+    try:
+        qc_result = run_listing_qc(
+            sku=sku,
+            candidate=qc_candidate,
+            source_title=source_title or product.get('title', ''),
+            source_description=product.get('description', ''),
+            source_attributes=product.get('attributes', {}) or {},
+            source_specs=product.get('specs', {}) or {},
+            images=product.get('images', []) or [],
+            videos=product.get('videos', []) or [],
+            category_matcher=category_matcher,
+            fact_sheet_conn=fs_conn,
+        )
+    finally:
+        if fs_conn is not None:
+            fs_conn.close()
+    publish_blockers.extend(qc_result["blockers"])
+    source_fingerprint = qc_result["source_fingerprint"]
+    candidate_fingerprint = qc_result["candidate_fingerprint"]
+
     publish_blockers = list(dict.fromkeys(publish_blockers))
     if publish_blockers:
         msg = "; ".join(publish_blockers)
@@ -973,11 +1004,27 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             "category_name": category_name,
             "aspects_count": len(completed_aspects),
             "dimensions": dims,
-            "images": len(product.get('images', [])),
+            "images": min(len(product.get('images', [])), publish_image_limit),
             "compatibility_mode": compatibility.mode,
             "compatibility_count": len(compatibility.compatible_products),
             "compatibility_issues": compatibility.issues,
+            "qc_status": qc_result["status"],
+            "qc_ruleset_version": qc_result["ruleset_version"],
+            "fact_sheet_version": qc_result["fact_sheet_version"],
+            "qc_warnings": qc_result["warnings"],
+            "qc_rule_ids": qc_result.get("rule_ids", []),
+            "qc_experience_ids": qc_result.get("experience_ids", []),
+            "qc_evidence_refs": qc_result.get("evidence_refs", []),
+            "candidate_fingerprint": candidate_fingerprint,
+            "source_fingerprint": source_fingerprint,
         }
+
+    # Check fingerprint against expected dry-run fingerprint if passed via env or args
+    expected_fingerprint = os.getenv(f"EXPECTED_FINGERPRINT_{sku}")
+    if expected_fingerprint and candidate_fingerprint != expected_fingerprint:
+        msg = f"Candidate fingerprint drifted: expected {expected_fingerprint} vs actual {candidate_fingerprint}"
+        record_error(sku, msg)
+        return {"status": "error", "message": msg}
 
     # ── Publish with retries ──
     last_error = None
@@ -998,10 +1045,14 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
 
             # Upload images to EPS (once — reuse on retries)
             if eps_images is None:
-                raw_images = product.get('images', [])[:24]
+                raw_images = product.get('images', [])[:publish_image_limit]
                 if raw_images:
                     logger.info(f"  Preparing {len(raw_images)} stable image URLs...")
-                    eps_images = ebay_client._prepare_inventory_image_urls(sku, raw_images, max_images=24)
+                    eps_images = ebay_client._prepare_inventory_image_urls(
+                        sku,
+                        raw_images,
+                        max_images=publish_image_limit,
+                    )
                     logger.info(f"  Images: {len(eps_images)}/{len(raw_images)} ready")
                 else:
                     eps_images = []
@@ -1066,6 +1117,50 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             if not listing_id:
                 return {"status": "error", "message": "No listing ID after publish"}
 
+            readback_expectation = build_publish_readback_expectation(
+                sku=sku,
+                inventory_product=inv_product,
+                category_id=category_id,
+                offer_id=offer_id,
+                listing_id=listing_id,
+            )
+            try:
+                inventory_readback = ebay_client.get_inventory_item(sku)
+                offer_readback = ebay_client.get_offer(offer_id)
+            except Exception as readback_error:
+                readback = {
+                    "status": "transport_failure",
+                    "passed": False,
+                    "issues": [],
+                    "transport_failures": [
+                        {
+                            "code": "readback_exception",
+                            "message": str(readback_error),
+                        }
+                    ],
+                    "sku": sku,
+                    "offer_id": offer_id,
+                    "listing_id": listing_id,
+                }
+            else:
+                readback = verify_publish_readback(
+                    readback_expectation,
+                    inventory_readback,
+                    offer_readback,
+                )
+            if not readback["passed"]:
+                message = (
+                    f"Publish readback failed ({readback['status']}): "
+                    f"{readback.get('issues') or readback.get('transport_failures')}"
+                )
+                record_error(sku, message)
+                return {
+                    "status": "error",
+                    "message": message,
+                    "write_state": readback["status"],
+                    "readback": readback,
+                }
+
             # Update DB
             extra_logs = [f"Video: {video_id}"] if video_id else []
             update_product_status(sku, listing_id, offer_id, category_id, extra_logs)
@@ -1076,6 +1171,11 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 "listing_id": listing_id,
                 "offer_id": offer_id,
                 "category_id": category_id,
+                "write_state": "verified",
+                "readback": readback,
+                "qc_rule_ids": qc_result.get("rule_ids", []),
+                "qc_experience_ids": qc_result.get("experience_ids", []),
+                "qc_evidence_refs": qc_result.get("evidence_refs", []),
             }
 
         except Exception as e:
@@ -1101,6 +1201,9 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 compatibility.issues = list(compatibility.issues) + [
                     "eBay rejected the generated compatibleProducts payload; retried without structured compatibility."
                 ]
+                continue
+
+            if _try_fix_missing_product_identifier(last_error, completed_aspects) and attempt < MAX_RETRIES - 1:
                 continue
 
             # Auto-fix: missing aspect or multi-value aspect
@@ -1232,6 +1335,19 @@ def _try_fix_missing_aspect(error_msg: str, aspects: dict, category_id: str) -> 
         MEASUREMENT_ASPECT_KEYS,
         log=lambda message: logger.info(f"  {message}"),
     )
+
+
+def _try_fix_missing_product_identifier(error_msg: str, aspects: dict) -> bool:
+    """Add eBay US's official unavailable text after an explicit missing-ID error."""
+    for aspect_name in ("UPC", "EAN", "ISBN"):
+        if re.search(rf"\b{aspect_name}\s+field\s+is\s+missing\b", error_msg or "", re.IGNORECASE):
+            aspects[aspect_name] = [PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT]
+            logger.info(
+                f"  [FIX] {aspect_name} is required but unavailable; "
+                f"using eBay US identifier text '{PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT}'"
+            )
+            return True
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════

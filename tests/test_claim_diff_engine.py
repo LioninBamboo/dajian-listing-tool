@@ -128,6 +128,24 @@ def test_foldable_title_only_folding_mattress_is_supported_not_claim_violation()
     assert not any(v.claim_text == "foldable" for v in violations)
 
 
+def test_source_two_in_one_phrase_supports_convertible_feature():
+    source = build_source_constraints(
+        {},
+        {},
+        "A versatile desk for home office use.",
+        "L-Shaped Desk with 2-in-1 Storage Design",
+    )
+
+    assert "convertible" in source["supported_features"]
+    violations = detect_claim_violations(
+        source,
+        "L-Shaped Desk with 2-in-1 Storage Design",
+        "2-in-1 workspace and storage.",
+        {},
+    )
+    assert not any(v.claim_text == "convertible" for v in violations)
+
+
 def test_extendable_alone_does_not_support_foldable():
     source = build_source_constraints(
         {},

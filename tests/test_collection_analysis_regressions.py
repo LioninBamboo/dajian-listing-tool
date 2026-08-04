@@ -1,4 +1,5 @@
 import ast
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -981,3 +982,156 @@ def test_ready_draft_category_choice_does_not_keep_protected_but_implausible_cat
     )
 
     assert (category_id, category_name) == ("180993", "Arbors & Arches")
+
+
+def test_qwen_optimizer_extract_product_dimensions_import():
+    optimizer = object.__new__(QwenOptimizer)
+    dimensions = optimizer.extract_dimensions(
+        attributes={},
+        specs={},
+        description="Dimensions: 10 in L x 20 in W x 30 in H",
+    )
+    assert dimensions["length"] == "10.0"
+
+
+def test_daily_tasks_hallucination_retry(monkeypatch):
+    import daily_tasks
+    
+    # Mock database
+    class DummyProduct:
+        def __init__(self):
+            self.sku = "TEST_RETRY"
+            self.status = "ERROR"
+            self.title = "A basic chair"
+            self.description = ""
+            self.attributes = {}
+            self.specs = {"Item Length (in.)": "10", "Item Width (in.)": "10", "Item Height (in.)": "10"}
+            self.price = 100
+            self.shipping = 0
+            self.images = ["http://example.com/img1.jpg", "http://example.com/img2.jpg"]
+            self.videos = []
+            self.logs = []
+            self.optimization = None
+            self.categoryId = "123"
+
+    product = DummyProduct()
+    
+    class DummyQuery:
+        def filter(self, *args, **kwargs):
+            return self
+        def all(self):
+            return [product]
+            
+    class DummySession:
+        def query(self, *args, **kwargs):
+            return DummyQuery()
+        def merge(self, p):
+            return p
+        def commit(self):
+            pass
+        def rollback(self):
+            pass
+        def close(self):
+            pass
+
+    monkeypatch.setattr("src.db.collection_db.SessionLocal", DummySession)
+    
+    # Mock PricingEngine
+    class DummyPricingEngine:
+        @classmethod
+        def calculate_dajian_cost(cls, *args, **kwargs):
+            return {"total_dajian_cost": 50}
+        @classmethod
+        def calculate_selling_price(cls, *args, **kwargs):
+            return {"selling_price": 75}
+            
+    monkeypatch.setattr("src.services.pricing_engine.PricingEngine", DummyPricingEngine)
+    
+    # Mock QwenOptimizer
+    class DummyQwen:
+        def fetch_market_intelligence(self, title):
+            return None
+    monkeypatch.setattr("qwen_optimizer.QwenOptimizer", lambda api_key: DummyQwen())
+
+    call_count = 0
+    def mock_optimize(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        previous_errors = kwargs.get("previous_errors")
+        
+        if call_count == 1:
+            assert previous_errors is None
+            return {
+                "title": "A basic chair",
+                "description": "Solid wood foldable chair",
+                "aspects": {"Material": ["Solid Wood"], "Features": ["Foldable"]},
+                "categoryId": "123"
+            }
+        else:
+            assert previous_errors is not None
+            assert any("foldable" in str(e).lower() for e in previous_errors)
+            return {
+                "title": "A basic chair",
+                "description": "A normal chair",
+                "aspects": {"Material": ["Metal"]},
+                "categoryId": "123"
+            }
+            
+    monkeypatch.setattr("sqlalchemy.orm.attributes.flag_modified", lambda *args, **kwargs: None)
+    
+    validate_call_count = 0
+    def mock_validate(*args, **kwargs):
+        nonlocal validate_call_count
+        validate_call_count += 1
+        if validate_call_count == 1:
+            from src.utils.listing_quality_gate import ListingQualityIssue
+            return [ListingQualityIssue(code="hallucination", message="Unsupported claim: foldable", severity="BLOCKER")]
+        return []
+    monkeypatch.setattr("src.utils.listing_quality_gate.validate_listing_quality", mock_validate)
+    
+    monkeypatch.setattr("qwen_optimizer.optimize_product_full_with_timeout", mock_optimize)
+    monkeypatch.setenv("QWEN_API_KEY", "dummy")
+    monkeypatch.setattr(
+        daily_tasks,
+        "_open_listing_qc_connection",
+        lambda: sqlite3.connect(":memory:"),
+    )
+    fact_call_count = 0
+
+    def mock_fact_sheet(**kwargs):
+        nonlocal fact_call_count
+        fact_call_count += 1
+        if fact_call_count == 1:
+            return {
+                "status": "violations",
+                "violations": [
+                    {
+                        "claim_type": "semantic_material",
+                        "claim_text": "fabric",
+                        "severity": "CRITICAL",
+                        "source_evidence": "solid wood",
+                    }
+                ],
+                "source_fingerprint": "source-before",
+                "candidate_fingerprint": "candidate-before",
+            }
+        return {
+            "status": "pass",
+            "violations": [],
+            "source_fingerprint": "source",
+            "candidate_fingerprint": "candidate",
+        }
+
+    monkeypatch.setattr(
+        "src.services.listing_qc.check_fact_sheet_violations",
+        mock_fact_sheet,
+    )
+
+    res = daily_tasks.analyze_collected_products(sku_filter=["TEST_RETRY"], eligible_statuses=("ERROR",))
+    
+    assert res['success'] == 1
+    assert call_count == 2
+    assert fact_call_count == 2
+    assert product.status == "READY"
+    assert product.optimization["_listing_qc"]["status"] == "pass"
+    assert product.optimization["_listing_qc"]["source_fingerprint"] == "source"

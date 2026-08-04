@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Comprehensive audit & fix for ALL active eBay listings.
 
@@ -780,6 +780,7 @@ def audit_single_product(
     title_context = " ".join(part for part in (title, opt_title) if part).strip()
     db_images = parse_image_list(images_raw)
     db_videos = parse_image_list(videos_raw)
+    local_video_status = str(opt.get("video_status") or opt.get("videoStatus") or "").strip().upper()
     cleaned_title, title_changed = sanitize_listing_title(opt_title or title or "")
 
     if title_changed and cleaned_title:
@@ -815,7 +816,7 @@ def audit_single_product(
                     fixes["__restore_images__"] = True
 
             live_video_ids = parse_image_list(live_product.get("videoIds") or [])
-            if db_videos and not live_video_ids:
+            if db_videos and not live_video_ids and local_video_status != "UNSUPPORTED_SOURCE":
                 issues.append({
                     "type": "missing_video",
                     "severity": "HIGH",
@@ -1030,7 +1031,11 @@ def audit_single_product(
                 "detail": f"{weight_key} has {weight_issue} value '{weight_val_str or 'empty'}', source has {source_weight} lbs"
             })
             fixes["Item Weight"] = [f"{source_weight} lbs"]
-        elif abs(weight_num - source_weight) > 5.0:
+        # Keep the operational fix threshold aligned with the semantic
+        # FactSheet guard (2 lbs). A 4-lb disagreement is already a CRITICAL
+        # source/live contradiction even though the old 5-lb threshold let it
+        # pass without a generated fix.
+        elif abs(weight_num - source_weight) > 2.0:
             issues.append({
                 "type": "wrong_weight",
                 "severity": "HIGH",
@@ -1270,46 +1275,36 @@ def audit_single_product(
         print(f"ClaimDiffEngine error for sku {sku}: {e}")
 
     # ── Layer 2.5: Semantic fact-sheet guard (LLM extract → deterministic diff) ──
-    # Report-only net for the long tail the rule tables cannot enumerate
-    # (e.g. source "600D Oxford" published as "Canvas" — no upgrade chain
-    # existed, so Layer 2 stayed silent). Extraction results are cached by
-    # content hash, so the LLM only runs when source or live content changed.
-    if os.getenv("AUDIT_SEMANTIC_FACT_SHEET", "1") != "0" and os.getenv("QWEN_API_KEY"):
-        try:
-            from src.utils.listing_fact_sheet import compare_fact_sheets, fact_sheet_for_content
+    try:
+        from src.utils.listing_fact_sheet import check_fact_sheet_violations
 
-            _fs_conn = get_fact_sheet_conn()
-            # Aspects are eBay category ENUMS, not our prose. eBay requires
-            # picking from a fixed option list ("Features: With Cushions /
-            # Upholstered", "Style: Modern", "Room: Living Room"), and the
-            # source never phrases things that way — so feeding them to the
-            # hallucination check flagged 1934 of 3177 feature rows (61%) as
-            # fake "claims" (2026-07-26 audit). Item-specifics correctness is
-            # already covered by the aspect-validation layer; this guard is for
-            # copy the source can actually contradict. Structured values that
-            # ARE falsifiable (materials/dimensions) still reach the sheet via
-            # the description and the dedicated dimension/material rules.
-            _source_sheet = fact_sheet_for_content(_fs_conn, title, description or "", {**attrs, **specs})
-            _live_sheet = fact_sheet_for_content(_fs_conn, opt_title, live_description, {})
-            if _source_sheet and _live_sheet:
-                _existing_details = " || ".join(str(i.get("detail", "")) for i in issues).lower()
-                _strip_fs = lambda h: re.sub(r"<[^>]+>", " ", str(h or ""))
-                _live_txt = " ".join([opt_title or "", _strip_fs(live_description),
-                                      " ".join(f"{k}: {v}" for k, v in (aspects or {}).items())])
-                _source_txt = " ".join([title or "", _strip_fs(description),
-                                       " ".join(f"{k}: {v}" for k, v in {**attrs, **specs}.items())])
-                for _sv in compare_fact_sheets(_source_sheet, _live_sheet, live_text=_live_txt, source_text=_source_txt):
-                    if _sv["claim_type"] == "semantic_dimension" and not source_dims_trustworthy:
-                        continue  # source dims are box dims — comparison is meaningless
-                    if _sv["claim_text"].lower() in _existing_details:
-                        continue  # already reported by a rule layer
-                    issues.append({
-                        "type": _sv["claim_type"],
-                        "severity": _sv["severity"],
-                        "detail": f"[FactSheet] {_sv['claim_text']} — source evidence: {_sv['source_evidence']}",
-                    })
-        except Exception as e:
-            print(f"FactSheet guard error for sku {sku}: {e}")
+        _fs_conn = get_fact_sheet_conn()
+        _fs_result = check_fact_sheet_violations(
+            conn=_fs_conn,
+            source_title=title,
+            source_description=description or "",
+            source_attributes=attrs,
+            source_specs=specs,
+            candidate_title=opt_title,
+            candidate_description=live_description,
+            candidate_aspects=aspects,
+        )
+        if _fs_result["status"] == "violations":
+            _existing_details = " || ".join(str(i.get("detail", "")) for i in issues).lower()
+            for _sv in _fs_result["violations"]:
+                if _sv["claim_type"] == "semantic_dimension" and not source_dims_trustworthy:
+                    continue
+                if _sv["claim_text"].lower() in _existing_details:
+                    continue
+                issues.append({
+                    "type": _sv["claim_type"],
+                    "severity": _sv["severity"],
+                    "detail": f"[FactSheet] {_sv['claim_text']} — source evidence: {_sv['source_evidence']}",
+                })
+                # Add support for semantic rebuild if we encounter FactSheet violations
+                fixes["__semantic_rebuild_from_source__"] = True
+    except Exception as e:
+        print(f"FactSheet guard error for sku {sku}: {e}")
     
     giga_text = f"{giga_title_l} {giga_desc_l} " + " ".join(str(v).lower() for v in attrs.values())
     opt_text = f"{opt_title_l} {opt_desc_l} " + " ".join(" ".join(str(x).lower() for x in v) if isinstance(v, list) else str(v).lower() for v in aspects.values())
@@ -2132,6 +2127,12 @@ def _put_inventory_product_only(ebay_client, sku, title, description, aspects):
         if pkg:
             payload["packageWeightAndSize"] = pkg
 
+    # Inventory PUT is a replacement-style request. Preserve the live
+    # availability block so a product-only aspect/description edit cannot
+    # republish an otherwise in-stock listing as OUT_OF_STOCK.
+    if live_inventory.get("availability") is not None:
+        payload["availability"] = live_inventory["availability"]
+
     token = ebay_client.oauth.get_valid_token()
     headers = {
         "Authorization": f"Bearer {token}",
@@ -2503,6 +2504,125 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
                 )
             except Exception as exc:
                 results.append(f"ERROR [{sku}]: source rebuild exception: {exc}")
+            continue
+        if key == "__semantic_rebuild_from_source__":
+            # Semantic FactSheet hallucination remediation.
+            # Ensure we backup the original state.
+            from pathlib import Path
+            import time
+            from scripts.repair_broken_listings import (
+                _dajian,
+                build_description_from_snapshot,
+                build_repair,
+                reconcile_semantic_aspects,
+                verify,
+            )
+            
+            try:
+                backup_dir = Path("logs/semantic_rewrite_backups")
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Backup live inventory before touching
+                live_inv = ebay_client.get_inventory_item(sku)
+                if not live_inv:
+                    results.append(f"ERROR [{sku}]: Could not backup live inventory for semantic rebuild. Aborting.")
+                    continue
+                backup_path = backup_dir / f"{sku}.json"
+                backup_path.write_text(json.dumps({
+                    "sku": sku,
+                    "timestamp": time.time(),
+                    "inventory": live_inv,
+                    "opt_snapshot": stored_opt,
+                }, ensure_ascii=False), encoding="utf-8")
+
+                dj = _dajian()
+                built, reason = build_repair(db_conn, dj, sku)
+                if built is None:
+                    results.append(f"ERROR [{sku}]: semantic rebuild skipped ({reason or 'unknown'})")
+                    continue
+                new_title, new_desc, new_aspects, snap = built
+                v = verify(new_title, new_desc, new_aspects, snap)
+                
+                # We need to run the FactSheet guard on the built candidate!
+                from src.utils.listing_fact_sheet import check_fact_sheet_violations
+                fs_conn = get_fact_sheet_conn()
+                full_source_description = (snap.description_html or "") + "\n\n" + "\n".join(snap.characteristics or [])
+                fs_result = check_fact_sheet_violations(
+                    conn=fs_conn,
+                    source_title=snap.title,
+                    source_description=full_source_description,
+                    source_attributes=snap.attributes,
+                    source_specs=snap.specs,
+                    candidate_title=new_title,
+                    candidate_description=new_desc,
+                    candidate_aspects=new_aspects,
+                )
+
+                # A source rebuild can still reuse stale live aspects (for
+                # example Frame Material=Steel or Type=Canvas Wardrobe). Use
+                # the actual FactSheet violations to remove those legacy
+                # claims, rebuild the template, and validate the cleaned
+                # candidate once more before any eBay write.
+                if fs_result["status"] == "violations":
+                    cleaned_aspects = reconcile_semantic_aspects(
+                        new_aspects,
+                        snap,
+                        fs_result.get("violations", []),
+                    )
+                    if cleaned_aspects != new_aspects:
+                        rebuilt_desc = build_description_from_snapshot(
+                            new_title,
+                            snap,
+                            cleaned_aspects,
+                        )
+                        if rebuilt_desc:
+                            new_aspects = cleaned_aspects
+                            new_desc = rebuilt_desc
+                            v = verify(new_title, new_desc, new_aspects, snap)
+                            fs_result = check_fact_sheet_violations(
+                                conn=fs_conn,
+                                source_title=snap.title,
+                                source_description=full_source_description,
+                                source_attributes=snap.attributes,
+                                source_specs=snap.specs,
+                                candidate_title=new_title,
+                                candidate_description=new_desc,
+                                candidate_aspects=new_aspects,
+                            )
+                
+                blocking_fs_violations = [
+                    vv
+                    for vv in fs_result.get("violations", [])
+                    if vv.get("severity") in ("CRITICAL", "HIGH")
+                ]
+                if not v.get("passed") or blocking_fs_violations:
+                    violations_str = ", ".join(
+                        f"[{vv['claim_type']}] {vv['claim_text']}"
+                        for vv in blocking_fs_violations
+                    )
+                    results.append(
+                        f"ERROR [{sku}]: semantic rebuild failed verification "
+                        f"(verify_pass={v.get('passed')}, fs_violations={violations_str}) — not pushed"
+                    )
+                    continue
+
+                if fs_result.get("status") == "violations":
+                    results.append(
+                        "FactSheet non-blocking MEDIUM findings retained after "
+                        "CRITICAL/HIGH gate"
+                    )
+
+                title = new_title
+                title_changed = True
+                description = sanitize_generated_description_html(new_desc)
+                description_changed = True
+                aspects = dict(new_aspects or aspects)
+                aspect_changed = True
+                results.append(
+                    "Rebuilt listing semantics from source (FactSheet hallucination remediation)"
+                )
+            except Exception as exc:
+                results.append(f"ERROR [{sku}]: semantic rebuild exception: {exc}")
             continue
         if key == "__restore_live_description_from_local__":
             stored_opt = parse_json(product_row["optimization"])

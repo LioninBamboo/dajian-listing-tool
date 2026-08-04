@@ -1,7 +1,51 @@
 import os
 import json
+import html
+import re
 from typing import List, Dict, Any
 from openai import OpenAI
+
+from src.utils.store_profile import get_store_profile
+
+
+def _is_configured_store_boilerplate(quote: object) -> bool:
+    """Return True for seller-level copy explicitly configured by this store."""
+    profile = get_store_profile()
+    phrases = [
+        profile.brand_tagline,
+        profile.description_footer_line1,
+        profile.description_footer_line2,
+        profile.footer_html,
+    ]
+    if profile.force_house_brand:
+        phrases.append(profile.brand_name)
+
+    normalized_quote = " ".join(str(quote or "").casefold().split())
+    if len(normalized_quote) < 4:
+        return False
+    for phrase in phrases:
+        normalized_phrase = " ".join(str(phrase or "").casefold().split())
+        if normalized_phrase and (
+            normalized_quote in normalized_phrase
+            or normalized_phrase in normalized_quote
+        ):
+            return True
+    return False
+
+
+def _normalized_grounding_text(value: object) -> str:
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text.casefold())
+    return " ".join(text.split())
+
+
+def _quote_is_grounded_in_generated_copy(quote: object, generated_copy: str) -> bool:
+    """Reject extractor quotes the generated title/description never make."""
+    normalized_quote = _normalized_grounding_text(quote)
+    if len(normalized_quote) < 4:
+        return False
+    return normalized_quote in _normalized_grounding_text(generated_copy)
 
 def llm_fact_check(
     source_title: str,
@@ -37,6 +81,7 @@ def llm_fact_check(
     # Format generated content
     generated_text = f"GENERATED TITLE:\n{generated_title}\n\n"
     generated_text += f"GENERATED DESCRIPTION:\n{generated_description}\n"
+    generated_copy = f"{generated_title}\n{generated_description}"
 
     prompt = f"""You are a strict, emotionless Fact-Checker. 
 Your task is to compare the GENERATED COPY against the SOURCE FACTS.
@@ -103,6 +148,10 @@ If there are no violations, return an empty array []. Do NOT wrap the JSON in Ma
             for v in violations:
                 quote = v.get("quote", "").lower()
                 reason = v.get("reason", "").lower()
+                if _is_configured_store_boilerplate(v.get("quote", "")):
+                    continue
+                if not _quote_is_grounded_in_generated_copy(v.get("quote", ""), generated_copy):
+                    continue
                 # If the quote or reason complains about dimensions, skip it
                 filter_keywords = [
                     "dimension", "inch", " cm", "length", "width", "height", "depth", 
