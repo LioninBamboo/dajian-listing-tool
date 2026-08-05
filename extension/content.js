@@ -833,7 +833,6 @@
 
         const btn = document.createElement("button");
         btn.id = "dajian-collect-btn";
-        btn.innerHTML = "<span>🐟</span> 采集到 Dashboard";
         btn.style.cssText = `
             position: fixed; bottom: 80px; right: 30px; z-index: 2147483647;
             background: linear-gradient(135deg, #FF6B6B, #EE5253); color: white;
@@ -842,6 +841,22 @@
             cursor: pointer; transition: transform 0.2s; font-family: sans-serif;
             display: flex; align-items: center; gap: 8px;
         `;
+
+        // The target store is sticky, so the button must ALWAYS show where the
+        // click sends this product — otherwise a forgotten selection quietly
+        // files a whole batch into the wrong store.
+        function paintTarget(id) {
+            const s = dajianStoreById(id || DAJIAN_DEFAULT_STORE);
+            btn.innerHTML = `<span>🐟</span> 采集 → ${s.short}`;
+            btn.title = `发送到 ${s.name} (localhost:${s.port})。在扩展弹窗里切换目标店。`;
+            btn.style.background = `linear-gradient(135deg, ${s.color}, ${s.color}dd)`;
+        }
+        chrome.storage.local.get([DAJIAN_STORE_KEY], (r) => paintTarget(r[DAJIAN_STORE_KEY]));
+        chrome.storage.onChanged.addListener((changes, area) => {
+            if (area === "local" && changes[DAJIAN_STORE_KEY]) {
+                paintTarget(changes[DAJIAN_STORE_KEY].newValue);
+            }
+        });
 
         btn.onmouseover = () => btn.style.transform = "scale(1.05)";
         btn.onmouseout = () => btn.style.transform = "scale(1)";
@@ -908,7 +923,8 @@
                     return;
                 }
                 if (response && response.status === "success") {
-                    showToast(`✅ 已采集!\n📸 图片: ${data.images.length} | 🎥 视频: ${data.videos.length}\n🚚 运费: $${data.shipping}`, "success");
+                    const dest = response.store ? response.store.short : "Dashboard";
+                    showToast(`✅ 已采集到【${dest}】!\n📸 图片: ${data.images.length} | 🎥 视频: ${data.videos.length}\n🚚 运费: $${data.shipping}`, "success");
                     // 自动点击收藏按钮 (心形图标)
                     setTimeout(() => {
                         try {

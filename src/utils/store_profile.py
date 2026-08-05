@@ -37,6 +37,11 @@ class StoreProfile:
     description_footer_line1: str = "✦ Ships from US Warehouse ✦"
     description_footer_line2: str = "Quality Guaranteed • Fast US Shipping • Trusted Seller"
     promotion_prefix: str = "AquaVerve Auto Sale"
+    # What this instance sells. Used to sanity-check collected products against
+    # the store they were sent to (see product_router). Kept separate from
+    # template_style because a store's copy template can change independently of
+    # what it sells (e.g. auto parts ran on the furniture template at first).
+    store_kind: str = "furniture"   # furniture | auto | arttoy
 
     # The Sell-API marketplace for offers/policies. US selling is always EBAY_US —
     # the Inventory API rejects EBAY_MOTORS_US here ("Could not serialize field
@@ -125,6 +130,7 @@ class StoreProfile:
 
 _SECTION_FIELD_MAP = {
     "store": {
+        "store_kind",
         "brand_name",
         "brand_tagline",
         "description_footer_line1",

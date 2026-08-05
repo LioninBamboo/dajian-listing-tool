@@ -28,6 +28,7 @@ class TestProfileDefaultsContract:
         p = StoreProfile()  # no YAML, no env — the guaranteed floor
         # identity
         assert p.brand_name == "AquaVerve"
+        assert p.store_kind == "furniture"
         assert p.merchant_location_key == "DAJIAN_LA_WAREHOUSE"
         # marketplace / catalog: general eBay.com US, NOT Motors
         assert p.ebay_marketplace_id == "EBAY_US"

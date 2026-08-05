@@ -917,7 +917,7 @@ async def collect_product(
                 attributes=attributes,
                 supplier_category=str((specs or {}).get("category") or ""),
             )
-            this_store = "arttoy" if _gsp().template_style == "arttoy_hype" else "furniture"
+            this_store = _gsp().store_kind
             if routing["target"] not in (this_store, "unknown"):
                 route_note = (
                     f"ROUTING: looks like '{routing['target']}' "
