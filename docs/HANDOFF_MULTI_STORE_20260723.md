@@ -7,7 +7,12 @@
 
 ## 0. 一句话现状
 
-**一套代码、三个 eBay 店铺**（家具主店 + 盲盒 + 汽配），靠 `store_profile` 按实例分流。盲盒、汽配两个子店已完成授权/政策/库位/金丝雀刊登。**当前两个待攻坚点：**①汽配要进主流 Motors 类目**必须走 Trading API**（已实证可行，待工程化）；②盲盒首条 listing 被 eBay 判仿冒下架，**换自有图是复工前提**。
+**一套代码、三个 eBay 店铺**（家具主店 + 盲盒 + 汽配），靠 `store_profile` 按实例分流。盲盒、汽配两个子店已完成授权/政策/库位/金丝雀刊登。
+
+> **🚩 战略调整（2026-07-23，业主决定）：美国海关趋严，暂时只做【美国本地仓】，放下中国直邮，等海关宽松再议。**
+> 影响：**家具主店（美国仓）+ 汽配 AquaRides（美国仓）= 当前重心**；**盲盒 GrovePop（中国 SpeedPAK 直邮）暂停**——其代码/授权/政策全部保留可随时恢复，但不再是 P0。若扩品类，优先考虑同样走美国仓的（如工具）。
+
+**当前主攻：汽配要进主流 Motors 类目——必须走 Trading API**（已实证可行，待工程化，见 §5 P0-A/P0-A2）。
 
 ---
 
@@ -78,7 +83,8 @@
 | **禁词剥离** | finalize 确定性剥离禁词（不靠 LLM 自觉，降级不返回带禁词源） | `banned_terms_guard.py`（strip_banned_terms/clean_banned_aspects） |
 | **B5** | 多变体发布（inventory_item_group，dry_run 预览） | `src/clients/real_ebay_client.py`、`src/services/variation_publisher.py` |
 | **Motors 配置** | category_tree_id 与 marketplace 解耦；aspects 改 App Token | `store_profile.py`、`ebay_category_matcher.py`、`batch_publish.py` |
-| **品类路由** | 采集时判定 auto/furniture/arttoy/unknown（含"假朋友"防误判）+ 搬运工具 | `src/services/product_router.py`、`tools/route_products.py` |
+| **采集目标店选择器** | 扩展弹窗选目标店（家具8000/汽配8001/盲盒8002），chrome.storage 粘性保持；采集按钮常显并着色当前目标、toast 报实际入库店 | `extension/stores.js`、`popup.*`、`background.js`、`content.js` |
+| **品类路由（安全网）** | 判定 auto/furniture/arttoy/unknown（含"假朋友"防误判）；**操作者的显式选择是权威**，路由只在与 `store_kind` 不符时告警 + 搬运工具 | `src/services/product_router.py`、`tools/route_products.py` |
 | **杂项修复** | `replace_description_measurements` 漏 import（主店描述尺寸归一化一直静默失效）；token 刷新窗口 5→30min（时钟偏差） | `qwen_optimizer.py`、`src/services/ebay_auth.py` |
 
 对应测试：`tests/test_banned_terms_guard.py`、`test_undercut_pricing.py`、`test_ebay_browse_collector.py`、`test_arttoy_listing.py`、`test_store_profile.py`、`test_variation_publisher.py`、`test_product_router.py`。全量约 **2057 用例通过**。
@@ -141,14 +147,15 @@ eBay 把汽配归到独立站点 **eBay Motors US（SiteID = 100）**，它是"�
 4. 车型适配数据 `motorsCompatibility.compatibleProducts` 本就在——描述里渲染成醒目适配段，同时进 Trading 的 `ItemCompatibilityList`（P0-A 第5点）。**把适配放描述最前也是降退货手段**（汽配第一退货因=装错/不适配）。
 5. 家具模板一字不动（受 §7.5 主店契约保护）。
 
-### 🔴 P0-B：盲盒自有图管线（GrovePop 复工前提）
+### ⏸ P0-B（已降级为暂停）：盲盒自有图管线 —— GrovePop 因中国直邮战略暂停
+> 因 §0 的战略调整（只做美国本地仓），**GrovePop 整条线暂停**，本项不再是 P0。代码/授权/政策/采集与生成管线全部保留，海关宽松后可直接恢复。恢复时这仍是**复工第一前提**：
 - 采集图仅作草稿，**发布前必须换自有/授权图**（EPS 转存或本地实拍）。现 `real_ebay_client._prepare_inventory_image_urls` 对 eBay 自托管 URL 直接复用——正是被判仿冒的原因。
 - 需要：图片转存到自有图床/EPS 的流程 + 发布前门禁（无自有图不许发）。
 
 ### 🟡 P1
 - **质检/营销上子店**：按 §5.5 的复用架构（引擎复用 + `qc_profile` 分流 + `cro_tenant_config` 加租户），**不要重写 CRO**。前置：质检按品类分流（家具规则会误伤子店）。
 - **viomall 采集渠道**（汽配第二货源，代码库零覆盖，从头做）。
-- **品类路由接线深化**：`product_router` 已在 `/api/collect` 记录判定（advisory），`tools/route_products.py` 可搬运；但"采集入口自动写入对应实例库"尚未全自动。
+- ~~品类路由接线深化~~ **已由采集选择器解决**：扩展里选目标店（粘性），采集直接进对应实例。`product_router` 保留为**安全网**（与 `store_kind` 不符时在 logs 告警），不再充当决策者。**设计原则：操作者按批次采集，显式意图优于标题猜测。**
 - **盲盒变体维度**：现用 "Style 1..N" 通用值，非角色名（源数据未干净映射）。
 - **GrovePop 广告**：`sell.marketing` 待账号有资格后补授。
 
