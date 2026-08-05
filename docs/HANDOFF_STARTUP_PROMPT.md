@@ -19,7 +19,7 @@
 
 **你的任务（二选一开工，优先级见报告 §5）：**
 
-- **P0-A：汽配 Trading API 刊登通道。** 已实证：真·汽配类目在 **eBay Motors 站（SiteID 100）**，Inventory API 发不进去（errorId 25005），**Trading API `AddFixedPriceItem`（`X-EBAY-API-SITEID: 100`）能发**（含 77 条车型适配已验证成功，ItemID 188732319492 测试后已结束）。要把这套封装进管线：`real_ebay_client` 加 Trading 刊登方法、`store_profile` 加 `listing_channel`/`ebay_site_id`、`batch_publish` 按 channel 分流、汽配用 Motors 合规退货政策 `262619354013`（P&A 硬性要求卖家承担退货费）、Motros 类目重映射（**逐个实发验证，不空谈**）。详见报告 §5-P0-A 与 §6 字段清单。
+- **P0-A：汽配 Trading API 刊登通道 + 汽配描述模板。**（通道负责"发进对的 Motors 类目"，模板负责"内容打动汽配买家"，配套做） 已实证：真·汽配类目在 **eBay Motors 站（SiteID 100）**，Inventory API 发不进去（errorId 25005），**Trading API `AddFixedPriceItem`（`X-EBAY-API-SITEID: 100`）能发**（含 77 条车型适配已验证成功，ItemID 188732319492 测试后已结束）。要把这套封装进管线：`real_ebay_client` 加 Trading 刊登方法、`store_profile` 加 `listing_channel`/`ebay_site_id`、`batch_publish` 按 channel 分流、汽配用 Motors 合规退货政策 `262619354013`（P&A 硬性要求卖家承担退货费）、Motros 类目重映射（**逐个实发验证，不空谈**）。**同时做汽配描述模板**：AquaRides 现用家具模板（凑合值），需按报告 §5-P0-A2 新建 `auto_prompt.py`（`template_style: auto_technical`，两种内容模式：适配件主打车型适配+规格表、工具主打参数），沿用 arttoy 的分流模式。详见报告 §5-P0-A / §5-P0-A2 与 §6 字段清单。
 - **P0-B：盲盒自有图管线。** GrovePop 首条 listing 被 eBay 自动判仿冒下架，触发因是**直接用了源卖家的图**。需要发布前把图转存为自有/EPS 托管 + 无自有图不许发的门禁。
 
 **必须遵守的工作准则（本项目血的教训，报告 §8 有全文）：**

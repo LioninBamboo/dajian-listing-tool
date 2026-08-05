@@ -131,6 +131,16 @@ eBay 把汽配归到独立站点 **eBay Motors US（SiteID = 100）**，它是"�
 6. fitment 数据清洗（去无效车型组合，如 1998 Mazda B2300 这类只是 Warning，但应过滤）。
 7. Motros 类目的必填 aspect 覆盖（如车顶架要 `Capacity`，值须来自源数据不得编造）。
 
+### 🔴 P0-A2：汽配描述模板（配合 P0-A；现用家具模板，是凑合值）
+⚠️ AquaRides 现在 `template_style: furniture_classic` —— 生成的描述是**家具味**（KEY FEATURES 罗列、生活方式调性，无车型适配段/规格表/安装说明）。汽配/工具买家决策逻辑完全不同：**适配件看"装不装得上我的车"，工具看参数**。要新设计，**沿用 B3 的 `template_style` 分流模式（和 arttoy 一模一样）**：
+1. `template_style` 加值 `auto_technical`，AquaRides 改用它。
+2. 新建 `src/services/auto_prompt.py`（与 `arttoy_prompt.py` 平级）：`build_auto_system_prompt` + `finalize_auto_listing`。**HTML 描述含两种内容模式**（由"是否有 fitment/compatibility 数据"决定，采集数据/product_router 已知）：
+   - **模式 A 适配件**（拖车钩/踏板/大灯…）：①顶部醒目【✓ FITS THESE VEHICLES 车型适配】②规格表(Type/Material/尺寸/承重/MPN，含 eBay 必填 aspect) ③安装说明/难度/所需工具 ④含什么 ⑤保修/退货。调性：功能、参数、可信，**不要生活方式抒情/hype**。
+   - **模式 B 工具/通用件**（千斤顶/胎压泵/脚垫/车衣…）：①主打参数/能力 ②用途场景+卖点 ③含什么+安全 ④保修。
+3. `qwen_optimizer.optimize_product_full` 顶部分流加一支 `template_style == "auto_technical" → optimize_auto_listing`（现已支持 arttoy 分流，照抄）。
+4. 车型适配数据 `motorsCompatibility.compatibleProducts` 本就在——描述里渲染成醒目适配段，同时进 Trading 的 `ItemCompatibilityList`（P0-A 第5点）。**把适配放描述最前也是降退货手段**（汽配第一退货因=装错/不适配）。
+5. 家具模板一字不动（受 §7.5 主店契约保护）。
+
 ### 🔴 P0-B：盲盒自有图管线（GrovePop 复工前提）
 - 采集图仅作草稿，**发布前必须换自有/授权图**（EPS 转存或本地实拍）。现 `real_ebay_client._prepare_inventory_image_urls` 对 eBay 自托管 URL 直接复用——正是被判仿冒的原因。
 - 需要：图片转存到自有图床/EPS 的流程 + 发布前门禁（无自有图不许发）。
