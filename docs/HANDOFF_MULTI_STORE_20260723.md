@@ -136,6 +136,7 @@ eBay 把汽配归到独立站点 **eBay Motors US（SiteID = 100）**，它是"�
 - 需要：图片转存到自有图床/EPS 的流程 + 发布前门禁（无自有图不许发）。
 
 ### 🟡 P1
+- **质检/营销上子店**：按 §5.5 的复用架构（引擎复用 + `qc_profile` 分流 + `cro_tenant_config` 加租户），**不要重写 CRO**。前置：质检按品类分流（家具规则会误伤子店）。
 - **viomall 采集渠道**（汽配第二货源，代码库零覆盖，从头做）。
 - **品类路由接线深化**：`product_router` 已在 `/api/collect` 记录判定（advisory），`tools/route_products.py` 可搬运；但"采集入口自动写入对应实例库"尚未全自动。
 - **盲盒变体维度**：现用 "Style 1..N" 通用值，非角色名（源数据未干净映射）。
@@ -144,6 +145,42 @@ eBay 把汽配归到独立站点 **eBay Motors US（SiteID = 100）**，它是"�
 ### 🟢 P2 / 观察项
 - AquaRides 是否需要 Motors 车型兼容性做成采集必抓字段（取决于货源品类）。
 - 主店那批历史汽配（484 DELISTED/391 ENDED）是否借 Trading 通道 + 正确类目重新上架（还是并入 AquaRides）。
+
+---
+
+## 5.5 质检 / 营销上子店：复用架构（骨架，别重写）
+
+**核心结论：引擎复用，规则分流。** 现有的营销（CRO，`src/services/cro_*.py` 共 100+ 模块）和质检（`src/services/listing_qc*.py`、`semantic_rewrite.py`、`src/utils/listing_quality_gate.py`、`claim_diff_engine.py`、`llm_fact_checker.py`、`banned_terms_guard.py`）本就是一套代码、三店同跑。子店上这些功能**不是重写，是沿用 listing 已建好的 `template_style` 分流模式**。复用性分三档：
+
+### ✅ 第一档：直接复用（与品类无关的机制）
+CRO 绝大多数模块是纯机制、不含品类假设：转化漏斗/流量分析、bandit 实验、审批队列/RBAC、事件总线、快照存储、看板、告警 RCA、定价机制（`cro_offer_pricing`/`cro_pricing_psychology`）、折扣/促销 API（`ebay_discount_service` **已读 store_profile**）、Terapeak 调研、图片质量评分、退货 NLP。换个店的库/token 直接用。
+
+### 🟡 第二档：复用 + 填配置（接缝已存在）
+- **`src/services/cro_tenant_config.py` 已是多租户配置层**（`configs/cro_tenants.json`，`_default` + 各租户覆盖，缺则用 default）。给汽配/盲盒各加一个租户条目（阈值/预算/投放策略）即可。
+- `store_profile`（品牌/市场/政策，已实例化）、`banned_terms`（盲盒已用）。工作量 = 加配置行。
+
+### 🔴 第三档：按品类加规则分支（唯一实打实的开发；误伤全在这）
+**质检的语义守卫规则是家具专属**（`listing_quality_gate.py` 全是 Assembly Status / 尺寸 / 床垫）。直接跑到子店会误伤，命门也不同：
+| 店 | 家具规则误伤点 | 该店真正的质检命门 |
+|---|---|---|
+| 汽配 | 拖车钩没有"组装状态"，尺寸规则误判 | **车型适配(fitment)正确性** |
+| 盲盒 | 无尺寸/组装 | **IP/仿冒/真伪**（GrovePop 被判仿冒即例证） |
+
+**做法 = 沿用 `template_style` 分流的同一套模式**：`store_profile` 加 `qc_profile: furniture | motors | arttoy`（默认 furniture，受 §7.5 主店契约测试保护）；质检引擎按它选规则模块；家具规则**一字不动**，汽配 fitment 校验 / 盲盒 IP 校验做成**新模块**。
+
+⚠️ **现状风险 & 前置**：家具质检若现在直接跑到子店会误伤，所以子实例**暂不启动 `scheduler_daemon` / 语义改写**（见 §8）。**质检的按品类分流是子店安全开跑质检/营销的前置条件。**
+
+### 复用率估计
+管道/机制 ~80% 直接用 · 配置 ~15% 填条目 · 品类规则 ~5%（但关键，误伤全在这）。**不要去重写那 100 个 CRO 模块。**
+
+```
+              一套引擎（CRO 100+ 模块 / QC 引擎 / 队列 / 审批 / 看板）
+                                 │
+   ┌──────────────────────────────┼──────────────────────────────┐
+家具主店 qc:furniture        盲盒 qc:arttoy(IP/真伪)        汽配 qc:motors(fitment)
+cro租户:_default             cro租户:grovepop               cro租户:aquarides
+（现状全焊在这，受契约保护）  （待建规则模块）               （待建规则模块）
+```
 
 ---
 
