@@ -170,6 +170,22 @@ Item 必填：`Title`、`Description`(CDATA)、`PrimaryCategory/CategoryID`(Moto
 
 ---
 
+## 7.5 主店隔离契约（开发汽配 Trading 通道的强制前置约束）
+
+**问题：汽配 Trading 通道会动到三店共享的 `real_ebay_client` / `batch_publish` / `store_profile`，如何保证不影响家具主店？** 靠四层隔离 + 一个机器守卫，不靠自觉：
+
+1. **配置分流，默认 = 主店**：每个新能力挂 `store_profile` 开关，默认值 = 主店现行为。主店 profile 不写该键 → 走默认 → **从构造上进不了新代码**。（已有：force_house_brand、category_tree_id、shipping_model、template_style 全默认主店值。）
+2. **代码路径门控**：Trading 通道是**新增函数**（不改现有 `create_offer`/`publish_offer`）。`batch_publish` 加 `if listing_channel == "trading": <新路径> else: <现有 Inventory 路径，一字不改>`。主店走 else，字节级不变。
+3. **运行时隔离**：三店各自目录/DB/token/scheduler，进程互不可及。
+4. **pull 门控**：主店实例何时 `git pull` 可控——先在汽配实例验证 + 家具回归全绿，主店再 pull。
+
+**机器守卫（已落地）：`tests/test_main_store_contract.py`**
+- Layer A：`StoreProfile()` 零配置的每个行为字段必须 = 主店值（含 `listing_channel` 缺省=inventory、`ebay_site_id` 缺省=0、`category_tree_id`=0、非 Motors）。**任何新字段若默认值不是主店值，或改了现有默认，立即报红。**
+- Layer B：家具 profile 下 `create_offer` 产出 marketplaceId=EBAY_US、主店库位、无 Motors/compatibility 泄漏；`create_inventory_item` payload 形状稳定。
+- **视其失败为"你碰了主店"**，除非主店行为是**有意**变更。反证已确认：把 `category_tree_id` 默认改成 100 会立即触发 Layer A 失败。
+
+**开发 P0-A 的硬规矩**：改共享代码后必须 `pytest tests/test_main_store_contract.py` 全绿 + 全量 `pytest tests/` 全绿；契约红了先停下查是否误伤主店。
+
 ## 8. 给接手 AI 的工作准则（血的教训）
 
 1. **涉及"能不能刊登"的判断，一律实发验证，不空谈**。本会话在 Motors 上错了三次（说 API 不支持/要资格/账号问题），全因没实发就下结论。"taxonomy 类目有效"≠"能发进去"。
