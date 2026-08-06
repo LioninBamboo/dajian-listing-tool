@@ -268,7 +268,14 @@ def _persist_prepared_listing(
         optimization["description"] = description
         optimization["aspects"] = aspects
         if compatibility is not None:
-            optimization["motorsCompatibility"] = serialize_compatibility_analysis(compatibility)
+            new_mc = serialize_compatibility_analysis(compatibility)
+            prior_cp = (optimization.get("motorsCompatibility") or {}).get("compatibleProducts") or []
+            new_cp = (new_mc or {}).get("compatibleProducts") or []
+            # Never overwrite authoritative structured fitment (77 Year/Make/Model
+            # from GIGA) with a poorer text re-derivation (0). This runs on BOTH
+            # dry-run and live, so a clobber here silently poisons the next publish.
+            if len(new_cp) >= len(prior_cp):
+                optimization["motorsCompatibility"] = new_mc
         product.optimization = optimization
         flag_modified(product, "optimization")
 
