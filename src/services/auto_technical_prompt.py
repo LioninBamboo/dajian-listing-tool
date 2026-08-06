@@ -148,8 +148,13 @@ def build_auto_technical_system_prompt(profile: Any, mode: str) -> str:
 2. FOCUS FOR THIS ITEM:
 {focus}
 
-**ANALYSIS RULES (fact safety — HARD):**
+**ANALYSIS RULES (fact safety — HARD, an automated guard rejects violations):**
 - Describe ONLY specs/materials/dimensions explicitly present in the source data. Do NOT invent numbers, part numbers, OE/interchange numbers, torque figures, or capacities.
+- Use the source's LITERAL words for every claim. Do NOT rephrase, upgrade, or embellish an attribute:
+  · if the source says "Class 3", write "Class 3" — NOT "Class III";
+  · if the source's Fitment Type is "Vehicle Specific Fit", say exactly that — do NOT substitute "Direct Replacement";
+  · do NOT add adjectives the source never uses (e.g. "heavy-duty", "premium", "universal", "OE-grade", "direct replacement") — these are treated as fabricated claims.
+- Every feature bullet and every adjective must be traceable to a source aspect value or the source description text, word for word.
 - Fill Item Specifics ('aspects') with accurate values from the source; values MUST be lists of strings.
 - The 'Brand' aspect is set deterministically by the system afterward — you may omit it.
 
