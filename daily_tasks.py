@@ -258,8 +258,13 @@ def analyze_collected_products(
                 # re-derives it, so without this a re-analysis silently drops all
                 # Motors fitment. No-op for furniture (prior has none).
                 prior_opt = product.optimization if isinstance(product.optimization, dict) else {}
-                prior_mc = prior_opt.get("motorsCompatibility")
-                if prior_mc and not opt_data.get("motorsCompatibility"):
+                prior_mc = prior_opt.get("motorsCompatibility") or {}
+                prior_cp = prior_mc.get("compatibleProducts") or []
+                new_cp = (opt_data.get("motorsCompatibility") or {}).get("compatibleProducts") or []
+                # The regenerated analysis re-derives fitment from LLM-rewritten
+                # text and routinely loses the authoritative structured entries
+                # (77 Year/Make/Model from GIGA -> 0). Keep the richer prior set.
+                if len(prior_cp) > len(new_cp):
                     opt_data["motorsCompatibility"] = prior_mc
                 opt_data["_listing_qc"] = qc_result
                 product.optimization = opt_data
