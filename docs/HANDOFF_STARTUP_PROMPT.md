@@ -17,12 +17,18 @@
 
 **当前状态一句话：** 盲盒、汽配两个子店已完成 OAuth/政策/库位/金丝雀刊登。
 
-**🚩 战略前提（务必知晓）：美国海关趋严，业主决定暂时只做【美国本地仓】，放下中国直邮。** 因此**家具主店 + 汽配 AquaRides（均美国仓）是当前重心**；**盲盒 GrovePop（中国 SpeedPAK）暂停**——代码与授权全保留，但原 P0-B（盲盒换图）已降级，别再当首要任务做。
+**🚩 战略前提（务必知晓）：美国海关趋严，业主决定暂时只做【美国本地仓】，三个店全部改从 GIGA（大建）采购。**
+- 家具主店 AquaVerve = 家具（不变）
+- **AquaRides = 汽配 + 工具 综合店**（工具不单开店）
+- **GrovePop = 放弃盲盒潮玩**，改从 GIGA 采、美国仓，**新类目待业主决定**（类目定下来前别动工）
+- **顺序：先把 GIGA 链路跑通，再考虑 viomall。** viomall 是另一种模式——授权 AquaRides 给 viomall、由其直接刊登，ERP 只做"description 改成本店模板 + 质检 + 营销"，**因此复用 `semantic_rewrite`/`active_listing_optimizer` 改写在线 listing 的管线，不是新建采集器**。
+- 盲盒中国直邮相关（换图管线/SpeedPAK 政策/深圳库位）**已作废**，别再当待办推进。
 
 **你的任务（默认从 P0-A 开工；完整排序与理由见报告 §5 开头的优先级表）：**
 
 - **P0-A：汽配 Trading API 刊登通道 + 汽配描述模板。**（通道负责"发进对的 Motors 类目"，模板负责"内容打动汽配买家"，配套做） 已实证：真·汽配类目在 **eBay Motors 站（SiteID 100）**，Inventory API 发不进去（errorId 25005），**Trading API `AddFixedPriceItem`（`X-EBAY-API-SITEID: 100`）能发**（含 77 条车型适配已验证成功，ItemID 188732319492 测试后已结束）。要把这套封装进管线：`real_ebay_client` 加 Trading 刊登方法、`store_profile` 加 `listing_channel`/`ebay_site_id`、`batch_publish` 按 channel 分流、汽配用 Motors 合规退货政策 `262619354013`（P&A 硬性要求卖家承担退货费）、Motros 类目重映射（**逐个实发验证，不空谈**）。**同时做汽配描述模板**：AquaRides 现用家具模板（凑合值），需按报告 §5-P0-A2 新建 `auto_prompt.py`（`template_style: auto_technical`，两种内容模式：适配件主打车型适配+规格表、工具主打参数），沿用 arttoy 的分流模式。详见报告 §5-P0-A / §5-P0-A2 与 §6 字段清单。
-- **⏸ P0-B（已暂停）：盲盒自有图管线。** GrovePop 因中国直邮战略暂停（见上）。恢复时它仍是复工第一前提：首条 listing 被 eBay 自动判仿冒下架，触发因是**直接用了源卖家的图**，需发布前转存自有/EPS 图 + 门禁。
+- **P1-a：工具并入 AquaRides**（不单开店）——类目映射 + 描述模板模式 B + 通道按商品分流。
+- **P1-b：GrovePop 转向**——**卡在业主的"新类目未定"，类目定了再动**；之后要重建美国仓政策/库位、改 `store_kind`/模板/定价。
 
 **必须遵守的工作准则（本项目血的教训，报告 §8 有全文）：**
 1. **涉及"能不能刊登"的判断，一律真实发布验证，绝不空谈**——"taxonomy 类目有效"≠"能发进去"。前一个 AI 在 Motors 上因没实发就下结论错了三次。

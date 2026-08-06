@@ -9,8 +9,16 @@
 
 **一套代码、三个 eBay 店铺**（家具主店 + 盲盒 + 汽配），靠 `store_profile` 按实例分流。盲盒、汽配两个子店已完成授权/政策/库位/金丝雀刊登。
 
-> **🚩 战略调整（2026-07-23，业主决定）：美国海关趋严，暂时只做【美国本地仓】，放下中国直邮，等海关宽松再议。**
-> 影响：**家具主店（美国仓）+ 汽配 AquaRides（美国仓）= 当前重心**；**盲盒 GrovePop（中国 SpeedPAK 直邮）暂停**——其代码/授权/政策全部保留可随时恢复，但不再是 P0。若扩品类，优先考虑同样走美国仓的（如工具）。
+> **🚩 战略调整（2026-07-23，业主决定）：美国海关趋严，暂时只做【美国本地仓】，放下中国直邮，等海关宽松再议。三个店全部改从 GIGA（大建）采购、美国仓发货。**
+>
+> | 店 | 新定位 | 变化 |
+> |---|---|---|
+> | 家具主店 AquaVerve | 家具（不变） | 无 |
+> | **AquaRides** | **汽配 + 工具 综合店** | 工具**不单开店**，作为本店一个品类 |
+> | **GrovePop** | **改从 GIGA 采、美国仓、类目完全待定**（可能家居小件/户外等） | **不再做盲盒潮玩、不再走中国直邮**；店铺与授权保留 |
+>
+> **推进顺序：先把 GIGA 链路跑通（三个店），再考虑 viomall。**
+> **viomall 是另一种模式**：授权 **AquaRides** 给 viomall，**由 viomall 直接刊登**；ERP 只负责把其 description 改成本店模板 + 质检 + 营销 → 因此它**复用"改写在线 listing"管线**（`semantic_rewrite` / `active_listing_optimizer`），**不是新建采集器**。
 
 **当前主攻：汽配要进主流 Motors 类目——必须走 Trading API**（已实证可行，待工程化，见 §5 P0-A/P0-A2）。
 
@@ -27,16 +35,20 @@
 | | 主账号 AquaVerve | GrovePop（实例C） | AquaRides（实例B） |
 |---|---|---|---|
 | 目录 | `Dajian_Listing_Tool` | `GrovePop_Listing_Tool` | `AutoParts_Listing_Tool` |
-| 品类 | 家具 | 盲盒潮玩 | 汽配 |
+| 品类 | 家具 | ⚠️**待定**（原盲盒潮玩已放弃） | **汽配 + 工具** |
 | 端口 | 8000 | 8002 | 8001 |
+| store_kind | furniture | arttoy（**待类目定后改**） | auto |
 | marketplace | EBAY_US | EBAY_US | EBAY_US |
 | category_tree_id | 0 | 0 | 0（暂，见 §5 Motors） |
-| template_style | furniture_classic | **arttoy_hype** | furniture_classic |
-| 定价 | cost_plus | **undercut**（总到手价） | cost_plus |
-| force_house_brand | true | **false**（保留 IP/Unbranded 兜底） | true |
+| template_style | furniture_classic | arttoy_hype（**已停用，待新类目配模板**） | furniture_classic（凑合，待 `auto_technical`） |
+| 定价 | cost_plus | undercut（**已不适用**，GIGA 采购应回 cost_plus） | cost_plus |
+| force_house_brand | true | false（潮玩遗留，**待新类目重定**） | true |
 | 账号注册地 | 美国 | 香港 CBT | 香港 CBT |
-| 发货 | 美国仓 | 中国 SpeedPAK | 美国仓（多仓代发，地址仅参考） |
+| 货源 | GIGA（大建） | **改为 GIGA** | GIGA（+ 后续 viomall，见 §0） |
+| 发货 | 美国仓 | ⚠️**改为美国仓**（原中国 SpeedPAK 作废） | 美国仓（多仓代发，地址仅参考） |
 | OAuth | 已授权 | 已授权（3 scope） | 已授权（3 scope） |
+
+> ⚠️ **GrovePop 转向的连带影响（重要待办）**：它现有的 eBay 侧配置是**为中国直邮建的，改美国仓后全部不适用**——运费政策 `264935711017`（SpeedPAK Standard/发全欧加澳）与库位 `GROVEPOP_CN_WAREHOUSE`（深圳）**都要重建**为美国仓版本（可照抄 AquaRides 的 `ShippingMethodStandard`/免邮/只发美国本土 + 美国 location）。收款/退货政策可沿用。详见 §5。
 
 ---
 
@@ -127,15 +139,16 @@ eBay 把汽配归到独立站点 **eBay Motors US（SiteID = 100）**，它是"�
 
 ## 5. 未完成 / 下一步（按优先级，2026-07-23 按"只做美国仓"战略重排）
 
-> **排序原则**：①美国仓的活优先（中国直邮线整体后置）；②能让**已授权好的店真正出单**的活优先于新建店；③新建店优先选美国仓品类。
+> **排序原则**：①**先把 GIGA 链路跑通**（三个店同一货源），viomall 之后再说；②能让**已授权好的店真正出单**的活优先于新建；③全部美国仓。
 >
 > | 顺位 | 事项 | 为什么在这个位置 |
 > |---|---|---|
-> | **P0-A / A2** | 汽配 Trading 通道 + 汽配描述模板 | AquaRides 账号/政策/库位/金丝雀全就绪，**只差这一步就能进主流汽配类目出单**；美国仓，符合战略 |
-> | **P1-a** | 工具店评估与决策 | 树0 + Inventory API，**是最省事的扩张**（不碰 Motors/Trading/fitment）；美国仓 |
-> | **P1-b** | viomall 采集渠道 | 汽配第二货源，喂饱 P0-A 打通的通道 |
-> | **P1-c** | 质检/营销上子店 | 子店有量之后才需要；且需先做质检按品类分流 |
-> | **⏸ 暂停** | 盲盒全部（换图/变体维度/广告） | 中国直邮线，战略暂停 |
+> | **P0-A / A2** | 汽配 Trading 通道 + 汽配描述模板 | AquaRides 账号/政策/库位/金丝雀全就绪，**只差这一步就能进主流汽配类目出单** |
+> | **P1-a** | 工具作为 AquaRides 的品类（**不单开店，业主已定**） | 复用同一店的授权/政策/库位；只需类目映射 + 模板模式 B |
+> | **P1-b** | GrovePop 转向：定类目 → 重建美国仓政策/库位 → 配模板 | 店和授权已在手，**卡在"类目未定"这个业主决策**上 |
+> | **P1-c** | 质检/营销上子店 | 子店有量之后才需要；需先做质检按品类分流 |
+> | **P2** | viomall 接入（**复用改写管线，非新建采集器**） | 明确排在 GIGA 跑通之后 |
+> | **❌ 作废** | 盲盒中国直邮线（SpeedPAK 政策/深圳库位/自有图管线/变体维度） | 战略转向，见下 |
 
 ### 🔴 P0-A：Trading API 汽配刊登通道（汽配真正跑起来的前提，已实证可行）
 把已验证成功的 `AddFixedPriceItem`+`ItemCompatibilityList` 封装进管线：
@@ -157,8 +170,8 @@ eBay 把汽配归到独立站点 **eBay Motors US（SiteID = 100）**，它是"�
 4. 车型适配数据 `motorsCompatibility.compatibleProducts` 本就在——描述里渲染成醒目适配段，同时进 Trading 的 `ItemCompatibilityList`（P0-A 第5点）。**把适配放描述最前也是降退货手段**（汽配第一退货因=装错/不适配）。
 5. 家具模板一字不动（受 §7.5 主店契约保护）。
 
-### 🟡 P1-a：工具店评估与决策（美国仓扩张的首选，**决策题不是技术题**）
-工具落哪棵树决定复杂度——实测（taxonomy 建议）：
+### 🟡 P1-a：工具作为 AquaRides 的品类（**业主已定：不单开工具店**）
+AquaRides = **汽配 + 工具综合店**，工具复用同一店的授权/政策/库位/品牌，无需新实例。要做的只是**类目映射 + 描述模板模式 B**。工具落哪棵树决定走哪个通道——实测（taxonomy 建议）：
 
 | 品类 | 树0（eBay.com，Inventory API） | 树100（Motors，Trading API） | 归属建议 |
 |---|---|---|---|
@@ -167,20 +180,31 @@ eBay 把汽配归到独立站点 **eBay Motors US（SiteID = 100）**，它是"�
 | 胎压泵 | 30506 Air Compressors ✅ | 262093 **A/C Compressors（错）** | **树0** |
 | OBD 诊断仪 | 175837 Other Consumer Electronics（泛） | 179476 Code Readers（精准） | Motors 更准但要 Trading |
 
-**关键判断：是否单开店 = 三条正交的轴，只有一条真需要独立"店"**
-1. **账号/品牌轴（唯一需要开店的理由，商业决策）**：想要独立品牌定位（"高性能汽配"店卖通用电钻会违和）／隔离账号风险与表现。
-2. **通道/站点轴（配置即可，不必开店）**：Motors 精准类目走 Trading/SiteID 100，树0 类目走 Inventory——**同一账号可两通道并行**（P0-A 的 `listing_channel` 按商品分流）。
-3. **内容模板轴（配置即可）**：工具 = P0-A2 的**模式 B**（主打参数，无 fitment），或单起 `tools_technical`。
+**要做的三件事（都在 AquaRides 内部，无新实例）**
+1. **通道按商品分流**：Motors 精准类目走 Trading/SiteID 100，树0 类目走 Inventory——**同一账号两通道并行**，正是 P0-A 的 `listing_channel`（做成按商品判定，而非整店固定）。
+2. **内容模板**：工具 = P0-A2 的**模式 B**（主打参数，无 fitment）。
+3. **类目映射**：工具关键词 → 树0 类目（电钻 184655、扳手 84237、气泵 30506、千斤顶 43593…），**逐个实发验证**。
 
-**建议默认不单开店**（工具作为汽配店里的"通道+模板变体"）；若为品牌考虑要开，**它是最省事的子店**：树0 + Inventory，不碰 Motors/Trading/fitment。开店清单 = 脚手架实例 D（同盲盒/汽配流程）+ 授权 + 政策 + 库位 + `store_kind: tools` + 扩展 `stores.js` 加一项（端口 8003）。
+⚠️ **边界毛刺**：汽车工具（千斤顶/OBD/胎压泵）在"汽车"与"工具"之间摇摆——**按 eBay 类目落点定归属**（能进 Motors 精准类目→走 Trading；只在树0 有好类目→走 Inventory+模式B）。另注意胎压泵在树100 被误判成 A/C 压缩机，**再次印证：类目必须实发验证，别信 taxonomy 建议第一条**。
 
-⚠️ **边界毛刺**：汽车工具（千斤顶/OBD/胎压泵）在"汽车"与"工具"之间摇摆——**建议按 eBay 类目落点定归属**（能进 Motors 精准类目→汽配店走 Trading；只在树0 有好类目→工具模式）。另注意胎压泵在树100 被误判成 A/C 压缩机，**再次印证：类目必须实发验证，别信 taxonomy 建议第一条**。
+### 🟡 P1-b：GrovePop 转向（店在手，卡在"类目未定"这个业主决策）
+业主已定：**放弃盲盒潮玩，改从 GIGA 采、美国仓发货，新类目待定**（可能家居小件/户外等）。**类目定下来之前不要动工**。定了之后按序做：
+1. **重建 eBay 侧配置**（现有的是中国直邮版，不适用）：运费政策改美国仓版（照抄 AquaRides 的 `ShippingMethodStandard`/免邮/只发美国本土）、库位改美国仓；收款/退货政策可沿用。回填 `store_profile.local.yaml`。
+2. **改 `store_kind`**（现为 `arttoy`）与 `template_style`（现 `arttoy_hype` 已停用）→ 按新类目配；`force_house_brand` 按新类目重定（潮玩才需要 false 保留 IP，通用货应回 true）。
+3. **定价回 `cost_plus`**（现 `undercut` 是为"采 eBay 链接比价"设计的，GIGA 采购不适用）。
+4. 扩展 `stores.js` 里 GrovePop 的显示名按新定位改。
 
-### 🟡 P1-b：viomall 采集渠道（汽配第二货源，喂饱 P0-A 打通的通道）
-代码库零覆盖，从头做。评估时先确认：是否美国仓、是否提供 fitment 车型数据（决定走模式 A 还是 B）。
+> 潮玩相关资产的处置：`arttoy_prompt.py`（模板）、`banned_terms_guard`（禁词）、`undercut_pricing`（比价定价）、`ebay_browse_collector`（eBay 链接采集）**保留在代码库但转为休眠**——都是通用能力，将来若做潮玩或比价场景可直接复用；`variation_publisher`（多变体发布）**继续有用**（GIGA 商品也有变体）。
 
 ### 🟡 P1-c：质检/营销上子店
 按 §5.5 的复用架构（引擎复用 + `qc_profile` 分流 + `cro_tenant_config` 加租户），**不要重写 CRO**。前置：质检按品类分流（家具规则会误伤子店）。子店有量之后再做。
+
+### 🟢 P2：viomall 接入（**复用改写管线，不是新建采集器**）
+业主已定：**授权 AquaRides 给 viomall，由 viomall 直接刊登**；ERP 只负责把其 description 改成本店模板 + 跑质检 + 营销。**因此这不是采集流程，是"接管已在线 listing"流程**：
+- 复用 **`src/services/semantic_rewrite.py`（`plan_rewrite`/`apply_rewrite`）+ `src/plugins/active_listing_optimizer/`** ——后者已在用 Trading `ReviseFixedPriceItem`/`ReviseItem` 改写在线 listing，正是所需能力。
+- 要做的是：把这套管线指向 AquaRides 实例 + 按本店模板改写 viomall 的描述 + 接质检/营销。
+- ⚠️ 早期版本本文档曾写"viomall 采集渠道，代码库零覆盖，从头做"——**那是错误估计**，已按本节修正。
+- 排在 **GIGA 链路跑通之后**。
 
 ### 🟢 P2 / 观察项
 - AquaRides 是否需要 Motors 车型兼容性做成采集必抓字段（取决于货源品类）。
@@ -190,11 +214,11 @@ eBay 把汽配归到独立站点 **eBay Motors US（SiteID = 100）**，它是"�
 
 ---
 
-### ⏸ 已暂停：盲盒 GrovePop 全线（中国直邮，待海关宽松再启）
-> 因 §0 战略调整暂停。**代码、OAuth 授权、三条政策、深圳库位、采集/生成/多变体管线全部保留可直接恢复。** 恢复时按以下顺序：
-1. **（原 P0-B，复工第一前提）自有图管线**：首条 listing 被 eBay 自动判仿冒下架，触发因是**直接用了源卖家的图**。现 `real_ebay_client._prepare_inventory_image_urls` 对 eBay 自托管 URL 直接复用——正是根因。需要：图片转存自有图床/EPS + **无自有图不许发**的门禁。
-2. **盲盒变体维度**：现用 "Style 1..N" 通用值，非角色名（源数据未干净映射）。
-3. **GrovePop 广告**：`sell.marketing` 待账号有资格后补授。
+### ❌ 已作废：盲盒中国直邮线（业主已放弃该方向，勿再推进）
+> GrovePop 改做 GIGA/美国仓/新类目（见 P1-b），以下**不再是待办**，仅作历史记录与教训：
+- **原 P0-B 自有图管线**：首条 listing 被 eBay 自动判仿冒下架，根因是**直接用了源卖家的图**（`real_ebay_client._prepare_inventory_image_urls` 对 eBay 自托管 URL 直接复用）。**教训仍然有效**：任何"照搬源图"的采集场景都有此风险，GIGA 官方图属供应商授权素材、风险低，但若将来再做"采 eBay 链接"务必先换图。
+- **盲盒变体维度**（"Style 1..N" 非角色名）、**SpeedPAK 运费政策 `264935711017`**、**深圳库位 `GROVEPOP_CN_WAREHOUSE`**：随方向作废，政策/库位需按 P1-b 重建为美国仓版。
+- **GrovePop 广告** `sell.marketing`：待账号有资格后补授（与类目无关，仍适用）。
 
 ### ✅ 已解决（原 P1，记录以免重做）
 - ~~品类路由接线深化~~ **已由采集选择器解决**：扩展弹窗选目标店（粘性，家具8000/汽配8001/盲盒8002），采集直接进对应实例；采集按钮常显并着色当前目标。`product_router` 保留为**安全网**（与实例 `store_kind` 不符时在 logs 告警），不再充当决策者。**设计原则：操作者按批次采集，显式意图优于标题猜测。**
