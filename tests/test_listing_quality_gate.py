@@ -1,4 +1,7 @@
 from src.utils.listing_quality_gate import (
+    description_contains_cjk,
+    description_uses_store_template,
+    ensure_store_description_template,
     normalize_generated_listing,
     sanitize_generated_description_html,
     validate_listing_quality,
@@ -8,6 +11,124 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_description_cjk_and_store_template_helpers():
+    assert description_contains_cjk("产品规格 基础信息")
+    assert not description_contains_cjk("Premium end table with USB ports")
+    chinese_supplier = (
+        "<div><h3>KEY FEATURES</h3><ul><li>Storage</li></ul>"
+        "<p>产品规格 基础信息 产品类型</p></div>"
+    )
+    rebuilt = ensure_store_description_template(
+        chinese_supplier,
+        title='19.6" Farmhouse End Table with Charging Station',
+        source_description=(
+            "End table with USB charging ports, adjustable shelf, and easy assembly. "
+            "Particle board and MDF construction."
+        ),
+        attributes={
+            "Assembled Length (in.)": "19.6",
+            "Assembled Width (in.)": "19.6",
+            "Assembled Height (in.)": "23.6",
+            "Product Weight (lbs.)": "36.38",
+            "Main Material": "Particle Board",
+            "Color": "White",
+        },
+        aspects={
+            "Item Length": ["19.6 in"],
+            "Item Width": ["19.6 in"],
+            "Item Height": ["23.6 in"],
+            "Item Weight": ["36.38 lbs"],
+            "Type": ["End Table"],
+            "Material": ["Particle Board"],
+            "Color": ["White"],
+        },
+    )
+    assert not description_contains_cjk(rebuilt)
+    assert description_uses_store_template(rebuilt)
+    assert "aquaverve" in rebuilt.lower()
+    assert "ships from" in rebuilt.lower()
+    assert "KEY FEATURES" in rebuilt
+
+
+def test_validate_blocks_cjk_and_missing_store_template():
+    issues = validate_listing_quality(
+        {
+            "title": "Farmhouse End Table",
+            "description": (
+                "<div><h3>KEY FEATURES</h3><ul><li>USB ports</li></ul>"
+                "<p>产品规格 基础信息</p></div>"
+            ),
+            "categoryId": "38199",
+            "aspects": {
+                "Item Length": ["19.6 in"],
+                "Item Width": ["19.6 in"],
+                "Item Height": ["23.6 in"],
+                "Item Weight": ["36 lbs"],
+                "Type": ["End Table"],
+                "Material": ["Wood"],
+                "Color": ["White"],
+                "Brand": ["AquaVerve"],
+            },
+        },
+        source_title="Farmhouse End Table",
+        source_description="End table with shelf",
+        images=["https://example.com/a.jpg", "https://example.com/b.jpg"],
+    )
+    codes = {i.code for i in issues}
+    assert "description_contains_cjk" in codes
+    assert "missing_store_banner" in codes or "missing_store_footer" in codes
+
+
+def test_normalize_rebuilds_chinese_supplier_html_into_store_template():
+    normalized = normalize_generated_listing(
+        {
+            "title": '19.6" Farmhouse End Table with Charging Station',
+            "description": (
+                "<div><h3>KEY FEATURES</h3><ul><li>充电口</li></ul>"
+                "<p>产品规格 基础信息 产品类型 产品名称</p></div>"
+            ),
+            "categoryId": "38199",
+            "categoryName": "Nightstands",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Type": ["End Table"],
+                "Item Length": ["19.6 in"],
+                "Item Width": ["19.6 in"],
+                "Item Height": ["23.6 in"],
+                "Item Weight": ["36.38 lbs"],
+                "Material": ["Particle Board"],
+                "Color": ["White"],
+            },
+        },
+        source_title='19.6" Farmhouse End Table with Charging Station',
+        source_description=(
+            "Farmhouse end table with built-in USB charging station, adjustable shelf, "
+            "particle board construction, easy assembly."
+        ),
+        attributes={
+            "Assembled Length (in.)": "19.6",
+            "Assembled Width (in.)": "19.6",
+            "Assembled Height (in.)": "23.6",
+            "Product Weight (lbs.)": "36.38",
+            "Main Material": "Particle Board",
+            "Color": "White",
+        },
+        images=["https://example.com/a.jpg", "https://example.com/b.jpg"],
+    )
+    assert not description_contains_cjk(normalized["description"])
+    assert description_uses_store_template(normalized["description"])
+    issues = validate_listing_quality(
+        normalized,
+        source_title='19.6" Farmhouse End Table with Charging Station',
+        source_description="Farmhouse end table with USB charging station",
+        images=["https://example.com/a.jpg", "https://example.com/b.jpg"],
+    )
+    codes = {i.code for i in issues}
+    assert "description_contains_cjk" not in codes
+    assert "missing_store_banner" not in codes
+    assert "missing_store_footer" not in codes
 
 
 def test_quality_gate_sanitizes_literal_escape_and_quote_artifacts():
@@ -114,7 +235,7 @@ def test_normalize_generated_listing_adds_fallback_bullets_when_heading_exists_w
         source_description="<div>Assembly Required No</div>",
     )
 
-    assert "<li>" in normalized["description"]
+    assert "<li" in normalized["description"]  # may be <li> or <li style=...>
     issues = validate_listing_quality(
         normalized,
         source_title="Classic Sofa",
@@ -1454,7 +1575,8 @@ class TestSofaAccessoryTableExclusion:
             "", "38208",
         )
         assert profile.kind == "side_table"
-        assert profile.category_id == "38204"
+        assert profile.category_id == "54235"
+        assert profile.category_name == "End Tables"
         assert profile.type_value == "End & Side Tables"
 
     def test_real_sofa_still_classified(self):

@@ -40,6 +40,14 @@ class EbayCategoryMatcher:
         text_lower = self._normalize_keyword_text(
             " ".join(part for part in (title or "", description or "", category_name or "") if part)
         )
+        # Product-only text (NO stored category_name). Signals whose keyword is a
+        # substring of their OWN target category name — "wine rack" ⊂ "Wine Racks
+        # & Bottle Holders", "hall tree" ⊂ "Hall Trees & Stands" — must read this,
+        # not text_lower: folding the stored name back in makes them self-fulfilling
+        # (a coffee-bar kitchen hutch mis-stored as 20689 would stay 20689 forever).
+        product_text_lower = self._normalize_keyword_text(
+            " ".join(part for part in (title or "", description or "") if part)
+        )
         title_lower = self._normalize_keyword_text(title or "")
         has_plant_stand = any(
             kw in text_lower
@@ -273,9 +281,47 @@ class EbayCategoryMatcher:
             "hutch cabinet",
             "microwave shelf",
         )
-        has_pantry_cabinet = not (has_bunk_bed or has_bed_frame) and (
-            any(kw in text_lower for kw in pantry_markers)
-            or ("hutch" in text_lower and any(kw in text_lower for kw in ("kitchen", "pantry", "microwave")))
+        # Kitchen coffee-bar / fridge cabinets often say "wine cabinet" in
+        # marketing while remaining buffets/sideboards. Do not force those
+        # into Wine Racks 20689 (N707 residual CRITICAL after 183322, 2026-08-06).
+        kitchen_buffet_context = any(
+            kw in product_text_lower
+            for kw in (
+                "coffee bar",
+                "fridge cabinet",
+                "mini fridge",
+                "sideboard",
+                "buffet",
+                "kitchen hutch",
+                "microwave stand",
+                "pantry",
+            )
+        )
+        has_wine_storage = (
+            not kitchen_buffet_context
+            and (
+                any(kw in product_text_lower for kw in ("wine rack", "wine cabinet", "stemware rack"))
+                or (
+                    "bar cabinet" in product_text_lower
+                    and "coffee bar cabinet" not in product_text_lower
+                    and any(kw in product_text_lower for kw in ("wine", "stemware", "liquor", "bottle"))
+                )
+            )
+        )
+        has_hall_tree = any(
+            kw in product_text_lower for kw in ("hall tree", "coat rack bench", "hall stand")
+        )
+        has_pantry_cabinet = (
+            not (has_bunk_bed or has_bed_frame)
+            and not has_wine_storage
+            and not has_hall_tree
+            and (
+                any(kw in text_lower for kw in pantry_markers)
+                or (
+                    "hutch" in text_lower
+                    and any(kw in text_lower for kw in ("kitchen", "pantry", "microwave"))
+                )
+            )
         )
         has_display_cabinet = (
             not has_pantry_cabinet
@@ -350,14 +396,7 @@ class EbayCategoryMatcher:
             kw in text_lower
             for kw in ("patio dining table", "outdoor dining table", "bistro table", "garden table", "outdoor table", "patio table")
         )
-        has_wine_storage = (
-            any(kw in text_lower for kw in ("wine rack", "wine cabinet", "stemware rack"))
-            or (
-                "bar cabinet" in text_lower
-                and "coffee bar cabinet" not in text_lower
-                and any(kw in text_lower for kw in ("wine", "stemware", "liquor", "bottle"))
-            )
-        )
+        # has_wine_storage / has_hall_tree already computed above (before pantry)
         has_explicit_table = any(
             kw in text_lower
             for kw in (
@@ -436,6 +475,13 @@ class EbayCategoryMatcher:
         if has_dining_set and cid != "107578":
             return "107578", "Dining Sets"
 
+        # Wine/bar liquor cabinets and hall trees must win over generic pantry remap.
+        if has_wine_storage and cid != "20689":
+            return "20689", "Wine Racks & Bottle Holders"
+
+        if has_hall_tree and cid != "261263":
+            return "261263", "Hall Trees & Stands"
+
         if has_pantry_cabinet and cid != "20487":
             return "20487", "Cabinets & Cupboards"
 
@@ -483,8 +529,23 @@ class EbayCategoryMatcher:
         if has_frog_statuary and cid in {"20740", "20518", "29514", "79682", "79684", "38208"}:
             return "29511", "Ornaments & Statues"
 
-        if cid == "75669" and any(kw in text_lower for kw in ("garden cart", "dump cart", "wagon", "wheelbarrow", "tow behind")):
+        if cid == "75669" and any(kw in text_lower for kw in ("garden cart", "dump cart", "utility wagon", "wheelbarrow", "tow behind")):
             return "75671", "Wheelbarrows, Carts & Wagons"
+
+        # Stroller/wagon hybrids for kids: never leave in garden hand-tool carts.
+        if any(
+            kw in text_lower
+            for kw in (
+                "wagon stroller",
+                "stroller wagon",
+                "kids wagon",
+                "kid wagon",
+                "baby stroller",
+                "stroller for",
+            )
+        ) or ("stroller" in text_lower and "wagon" in text_lower):
+            if cid in {"75671", "75669", "180994", "180995", "95495"}:
+                return "66700", "Strollers"
 
         if cid == "38204":
             if has_patio_furniture_set:
@@ -493,7 +554,10 @@ class EbayCategoryMatcher:
                 return "262980", "Benches"
             if has_explicit_table:
                 return cid, category_name
-            if any(kw in text_lower for kw in ("dump cart", "wagon", "wheelbarrow", "tow behind", "hauling", "cart trailer")):
+            if any(
+                kw in text_lower
+                for kw in ("dump cart", "utility wagon", "wheelbarrow", "tow behind", "hauling", "cart trailer")
+            ) and "stroller" not in text_lower:
                 return "75671", "Wheelbarrows, Carts & Wagons"
             if has_plant_stand:
                 return "29514", "Plant Stands"
@@ -1539,7 +1603,11 @@ class EbayCategoryMatcher:
             (["greenhouse", "potting bench"], "139939", "Greenhouses"),
             (["raised bed", "garden bed"], "181017", "Raised Garden Beds"),
             (["fence panel", "garden fence", "privacy screen panel"], "139946", "Fence Panels"),
-            (["dump cart", "garden cart", "wagon", "wheelbarrow", "tow behind"], "75671", "Wheelbarrows, Carts & Wagons"),
+            # Kids / baby stroller wagons must win over garden utility wagons.
+            (["wagon stroller", "stroller wagon", "kids wagon", "kid wagon", "baby stroller", "double stroller", "stroller for"], "66700", "Strollers"),
+            (["dump cart", "garden cart", "utility wagon", "folding wagon", "collapsible wagon", "wheelbarrow", "tow behind"], "75671", "Wheelbarrows, Carts & Wagons"),
+            # Bare "wagon" only when not a stroller context (checked earlier rules first).
+            (["wagon"], "75671", "Wheelbarrows, Carts & Wagons"),
 
             # ==================== LIGHTING ====================
             (["floor lamp", "standing lamp", "crystal lamp"], "112581", "Lamps"),
@@ -1792,30 +1860,35 @@ class EbayCategoryMatcher:
         
         fabric_map = {
             "velvet": "Velvet",
-            "linen": "Linen", 
+            "linen": "Linen",
             "corduroy": "Corduroy",
             "leather": "Leather",
             "faux leather": "Faux Leather",
             "pu leather": "Faux Leather",
-            "fabric": "Polyester",
-            "polyester": "Polyester",
-            "cotton": "Cotton",
+            "microsuede": "Microfiber",
             "microfiber": "Microfiber",
-            "foam": "Polyester",  # foam seats usually have polyester cover
+            "chenille": "Chenille",
+            "plush fabric": "Plush Fabric",
+            "plush": "Plush Fabric",
+            "cotton": "Cotton",
+            "polyester": "Polyester",
+            # Bare "fabric" / foam fill is not a specific fiber — do not invent
+            # Microfiber/Polyester (FactSheet semantic_material CRITICAL).
+            "fabric": "Fabric",
         }
-        
-        # Check material first
-        for key, val in fabric_map.items():
+
+        # Check material first (prefer longer keys via sorted order)
+        for key, val in sorted(fabric_map.items(), key=lambda kv: -len(kv[0])):
             if key in material:
                 return val
-        
+
         # Check title
-        for key, val in fabric_map.items():
+        for key, val in sorted(fabric_map.items(), key=lambda kv: -len(kv[0])):
             if key in title:
                 return val
-        
-        # Default
-        return "Polyester"
+
+        # Generic Fabric is safer than inventing a fiber name absent from source.
+        return "Fabric"
     
     def _detect_size(self, existing: Dict, title: str, allowed: List[str]) -> Optional[str]:
         """Detect bed/mattress size"""

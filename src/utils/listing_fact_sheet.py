@@ -55,6 +55,16 @@ _SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"water resistant", "water-resistant", "withstand rain", "rain resistant"}),
     frozenset({"assembly required", "setup required", "needs assembly"}),
     frozenset({"adjustable height", "height adjustable", "hydraulic adjustment", "hydraulic lift"}),
+    # Surface treatment wording (trellis W1586*: source says "powder coating",
+    # live/extractor often says "powder coated" — not a material upgrade).
+    frozenset({
+        "powder coated",
+        "powder coating",
+        "powder-coat",
+        "powder-coated",
+        "powder-coating",
+        "powder coat",
+    }),
 )
 
 # Generalization is safe, specialization is the hallucination direction:
@@ -528,6 +538,12 @@ def _claim_in_text(claim: str, text: str) -> bool:
     # Lexicon catches variant spellings (rubber wood/rubberwood)
     if claim_norm in lexical_materials(text_norm):
         return True
+    # Synonym groups: powder coated ↔ powder coating, foldable ↔ folding, etc.
+    group = _matches_synonym_group(claim_norm)
+    if group is not None:
+        normalized = re.sub(r"[\s-]+", " ", text_norm)
+        if any(phrase in normalized for phrase in group):
+            return True
     return False
 
 

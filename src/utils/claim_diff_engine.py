@@ -71,7 +71,14 @@ FEATURE_CLAIM_PATTERNS: dict[str, tuple[str, ...]] = {
     "weather_resistant": (r"\bweather[\s-]*resistant\b", r"\ball[\s-]*weather\b"),
     "fade_resistant":  (r"\bfade[\s-]*resistant\b",),
     "heated":          (r"\bheated\b", r"\bheating\b", r"\bwarmer\b"),
-    "massage":         (r"\bmassage\b", r"\bvibrat(?:ion|ing)\b"),
+    # Do NOT match bare "vibration/vibrating": soft-close cabinet copy often
+    # says "reducing impact and vibration" (N728 false CRITICAL, 2026-08-06).
+    # Only treat vibration as massage when tied to seat/function/massage language.
+    "massage": (
+        r"\bmassage(?:s|d|ing)?\b",
+        r"\bvibrating\s+(?:seat|massage|function|mode|motor)s?\b",
+        r"\bvibration\s+massage\b",
+    ),
     "led_lighting":    (r"\bled\s+light\b", r"\bled\s+strip\b", r"\bbacklit\b"),
     "soft_close":      (r"\bsoft[\s-]*close\b",),
     "self_closing":    (r"\bself[\s-]*closing\b",),

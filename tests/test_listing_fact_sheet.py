@@ -684,6 +684,22 @@ class TestGroundingGuard:
                                 source_text="MDF board with melamine coating")
         assert not any(x["claim_type"] == "semantic_material" for x in v)
 
+    def test_A_powder_coated_supported_by_source_powder_coating(self):
+        # W1586 trellis residual CRITICAL: live/extractor "powder coated",
+        # source says "powder coating surface treatment" (same finish).
+        src = self._src(["iron"])
+        live = {**self.BASE, "materials": ["powder coated", "iron"]}
+        v = compare_fact_sheets(
+            src,
+            live,
+            live_text="Metal galvanized tube with powder coated finish",
+            source_text="Sturdy Material: Metal galvanized tube with powder coating surface treatment",
+        )
+        assert not any(
+            x["claim_type"] == "semantic_material" and "powder" in x["claim_text"]
+            for x in v
+        )
+
     def test_token_disjoint_hallucination_survives_grounding(self):
         # 源 plastic,描述写 bamboo(无共享 token、真在描述里、源无) → 必须报,
         # grounding 不能因为"在描述里"就放过它

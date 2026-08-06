@@ -229,3 +229,30 @@ def test_replace_description_measurements_numeric_weight_after_backreference():
     )
     updated = replace_description_measurements(description, weight=19.7)
     assert "19.7 lbs" in updated
+
+
+def test_soft_close_vibration_is_not_massage_hallucination():
+    """Cabinet soft-close damping mentions vibration, not massage (N728 incident)."""
+    soft_close = (
+        "Soft-close hinges enable quiet door closing while reducing impact and vibration. "
+        "They help protect the cabinet structure and wine."
+    )
+    source = build_source_constraints({}, {}, soft_close, '70" Tall Arched Bar Cabinet')
+    violations = detect_claim_violations(
+        source,
+        '70" Tall Arched Bar Cabinet',
+        soft_close,
+        {"Type": ["Apothecary Cabinet"], "Material": ["MDF+Metal"]},
+    )
+    assert not any(v.claim_text == "massage" for v in violations)
+
+
+def test_still_detects_real_massage_claim():
+    source = build_source_constraints({}, {}, "Upholstered recliner with heat only.", "Recliner")
+    violations = detect_claim_violations(
+        source,
+        "Massage Recliner",
+        "Built-in massage functions and vibrating seat modes.",
+        {"Massage Functions": ["Full Body"]},
+    )
+    assert any(v.claim_text == "massage" for v in violations)

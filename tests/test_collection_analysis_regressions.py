@@ -539,6 +539,20 @@ def test_coffee_bar_hutch_is_not_forced_to_wine_storage():
     )
 
 
+def test_fridge_coffee_bar_with_wine_cabinet_wording_stays_buffet():
+    """N707: marketing says wine cabinet but product is fridge/coffee-bar buffet."""
+    matcher = object.__new__(EbayCategoryMatcher)
+    title = (
+        '53.2" Farmhouse Fridge Cabinet with Power Outlet, Coffee Bar Cabinet with Storage Space, '
+        "Mini Fridge Wine Cabinet with 2 Doors and 2 Drawers, Fluted Buffet Sideboard"
+    )
+    assert matcher.canonicalize_category(title, "183322", "Sideboards & Buffets") == (
+        "183322",
+        "Sideboards & Buffets",
+    )
+    assert matcher.canonicalize_category(title, "183322", "Sideboards & Buffets")[0] != "20689"
+
+
 def test_ready_benches_are_not_published_as_tables_stools_or_pet_furniture():
     matcher = object.__new__(EbayCategoryMatcher)
     mid_century_bench = (
@@ -892,6 +906,22 @@ def test_publish_aspect_completion_does_not_add_sofa_set_to_bean_bags():
     )
 
     assert "Set Includes" not in completed
+
+
+def test_infer_upholstery_fabric_does_not_invent_microfiber_from_plush_or_foam():
+    """Plush/foam source copy must not auto-fill Microfiber (FactSheet CRITICAL)."""
+    from src.utils.publish_aspect_completion import infer_upholstery_fabric
+
+    assert (
+        infer_upholstery_fabric(
+            '69" Cloud Sectional Couch (Plush Fabric), Beige',
+            {"Material": ["Foam"]},
+        )
+        == "Plush Fabric"
+    )
+    assert infer_upholstery_fabric("cloud sofa foam fill", {"Material": ["Foam"]}) == "Fabric"
+    assert infer_upholstery_fabric("velvet loveseat", {}) == "Velvet"
+    assert infer_upholstery_fabric("microfiber sofa", {}) == "Microfiber"
 
 
 def test_publish_aspect_completion_sets_dining_set_item_count_from_title():

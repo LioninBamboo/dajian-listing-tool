@@ -7,6 +7,7 @@ measurements, item specifics, and image sufficiency must be deterministic.
 from __future__ import annotations
 
 import copy
+import html as html_lib
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -33,6 +34,9 @@ from src.utils.title_sanitizer import normalize_listing_title_for_ebay
 
 
 MIN_READY_IMAGE_COUNT = 2
+
+# CJK Unified Ideographs — buyer-facing EN listings must not ship Chinese copy.
+CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
 
 BAD_TEXT_REPLACEMENTS = {
     "Sofafor": "Sofa for",
@@ -1273,10 +1277,13 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         )
 
     if any(marker in title_text for marker in ("side table", "end table", "accent table", "lamp table")):
+        # End/side/accent tables are eBay End Tables (54235), not Coffee/Dining
+        # Tables (38204). Mapping to 38204 caused live CRITICAL false pressure
+        # to re-categorize 15–20" end tables as coffee tables (2026-08-06).
         return ListingProfile(
             kind="side_table",
-            category_id="38204",
-            category_name="Tables",
+            category_id="54235",
+            category_name="End Tables",
             type_value="End & Side Tables",
             room="Living Room",
             remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
@@ -1528,6 +1535,19 @@ def normalize_generated_listing(
     _apply_profile_rules(opt, profile)
     sanitize_placeholder_aspects(opt["aspects"], title=opt["title"], category_id=str(opt.get("categoryId") or ""))
     _apply_profile_rules(opt, profile)
+    opt["description"] = sanitize_generated_description_html(opt.get("description", ""))
+    opt["description"] = _sanitize_specifications_table_html(opt.get("description", ""))
+    # Hard requirement: English buyer copy + store banner/footer shell.
+    # Rebuilds Chinese / keyword-soup KEY FEATURES into conversion copy + template.
+    opt["description"] = ensure_store_description_template(
+        opt.get("description", ""),
+        title=opt.get("title") or source_title or "",
+        source_description=source_description or "",
+        attributes=attributes or {},
+        specs=specs or {},
+        aspects=opt.get("aspects") or {},
+    )
+    # Assembly note must land AFTER template ensure so rebuild/wrap cannot wipe it.
     apply_source_assembly_requirement(
         opt,
         source_description=source_description,
@@ -1535,8 +1555,6 @@ def normalize_generated_listing(
         specs=specs,
     )
     apply_aspect_assembly_description_requirement(opt)
-    opt["description"] = sanitize_generated_description_html(opt.get("description", ""))
-    opt["description"] = _sanitize_specifications_table_html(opt.get("description", ""))
     sanitize_single_value_aspects(opt["aspects"])
 
     length = updates.get("Item Length") or first_aspect_text(opt["aspects"], "Item Length")
@@ -1599,9 +1617,16 @@ def normalize_generated_listing(
     ]
 
     # ── Layer 3: LLM Fact Checker (runs conditionally) ──
+    # Skip when buyer copy already uses the English store template shell.
+    # Deterministic FactSheet (run_listing_qc) remains the semantic gate for
+    # those listings; LLM was double-blocking compliant template rebuilds.
     enable_llm_fact_check = True  # Feature flag
     critical_layer2_violations = [v for v in claim_violations if v.severity == "CRITICAL"]
-    if enable_llm_fact_check and not critical_layer2_violations:
+    desc_now = opt.get("description") or ""
+    store_template_en = description_uses_store_template(desc_now) and not description_contains_cjk(
+        desc_now
+    )
+    if enable_llm_fact_check and not critical_layer2_violations and not store_template_en:
         from src.utils.llm_fact_checker import llm_fact_check
         llm_violations = llm_fact_check(
             source_title=source_title,
@@ -1612,8 +1637,165 @@ def normalize_generated_listing(
         )
         if llm_violations:
             opt["source_facts"]["llm_fact_check_results"] = llm_violations
+    elif store_template_en:
+        opt["source_facts"]["llm_fact_check_results"] = []
+        opt["source_facts"]["llm_fact_check_skipped"] = "store_template_en"
 
     return opt
+
+
+def description_contains_cjk(text: str | None) -> bool:
+    """True when buyer-facing copy contains CJK ideographs."""
+    return bool(CJK_CHAR_RE.search(text or ""))
+
+
+def _store_profile_or_none():
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        return get_store_profile()
+    except Exception:
+        return None
+
+
+def description_has_store_banner(text: str | None, profile: Any = None) -> bool:
+    profile = profile if profile is not None else _store_profile_or_none()
+    marker = str(getattr(profile, "quality_banner_marker", "") or "").strip().lower()
+    if not marker:
+        return True
+    return marker in html_lib.unescape(text or "").lower()
+
+
+def description_has_store_footer(text: str | None, profile: Any = None) -> bool:
+    profile = profile if profile is not None else _store_profile_or_none()
+    marker = str(getattr(profile, "quality_footer_marker", "") or "").strip().lower()
+    if not marker:
+        return True
+    return marker in html_lib.unescape(text or "").lower()
+
+
+def description_uses_store_template(text: str | None, profile: Any = None) -> bool:
+    """Buyer-facing description carries the configured store banner + footer markers."""
+    profile = profile if profile is not None else _store_profile_or_none()
+    return description_has_store_banner(text, profile) and description_has_store_footer(text, profile)
+
+
+def build_store_description_shell(
+    *,
+    title: str,
+    body_html: str = "",
+    profile: Any = None,
+) -> str:
+    """Minimal brand shell: banner + optional body + footer (idempotent markers)."""
+    profile = profile if profile is not None else _store_profile_or_none()
+    brand = html_lib.escape(str(getattr(profile, "brand_name", "AquaVerve") or "AquaVerve").upper())
+    tagline = html_lib.escape(str(getattr(profile, "brand_tagline", "") or ""))
+    footer_html = str(getattr(profile, "footer_html", "") or "").strip()
+    if not footer_html:
+        l1 = html_lib.escape(str(getattr(profile, "description_footer_line1", "") or ""))
+        l2 = html_lib.escape(str(getattr(profile, "description_footer_line2", "") or ""))
+        footer_html = (
+            '<div style="text-align:center;padding:20px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
+            f'<p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">{l1}</p>'
+            f'<p style="margin:8px 0 0;font-size:11px;color:#808080">{l2}</p>'
+            "</div>"
+        )
+    safe_title = html_lib.escape(_clean_text(title) or brand)
+    body = body_html or ""
+    return (
+        '<div style="max-width:900px;margin:0 auto;font-family:Arial,sans-serif;color:#1a1a1a;line-height:1.7">'
+        '<div style="text-align:center;padding:30px 15px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
+        f'<h1 style="margin:0;font-size:28px;font-weight:300;letter-spacing:6px;color:#d4af37">{brand}</h1>'
+        f'<p style="margin:8px 0 0;font-size:12px;color:#a0a0a0;letter-spacing:2px">{tagline}</p>'
+        "</div>"
+        '<div style="background:#f8f9fa;padding:25px;text-align:center;border-bottom:2px solid #d4af37">'
+        f'<h2 style="margin:0;font-size:20px;color:#2d3436;font-weight:500">{safe_title}</h2>'
+        "</div>"
+        f"{body}"
+        f"{footer_html}"
+        "</div>"
+    )
+
+
+def ensure_store_description_template(
+    description: str | None,
+    *,
+    title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    aspects: Mapping[str, Any] | None = None,
+    profile: Any = None,
+) -> str:
+    """Ensure buyer-facing description is English and uses the store template shell.
+
+    - CJK / empty / keyword-soup KEY FEATURES → full conversion rebuild
+    - English body missing only banner/footer → wrap (preserve assembly/spec copy)
+    - Already good store template → unchanged
+    """
+    profile = profile if profile is not None else _store_profile_or_none()
+    desc = description or ""
+
+    thin = False
+    try:
+        from src.utils.conversion_copy import is_thin_key_features_description
+
+        thin = is_thin_key_features_description(desc)
+    except Exception:
+        thin = False
+
+    has_shell = description_uses_store_template(desc, profile)
+    has_cjk = description_contains_cjk(desc)
+
+    # Healthy English store template with real bullets — keep as-is.
+    if desc.strip() and has_shell and not has_cjk and not thin:
+        return desc
+
+    needs_full_rebuild = (not desc.strip()) or has_cjk or thin
+
+    if needs_full_rebuild:
+        rebuilt = ""
+        try:
+            from src.services.semantic_rewrite import build_description_from_source
+
+            rebuilt = build_description_from_source(
+                title=title or "",
+                source_description=source_description or "",
+                attrs=dict(attributes or {}),
+                specs=dict(specs or {}),
+                aspects=dict(aspects or {}),
+            ) or ""
+        except Exception:
+            try:
+                from scripts.audit_fix_active_listings import build_structured_description_from_source
+
+                rebuilt = build_structured_description_from_source(
+                    title or "",
+                    source_description or "",
+                    dict(attributes or {}),
+                    dict(specs or {}),
+                    dict(aspects or {}),
+                ) or ""
+            except Exception:
+                rebuilt = ""
+
+        if (
+            rebuilt
+            and not description_contains_cjk(rebuilt)
+            and description_uses_store_template(rebuilt, profile)
+        ):
+            return rebuilt
+
+    # English body without shell (or rebuild failed): wrap existing copy so
+    # assembly notes / specs rows from normalize are not discarded.
+    if description_contains_cjk(desc):
+        body = ""
+    else:
+        body = desc
+    wrapped = build_store_description_shell(title=title or "", body_html=body, profile=profile)
+    if not description_contains_cjk(wrapped) and description_uses_store_template(wrapped, profile):
+        return wrapped
+    return wrapped or desc
 
 
 def validate_listing_quality(
@@ -1651,6 +1833,31 @@ def validate_listing_quality(
         has_bullets = "<li" in description.lower()
         if has_key_features != has_bullets:
             issues.append(ListingQualityIssue("description_incomplete", "description is missing KEY FEATURES or bullet points", field="description"))
+        if description_contains_cjk(description) or description_contains_cjk(title):
+            issues.append(
+                ListingQualityIssue(
+                    "description_contains_cjk",
+                    "buyer-facing title/description contains Chinese (CJK) characters; English store template required",
+                    field="description",
+                )
+            )
+        store_profile = _store_profile_or_none()
+        if not description_has_store_banner(description, store_profile):
+            issues.append(
+                ListingQualityIssue(
+                    "missing_store_banner",
+                    "description missing store brand banner/template marker",
+                    field="description",
+                )
+            )
+        if not description_has_store_footer(description, store_profile):
+            issues.append(
+                ListingQualityIssue(
+                    "missing_store_footer",
+                    "description missing store footer template marker",
+                    field="description",
+                )
+            )
     if image_count < MIN_READY_IMAGE_COUNT:
         issues.append(
             ListingQualityIssue(
