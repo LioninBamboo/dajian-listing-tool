@@ -498,15 +498,21 @@ class RealEbayClient:
             max_images=24,
         )
         
-        # Truncate description if too long (eBay limit: 4000 chars)
+        # Truncate description if too long (eBay limit: 4000 chars).
+        # Must preserve store footer markers (banner/footer QC contract).
         if len(description) > 4000:
             print(f"[WARN] Description is {len(description)} chars (limit: 4000), truncating...")
-            # Find a good breakpoint before 3900 chars to leave room for closing tags
-            description = description[:3900]
-            # Try to close any open HTML tags
-            if "</div>" not in description[-100:]:
+            try:
+                from src.utils.html_truncator import smart_truncate_html
+
+                description = smart_truncate_html(
+                    description, max_length=4000, min_length=3600
+                )
+            except Exception:
+                description = description[:3900]
+                if "</div>" not in description[-100:]:
+                    description = description + "</div>"
                 description = description + "</div>"
-            description = description + "</div>"  # Close outer div
         
         # Validate aspects format (must be list of strings)
         aspects = product.get("aspects", {})
@@ -956,6 +962,57 @@ class RealEbayClient:
         raise Exception(
             f"publish_by_inventory_item_group failed ({response.status_code}): {response.text[:400]}"
         )
+
+    def add_fixed_price_item_motors(self, product: Dict, *, category_id: str,
+                                    price: float, quantity: int = 5) -> Dict:
+        """Publish an eBay Motors parts listing via the Trading API (SiteID 100).
+
+        Motors categories can't be published through the Inventory API (25005),
+        so this posts AddFixedPriceItem. ``product`` carries title/description/
+        image_urls/aspects and optional ``compatibility`` (the collected
+        motorsCompatibility.compatibleProducts). Returns {"itemId", "status"} or
+        raises with eBay's error messages.
+        """
+        import re
+        from src.services.motors_trading import build_add_fixed_price_item_xml
+        from src.utils.store_profile import get_store_profile
+
+        profile = get_store_profile()
+        xml = build_add_fixed_price_item_xml(
+            title=product.get("title", ""),
+            description=product.get("description", ""),
+            category_id=str(category_id),
+            price=price,
+            quantity=quantity,
+            policies=profile.fallback_listing_policies(),
+            location=profile.warehouse_location,
+            postal_code=profile.warehouse_postal,
+            aspects=product.get("aspects") or {},
+            image_urls=product.get("image_urls") or product.get("images") or [],
+            compatibility=product.get("compatibility") or [],
+        )
+
+        token = self.oauth.get_valid_token()
+        headers = {
+            "X-EBAY-API-CALL-NAME": "AddFixedPriceItem",
+            "X-EBAY-API-SITEID": profile.ebay_site_id,   # 100 = eBay Motors
+            "X-EBAY-API-COMPATIBILITY-LEVEL": "1155",
+            "X-EBAY-API-IAF-TOKEN": token,
+            "Content-Type": "text/xml",
+        }
+        resp = self.session.post("https://api.ebay.com/ws/api.dll", headers=headers,
+                                 data=xml.encode("utf-8"), timeout=90)
+        body = resp.text
+        ack = (re.search(r"<Ack>(.*?)</Ack>", body) or [None, ""])[1] if "<Ack>" in body else ""
+        item_id = (re.search(r"<ItemID>(.*?)</ItemID>", body) or [None, None])[1]
+        if item_id and ack in ("Success", "Warning"):
+            logging.info(f"[MOTORS] Trading publish OK: ItemID {item_id} (Ack={ack})")
+            return {"itemId": item_id, "status": "published", "ack": ack}
+        errors = [
+            (m.group(1) or "").strip()
+            for m in re.finditer(r"<LongMessage>(.*?)</LongMessage>", body, re.S)
+        ]
+        raise Exception(f"Motors AddFixedPriceItem failed (Ack={ack}): {'; '.join(errors)[:400]}")
 
     def publish_offer(self, offer_id: str, max_retries: int = 3) -> Dict:
         """

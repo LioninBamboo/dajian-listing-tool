@@ -91,6 +91,20 @@ class StoreProfile:
     shipping_model: str = "free"                 # free | fixed
     fixed_shipping_amount: float = 8.99          # used only when shipping_model == fixed
 
+    # Listing channel. "inventory" = Sell Inventory API (furniture/general, the
+    # default and only path that works for tree-0 categories). "trading" = legacy
+    # Trading API AddFixedPriceItem — REQUIRED for eBay Motors parts categories,
+    # which the Inventory API rejects (errorId 25005). Auto-parts instances that
+    # list into Motors set this to "trading".
+    listing_channel: str = "inventory"   # inventory | trading
+    # eBay Trading SiteID for the trading channel. 0 = eBay.com US, 100 = eBay
+    # Motors US. Only consulted when listing_channel == "trading".
+    ebay_site_id: str = "0"
+    # Ship-from shown on Trading listings (the Inventory API takes this from the
+    # merchant location instead). Defaults to the main LA warehouse.
+    warehouse_location: str = "Los Angeles, CA"
+    warehouse_postal: str = "90001"
+
     # Local server
     server_port: int = 8000
 
@@ -140,6 +154,10 @@ _SECTION_FIELD_MAP = {
     "ebay": {
         "ebay_marketplace_id",
         "category_tree_id",
+        "listing_channel",
+        "ebay_site_id",
+        "warehouse_location",
+        "warehouse_postal",
         "merchant_location_key",
         "fallback_fulfillment_policy_id",
         "fallback_return_policy_id",

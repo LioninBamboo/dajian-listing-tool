@@ -51,8 +51,8 @@ class TestProfileDefaultsContract:
         # keep it on the existing Inventory path. Update the expected value here
         # ONLY when the field is added, never loosen it to a truthy default.
         p = StoreProfile()
-        assert getattr(p, "listing_channel", "inventory") == "inventory"
-        assert getattr(p, "ebay_site_id", "0") == "0"
+        assert p.listing_channel == "inventory"   # main uses the Inventory API
+        assert p.ebay_site_id == "0"              # eBay.com US, not Motors (100)
 
     def test_no_field_default_is_motors_or_trading(self):
         # A blunt catch-all: no default value should smell like Motors/Trading.
