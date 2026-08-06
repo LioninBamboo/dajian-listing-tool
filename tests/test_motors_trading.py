@@ -150,9 +150,19 @@ def _auto_profile():
         warehouse_location="Los Angeles, CA",
         warehouse_postal="90001",
         fallback_fulfillment_policy_id="262397301013",
-        fallback_return_policy_id="262619354013",
+        fallback_return_policy_id="262397300013",   # buyer-paid (tools / non-Motors)
+        motors_return_policy_id="262619354013",      # seller-paid (Motors P&A mandate)
         fallback_payment_policy_id="262397299013",
     )
+
+
+class TestReturnPolicySplit:
+    def test_motors_publish_uses_seller_paid_return(self):
+        # add_fixed_price_item_motors must source motors_listing_policies(), so the
+        # seller-paid return id — not the buyer-paid fallback — lands in the XML.
+        p = _auto_profile()
+        assert p.motors_listing_policies()["returnPolicyId"] == "262619354013"
+        assert p.fallback_listing_policies()["returnPolicyId"] == "262397300013"
 
 
 class TestClientWrapper:
@@ -183,6 +193,7 @@ class TestClientWrapper:
         xml = call["data"].decode("utf-8")
         assert "<CategoryID>33653</CategoryID>" in xml
         assert "<ItemCompatibilityList>" in xml                       # fitment carried
+        assert "<ReturnProfileID>262619354013</ReturnProfileID>" in xml  # seller-paid (Motors P&A)
 
     def test_warning_ack_still_succeeds(self, monkeypatch):
         warn = "<r><Ack>Warning</Ack><ItemID>999</ItemID></r>"

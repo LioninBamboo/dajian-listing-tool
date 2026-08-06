@@ -45,6 +45,18 @@ class TestProfileDefaultsContract:
         # server
         assert p.server_port == 8000
 
+    def test_main_store_return_policy_is_buyer_paid_everywhere(self):
+        # The Motors seller-paid return is auto-parts-only. With no Motors return
+        # id configured, BOTH policy helpers yield the same (buyer-paid) return —
+        # the main store never accidentally offers seller-paid returns.
+        p = StoreProfile()
+        assert p.motors_return_policy_id == ""
+        assert (
+            p.motors_listing_policies()["returnPolicyId"]
+            == p.fallback_listing_policies()["returnPolicyId"]
+            == p.fallback_return_policy_id
+        )
+
     def test_channel_defaults_to_inventory(self):
         # Guards the P0-A auto-parts Trading channel: whatever field name gates it
         # (listing_channel / ebay_site_id), the main store's zero-config value must
@@ -55,9 +67,12 @@ class TestProfileDefaultsContract:
         assert p.ebay_site_id == "0"              # eBay.com US, not Motors (100)
 
     def test_no_field_default_is_motors_or_trading(self):
-        # A blunt catch-all: no default value should smell like Motors/Trading.
+        # A blunt catch-all: no default VALUE should smell like Motors/Trading.
+        # Check values only, not field names — a field may legitimately reference
+        # Motors (e.g. motors_return_policy_id) as long as its main-store default
+        # is empty/inert. A Motors-flavored default VALUE is the real leak.
         p = StoreProfile()
-        blob = json.dumps({f: getattr(p, f) for f in vars(p)}, default=str).lower()
+        blob = json.dumps([getattr(p, f) for f in vars(p)], default=str).lower()
         assert "motors" not in blob
         assert "trading" not in blob
         assert "100" not in str(p.category_tree_id)

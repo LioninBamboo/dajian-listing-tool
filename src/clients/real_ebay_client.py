@@ -984,7 +984,7 @@ class RealEbayClient:
             category_id=str(category_id),
             price=price,
             quantity=quantity,
-            policies=profile.fallback_listing_policies(),
+            policies=profile.motors_listing_policies(),   # seller-paid returns (Motors P&A mandate)
             location=profile.warehouse_location,
             postal_code=profile.warehouse_postal,
             aspects=product.get("aspects") or {},

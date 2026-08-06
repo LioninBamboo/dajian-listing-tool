@@ -104,6 +104,12 @@ class StoreProfile:
     # merchant location instead). Defaults to the main LA warehouse.
     warehouse_location: str = "Los Angeles, CA"
     warehouse_postal: str = "90001"
+    # Return policy for eBay Motors PARTS & ACCESSORIES publishes (the Trading
+    # channel). eBay MANDATES 30-day, SELLER-paid return shipping for Motors P&A,
+    # so a buyer-paid return policy is rejected at publish. Everything else — the
+    # furniture main store, tools, any non-Motors listing — uses the buyer-paid
+    # fallback_return_policy_id (30-day). Empty => fall back to that same id.
+    motors_return_policy_id: str = ""
 
     # Local server
     server_port: int = 8000
@@ -122,6 +128,19 @@ class StoreProfile:
             "returnPolicyId": self.fallback_return_policy_id,
             "paymentPolicyId": self.fallback_payment_policy_id,
         }
+
+    def motors_listing_policies(self) -> Dict[str, str]:
+        """Policies for a Motors P&A (Trading) publish: seller-paid returns.
+
+        Same fulfillment/payment as the fallback, but the return policy is the
+        Motors seller-paid one (eBay mandates it for Parts & Accessories). Falls
+        back to the buyer-paid return id when no Motors return policy is set, so
+        non-auto instances are unaffected.
+        """
+        policies = self.fallback_listing_policies()
+        if self.motors_return_policy_id:
+            policies["returnPolicyId"] = self.motors_return_policy_id
+        return policies
 
     @property
     def banned_terms_lower(self) -> tuple:
@@ -162,6 +181,7 @@ _SECTION_FIELD_MAP = {
         "fallback_fulfillment_policy_id",
         "fallback_return_policy_id",
         "fallback_payment_policy_id",
+        "motors_return_policy_id",
     },
     "quality_gate": {
         "quality_banner_marker",
