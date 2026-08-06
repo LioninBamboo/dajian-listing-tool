@@ -771,6 +771,12 @@ class EbayCategoryMatcher:
         motors_categories = {
             "262210", "174020", "174021", "262216", "262093", "85040",
             "177849",  # Car & Truck Racks (tree 0)
+            # eBay Motors tree-100 leaves. A Motors store (tree 100) resolves auto
+            # categories through the Taxonomy API against tree 100, so plausibility
+            # must accept the tree-100 id or it blocks its own correct category.
+            # 33653 is live-publish verified; add each new tree-100 leaf here as it
+            # is confirmed by a real publish.
+            "33653",   # Trailer Hitches (tree 100) — verified live 2026-07-23
         }
         outdoor_chair_categories = {"79682", "79684", "138996"}
         porch_swing_categories = {"79694"}
