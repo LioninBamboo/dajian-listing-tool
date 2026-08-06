@@ -110,3 +110,93 @@ class TestAddItemXml:
             self._build(category_id="")
         with pytest.raises(ValueError):
             self._build(title="")
+
+
+# --- production wrapper: real_ebay_client.add_fixed_price_item_motors ----------
+
+import dataclasses  # noqa: E402
+
+from src.clients.real_ebay_client import RealEbayClient  # noqa: E402
+from src.utils.store_profile import StoreProfile  # noqa: E402
+
+
+class _Resp:
+    def __init__(self, text, status=200):
+        self.text = text
+        self.status_code = status
+
+
+class _CaptureSession:
+    def __init__(self, text):
+        self._text = text
+        self.calls = []
+
+    def post(self, url, headers=None, data=None, timeout=None):
+        self.calls.append({"url": url, "headers": headers, "data": data})
+        return _Resp(self._text)
+
+
+class _Oauth:
+    def get_valid_token(self):
+        return "iaf-token"
+
+
+def _auto_profile():
+    return dataclasses.replace(
+        StoreProfile(),
+        store_kind="auto",
+        listing_channel="trading",
+        ebay_site_id="100",
+        warehouse_location="Los Angeles, CA",
+        warehouse_postal="90001",
+        fallback_fulfillment_policy_id="262397301013",
+        fallback_return_policy_id="262619354013",
+        fallback_payment_policy_id="262397299013",
+    )
+
+
+class TestClientWrapper:
+    def _client(self, monkeypatch, resp_text):
+        monkeypatch.setattr(
+            "src.utils.store_profile.get_store_profile", lambda: _auto_profile()
+        )
+        c = object.__new__(RealEbayClient)
+        c.oauth = _Oauth()
+        c.session = _CaptureSession(resp_text)
+        return c
+
+    def test_publishes_and_returns_item_id(self, monkeypatch):
+        ok = "<AddFixedPriceItemResponse><Ack>Success</Ack><ItemID>188732319492</ItemID></AddFixedPriceItemResponse>"
+        c = self._client(monkeypatch, ok)
+        out = c.add_fixed_price_item_motors(
+            {"title": "Class 3 Trailer Hitch", "description": "<p>x</p>",
+             "aspects": {"Brand": ["AquaRides"]}, "images": ["https://img/a.jpg"],
+             "compatibility": _FITMENT},
+            category_id="33653", price=129.99, quantity=5,
+        )
+        assert out["itemId"] == "188732319492"
+        assert out["status"] == "published"
+        call = c.session.calls[0]
+        assert call["url"].endswith("/ws/api.dll")
+        assert call["headers"]["X-EBAY-API-SITEID"] == "100"          # eBay Motors
+        assert call["headers"]["X-EBAY-API-CALL-NAME"] == "AddFixedPriceItem"
+        xml = call["data"].decode("utf-8")
+        assert "<CategoryID>33653</CategoryID>" in xml
+        assert "<ItemCompatibilityList>" in xml                       # fitment carried
+
+    def test_warning_ack_still_succeeds(self, monkeypatch):
+        warn = "<r><Ack>Warning</Ack><ItemID>999</ItemID></r>"
+        c = self._client(monkeypatch, warn)
+        assert c.add_fixed_price_item_motors(
+            {"title": "T", "description": "d"}, category_id="33653", price=9.99
+        )["itemId"] == "999"
+
+    def test_failure_raises_with_message(self, monkeypatch):
+        fail = ("<r><Ack>Failure</Ack><Errors><LongMessage>"
+                "non-compliant domestic return policy</LongMessage></Errors></r>")
+        c = self._client(monkeypatch, fail)
+        with pytest.raises(Exception) as exc:
+            c.add_fixed_price_item_motors(
+                {"title": "T", "description": "d"}, category_id="33653", price=9.99
+            )
+        assert "return policy" in str(exc.value)

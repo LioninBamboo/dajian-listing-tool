@@ -1083,7 +1083,45 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 inv_product["video_urls"] = [video_id]
             if pws:
                 inv_product["packageWeightAndSize"] = pws
-            
+
+            # --- Channel split: Motors parts must go via the Trading API -------
+            # eBay Motors categories can't be published through the Inventory API
+            # (errorId 25005). Trading AddFixedPriceItem on SiteID 100 does it in
+            # one call (item + fitment + publish), so branch out entirely here.
+            if get_store_profile().listing_channel == "trading":
+                trading_product = dict(inv_product)
+                trading_product["description"] = description
+                trading_product["compatibility"] = (
+                    compatibility.compatible_products
+                    if compatibility and compatibility.mode != "not_applicable"
+                    else []
+                )
+                logger.info(
+                    f"  [TRADING] Motors publish via AddFixedPriceItem "
+                    f"(cat {category_id}, {len(trading_product['compatibility'])} fitment)"
+                )
+                trade = ebay_client.add_fixed_price_item_motors(
+                    trading_product,
+                    category_id=category_id,
+                    price=final_price,
+                    quantity=inv_product["quantity"],
+                )
+                listing_id = trade.get("itemId")
+                if not listing_id:
+                    return {"status": "error", "message": "Trading publish returned no ItemID"}
+                extra_logs = [f"Trading Motors publish (Ack={trade.get('ack')})"]
+                if video_id:
+                    extra_logs.append(f"Video: {video_id}")
+                update_product_status(sku, listing_id, None, category_id, extra_logs)
+                logger.info(f"  OK: Published (Trading Motors)! Listing: {listing_id}")
+                return {
+                    "status": "success",
+                    "message": f"Published via Trading! Listing: {listing_id}",
+                    "listing_id": listing_id,
+                    "channel": "trading",
+                }
+            # --- default Inventory API path (furniture / general) --------------
+
             ebay_client.create_or_replace_inventory_item(
                 sku=sku,
                 product=inv_product,
