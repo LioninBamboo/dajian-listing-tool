@@ -500,11 +500,22 @@ def analyze_ebay_motors_compatibility(
     title: str,
     description: str,
     aspects: Dict[str, Any],
+    is_motors_store: bool = False,
 ) -> CompatibilityAnalysis:
-    """Classify Motors fitment and return structured compatibility data when possible."""
+    """Classify Motors fitment and return structured compatibility data when possible.
+
+    ``is_motors_store`` bypasses the tree-0 category whitelist for instances that
+    publish against the eBay Motors catalog (category tree 100). Those stores use
+    tree-100 leaf ids — 33653 Trailer Hitches, 33650 Running Boards, … — which are
+    NOT in the tree-0 ``EBAY_MOTORS_CATEGORIES`` set, so without this a hitch would
+    silently publish with no fitment. Running the parser on any tree-100 category
+    is safe: it self-gates on the presence of vehicle data (a tool or universal
+    accessory just yields empty ``compatible_products``, never a bogus fitment).
+    Default False preserves the tree-0 gate for the furniture main store.
+    """
 
     category_id = str(category_id or "").strip()
-    if category_id not in EBAY_MOTORS_CATEGORIES:
+    if not is_motors_store and category_id not in EBAY_MOTORS_CATEGORIES:
         return CompatibilityAnalysis(mode="not_applicable")
 
     parser = VehicleCompatibilityParser()

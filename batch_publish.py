@@ -881,6 +881,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         title=title,
         description=description,
         aspects=completed_aspects,
+        is_motors_store=get_store_profile().is_motors,
     )
     completed_aspects = apply_compatibility_aspects(category_id, completed_aspects, compatibility)
     sanitize_placeholder_aspects(
@@ -923,6 +924,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         title=title,
         description=description,
         aspects=completed_aspects,
+        is_motors_store=get_store_profile().is_motors,
     )
     completed_aspects = apply_compatibility_aspects(category_id, completed_aspects, compatibility)
     sanitize_placeholder_aspects(
