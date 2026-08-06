@@ -690,22 +690,120 @@ class QwenOptimizer:
             "error": f"banned terms unresolved: {last_error}" if last_error else "generation failed",
         }
 
+    def optimize_auto_technical_listing(self, original_title, original_description, attributes=None, specs=None, market_intel=None, compatibility=None):
+        """Generate an auto-parts / tools listing (template_style=auto_technical).
+
+        Parallel to optimize_product_full but with the technical automotive
+        prompt. Auto-detects fitment (vehicle part) vs tool mode from the source
+        text and swaps the prompt accordingly. The exact Year-Make-Model fitment
+        is NOT written into the description — it goes to eBay's structured
+        ItemCompatibilityList at publish time (Trading channel), so the copy
+        never fabricates a fitment table. Returns furniture-compatible keys
+        ({title, description, aspects, categoryId}) plus the detected ``mode``.
+        """
+        from src.services.auto_technical_prompt import (
+            build_auto_technical_system_prompt,
+            build_auto_technical_user_prompt,
+            detect_auto_mode,
+            finalize_auto_technical_listing,
+        )
+
+        profile = get_store_profile()
+        mode = detect_auto_mode(original_title, original_description, attributes, compatibility)
+        print(f"🔧 Starting auto-technical optimization ({mode}) for: {str(original_title)[:50]}...")
+
+        system_prompt = build_auto_technical_system_prompt(profile, mode)
+        user_prompt = build_auto_technical_user_prompt(
+            title=original_title,
+            description=original_description,
+            mode=mode,
+            attributes=attributes,
+            specs=specs,
+            market_intel=market_intel,
+        )
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.4,
+            )
+            content = response.choices[0].message.content
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                data = json.loads(content.replace("```json", "").replace("```", "").strip())
+
+            # Same HTML hygiene as the furniture path, then truncate BEFORE the
+            # footer is appended so the footer always survives eBay's char limit.
+            body = self._validate_and_fix_html(self._clean_placeholder_text(str(data.get("description") or "")))
+            if len(body) > 3300:
+                body = self._smart_truncate_html(body, 3300)
+            data["description"] = body
+
+            result = finalize_auto_technical_listing(data, profile, mode)
+
+            # Share the category matcher so generation-time taxonomy agrees with publish.
+            try:
+                from src.services.ebay_category_matcher import create_category_matcher
+                matcher = create_category_matcher(os.getenv("EBAY_ENVIRONMENT", "PRODUCTION"))
+                matched_id, matched_name, matched_aspects = matcher.get_category_and_aspects(
+                    original_title or result.get("title", ""),
+                    result.get("aspects", {}),
+                    result.get("description", ""),
+                )
+                if matched_id:
+                    result["categoryId"] = matched_id
+                    result["categoryName"] = matched_name
+                    result["aspects"] = matched_aspects or result.get("aspects", {})
+            except Exception as cat_err:
+                print(f"   [WARN] category matcher unavailable: {cat_err}")
+
+            print(f"✅ Auto-technical optimization complete ({mode}). Title: {result.get('title','')[:50]}...")
+            return result
+
+        except Exception as e:
+            print(f"❌ Auto-technical optimization failed: {e}")
+            traceback.print_exc()
+            # Fall back rather than publish something unvalidated.
+            return {
+                "title": str(original_title or "")[:80],
+                "description": str(original_description or ""),
+                "aspects": {},
+                "features": [],
+                "mode": mode,
+                "error": "generation failed",
+            }
+
     def optimize_product_full(self, original_title, original_description, attributes=None, images=None, specs=None, video_url=None, market_intel=None, previous_errors=None):
         """
         优化产品标题和描述
-        
+
         Args:
             video_url: Optional video URL to embed in description
             market_intel: Optional market intelligence from Terapeak/Browse API
-                         {'top_keywords': [...], 'competitor_titles': [...], 
+                         {'top_keywords': [...], 'competitor_titles': [...],
                           'common_aspects': {...}, 'price_stats': {...}}
             previous_errors: List of error strings from previous failed attempts
         """
-        # Blind-box instance: route to the art-toy Hypebeast path. Furniture /
-        # auto instances (template_style == "furniture_classic") fall through to
-        # the existing logic below, completely unchanged.
-        if get_store_profile().template_style == "arttoy_hype":
+        # Sub-store instances route to their own template path. Furniture (the
+        # main store, template_style == "furniture_classic") falls through to the
+        # existing logic below, completely unchanged.
+        _style = get_store_profile().template_style
+        if _style == "arttoy_hype":
             return self.optimize_arttoy_listing(
+                original_title,
+                original_description,
+                attributes=attributes,
+                specs=specs,
+                market_intel=market_intel,
+            )
+        if _style == "auto_technical":
+            return self.optimize_auto_technical_listing(
                 original_title,
                 original_description,
                 attributes=attributes,
