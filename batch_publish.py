@@ -999,6 +999,43 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         dims = {k: completed_aspects.get(k) for k in
                 ['Item Length','Item Width','Item Height','Item Weight']
                 if completed_aspects.get(k)}
+        # Preview the ACTUAL channel payload. A Trading (Motors) publish sources
+        # fitment from the stored authoritative compatibleProducts and uses the
+        # seller-paid return policy — mirror the Trading branch so the dry-run
+        # reflects exactly what would go live, not the Inventory-path estimate.
+        _prof = get_store_profile()
+        if _prof.listing_channel == "trading":
+            _stored_fitment = (
+                (product.get("optimization") or {}).get("motorsCompatibility") or {}
+            ).get("compatibleProducts") or []
+            _fitment = _stored_fitment or (
+                compatibility.compatible_products
+                if compatibility and compatibility.mode != "not_applicable" else []
+            )
+            _ret = _prof.motors_listing_policies().get("returnPolicyId")
+            logger.info(
+                f"  DRY: [TRADING] cat {category_id}, {len(_fitment)} fitment, "
+                f"return policy {_ret} (seller-paid Motors P&A)"
+            )
+            return {
+                "status": "dry_run",
+                "channel": "trading",
+                "message": (
+                    f"[TRADING] Would publish at ${final_price:.2f} in cat "
+                    f"{category_id} ({category_name}), {len(_fitment)} fitment, "
+                    f"seller-paid return {_ret}"
+                ),
+                "category_id": category_id,
+                "category_name": category_name,
+                "aspects_count": len(completed_aspects),
+                "dimensions": dims,
+                "images": min(len(product.get('images', [])), publish_image_limit),
+                "compatibility_count": len(_fitment),
+                "return_policy_id": _ret,
+                "qc_status": qc_result["status"],
+                "candidate_fingerprint": candidate_fingerprint,
+                "source_fingerprint": source_fingerprint,
+            }
         return {
             "status": "dry_run",
             "message": f"Would publish at ${final_price:.2f} in cat {category_id} ({category_name})",
