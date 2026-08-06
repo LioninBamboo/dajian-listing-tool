@@ -1093,7 +1093,14 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             if get_store_profile().listing_channel == "trading":
                 trading_product = dict(inv_product)
                 trading_product["description"] = description
-                trading_product["compatibility"] = (
+                # Fitment is authoritative structured source data (GIGA
+                # motorsCompatibility), NOT something the LLM should re-derive.
+                # Prefer the stored compatibleProducts; only fall back to the
+                # text-parsed analysis when the source carried none.
+                stored_fitment = (
+                    (product.get("optimization") or {}).get("motorsCompatibility") or {}
+                ).get("compatibleProducts") or []
+                trading_product["compatibility"] = stored_fitment or (
                     compatibility.compatible_products
                     if compatibility and compatibility.mode != "not_applicable"
                     else []

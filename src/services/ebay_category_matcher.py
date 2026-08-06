@@ -697,6 +697,19 @@ class EbayCategoryMatcher:
             logging.warning(f"[WARN] Taxonomy API failed: {e}")
         
         # Step 3: Cross-validate and decide
+        # Motors stores publish against category tree 100. The keyword fallback map
+        # holds tree-0 ids (e.g. 174020 Trailer Hitches) that do not exist in tree
+        # 100; the Taxonomy API is queried against the store's OWN tree, so its
+        # suggestion is the correct tree-100 leaf (e.g. 33653). Trust the API there
+        # rather than the wrong-tree keyword id. Furniture (tree 0) is unaffected.
+        if get_store_profile().is_motors and api_cat_id:
+            if kw_cat_id and kw_cat_id != api_cat_id:
+                logging.info(
+                    f"[CAT] Motors tree 100: using API={api_cat_id} ({api_cat_name}) "
+                    f"over tree-0 keyword={kw_cat_id} ({kw_cat_name})"
+                )
+            return api_cat_id, api_cat_name
+
         if kw_cat_id and kw_cat_id != "38208":  # Not the generic fallback default
             # Strong keyword match — trust it over API
             if api_cat_id and api_cat_id != kw_cat_id:

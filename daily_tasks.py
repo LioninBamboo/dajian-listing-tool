@@ -252,6 +252,15 @@ def analyze_collected_products(
                     previous_errors = blockers
                 
                 # 3. 保存
+                # Preserve authoritative vehicle fitment across regeneration.
+                # motorsCompatibility (structured Year/Make/Model from the source
+                # / GIGA) is NOT LLM-generated copy — the optimizer never
+                # re-derives it, so without this a re-analysis silently drops all
+                # Motors fitment. No-op for furniture (prior has none).
+                prior_opt = product.optimization if isinstance(product.optimization, dict) else {}
+                prior_mc = prior_opt.get("motorsCompatibility")
+                if prior_mc and not opt_data.get("motorsCompatibility"):
+                    opt_data["motorsCompatibility"] = prior_mc
                 opt_data["_listing_qc"] = qc_result
                 product.optimization = opt_data
                 product.cost_breakdown = dajian_costs
