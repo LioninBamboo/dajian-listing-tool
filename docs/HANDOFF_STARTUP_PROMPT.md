@@ -19,7 +19,7 @@
 
 **🚩 战略前提（务必知晓）：美国海关趋严，业主决定暂时只做【美国本地仓】，放下中国直邮。** 因此**家具主店 + 汽配 AquaRides（均美国仓）是当前重心**；**盲盒 GrovePop（中国 SpeedPAK）暂停**——代码与授权全保留，但原 P0-B（盲盒换图）已降级，别再当首要任务做。
 
-**你的任务（二选一开工，优先级见报告 §5）：**
+**你的任务（默认从 P0-A 开工；完整排序与理由见报告 §5 开头的优先级表）：**
 
 - **P0-A：汽配 Trading API 刊登通道 + 汽配描述模板。**（通道负责"发进对的 Motors 类目"，模板负责"内容打动汽配买家"，配套做） 已实证：真·汽配类目在 **eBay Motors 站（SiteID 100）**，Inventory API 发不进去（errorId 25005），**Trading API `AddFixedPriceItem`（`X-EBAY-API-SITEID: 100`）能发**（含 77 条车型适配已验证成功，ItemID 188732319492 测试后已结束）。要把这套封装进管线：`real_ebay_client` 加 Trading 刊登方法、`store_profile` 加 `listing_channel`/`ebay_site_id`、`batch_publish` 按 channel 分流、汽配用 Motors 合规退货政策 `262619354013`（P&A 硬性要求卖家承担退货费）、Motros 类目重映射（**逐个实发验证，不空谈**）。**同时做汽配描述模板**：AquaRides 现用家具模板（凑合值），需按报告 §5-P0-A2 新建 `auto_prompt.py`（`template_style: auto_technical`，两种内容模式：适配件主打车型适配+规格表、工具主打参数），沿用 arttoy 的分流模式。详见报告 §5-P0-A / §5-P0-A2 与 §6 字段清单。
 - **⏸ P0-B（已暂停）：盲盒自有图管线。** GrovePop 因中国直邮战略暂停（见上）。恢复时它仍是复工第一前提：首条 listing 被 eBay 自动判仿冒下架，触发因是**直接用了源卖家的图**，需发布前转存自有/EPS 图 + 门禁。
