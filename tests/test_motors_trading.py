@@ -6,8 +6,27 @@ import pytest
 
 from src.services.motors_trading import (
     build_add_fixed_price_item_xml,
+    build_revise_fixed_price_item_xml,
     format_compatibility_list,
 )
+
+
+class TestReviseBuilder:
+    def test_partial_update_only_sends_given_fields(self):
+        xml = build_revise_fixed_price_item_xml(item_id="188752675328", description="<b>Clean</b>")
+        assert "<ItemID>188752675328</ItemID>" in xml
+        assert "<![CDATA[<b>Clean</b>]]>" in xml
+        assert "<Title>" not in xml                      # omitted field left untouched live
+        assert "<ItemSpecifics>" not in xml              # fitment/aspects preserved
+        assert xml.startswith("<?xml")
+
+    def test_title_clipped_to_80(self):
+        xml = build_revise_fixed_price_item_xml(item_id="1", title="x" * 120)
+        assert "<Title>" + "x" * 80 + "</Title>" in xml
+
+    def test_requires_item_id(self):
+        with pytest.raises(ValueError):
+            build_revise_fixed_price_item_xml(item_id="", description="d")
 
 _POLICIES = {
     "fulfillmentPolicyId": "262397301013",

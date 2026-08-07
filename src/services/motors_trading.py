@@ -67,6 +67,34 @@ def _pictures_xml(image_urls: Optional[Sequence[str]]) -> str:
     return f"<PictureDetails>{inner}</PictureDetails>"
 
 
+def build_revise_fixed_price_item_xml(
+    *,
+    item_id: str,
+    description: Optional[str] = None,
+    title: Optional[str] = None,
+) -> str:
+    """Build a minimal ReviseFixedPriceItem request for a live Motors item.
+
+    Only the fields passed are sent — ReviseFixedPriceItem is a partial update, so
+    omitting ItemSpecifics/Compatibility/Price leaves the live values untouched.
+    Used to push a corrected description (or a strengthened title) onto an item
+    that was published before a template/QC fix, without disturbing its fitment.
+    """
+    if not item_id:
+        raise ValueError("item_id is required")
+    parts = [f"<ItemID>{escape(str(item_id))}</ItemID>"]
+    if title is not None:
+        parts.append(f"<Title>{escape(str(title)[:80])}</Title>")
+    if description is not None:
+        parts.append(f"<Description><![CDATA[{description}]]></Description>")
+    return (
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<ReviseFixedPriceItemRequest xmlns=\"urn:ebay:apis:eBLBaseComponents\">"
+        f"<Item>{''.join(parts)}</Item>"
+        "</ReviseFixedPriceItemRequest>"
+    )
+
+
 def build_add_fixed_price_item_xml(
     *,
     title: str,

@@ -1014,6 +1014,59 @@ class RealEbayClient:
         ]
         raise Exception(f"Motors AddFixedPriceItem failed (Ack={ack}): {'; '.join(errors)[:400]}")
 
+    def get_item_description_motors(self, item_id: str) -> str:
+        """Fetch the live Description of a Trading item (Motors) — read-only."""
+        import re
+        from src.utils.store_profile import get_store_profile
+        profile = get_store_profile()
+        xml = (
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            "<GetItemRequest xmlns=\"urn:ebay:apis:eBLBaseComponents\">"
+            f"<ItemID>{item_id}</ItemID><DetailLevel>ItemReturnDescription</DetailLevel>"
+            "</GetItemRequest>"
+        )
+        headers = {
+            "X-EBAY-API-CALL-NAME": "GetItem",
+            "X-EBAY-API-SITEID": profile.ebay_site_id,
+            "X-EBAY-API-COMPATIBILITY-LEVEL": "1155",
+            "X-EBAY-API-IAF-TOKEN": self.oauth.get_valid_token(),
+            "Content-Type": "text/xml",
+        }
+        resp = self.session.post("https://api.ebay.com/ws/api.dll", headers=headers,
+                                 data=xml.encode("utf-8"), timeout=60)
+        m = re.search(r"<Description>(.*?)</Description>", resp.text, re.S)
+        return (m.group(1) if m else "")
+
+    def revise_fixed_price_item_motors(self, item_id: str, *, description: Optional[str] = None,
+                                       title: Optional[str] = None) -> Dict:
+        """Partial-update a live Motors Trading item's description and/or title.
+
+        Leaves ItemSpecifics, Compatibility and Price untouched (they are simply
+        not sent). Returns {"itemId", "ack"} or raises with eBay's error messages.
+        """
+        import re
+        from src.services.motors_trading import build_revise_fixed_price_item_xml
+        from src.utils.store_profile import get_store_profile
+        profile = get_store_profile()
+        xml = build_revise_fixed_price_item_xml(item_id=item_id, description=description, title=title)
+        headers = {
+            "X-EBAY-API-CALL-NAME": "ReviseFixedPriceItem",
+            "X-EBAY-API-SITEID": profile.ebay_site_id,
+            "X-EBAY-API-COMPATIBILITY-LEVEL": "1155",
+            "X-EBAY-API-IAF-TOKEN": self.oauth.get_valid_token(),
+            "Content-Type": "text/xml",
+        }
+        resp = self.session.post("https://api.ebay.com/ws/api.dll", headers=headers,
+                                 data=xml.encode("utf-8"), timeout=90)
+        body = resp.text
+        ack = (re.search(r"<Ack>(.*?)</Ack>", body) or [None, ""])[1] if "<Ack>" in body else ""
+        if ack in ("Success", "Warning"):
+            logging.info(f"[MOTORS] Revise OK: ItemID {item_id} (Ack={ack})")
+            return {"itemId": item_id, "ack": ack}
+        errors = [(m.group(1) or "").strip()
+                  for m in re.finditer(r"<LongMessage>(.*?)</LongMessage>", body, re.S)]
+        raise Exception(f"ReviseFixedPriceItem failed (Ack={ack}): {'; '.join(errors)[:400]}")
+
     def publish_offer(self, offer_id: str, max_retries: int = 3) -> Dict:
         """
         Publish offer to eBay
