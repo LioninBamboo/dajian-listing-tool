@@ -35,7 +35,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -266,6 +266,51 @@ def build_enriched_title(title: str, aspects: Dict[str, Any],
         "added_keywords": surviving,
         "added_hot_keywords": surviving_hot,
     }
+
+
+def title_fact_guard(cand: Dict[str, Any], new_title: str) -> Tuple[bool, List[Dict[str, Any]]]:
+    """FactSheet backstop before any live title write.
+
+    ``build_enriched_title`` only appends the SKU's own aspect values, so the
+    enriched title is grounded by construction — but this runs the shared
+    semantic FactSheet as an explicit gate so a scheduled LIVE apply can never
+    push an un-sourced claim. Returns (passed, blocking_violations). QC being
+    unavailable (no QWEN key / no conn) does NOT block — it degrades to the
+    existing aspect-grounded behavior rather than silently failing every SKU.
+    """
+    try:
+        from src.utils.listing_fact_sheet import check_fact_sheet_violations
+    except Exception:
+        return True, []
+    opt = cand.get("optimization") or {}
+    aspects = cand.get("aspects") or {}
+    try:
+        conn = sqlite3.connect(str(PROJECT_ROOT / "ebay_collection.db"), timeout=30)
+    except Exception:
+        return True, []
+    try:
+        res = check_fact_sheet_violations(
+            conn,
+            source_title=str(cand.get("title") or ""),
+            source_description=str(opt.get("description") or ""),
+            source_attributes=aspects,
+            source_specs={},
+            candidate_title=new_title,
+            candidate_description=new_title,   # fact-check the title as the copy
+            candidate_aspects=aspects,
+        )
+    except Exception:
+        return True, []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if res.get("status") != "violations":
+        return True, []
+    blocking = [v for v in res.get("violations", [])
+                if str(v.get("severity")) in ("CRITICAL", "HIGH")]
+    return (not blocking), blocking
 
 
 def recently_rewritten_skus(days: int = REWRITE_COOLDOWN_DAYS,
@@ -752,6 +797,16 @@ def run(skus: List[str], apply_changes: bool, limit: int,
             "added_keywords": proposal["added_keywords"],
             "added_hot_keywords": proposal.get("added_hot_keywords", []),
         }
+        # QC backstop: never write a title the semantic FactSheet flags. Runs on
+        # dry-run too, so the report shows exactly which SKUs would be blocked.
+        guard_ok, guard_violations = title_fact_guard(cand, proposal["new_title"])
+        if not guard_ok:
+            row["status"] = "skipped"
+            row["reason"] = "title failed FactSheet guard"
+            row["fact_violations"] = guard_violations
+            rep["skipped"].append(sku)
+            rep["rows"].append(row)
+            continue
         if not apply_changes:
             row["status"] = "proposed"
             rep["proposed"].append(sku)
