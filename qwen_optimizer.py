@@ -158,8 +158,14 @@ class QwenOptimizer:
         try:
             from src.services.ebay_auth import EbayOAuthService
             oauth = EbayOAuthService(os.getenv("EBAY_ENVIRONMENT", "PRODUCTION"))
-            token = oauth.get_valid_token()
-            
+            # Browse item_summary/search needs an APPLICATION (client-credentials)
+            # token — the sub-account USER token has only sell.* scopes and 403s
+            # here. Fall back to the user token only if app token is unavailable.
+            try:
+                token = oauth.get_application_token() or oauth.get_valid_token()
+            except Exception:
+                token = oauth.get_valid_token()
+
             if not token:
                 print("   [WARN] No eBay token for market research, skipping")
                 return result

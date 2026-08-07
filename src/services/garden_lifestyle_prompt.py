@@ -116,10 +116,18 @@ the footer from 'aspects'. YOUR 'description' must contain ONLY the middle prose
   "pre-assembled") unless that exact word is in the source — they are treated as fabricated claims.
 - Every feature and adjective must trace to a source aspect value or the source description text, word for word.
 - Fill Item Specifics ('aspects') accurately; values MUST be lists of strings. The 'Brand' aspect is set by the system.
+  Fill AS MANY relevant aspects as the source supports (Type, Material, Color, Shape, Features, Indoor/Outdoor,
+  Style, Room, Set Includes …) — eBay ranks and filters on these, so more accurate specifics = more visibility.
+
+**TITLE (eBay Cassini search — THIS is where keywords rank, not the description):**
+- Use 75–80 of the 80 characters — never waste the space. Title Case, no brand name, no fluff (New/Best/Sale).
+- FRONT-LOAD the highest-search terms buyers actually type. Weave in as many of the provided trending keywords
+  as read naturally; include the product noun + key descriptors (size, color, material, shape, use). Prefer
+  words buyers search (e.g. "Planter Box", "Flower Pot", "Large", "Outdoor", "Yard") over codes nobody searches.
 
 **OUTPUT FORMAT:** a SINGLE valid JSON object, no markdown fences:
 {{
-  "title": "SEO title, max 80 chars, keyword-front-loaded, no brand name",
+  "title": "75-80 char keyword-front-loaded SEO title, no brand name",
   "description": "<div>intro + KEY FEATURES + PERFECT FOR, inline-CSS only</div>",
   "aspects": {{ "Type": ["Planter"], "Material": ["Magnesium Oxide (MGO)"], "Color": ["Rust"], "Shape": ["Square"] }},
   "features": ["selling point 1", "selling point 2"],
