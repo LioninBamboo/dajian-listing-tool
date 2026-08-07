@@ -161,11 +161,19 @@ def build_auto_technical_system_prompt(profile: Any, mode: str) -> str:
   · do NOT add adjectives the source never uses (e.g. "heavy-duty", "premium", "universal", "OE-grade", "direct replacement") — these are treated as fabricated claims.
 - Every feature bullet and every adjective must be traceable to a source aspect value or the source description text, word for word.
 - Fill Item Specifics ('aspects') with accurate values from the source; values MUST be lists of strings.
+  Fill AS MANY relevant aspects as the source supports (Type, Placement on Vehicle, Fitment Type, Material,
+  Finish, Features, capacity/size …) — eBay ranks and filters on these, so more accurate specifics = more visibility.
 - The 'Brand' aspect is set deterministically by the system afterward — you may omit it.
+
+**TITLE (eBay Cassini search — THIS is where keywords rank, not the description):**
+- Use 75–80 of the 80 characters — never waste the space. Title Case, no brand name, no fluff (New/Best/Sale).
+- FRONT-LOAD the highest-search terms buyers actually type. Weave in as many of the provided trending keywords
+  as read naturally; include the part noun + key descriptors (type, placement, size/class, material, finish).
+  Prefer words buyers search over codes/jargon nobody searches. Every word must still be source-accurate.
 
 **OUTPUT FORMAT:** return a SINGLE VALID JSON object, no markdown fences, no prose:
 {{
-  "title": "SEO title, max 80 chars, keyword-front-loaded, no brand name",
+  "title": "75-80 char keyword-front-loaded SEO title, no brand name",
   "description": "<div style='...'>full inline-CSS HTML</div>",
   "aspects": {aspects_hint},
   "features": ["selling point 1", "selling point 2"],
