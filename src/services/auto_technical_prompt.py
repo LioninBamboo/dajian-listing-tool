@@ -100,11 +100,7 @@ def detect_auto_mode(
 def build_auto_technical_system_prompt(profile: Any, mode: str) -> str:
     brand = getattr(profile, "brand_name", "") or "the store"
     tagline = getattr(profile, "brand_tagline", "") or ""
-    box_label = (
-        "WHAT'S IN THE BOX"
-        if mode == AUTO_MODE_TOOL
-        else "FITMENT / COMPATIBILITY note + PACKAGE INCLUDES"
-    )
+    box_label = "WHAT'S IN THE BOX" if mode == AUTO_MODE_TOOL else "PACKAGE INCLUDES"
     if mode == AUTO_MODE_TOOL:
         role = "automotive TOOLS & garage-equipment"
         focus = (
@@ -123,12 +119,13 @@ def build_auto_technical_system_prompt(profile: Any, mode: str) -> str:
     else:
         role = "automotive PARTS & accessories"
         focus = (
-            "- Lead with placement on the vehicle and the direct-replacement / "
-            "upgrade value (fit, finish, function).\n"
-            "- Include a short FITMENT / COMPATIBILITY note telling the buyer to "
-            "verify their Year-Make-Model against the compatibility chart. Do NOT "
-            "invent a Year/Make/Model list, part numbers, or OE/interchange numbers "
-            "— the exact fitment is shown by eBay's compatibility widget, not here.\n"
+            "- Lead with placement on the vehicle and the fit/finish/function value, "
+            "using ONLY the source's own wording for the fitment type.\n"
+            "- Do NOT add any Fitment / Compatibility / 'compatible models' section, "
+            "and do NOT list or allude to Year/Make/Model, part numbers, or "
+            "OE/interchange numbers. eBay renders the full vehicle compatibility "
+            "table natively below the description — a fitment section here is "
+            "redundant and leaves a dangling, empty 'models include:' line.\n"
             "- Cover material/finish, install difficulty, and any hardware included."
         )
         aspects_hint = (
@@ -203,6 +200,23 @@ def build_auto_technical_user_prompt(
     return "\n".join(parts)
 
 
+def _banner_block(profile: Any) -> str:
+    """Deterministic auto-styled brand banner (dark steel + safety-orange rule).
+
+    Prepended by finalize so every auto listing opens with a consistent, branded
+    header in the auto theme — not the furniture navy/gold shell — and carries the
+    store banner marker for the QC template check.
+    """
+    brand = html.escape(str(getattr(profile, "brand_name", "") or "").upper())
+    tagline = html.escape(str(getattr(profile, "brand_tagline", "") or ""))
+    return (
+        '<div style="text-align:center;padding:26px 15px;background:#1a1a1a;'
+        'border-bottom:4px solid #ff5722;font-family:Arial,sans-serif;">'
+        f'<h1 style="margin:0;font-size:26px;font-weight:800;letter-spacing:3px;color:#fff;">{brand}</h1>'
+        f'<p style="margin:8px 0 0;font-size:12px;color:#ff5722;letter-spacing:2px;">{tagline}</p></div>'
+    )
+
+
 def _footer_block(profile: Any) -> str:
     footer = str(getattr(profile, "footer_html", "") or "").strip()
     if footer:
@@ -255,6 +269,17 @@ def finalize_auto_technical_listing(
         aspects["Brand"] = [getattr(profile, "brand_name", "") or "Unbranded"]
     elif not aspects.get("Brand"):
         aspects["Brand"] = [getattr(profile, "default_brand", "Unbranded")]
+
+    # Prepend the branded auto banner once (idempotent via the store banner
+    # marker — brand_name.upper() contains it). Gives the auto template its own
+    # complete chrome so nothing downstream wraps it in the furniture shell.
+    banner = _banner_block(profile)
+    # Idempotency keys on the brand name — that is what the banner actually
+    # contains (quality_banner_marker can differ from brand_name).
+    brand_l = str(getattr(profile, "brand_name", "") or "").lower()
+    has_banner = bool(brand_l) and brand_l in html.unescape(description).lower()
+    if description and banner and not has_banner:
+        description = f"{banner}\n{description}"
 
     footer = _footer_block(profile)
     footer_marker = str(getattr(profile, "quality_footer_marker", "") or "").lower()

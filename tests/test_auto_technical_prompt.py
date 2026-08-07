@@ -123,6 +123,25 @@ class TestFinalize:
         )
         assert again["description"].count("Ships from US Warehouse") == 1
 
+    def test_brand_banner_prepended_once(self):
+        first = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>body</div>", "aspects": {}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        assert "AQUARIDES" in first["description"]          # branded banner present
+        assert first["description"].index("AQUARIDES") < first["description"].index("body")
+        again = finalize_auto_technical_listing(
+            {"title": "T", "description": first["description"], "aspects": {}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        assert again["description"].count("AQUARIDES") == 1  # idempotent, no double banner
+
+    def test_fitment_prompt_forbids_a_compatibility_section(self):
+        sp = build_auto_technical_system_prompt(_auto_profile(), AUTO_MODE_FITMENT)
+        low = sp.lower()
+        assert "compatible models include" not in low
+        assert "do not add any fitment" in low          # eBay renders it natively
+
     def test_mode_recorded_and_features_defaulted(self):
         out = finalize_auto_technical_listing(
             {"title": "T", "description": "<div>x</div>", "aspects": {}},

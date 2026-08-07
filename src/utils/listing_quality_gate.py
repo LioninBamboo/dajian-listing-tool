@@ -1736,6 +1736,17 @@ def ensure_store_description_template(
     profile = profile if profile is not None else _store_profile_or_none()
     desc = description or ""
 
+    # Specialized templates (arttoy_hype, auto_technical) emit their OWN complete
+    # banner + footer. The furniture shell here must not re-wrap them — doing so
+    # stacks a furniture header over the specialized body and duplicates the
+    # footer. Only furniture_classic uses this shell.
+    if (
+        str(getattr(profile, "template_style", "furniture_classic")) != "furniture_classic"
+        and desc.strip()
+        and not description_contains_cjk(desc)
+    ):
+        return desc
+
     thin = False
     try:
         from src.utils.conversion_copy import is_thin_key_features_description
