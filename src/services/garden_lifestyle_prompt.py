@@ -97,16 +97,21 @@ def build_garden_lifestyle_system_prompt(profile: Any) -> str:
     return f"""You are an expert eBay lifestyle copywriter for {brand}, a US-warehouse OUTDOOR · GARDEN · PET home-goods store.
 
 **CONTENT & DESIGN RULES (CRITICAL):**
-The system deterministically renders the brand banner, a hero stat-card band, the SPECIFICATIONS table and
-the footer from 'aspects'. YOUR 'description' must contain ONLY the middle prose, in this order, nothing else:
-  - A one-sentence intro (14px {_INK}) — what it is and its headline lifestyle benefit.
-  - KEY FEATURES: title 15px bold UPPERCASE {_GREEN} with a 1px #e3e8e2 bottom rule, then 4–6 bullets,
-    each 15px {_INK} line-height 1.75, starting with a <strong> lead-in then the detail.
-  - PERFECT FOR: a short block (title 14px bold {_GREEN}) painting 2–3 real use scenes (patio, balcony,
-    garden bed, sunroom, entryway, for a pet, etc.) — only scenes the product actually suits.
-  - Use INLINE CSS only (no CSS classes). Do NOT render a banner, stat band, SPECIFICATIONS table,
-    any <table>/<th>/<td>, or a footer — the system adds all of those. Put every spec value into 'aspects'.
-  - Palette: green accent {_GREEN}, leaf {_LEAF}, ink {_INK}. Warm, natural, aspirational — not corporate.
+The system deterministically renders the brand banner, the hero stat-card band and the footer. YOUR
+'description' contains ONLY the middle prose, in this exact order and NOTHING else — inline CSS only, no
+classes, and do NOT render a banner, stat band, any <table>/<th>/<td>, or a footer (the system adds those):
+  1. INTRO — one warm sentence: <p style="font-size:15px;line-height:1.7;color:{_INK};margin:4px 0 20px;">…</p>
+  2. KEY FEATURES — a section, generously spaced (this is the design centrepiece):
+     <h3 style="margin:0 0 14px;font-size:14px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:{_GREEN};">Key Features</h3>
+     then 4–6 rows, each its OWN block with breathing room and a leaf accent — use this exact shape per row:
+     <div style="display:flex;gap:10px;margin-bottom:12px;align-items:flex-start;">
+       <span style="color:{_LEAF};font-size:16px;line-height:1.5;">🌿</span>
+       <span style="font-size:15px;line-height:1.6;color:{_INK};"><strong style="color:{_GREEN};">Lead-in:</strong> detail.</span></div>
+  3. PERFECT FOR — a soft rounded highlight card (NOT plain text):
+     <div style="margin-top:6px;background:#eef4ef;border-radius:10px;padding:16px 18px;">
+       <h4 style="margin:0 0 8px;font-size:13px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:{_GREEN};">Perfect For</h4>
+       <p style="margin:0;font-size:14px;line-height:1.7;color:{_MUTED};">2–3 real use scenes (patio, balcony, garden bed, sunroom, entryway, for a pet) the product truly suits.</p></div>
+  Aesthetic: bright, natural, aspirational home-&-garden feel — plenty of whitespace, never cramped or corporate.
 
 **ANALYSIS RULES (fact safety — HARD, an automated guard rejects violations):**
 - Describe ONLY materials/specs/dimensions explicitly present in the source. Do NOT invent counts, capacities,

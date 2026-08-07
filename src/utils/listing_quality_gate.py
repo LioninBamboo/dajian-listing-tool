@@ -1557,18 +1557,30 @@ def normalize_generated_listing(
     apply_aspect_assembly_description_requirement(opt)
     sanitize_single_value_aspects(opt["aspects"])
 
+    # Specialized templates (arttoy_hype, auto_technical, garden_lifestyle) render
+    # their own complete description chrome and surface specs via their own blocks
+    # + eBay's native item-specifics panel. The furniture-era description appenders
+    # below (measurement box, fallback KEY FEATURES bullets) must NOT run for them —
+    # otherwise they inject a furniture-styled dimensions box and a raw <ul> AFTER
+    # the specialized footer, corrupting the layout.
+    _specialized_template = (
+        str(getattr(_store_profile_or_none(), "template_style", "furniture_classic"))
+        != "furniture_classic"
+    )
+
     length = updates.get("Item Length") or first_aspect_text(opt["aspects"], "Item Length")
     width = updates.get("Item Width") or first_aspect_text(opt["aspects"], "Item Width")
     height = updates.get("Item Height") or first_aspect_text(opt["aspects"], "Item Height")
     weight = updates.get("Item Weight") or first_aspect_text(opt["aspects"], "Item Weight")
     try:
-        opt["description"] = replace_description_measurements(
-            opt["description"],
-            length=float(re.search(r"(\d+(?:\.\d+)?)", length).group(1)) if length else None,
-            width=float(re.search(r"(\d+(?:\.\d+)?)", width).group(1)) if width else None,
-            height=float(re.search(r"(\d+(?:\.\d+)?)", height).group(1)) if height else None,
-            weight=float(re.search(r"(\d+(?:\.\d+)?)", weight).group(1)) if weight else None,
-        )
+        if not _specialized_template:
+            opt["description"] = replace_description_measurements(
+                opt["description"],
+                length=float(re.search(r"(\d+(?:\.\d+)?)", length).group(1)) if length else None,
+                width=float(re.search(r"(\d+(?:\.\d+)?)", width).group(1)) if width else None,
+                height=float(re.search(r"(\d+(?:\.\d+)?)", height).group(1)) if height else None,
+                weight=float(re.search(r"(\d+(?:\.\d+)?)", weight).group(1)) if weight else None,
+            )
     except Exception:
         pass
 
@@ -1584,12 +1596,15 @@ def normalize_generated_listing(
         claim_state = claim_facts.get(claim_name) if isinstance(claim_facts, Mapping) else {}
         if isinstance(claim_state, Mapping) and claim_state.get("supported"):
             _append_unique_aspect_value(opt["aspects"], "Features", feature_value)
-    opt["description"] = _ensure_key_features_block(
-        opt.get("description", ""),
-        title=opt.get("title", ""),
-        aspects=opt.get("aspects", {}),
-        source_facts=opt["source_facts"],
-    )
+    if not _specialized_template:
+        # Specialized templates write their own KEY FEATURES; skip the furniture
+        # fallback that would append a raw <ul> after their footer.
+        opt["description"] = _ensure_key_features_block(
+            opt.get("description", ""),
+            title=opt.get("title", ""),
+            aspects=opt.get("aspects", {}),
+            source_facts=opt["source_facts"],
+        )
 
     # ── Layer 2: Deterministic claim violation detection ──
     from src.utils.claim_diff_engine import build_source_constraints, detect_claim_violations
