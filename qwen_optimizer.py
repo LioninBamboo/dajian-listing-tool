@@ -848,6 +848,16 @@ class QwenOptimizer:
                 body = self._smart_truncate_html(body, 1900)
             data["description"] = body
 
+            # Fill Item L/W/H from the source BEFORE finalize renders the hero, so
+            # the dimensions the QC requires in the description are actually there
+            # (finalize runs before the category matcher completes aspects).
+            try:
+                from src.utils.listing_quality_gate import _fill_measurement_aspects
+                data.setdefault("aspects", {})
+                _fill_measurement_aspects(data["aspects"], {**(attributes or {}), **(specs or {})})
+            except Exception:
+                pass
+
             result = finalize_garden_lifestyle_listing(data, profile)
 
             try:
