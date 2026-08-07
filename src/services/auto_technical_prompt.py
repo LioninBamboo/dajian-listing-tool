@@ -289,25 +289,37 @@ _SPEC_CORE_ORDER = (
 )
 _SPEC_MAX = 10
 _DIM_UNIT_RE = re.compile(r"[0-9.]+")
+# Any of these prefixes + length/width/height is the SAME physical dimension the
+# source may repeat under several aspect names (Item Length, Assembled Length
+# (in.), Overall Width…). All fold into one row; all component rows are removed.
+_DIM_COMPONENT_RE = re.compile(
+    r"^(?:item|assembled|overall|product|package)?\s*(length|width|height|depth)\b", re.I
+)
 
 
 def _combine_dimensions(norm: Dict[str, str]) -> None:
-    """Collapse Item Length/Width/Height into a single L × W × H row (in place)."""
-    keys = ("Item Length", "Item Width", "Item Height")
-    vals = [norm.get(k) for k in keys]
-    if not all(vals):
+    """Collapse every Length/Width/Height aspect variant into one L × W × H row."""
+    axes: Dict[str, str] = {}
+    to_remove = []
+    for k in list(norm.keys()):
+        m = _DIM_COMPONENT_RE.match(k.strip())
+        if m:
+            axis = m.group(1).lower()
+            axes.setdefault(axis, norm[k])   # first name wins
+            to_remove.append(k)
+    if not all(a in axes for a in ("length", "width", "height")):
         return
     nums = []
     unit = "in"
-    for v in vals:
-        m = _DIM_UNIT_RE.search(v)
+    for axis in ("length", "width", "height"):
+        m = _DIM_UNIT_RE.search(axes[axis])
         if not m:
             return
         nums.append(m.group(0))
-        tail = v[m.end():].strip()
+        tail = axes[axis][m.end():].strip()
         if tail:
             unit = tail
-    for k in keys:
+    for k in to_remove:
         norm.pop(k, None)
     norm["Dimensions (L × W × H)"] = f"{' × '.join(nums)} {unit}".strip()
 
