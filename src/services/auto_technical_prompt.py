@@ -224,8 +224,15 @@ def _banner_block(profile: Any) -> str:
     )
 
 
-_SPEC_HIDDEN = {"brand", "features", "california prop 65 warning", "item sku",
-                "unit of measurement", "number of packages", "qty", "extra info"}
+_SPEC_HIDDEN = {
+    "brand", "features", "california prop 65 warning", "item sku",
+    "unit of measurement", "number of packages", "qty", "extra info",
+    # Vehicle fitment lives in eBay's native compatibility table below the
+    # description — keep it out of the spec table (a 25-year "Compatible Year"
+    # list is unreadable there).
+    "compatible make", "compatible model", "compatible year", "application",
+    "other part number", "interchange part number",
+}
 
 # Priority order of "headline" specs surfaced as big hero stat cards (the buyer's
 # key decision numbers). First matches present, short-valued, win — max 4.
