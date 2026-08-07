@@ -156,6 +156,19 @@ class TestFinalize:
         assert d.count("<table") == 1                        # single, deterministic
         assert ">Brand<" not in d                            # Brand is not a spec row
 
+    def test_hero_band_surfaces_key_numbers(self):
+        out = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>body</div>",
+             "aspects": {"Hitch Class": ["Class 3"], "Load Capacity": ["4500 lbs"],
+                         "Receiver Size": ["2 in"], "Material": ["Carbon Steel"]}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        d = out["description"]
+        assert "26px" in d                                   # hero stat cards present
+        assert "4500 lbs" in d and "Class 3" in d
+        # hero band comes before the body prose
+        assert d.index("4500 lbs") < d.index("body")
+
     def test_spec_table_not_injected_when_llm_made_one(self):
         # Guard against double tables if the model ignores the instruction.
         out = finalize_auto_technical_listing(

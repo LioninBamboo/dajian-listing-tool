@@ -139,21 +139,16 @@ def build_auto_technical_system_prompt(profile: Any, mode: str) -> str:
 1. HTML Description ('description'): a self-contained, MOBILE-FIRST inline-CSS block (most eBay
    traffic is phones — one column, generous tap spacing, no fixed widths). Use INLINE CSS
    (style="...") for ALL styling; NEVER use CSS classes (eBay strips them). No <html>/<head>/<body>.
-   Follow this DESIGN SYSTEM exactly for a consistent, high-contrast, premium-technical look:
-   - Palette: ink #14161a · steel #1f2329 · safety-orange accent #ff5722 · hairline #e5e7eb ·
-     light row #f6f7f9 · white #fff. High contrast ALWAYS — never dark text on a dark fill.
-   - HERO SPEC BAND (first thing after the title): a wrapping flex row of 2–4 "stat cards" holding
-     the buyer's KEY DECISION NUMBERS (e.g. the class/grade, the load/capacity figure, the size).
-     Each card = big bold value (28px, #14161a) + a small UPPERCASE label under it (11px, #6b7280,
-     letter-spacing:1px); white card, 1px #e5e7eb border, padding 14px, border-radius 8px. THIS BAND
-     IS THE CONVERSION FOCUS. Use ONLY numbers/values present in the source; omit the band if none.
-   - KEY FEATURES: title 15px bold UPPERCASE #ff5722 with a 1px #e5e7eb bottom rule. 4–6 bullets,
-     each 15px #14161a line-height 1.75, starting with a <strong> lead-in phrase, then the detail.
-   - Do NOT build a SPECIFICATIONS or specs table and do NOT use any <table>/<th>/<td> — the system
-     renders the specifications table automatically from the item specifics. Put every spec value into
-     'aspects' instead (that is what gets tabulated).
-   - {box_label}: one short line/list of exactly what ships in the box.
-   - Do NOT add a Shipping / Returns / Policies section — the system appends the footer automatically.
+   The system deterministically renders the brand banner, the hero stat-card band (key decision
+   numbers), the SPECIFICATIONS table, and the footer from 'aspects'. YOUR description must contain
+   ONLY the middle prose, in this order, and NOTHING else:
+   - A one-sentence intro (14px #14161a) — what the part is and its headline benefit.
+   - KEY FEATURES: a title 15px bold UPPERCASE #ff5722 with a 1px #e5e7eb bottom rule, then 4–6
+     bullets, each 15px #14161a line-height 1.75, each starting with a <strong> lead-in then the detail.
+   - {box_label}: one short line of exactly what ships in the box.
+   Palette to match: ink #14161a · orange accent #ff5722 · hairline #e5e7eb. High contrast always.
+   - Do NOT render a brand/header banner, a stat band, a SPECIFICATIONS table, any <table>/<th>/<td>,
+     or a Shipping/Returns/footer — the system adds all of those. Put every spec value into 'aspects'.
 2. FOCUS FOR THIS ITEM:
 {focus}
 
@@ -231,6 +226,45 @@ def _banner_block(profile: Any) -> str:
 
 _SPEC_HIDDEN = {"brand", "features", "california prop 65 warning", "item sku",
                 "unit of measurement", "number of packages", "qty", "extra info"}
+
+# Priority order of "headline" specs surfaced as big hero stat cards (the buyer's
+# key decision numbers). First matches present, short-valued, win — max 4.
+_HERO_KEYS = (
+    "Hitch Class", "Class", "Load Capacity", "Maximum Weight Capacity",
+    "Max Gross Trailer Weight", "Weight Carrying Capacity", "Maximum Load Capacity",
+    "Receiver Size", "Drive Size", "Power Source", "Tongue Weight",
+    "Number of Pieces", "Type",
+)
+
+
+def _hero_band(aspects: Mapping[str, Any]) -> str:
+    """Deterministic stat-card band for the buyer's key decision numbers."""
+    norm = {}
+    for k, v in (aspects or {}).items():
+        val = ", ".join(str(x).strip() for x in v if str(x).strip()) if isinstance(v, (list, tuple)) else str(v).strip()
+        if val:
+            norm[str(k).strip().lower()] = (str(k).strip(), val)
+    cards = []
+    seen = set()
+    for key in _HERO_KEYS:
+        hit = norm.get(key.lower())
+        if not hit or hit[0] in seen or len(hit[1]) > 24:
+            continue
+        seen.add(hit[0])
+        label, value = hit
+        cards.append(
+            '<div style="flex:1 1 120px;min-width:120px;background:#fff;border:1px solid #e5e7eb;'
+            'border-radius:8px;padding:14px;text-align:center;">'
+            f'<div style="font-size:26px;font-weight:800;color:#14161a;line-height:1.1;">{html.escape(value)}</div>'
+            f'<div style="margin-top:6px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#6b7280;">{html.escape(label)}</div>'
+            "</div>"
+        )
+        if len(cards) == 4:
+            break
+    if len(cards) < 2:
+        return ""
+    return ('<div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:18px;">'
+            + "".join(cards) + "</div>")
 
 
 def _spec_block(aspects: Mapping[str, Any]) -> str:
@@ -333,11 +367,14 @@ def finalize_auto_technical_listing(
     # complete chrome so nothing downstream wraps it in the furniture shell.
     banner = _banner_block(profile)
     # Idempotency keys on the brand name — that is what the banner actually
-    # contains (quality_banner_marker can differ from brand_name).
+    # contains (quality_banner_marker can differ from brand_name). The hero stat
+    # band goes in with the banner (both deterministic chrome).
     brand_l = str(getattr(profile, "brand_name", "") or "").lower()
     has_banner = bool(brand_l) and brand_l in html.unescape(description).lower()
     if description and banner and not has_banner:
-        description = f"{banner}\n{description}"
+        hero = _hero_band(aspects)
+        head = f"{banner}\n{hero}" if hero else banner
+        description = f"{head}\n{description}"
 
     # Inject the deterministic high-contrast spec table (once) before the footer,
     # so the buyer-critical specs are always legible regardless of the LLM.
