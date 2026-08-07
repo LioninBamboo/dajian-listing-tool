@@ -136,12 +136,25 @@ def build_auto_technical_system_prompt(profile: Any, mode: str) -> str:
     return f"""You are an expert eBay copywriter for a US-warehouse {role} store ({brand}).
 
 **CONTENT & DESIGN RULES (CRITICAL):**
-1. HTML Description ('description'): produce a self-contained, visually clean HTML block.
-   - COMPATIBILITY: use INLINE CSS (style="...") for ALL styling. NEVER use CSS classes — eBay strips them.
-   - STYLE: technical / industrial automotive look — dark steel + a single accent (red or safety-orange), clean spec tables, no fluff. Emoji sparingly (🔧 ⚙️ ✅) if at all.
-   - LAYOUT: a header banner div with the product name; a KEY FEATURES list; a SPECIFICATIONS table; a {box_label} block.
-   - Do NOT include any Shipping / Returns / Policies section — the system appends that automatically.
-   - Do NOT output <html>, <head>, or <body> tags. Return only the inner content <div>.
+1. HTML Description ('description'): a self-contained, MOBILE-FIRST inline-CSS block (most eBay
+   traffic is phones — one column, generous tap spacing, no fixed widths). Use INLINE CSS
+   (style="...") for ALL styling; NEVER use CSS classes (eBay strips them). No <html>/<head>/<body>.
+   Follow this DESIGN SYSTEM exactly for a consistent, high-contrast, premium-technical look:
+   - Palette: ink #14161a · steel #1f2329 · safety-orange accent #ff5722 · hairline #e5e7eb ·
+     light row #f6f7f9 · white #fff. High contrast ALWAYS — never dark text on a dark fill.
+   - HERO SPEC BAND (first thing after the title): a wrapping flex row of 2–4 "stat cards" holding
+     the buyer's KEY DECISION NUMBERS (e.g. the class/grade, the load/capacity figure, the size).
+     Each card = big bold value (28px, #14161a) + a small UPPERCASE label under it (11px, #6b7280,
+     letter-spacing:1px); white card, 1px #e5e7eb border, padding 14px, border-radius 8px. THIS BAND
+     IS THE CONVERSION FOCUS. Use ONLY numbers/values present in the source; omit the band if none.
+   - KEY FEATURES: title 15px bold UPPERCASE #ff5722 with a 1px #e5e7eb bottom rule. 4–6 bullets,
+     each 15px #14161a line-height 1.75, starting with a <strong> lead-in phrase, then the detail.
+   - SPECIFICATIONS: a HIGH-CONTRAST table (width 100%, border-collapse). Header row = #1f2329 fill +
+     #fff 13px UPPERCASE text. Body rows ALTERNATE #fff / #f6f7f9; label cell #6b7280 14px, value cell
+     <strong> #14161a 14px; 1px #e5e7eb borders; cell padding 11px 14px. (Legibility is the #1 fix —
+     dark-on-dark is forbidden.)
+   - {box_label}: one short line/list of exactly what ships in the box.
+   - Do NOT add a Shipping / Returns / Policies section — the system appends the footer automatically.
 2. FOCUS FOR THIS ITEM:
 {focus}
 
