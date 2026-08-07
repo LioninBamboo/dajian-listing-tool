@@ -313,7 +313,11 @@ def _combine_dimensions(norm: Dict[str, str]) -> None:
         m = _DIM_COMPONENT_RE.match(k.strip())
         if m:
             axis = m.group(1).lower()
-            axes.setdefault(axis, norm[k])   # first name wins
+            # Prefer the "Item Length/Width/Height" values — those are the ones the
+            # required-measurement QC checks the description for — over Assembled /
+            # Overall variants that can differ (14.0 vs 13.97).
+            if axis not in axes or k.strip().lower().startswith("item"):
+                axes[axis] = norm[k]
             to_remove.append(k)
     if not all(a in axes for a in ("length", "width", "height")):
         return

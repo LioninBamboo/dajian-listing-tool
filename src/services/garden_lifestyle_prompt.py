@@ -101,12 +101,14 @@ The system deterministically renders the brand banner, the hero stat-card band a
 'description' contains ONLY the middle prose, in this exact order and NOTHING else — inline CSS only, no
 classes, and do NOT render a banner, stat band, any <table>/<th>/<td>, or a footer (the system adds those):
   1. INTRO — one warm sentence: <p style="font-size:15px;line-height:1.7;color:{_INK};margin:4px 0 20px;">…</p>
-  2. KEY FEATURES — a section, generously spaced (this is the design centrepiece):
+  2. KEY FEATURES — a section, generously spaced (this is the design centrepiece). The heading text MUST
+     read "Key Features" and the items MUST be <li> elements (both are required):
      <h3 style="margin:0 0 14px;font-size:14px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:{_GREEN};">Key Features</h3>
-     then 4–6 rows, each its OWN block with breathing room and a leaf accent — use this exact shape per row:
-     <div style="display:flex;gap:10px;margin-bottom:12px;align-items:flex-start;">
+     <ul style="list-style:none;padding:0;margin:0;">  then 4–6 items, each with breathing room + a leaf accent:
+     <li style="display:flex;gap:10px;margin-bottom:12px;align-items:flex-start;">
        <span style="color:{_LEAF};font-size:16px;line-height:1.5;">🌿</span>
-       <span style="font-size:15px;line-height:1.6;color:{_INK};"><strong style="color:{_GREEN};">Lead-in:</strong> detail.</span></div>
+       <span style="font-size:15px;line-height:1.6;color:{_INK};"><strong style="color:{_GREEN};">Lead-in:</strong> detail.</span></li>
+     </ul>
   3. PERFECT FOR — a soft rounded highlight card (NOT plain text):
      <div style="margin-top:6px;background:#eef4ef;border-radius:10px;padding:16px 18px;">
        <h4 style="margin:0 0 8px;font-size:13px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:{_GREEN};">Perfect For</h4>
