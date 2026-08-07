@@ -149,10 +149,9 @@ def build_auto_technical_system_prompt(profile: Any, mode: str) -> str:
      IS THE CONVERSION FOCUS. Use ONLY numbers/values present in the source; omit the band if none.
    - KEY FEATURES: title 15px bold UPPERCASE #ff5722 with a 1px #e5e7eb bottom rule. 4–6 bullets,
      each 15px #14161a line-height 1.75, starting with a <strong> lead-in phrase, then the detail.
-   - SPECIFICATIONS: a HIGH-CONTRAST table (width 100%, border-collapse). Header row = #1f2329 fill +
-     #fff 13px UPPERCASE text. Body rows ALTERNATE #fff / #f6f7f9; label cell #6b7280 14px, value cell
-     <strong> #14161a 14px; 1px #e5e7eb borders; cell padding 11px 14px. (Legibility is the #1 fix —
-     dark-on-dark is forbidden.)
+   - Do NOT build a SPECIFICATIONS or specs table and do NOT use any <table>/<th>/<td> — the system
+     renders the specifications table automatically from the item specifics. Put every spec value into
+     'aspects' instead (that is what gets tabulated).
    - {box_label}: one short line/list of exactly what ships in the box.
    - Do NOT add a Shipping / Returns / Policies section — the system appends the footer automatically.
 2. FOCUS FOR THIS ITEM:
@@ -230,6 +229,52 @@ def _banner_block(profile: Any) -> str:
     )
 
 
+_SPEC_HIDDEN = {"brand", "features", "california prop 65 warning", "item sku",
+                "unit of measurement", "number of packages", "qty", "extra info"}
+
+
+def _spec_block(aspects: Mapping[str, Any]) -> str:
+    """Deterministic HIGH-CONTRAST specifications table built from item specifics.
+
+    The LLM cannot be trusted to keep dark text off dark fills, so the spec table
+    — the part buyers actually scan — is rendered in code: dark header + white
+    text, alternating white / #f6f7f9 rows, grey labels, bold dark values.
+    """
+    rows = []
+    for key, value in (aspects or {}).items():
+        k = str(key).strip()
+        if not k or k.lower() in _SPEC_HIDDEN:
+            continue
+        if isinstance(value, (list, tuple)):
+            val = ", ".join(str(v).strip() for v in value if str(v).strip())
+        else:
+            val = str(value).strip()
+        if not val:
+            continue
+        rows.append((html.escape(k), html.escape(val)))
+    if not rows:
+        return ""
+    body = ""
+    for i, (k, v) in enumerate(rows):
+        bg = "#ffffff" if i % 2 == 0 else "#f6f7f9"
+        body += (
+            f'<tr style="background:{bg};">'
+            f'<td style="padding:11px 14px;border-bottom:1px solid #e5e7eb;color:#6b7280;font-size:14px;width:42%;">{k}</td>'
+            f'<td style="padding:11px 14px;border-bottom:1px solid #e5e7eb;color:#14161a;font-size:14px;font-weight:700;">{v}</td>'
+            f"</tr>"
+        )
+    return (
+        '<div style="margin-top:22px;">'
+        '<h3 style="margin:0 0 12px;font-size:15px;font-weight:800;letter-spacing:1px;'
+        'text-transform:uppercase;color:#ff5722;border-bottom:1px solid #e5e7eb;padding-bottom:6px;">Specifications</h3>'
+        '<table style="width:100%;border-collapse:collapse;font-family:Arial,sans-serif;">'
+        '<tr style="background:#1f2329;">'
+        '<th style="text-align:left;padding:11px 14px;color:#ffffff;font-size:13px;text-transform:uppercase;letter-spacing:.5px;">Attribute</th>'
+        '<th style="text-align:left;padding:11px 14px;color:#ffffff;font-size:13px;text-transform:uppercase;letter-spacing:.5px;">Value</th>'
+        f"</tr>{body}</table></div>"
+    )
+
+
 def _footer_block(profile: Any) -> str:
     footer = str(getattr(profile, "footer_html", "") or "").strip()
     if footer:
@@ -293,6 +338,12 @@ def finalize_auto_technical_listing(
     has_banner = bool(brand_l) and brand_l in html.unescape(description).lower()
     if description and banner and not has_banner:
         description = f"{banner}\n{description}"
+
+    # Inject the deterministic high-contrast spec table (once) before the footer,
+    # so the buyer-critical specs are always legible regardless of the LLM.
+    spec = _spec_block(aspects)
+    if description and spec and "<th" not in description:
+        description = f"{description}\n{spec}"
 
     footer = _footer_block(profile)
     footer_marker = str(getattr(profile, "quality_footer_marker", "") or "").lower()

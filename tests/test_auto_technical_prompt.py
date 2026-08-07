@@ -142,6 +142,28 @@ class TestFinalize:
         assert "compatible models include" not in low
         assert "do not add any fitment" in low          # eBay renders it natively
 
+    def test_deterministic_spec_table_injected_and_legible(self):
+        out = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>body</div>",
+             "aspects": {"Type": ["Receiver Hitch"], "Material": ["Carbon Steel"],
+                         "Brand": ["AquaRides"]}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        d = out["description"]
+        assert "Specifications" in d and "<table" in d
+        assert "#1f2329" in d and "#f6f7f9" in d            # dark header + light row = high contrast
+        assert "Carbon Steel" in d
+        assert d.count("<table") == 1                        # single, deterministic
+        assert ">Brand<" not in d                            # Brand is not a spec row
+
+    def test_spec_table_not_injected_when_llm_made_one(self):
+        # Guard against double tables if the model ignores the instruction.
+        out = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div><th>x</th></div>", "aspects": {"Type": ["Hitch"]}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        assert out["description"].count("<table") == 0
+
     def test_mode_recorded_and_features_defaulted(self):
         out = finalize_auto_technical_listing(
             {"title": "T", "description": "<div>x</div>", "aspects": {}},
