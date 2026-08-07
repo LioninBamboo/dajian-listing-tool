@@ -24,13 +24,15 @@ from src.services.auto_technical_prompt import (
     _normalize_aspects,
 )
 
-# Botanical palette: deep garden green + leaf accent + warm cream.
+# Botanical palette: deep garden green + leaf accent + warm sand + cream tints.
 _GREEN = "#2e5d43"
-_GREEN_DK = "#204030"
-_LEAF = "#6fae7f"
-_SAND = "#c8a86a"
-_INK = "#26302a"
+_GREEN_DK = "#1c3b2b"
+_LEAF = "#8fc9a3"
+_SAND = "#cbab6b"
+_INK = "#25302a"
 _MUTED = "#5c6b60"
+_CREAM = "#f3f7f2"
+_LINE = "#e4ebe4"
 
 # Hero stat cards: the numbers a home/garden buyer scans. Short values only.
 _HERO_KEYS = (
@@ -38,16 +40,48 @@ _HERO_KEYS = (
     "Maximum Weight Capacity", "Set Includes", "Shape", "Style",
 )
 
+# One scoped <style> block instead of repeating inline styles on every element —
+# eBay's Inventory description allows <style>, and it survives _compress_html
+# (which only collapses whitespace between tags). This keeps a rich, layered
+# design well under the 4000-char inventory cap. Class prefix ``gpl-`` is unique.
+_STYLE_BLOCK = (
+    "<style>"
+    ".gpl-w{max-width:900px;margin:0 auto;font-family:Arial,Helvetica,sans-serif;"
+    f"color:{_INK};background:#fff;border:1px solid {_LINE};border-radius:12px;overflow:hidden}}"
+    f".gpl-bar{{background:linear-gradient(135deg,{_GREEN},{_GREEN_DK});text-align:center}}"
+    f".gpl-ban{{padding:22px 20px 18px;border-bottom:3px solid {_SAND};font-family:Georgia,serif}}"
+    ".gpl-brand{font-size:27px;letter-spacing:7px;color:#fff}"
+    f".gpl-tag{{font-size:10px;letter-spacing:3px;text-transform:uppercase;color:{_LEAF};margin-top:7px}}"
+    ".gpl-hero{display:flex;flex-wrap:wrap;gap:12px;padding:22px 22px 4px}"
+    f".gpl-card{{flex:1 1 130px;min-width:116px;background:{_CREAM};border-top:3px solid {_SAND};"
+    f"border-radius:10px;padding:15px 10px;text-align:center}}"
+    f".gpl-cv{{font-size:19px;font-weight:800;color:{_GREEN};line-height:1.25}}"
+    f".gpl-ck{{margin-top:6px;font-size:9px;letter-spacing:1px;text-transform:uppercase;color:{_MUTED}}}"
+    ".gpl-body{padding:20px 24px 4px}"
+    f".gpl-intro{{font-size:15px;line-height:1.75;margin:0}}"
+    f".gpl-h3{{margin:22px 0 13px;font-size:13px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase;"
+    f"color:{_GREEN};border-left:4px solid {_SAND};padding-left:11px}}"
+    ".gpl-ul{list-style:none;padding:0;margin:0}"
+    f".gpl-li{{display:flex;gap:10px;margin:0 0 11px;padding-bottom:11px;border-bottom:1px solid {_LINE}}}"
+    ".gpl-li:last-child{border:0;margin:0;padding:0}"
+    f".gpl-ico{{color:{_LEAF};flex:0 0 auto}}"
+    ".gpl-ft{font-size:14px;line-height:1.6}"
+    f".gpl-lead{{color:{_GREEN};font-weight:700}}"
+    f".gpl-pf{{background:{_CREAM};border-left:4px solid {_SAND};border-radius:9px;padding:15px 18px;margin-top:20px}}"
+    f".gpl-pfh{{font-size:12px;font-weight:800;letter-spacing:1px;text-transform:uppercase;color:{_GREEN};margin-bottom:7px}}"
+    f".gpl-pfb{{font-size:13.5px;line-height:1.7;color:{_MUTED}}}"
+    f".gpl-foot{{padding:15px 18px;border-top:3px solid {_SAND};margin-top:22px}}"
+    f".gpl-f1{{font-size:12px;color:{_SAND};letter-spacing:1px}}"
+    ".gpl-f2{font-size:10px;color:#cfe0d4;margin-top:4px}"
+    "</style>"
+)
+
 
 def _banner_block(profile: Any) -> str:
     brand = html.escape(str(getattr(profile, "brand_name", "") or "").upper())
     tagline = html.escape(str(getattr(profile, "brand_tagline", "") or ""))
-    return (
-        f'<div style="text-align:center;padding:30px 15px;'
-        f'background:linear-gradient(135deg,{_GREEN} 0%,{_GREEN_DK} 100%);font-family:Georgia,serif;">'
-        f'<h1 style="margin:0;font-size:28px;font-weight:400;letter-spacing:5px;color:#fff;">{brand}</h1>'
-        f'<p style="margin:8px 0 0;font-size:12px;color:{_LEAF};letter-spacing:3px;text-transform:uppercase;">{tagline}</p></div>'
-    )
+    return (f'<div class="gpl-bar gpl-ban"><div class="gpl-brand">{brand}</div>'
+            f'<div class="gpl-tag">{tagline}</div></div>')
 
 
 def _footer_block(profile: Any) -> str:
@@ -56,11 +90,8 @@ def _footer_block(profile: Any) -> str:
         return footer
     l1 = html.escape(str(getattr(profile, "description_footer_line1", "") or ""))
     l2 = html.escape(str(getattr(profile, "description_footer_line2", "") or ""))
-    return (
-        f'<div style="text-align:center;padding:22px;background:{_GREEN};margin-top:20px;font-family:Arial,sans-serif;">'
-        f'<p style="margin:0;font-size:13px;color:{_SAND};letter-spacing:1px;">{l1}</p>'
-        f'<p style="margin:6px 0 0;font-size:11px;color:#dce6df;">{l2}</p></div>'
-    )
+    return (f'<div class="gpl-bar gpl-foot"><div class="gpl-f1">{l1}</div>'
+            f'<div class="gpl-f2">{l2}</div></div>')
 
 
 def _hero_band(aspects: Mapping[str, Any]) -> str:
@@ -79,41 +110,28 @@ def _hero_band(aspects: Mapping[str, Any]) -> str:
             continue
         seen.add(key)
         cards.append(
-            f'<div style="flex:1 1 130px;min-width:130px;background:#fff;border:1px solid #e3e8e2;'
-            f'border-top:3px solid {_LEAF};border-radius:8px;padding:14px;text-align:center;">'
-            f'<div style="font-size:19px;font-weight:700;color:{_INK};line-height:1.2;">{html.escape(val)}</div>'
-            f'<div style="margin-top:6px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:{_MUTED};">{html.escape(key)}</div>'
-            "</div>"
+            f'<div class="gpl-card"><div class="gpl-cv">{html.escape(val)}</div>'
+            f'<div class="gpl-ck">{html.escape(key)}</div></div>'
         )
         if len(cards) == 3:
             break
     if len(cards) < 2:
         return ""
-    return f'<div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:18px;">{"".join(cards)}</div>'
+    return f'<div class="gpl-hero">{"".join(cards)}</div>'
 
 
 def build_garden_lifestyle_system_prompt(profile: Any) -> str:
     brand = getattr(profile, "brand_name", "") or "the store"
     return f"""You are an expert eBay lifestyle copywriter for {brand}, a US-warehouse OUTDOOR · GARDEN · PET home-goods store.
 
-**CONTENT & DESIGN RULES (CRITICAL):**
-The system deterministically renders the brand banner, the hero stat-card band and the footer. YOUR
-'description' contains ONLY the middle prose, in this exact order and NOTHING else — inline CSS only, no
-classes, and do NOT render a banner, stat band, any <table>/<th>/<td>, or a footer (the system adds those):
-  1. INTRO — one warm sentence: <p style="font-size:15px;line-height:1.7;color:{_INK};margin:4px 0 20px;">…</p>
-  2. KEY FEATURES — a section, generously spaced (this is the design centrepiece). The heading text MUST
-     read "Key Features" and the items MUST be <li> elements (both are required):
-     <h3 style="margin:0 0 14px;font-size:14px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:{_GREEN};">Key Features</h3>
-     <ul style="list-style:none;padding:0;margin:0;">  then 4–6 items, each with breathing room + a leaf accent:
-     <li style="display:flex;gap:10px;margin-bottom:12px;align-items:flex-start;">
-       <span style="color:{_LEAF};font-size:16px;line-height:1.5;">🌿</span>
-       <span style="font-size:15px;line-height:1.6;color:{_INK};"><strong style="color:{_GREEN};">Lead-in:</strong> detail.</span></li>
-     </ul>
-  3. PERFECT FOR — a soft rounded highlight card (NOT plain text):
-     <div style="margin-top:6px;background:#eef4ef;border-radius:10px;padding:16px 18px;">
-       <h4 style="margin:0 0 8px;font-size:13px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:{_GREEN};">Perfect For</h4>
-       <p style="margin:0;font-size:14px;line-height:1.7;color:{_MUTED};">2–3 real use scenes (patio, balcony, garden bed, sunroom, entryway, for a pet) the product truly suits.</p></div>
-  Aesthetic: bright, natural, aspirational home-&-garden feel — plenty of whitespace, never cramped or corporate.
+**HOW THIS WORKS:** The system OWNS the entire visual design (brand banner, hero stat cards, the KEY FEATURES
+layout, the PERFECT FOR card, the footer). You do NOT write any HTML, CSS, <div>, <li>, or emoji — you provide
+only TEXT, and the system styles it. Return three copy fields:
+  - "intro": one warm, benefit-led sentence introducing the product (plain text).
+  - "features": an array of 4–6 short strings, each "Lead-in: benefit detail." (e.g.
+    "Sturdy MGO Build: durable, natural-textured finish that ages beautifully outdoors."). Plain text only.
+  - "perfect_for": one or two sentences naming 2–3 real use scenes (patio, balcony, garden bed, sunroom,
+    entryway, for a pet) the product genuinely suits. Plain text.
 
 **VOICE — write like a lifestyle brand, sell the benefit:** Frame the TRUE source facts as buyer benefits with
 warm, aspirational language. You MAY use descriptive/aesthetic adjectives and benefit framing — sturdy, natural,
@@ -137,12 +155,13 @@ VERIFIABLE PROPERTY the source doesn't state:
   as read naturally; include the product noun + key descriptors (size, color, material, shape, use). Prefer
   words buyers search (e.g. "Planter Box", "Flower Pot", "Large", "Outdoor", "Yard") over codes nobody searches.
 
-**OUTPUT FORMAT:** a SINGLE valid JSON object, no markdown fences:
+**OUTPUT FORMAT:** a SINGLE valid JSON object, no markdown fences, NO HTML anywhere:
 {{
   "title": "75-80 char keyword-front-loaded SEO title, no brand name",
-  "description": "<div>intro + KEY FEATURES + PERFECT FOR, inline-CSS only</div>",
+  "intro": "one warm benefit-led sentence, plain text",
+  "features": ["Lead-in: benefit detail.", "Lead-in: benefit detail.", "..."],
+  "perfect_for": "one or two sentences of real use scenes, plain text",
   "aspects": {{ "Type": ["Planter"], "Material": ["Magnesium Oxide (MGO)"], "Color": ["Rust"], "Shape": ["Square"] }},
-  "features": ["selling point 1", "selling point 2"],
   "categoryId": "eBay numeric category id or null"
 }}"""
 
@@ -175,11 +194,50 @@ def build_garden_lifestyle_user_prompt(
     return "\n".join(parts)
 
 
+def _clip(text: str, cap: int) -> str:
+    """Truncate at a word boundary with an ellipsis, keeping sentences readable."""
+    t = str(text or "").strip()
+    if len(t) <= cap:
+        return t
+    cut = t[:cap].rsplit(" ", 1)[0].rstrip(",;: ")
+    return cut + "…"
+
+
+def _render_features(features: Any, max_feats: int = 6, detail_cap: int = 10_000) -> str:
+    """KEY FEATURES rendered deterministically from the LLM's structured list —
+    a sand-accented section header + leaf-bulleted rows with a bold green lead-in.
+    ``max_feats``/``detail_cap`` let the caller shrink the block to fit the char cap."""
+    rows = []
+    for feat in (features or []):
+        s = str(feat).strip()
+        if not s:
+            continue
+        if ":" in s:
+            label, detail = s.split(":", 1)
+            inner = (f'<span class="gpl-lead">{html.escape(label.strip())}:</span> '
+                     f'{html.escape(_clip(detail, detail_cap))}')
+        else:
+            inner = html.escape(_clip(s, detail_cap))
+        rows.append(
+            f'<li class="gpl-li"><span class="gpl-ico">🌿</span>'
+            f'<span class="gpl-ft">{inner}</span></li>'
+        )
+        if len(rows) >= max_feats:
+            break
+    if not rows:
+        return ""
+    return (f'<h3 class="gpl-h3">Key Features</h3>'
+            f'<ul class="gpl-ul">{"".join(rows)}</ul>')
+
+
 def finalize_garden_lifestyle_listing(data: Mapping[str, Any], profile: Any) -> Dict[str, Any]:
-    """Deterministic post-processing: brand banner + hero band + LLM prose + spec table + footer."""
+    """Build the WHOLE description deterministically from the LLM's structured
+    content (intro / features / perfect_for) — the model supplies only text, code
+    controls every pixel: slim banner, hero stat cards, an intro line, a
+    sand-accented KEY FEATURES section, a cream PERFECT FOR card, slim footer.
+    """
     result: Dict[str, Any] = dict(data or {})
     title = str(result.get("title") or "").strip()[:80]
-    description = str(result.get("description") or "").strip()
     aspects = _normalize_aspects(result.get("aspects"))
 
     if getattr(profile, "force_house_brand", False):
@@ -187,38 +245,40 @@ def finalize_garden_lifestyle_listing(data: Mapping[str, Any], profile: Any) -> 
     elif not aspects.get("Brand"):
         aspects["Brand"] = [getattr(profile, "default_brand", "Unbranded")]
 
-    # Deterministic chrome, idempotent on the brand name so nothing double-wraps.
-    brand_l = str(getattr(profile, "brand_name", "") or "").lower()
-    head = ""
-    if description and brand_l not in html.unescape(description).lower():
-        banner = _banner_block(profile)
-        hero = _hero_band(aspects)
-        head = f"{banner}\n{hero}\n" if hero else f"{banner}\n"
+    intro = str(result.get("intro") or "").strip()
+    perfect_for = str(result.get("perfect_for") or "").strip()
+    features = result.get("features") if isinstance(result.get("features"), list) else []
 
-    footer = ""
-    footer_marker = str(getattr(profile, "quality_footer_marker", "") or "").lower()
-    fblock = _footer_block(profile)
-    if description and fblock and not (footer_marker and footer_marker in html.unescape(description).lower()):
-        footer = fblock
+    banner = _banner_block(profile)
+    hero = _hero_band(aspects)
+    footer = _footer_block(profile)
 
-    # eBay's Inventory API caps the whole description at 4000 chars (unlike
-    # Trading). The banner + hero stat cards + inline-CSS prose + footer already
-    # fill most of that, so there is NO deterministic spec table here — eBay's
-    # native item-specifics panel shows the full spec grid, and the hero cards
-    # surface the key numbers. Hard-cap the body as a last resort.
-    body_html = description
-    parts = [p for p in (head + body_html, footer) if p]
-    description = "\n".join(parts)
-    if len(description) > 3990 and footer:
-        # trim the prose at a safe tag boundary, keep banner+hero+footer intact
-        keep = 3990 - len(head) - len(footer) - 2
-        cut = body_html[:max(0, keep)]
-        cut = cut[:cut.rfind("</")] if "</" in cut else cut
-        description = "\n".join(p for p in (head + cut, footer) if p)
+    def _assemble(intro_cap: int, max_feats: int, detail_cap: int, pf_cap: int) -> str:
+        intro_html = (f'<p class="gpl-intro">{html.escape(_clip(intro, intro_cap))}</p>'
+                      ) if intro else ""
+        feats_html = _render_features(features, max_feats=max_feats, detail_cap=detail_cap)
+        pf_html = (
+            f'<div class="gpl-pf"><div class="gpl-pfh">Perfect For</div>'
+            f'<div class="gpl-pfb">{html.escape(_clip(perfect_for, pf_cap))}</div></div>'
+        ) if perfect_for else ""
+        content = f'<div class="gpl-body">{intro_html}{feats_html}{pf_html}</div>'
+        return f'{_STYLE_BLOCK}<div class="gpl-w">{banner}{hero}{content}{footer}</div>'
+
+    # Inventory API caps descriptions at 4000 chars; the inline-styled chrome is
+    # fixed overhead, so budget the prose down progressively until it fits.
+    CAP = 3900
+    description = _assemble(240, 6, 10_000, 260)
+    if len(description) > CAP:
+        for max_feats, detail_cap, intro_cap, pf_cap in (
+            (6, 200, 220, 240), (6, 150, 190, 200), (5, 130, 170, 180),
+            (5, 100, 150, 150), (4, 90, 130, 130), (4, 70, 110, 110),
+        ):
+            description = _assemble(intro_cap, max_feats, detail_cap, pf_cap)
+            if len(description) <= CAP:
+                break
 
     result["title"] = title
     result["description"] = description
     result["aspects"] = aspects
-    if not isinstance(result.get("features"), list):
-        result["features"] = []
+    result["features"] = features
     return result

@@ -841,16 +841,10 @@ class QwenOptimizer:
 
             # eBay Inventory API caps the whole description at 4000 chars, so keep
             # the LLM prose small enough that prose + deterministic chrome fits.
-            # eBay Inventory API caps the whole description at 4000 chars, so keep
-            # the LLM prose small enough that prose + deterministic chrome fits.
-            body = self._validate_and_fix_html(self._clean_placeholder_text(str(data.get("description") or "")))
-            if len(body) > 1900:
-                body = self._smart_truncate_html(body, 1900)
-            data["description"] = body
-
-            # Fill Item L/W/H from the source BEFORE finalize renders the hero, so
-            # the dimensions the QC requires in the description are actually there
-            # (finalize runs before the category matcher completes aspects).
+            # The LLM returns only structured TEXT (intro / features / perfect_for);
+            # finalize builds the whole styled description deterministically. Fill
+            # Item L/W/H from the source BEFORE finalize so the hero carries the
+            # dimensions the QC requires (finalize runs before aspect completion).
             try:
                 from src.utils.listing_quality_gate import _fill_measurement_aspects
                 data.setdefault("aspects", {})
