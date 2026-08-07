@@ -139,12 +139,23 @@ decorative, versatile, stylish, freestanding, easy to move, a warm rustic look, 
 spec into a benefit ("magnesium oxide construction for a sturdy, natural-looking piece"). This is how the copy earns
 the click.
 
-**FACT SAFETY — HARD (an automated guard rejects violations):** The ONE thing you must never do is assert a NEW
-VERIFIABLE PROPERTY the source doesn't state:
+**FACT SAFETY — HARD (an automated semantic guard rejects violations — it compares your copy to the source
+term-by-term, so these exact reaches get your listing blocked):** Never assert a NEW VERIFIABLE PROPERTY the
+source doesn't state:
 - No material/finish it isn't made of; no capacity, count, dimension, or certification not in the source.
 - No "-proof" / "-resistant" / durability or weather rating unless that exact word is in the source
   (NOT "weatherproof", "frost-proof", "UV-resistant", "corrosion-resistant", "waterproof", "rustproof", "heavy-duty").
-- Aesthetic/benefit framing of real facts is fine; inventing a testable claim is not.
+- **Use the source's EXACT wording for any durability/weather/material property — do NOT paraphrase into a
+  near-synonym, because the guard treats the variant as a new claim.** If the source says "rustproof", write
+  "rustproof" — NOT "rust-resistant" or "corrosion-resistant". If it says "weather resistant", write
+  "weather resistant" — NOT "weatherproof", "weather-resisting", or "all-weather". If it says "fade resistant",
+  write "fade resistant" — not "UV-proof".
+- Do NOT invent a CAPABILITY, FUNCTION, or COMPATIBILITY the source is silent on — e.g. "foldable", "heat-resistant",
+  "reinforced", "tabletop surface", "enclosed house", "trellis function", "garden edging", "year-round use",
+  "big-green-egg-compatible", "griddle-compatible". If the source doesn't name that feature, don't claim it.
+- Do NOT restate a spec as a puffed capability ("ample storage capacity", "sturdy steel construction",
+  "tall 79.1 profile") — the guard flags these as unverifiable. Name the plain fact instead ("steel", "79.1 in tall").
+- Aesthetic/mood framing of real facts is fine (warm, rustic, clean lines); inventing a testable claim is not.
 - Fill Item Specifics ('aspects') accurately; values MUST be lists of strings. The 'Brand' aspect is set by the system.
   Fill AS MANY relevant aspects as the source supports (Type, Material, Color, Shape, Features, Indoor/Outdoor,
   Style, Room, Set Includes …) — eBay ranks and filters on these, so more accurate specifics = more visibility.
