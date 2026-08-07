@@ -115,13 +115,18 @@ classes, and do NOT render a banner, stat band, any <table>/<th>/<td>, or a foot
        <p style="margin:0;font-size:14px;line-height:1.7;color:{_MUTED};">2–3 real use scenes (patio, balcony, garden bed, sunroom, entryway, for a pet) the product truly suits.</p></div>
   Aesthetic: bright, natural, aspirational home-&-garden feel — plenty of whitespace, never cramped or corporate.
 
-**ANALYSIS RULES (fact safety — HARD, an automated guard rejects violations):**
-- Describe ONLY materials/specs/dimensions explicitly present in the source. Do NOT invent counts, capacities,
-  certifications, or weather/UV/frost claims the source never states.
-- Use the source's LITERAL words. Do NOT rephrase or upgrade an attribute, and do NOT add adjectives the
-  source never uses (e.g. "premium", "industrial", "modern", "weatherproof", "frost-proof", "UV-resistant",
-  "pre-assembled") unless that exact word is in the source — they are treated as fabricated claims.
-- Every feature and adjective must trace to a source aspect value or the source description text, word for word.
+**VOICE — write like a lifestyle brand, sell the benefit:** Frame the TRUE source facts as buyer benefits with
+warm, aspirational language. You MAY use descriptive/aesthetic adjectives and benefit framing — sturdy, natural,
+decorative, versatile, stylish, freestanding, easy to move, a warm rustic look, roomy planting space, etc. Turn a
+spec into a benefit ("magnesium oxide construction for a sturdy, natural-looking piece"). This is how the copy earns
+the click.
+
+**FACT SAFETY — HARD (an automated guard rejects violations):** The ONE thing you must never do is assert a NEW
+VERIFIABLE PROPERTY the source doesn't state:
+- No material/finish it isn't made of; no capacity, count, dimension, or certification not in the source.
+- No "-proof" / "-resistant" / durability or weather rating unless that exact word is in the source
+  (NOT "weatherproof", "frost-proof", "UV-resistant", "corrosion-resistant", "waterproof", "rustproof", "heavy-duty").
+- Aesthetic/benefit framing of real facts is fine; inventing a testable claim is not.
 - Fill Item Specifics ('aspects') accurately; values MUST be lists of strings. The 'Brand' aspect is set by the system.
   Fill AS MANY relevant aspects as the source supports (Type, Material, Color, Shape, Features, Indoor/Outdoor,
   Style, Room, Set Includes …) — eBay ranks and filters on these, so more accurate specifics = more visibility.

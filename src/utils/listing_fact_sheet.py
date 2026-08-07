@@ -117,6 +117,9 @@ _CAPACITY_UNIT_WORDS = ("person", "people", "seat", "seater", "occupant")
 _HIGH_RISK_FEATURE_PATTERN = re.compile(
     r"usb|charg|power|electric|outlet|heat|warm|cool|massage|vibrat|"
     r"waterproof|water[\s-]*resist|weather|fireproof|fire[\s-]*resist|"
+    # any "-proof" / "-resistant" property claim (rust/corrosion/uv/frost/scratch…)
+    r"[a-z]{3,}[\s-]*proof|[a-z]{3,}[\s-]*resist\w*|corros\w*|rust\b|uv[\s-]|frost|"
+    r"food[\s-]*grade|oe[\s-]*grade|heavy[\s-]*duty|"
     r"lock|safety|anti[\s-]*tip|certified|certification|tsa|ul\b|astm|"
     r"reclin|swivel|fold|convert|adjust",
     re.IGNORECASE,
@@ -143,6 +146,15 @@ _SUBJECTIVE_FEATURE_PATTERN = re.compile(
     r"lightweight|easy[\s-]*(?:to[\s-]*)?(?:clean|assemble|use|move|maintain)|"
     r"easy[\s-]*assembly|hassle[\s-]*free\s*\w*|simple\s*\w*|"
     r"perfect\s*\w*|ideal\s*\w*|great\s*\w*|excellent\s*\w*|"
+    # descriptive / aesthetic framing (HIGH_RISK is checked first, so real
+    # property claims like "corrosion-resistant finish" still get blocked):
+    r"decorative|decor|ornamental|natural(?:[\s-]*look\w*)?|inviting|charming|"
+    r"aesthetic|timeless|refined|tasteful|understated|vibrant|bold|airy|fresh|"
+    r"effortless|eye[\s-]*catching|statement|accent|"
+    r"freestanding|free[\s-]*standing|floor[\s-]*standing|standalone|tabletop|"
+    r"ready[\s-]*to[\s-]*use|use[\s-]*ready|no[\s-]*assembly|pre[\s-]*assembled|"
+    r"assembly[\s-]*free|no[\s-]*tools|"
+    r"[a-z]+[\s-]*(?:design|shape|style|finish|look|tone|profile|silhouette|feel|accent)|"
     r"indoor|outdoor|indoor\s*/?\s*outdoor|home|office|living\s*room|bedroom"
     r")$",
     re.IGNORECASE,

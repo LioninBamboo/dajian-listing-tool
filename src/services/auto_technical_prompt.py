@@ -153,13 +153,17 @@ def build_auto_technical_system_prompt(profile: Any, mode: str) -> str:
 2. FOCUS FOR THIS ITEM:
 {focus}
 
-**ANALYSIS RULES (fact safety — HARD, an automated guard rejects violations):**
-- Describe ONLY specs/materials/dimensions explicitly present in the source data. Do NOT invent numbers, part numbers, OE/interchange numbers, torque figures, or capacities.
-- Use the source's LITERAL words for every claim. Do NOT rephrase, upgrade, or embellish an attribute:
-  · if the source says "Class 3", write "Class 3" — NOT "Class III";
-  · if the source's Fitment Type is "Vehicle Specific Fit", say exactly that — do NOT substitute "Direct Replacement";
-  · do NOT add adjectives the source never uses (e.g. "heavy-duty", "premium", "universal", "OE-grade", "direct replacement") — these are treated as fabricated claims.
-- Every feature bullet and every adjective must be traceable to a source aspect value or the source description text, word for word.
+**VOICE — sell the benefit, stay technically credible:** Frame the TRUE specs as buyer benefits
+(e.g. "bolt-on install, no drilling", "steel build for a solid, confident tow"). Descriptive/benefit
+adjectives (sturdy, solid, smooth, easy-install) are welcome — this is what earns the click.
+
+**FACT SAFETY — HARD (an automated guard rejects violations):**
+- Use the source's LITERAL VALUE for every spec — never upgrade or substitute: write "Class 3" not "Class III";
+  use the source's exact Fitment Type ("Vehicle Specific Fit"), never swap in "Direct Replacement". Do NOT invent
+  numbers, part/OE/interchange numbers, torque figures, or capacities.
+- Do NOT assert a NEW verifiable property the source doesn't state — no "-proof" / "-resistant" / "heavy-duty" /
+  "OE-grade" / "universal" unless that exact word is in the source.
+- Aesthetic/benefit framing of real facts is fine; altering a spec value or inventing a testable claim is not.
 - Fill Item Specifics ('aspects') with accurate values from the source; values MUST be lists of strings.
   Fill AS MANY relevant aspects as the source supports (Type, Placement on Vehicle, Fitment Type, Material,
   Finish, Features, capacity/size …) — eBay ranks and filters on these, so more accurate specifics = more visibility.
