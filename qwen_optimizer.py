@@ -779,6 +779,96 @@ class QwenOptimizer:
                 "error": "generation failed",
             }
 
+    def optimize_garden_lifestyle_listing(self, original_title, original_description, attributes=None, specs=None, market_intel=None, previous_errors=None):
+        """Generate an outdoor/garden/pet lifestyle listing (template_style=garden_lifestyle).
+
+        Same deterministic-chrome architecture as the auto template: the LLM
+        writes only the intro + KEY FEATURES + PERFECT FOR prose; finalize renders
+        the brand banner, hero stat band, spec table and footer from aspects. When
+        the shared QC retry loop passes ``previous_errors`` (e.g. FactSheet
+        rejections), they are fed back so the model self-corrects instead of
+        relying on a lucky re-roll.
+        """
+        from src.services.garden_lifestyle_prompt import (
+            build_garden_lifestyle_system_prompt,
+            build_garden_lifestyle_user_prompt,
+            finalize_garden_lifestyle_listing,
+        )
+
+        profile = get_store_profile()
+        print(f"🌿 Starting garden-lifestyle optimization for: {str(original_title)[:50]}...")
+        system_prompt = build_garden_lifestyle_system_prompt(profile)
+        user_prompt = build_garden_lifestyle_user_prompt(
+            title=original_title,
+            description=original_description,
+            attributes=attributes,
+            specs=specs,
+            market_intel=market_intel,
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if previous_errors:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Your previous attempt was REJECTED by the fact guard for these claims: "
+                    + "; ".join(str(e) for e in previous_errors[:8])
+                    + ". Remove or rewrite EXACTLY those claims using only source-supported wording; "
+                    "do not add any adjective the source does not state."
+                ),
+            })
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=0.4,
+            )
+            content = response.choices[0].message.content
+            try:
+                data = json.loads(content)
+            except json.JSONDecodeError:
+                data = json.loads(content.replace("```json", "").replace("```", "").strip())
+
+            body = self._validate_and_fix_html(self._clean_placeholder_text(str(data.get("description") or "")))
+            if len(body) > 3300:
+                body = self._smart_truncate_html(body, 3300)
+            data["description"] = body
+
+            result = finalize_garden_lifestyle_listing(data, profile)
+
+            try:
+                from src.services.ebay_category_matcher import create_category_matcher
+                matcher = create_category_matcher(os.getenv("EBAY_ENVIRONMENT", "PRODUCTION"))
+                matched_id, matched_name, matched_aspects = matcher.get_category_and_aspects(
+                    original_title or result.get("title", ""),
+                    result.get("aspects", {}),
+                    result.get("description", ""),
+                )
+                if matched_id:
+                    result["categoryId"] = matched_id
+                    result["categoryName"] = matched_name
+                    result["aspects"] = matched_aspects or result.get("aspects", {})
+            except Exception as cat_err:
+                print(f"   [WARN] category matcher unavailable: {cat_err}")
+
+            print(f"✅ Garden-lifestyle optimization complete. Title: {result.get('title','')[:50]}...")
+            return result
+
+        except Exception as e:
+            print(f"❌ Garden-lifestyle optimization failed: {e}")
+            traceback.print_exc()
+            return {
+                "title": str(original_title or "")[:80],
+                "description": str(original_description or ""),
+                "aspects": {},
+                "features": [],
+                "error": "generation failed",
+            }
+
     def optimize_product_full(self, original_title, original_description, attributes=None, images=None, specs=None, video_url=None, market_intel=None, previous_errors=None):
         """
         优化产品标题和描述
@@ -809,6 +899,15 @@ class QwenOptimizer:
                 attributes=attributes,
                 specs=specs,
                 market_intel=market_intel,
+            )
+        if _style == "garden_lifestyle":
+            return self.optimize_garden_lifestyle_listing(
+                original_title,
+                original_description,
+                attributes=attributes,
+                specs=specs,
+                market_intel=market_intel,
+                previous_errors=previous_errors,
             )
 
         print(f"🚀 Starting Qwen optimization for: {original_title[:50]}...")
