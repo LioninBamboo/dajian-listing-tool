@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 from typing import Any, Dict, Mapping, Optional
 
 AUTO_MODE_FITMENT = "fitment"
@@ -274,14 +275,52 @@ def _hero_band(aspects: Mapping[str, Any]) -> str:
             + "".join(cards) + "</div>")
 
 
+# Curated core order — the ~10 specs a parts buyer actually scans. Rows are
+# emitted in this order first, then any remaining specs, capped at _SPEC_MAX.
+_SPEC_CORE_ORDER = (
+    "Type", "Hitch Class", "Class", "Fitment Type", "Placement on Vehicle",
+    "Material", "Finish",
+    "Max Gross Trailer Weight", "Maximum Weight Capacity", "Load Capacity",
+    "Weight Carrying Capacity",
+    "Receiver Size", "Drive Size", "Power Source",
+    "Dimensions (L × W × H)", "Item Weight",
+    "Tongue Weight", "Number of Pieces", "Mounting",
+    "Manufacturer Warranty", "Warranty",
+)
+_SPEC_MAX = 10
+_DIM_UNIT_RE = re.compile(r"[0-9.]+")
+
+
+def _combine_dimensions(norm: Dict[str, str]) -> None:
+    """Collapse Item Length/Width/Height into a single L × W × H row (in place)."""
+    keys = ("Item Length", "Item Width", "Item Height")
+    vals = [norm.get(k) for k in keys]
+    if not all(vals):
+        return
+    nums = []
+    unit = "in"
+    for v in vals:
+        m = _DIM_UNIT_RE.search(v)
+        if not m:
+            return
+        nums.append(m.group(0))
+        tail = v[m.end():].strip()
+        if tail:
+            unit = tail
+    for k in keys:
+        norm.pop(k, None)
+    norm["Dimensions (L × W × H)"] = f"{' × '.join(nums)} {unit}".strip()
+
+
 def _spec_block(aspects: Mapping[str, Any]) -> str:
     """Deterministic HIGH-CONTRAST specifications table built from item specifics.
 
     The LLM cannot be trusted to keep dark text off dark fills, so the spec table
     — the part buyers actually scan — is rendered in code: dark header + white
-    text, alternating white / #f6f7f9 rows, grey labels, bold dark values.
+    text, alternating white / #f6f7f9 rows, grey labels, bold dark values. Curated
+    to the core ~10 specs, with the three dimension rows folded into one.
     """
-    rows = []
+    norm: Dict[str, str] = {}
     for key, value in (aspects or {}).items():
         k = str(key).strip()
         if not k or k.lower() in _SPEC_HIDDEN:
@@ -290,9 +329,14 @@ def _spec_block(aspects: Mapping[str, Any]) -> str:
             val = ", ".join(str(v).strip() for v in value if str(v).strip())
         else:
             val = str(value).strip()
-        if not val:
-            continue
-        rows.append((html.escape(k), html.escape(val)))
+        if val:
+            norm[k] = val
+
+    _combine_dimensions(norm)
+
+    order = {name: i for i, name in enumerate(_SPEC_CORE_ORDER)}
+    ordered_keys = sorted(norm, key=lambda k: (order.get(k, len(order)), k))
+    rows = [(html.escape(k), html.escape(norm[k])) for k in ordered_keys[:_SPEC_MAX]]
     if not rows:
         return ""
     body = ""

@@ -169,6 +169,26 @@ class TestFinalize:
         # hero band comes before the body prose
         assert d.index("4500 lbs") < d.index("body")
 
+    def test_spec_table_folds_dimensions_and_caps_rows(self):
+        aspects = {
+            "Item Length": ["32.5 in"], "Item Width": ["17.0 in"], "Item Height": ["8.3 in"],
+            "Type": ["Receiver Hitch"], "Material": ["Carbon Steel"], "Finish": ["Black Powder Coat"],
+            "Hitch Class": ["Class 3"], "Receiver Size": ["2 in"], "Tongue Weight": ["675 lbs"],
+            "Mounting": ["Bolt-on"], "Placement on Vehicle": ["Rear"], "Fitment Type": ["Vehicle Specific Fit"],
+            "Warranty": ["1 Year"], "Max Gross Trailer Weight": ["4500 lbs"],
+        }
+        out = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>body</div>", "aspects": aspects},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        d = out["description"]
+        # three dimension rows folded into one L × W × H row
+        assert "Dimensions (L × W × H)" in d
+        assert "32.5 × 17.0 × 8.3 in" in d
+        assert ">Item Length<" not in d and ">Item Width<" not in d
+        # capped at 10 data rows (+1 header row)
+        assert d.count("<tr") == 11
+
     def test_spec_table_not_injected_when_llm_made_one(self):
         # Guard against double tables if the model ignores the instruction.
         out = finalize_auto_technical_listing(
