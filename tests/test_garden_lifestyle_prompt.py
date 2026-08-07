@@ -43,12 +43,12 @@ class TestFinalize:
         assert d.count("Ships from US Warehouse") == 1
         assert "f8f9fa" not in d.lower()                     # not the furniture navy/gold shell
 
-    def test_deterministic_chrome_present(self):
+    def test_deterministic_chrome_and_inventory_char_limit(self):
         d = self._out()
-        assert "<table" in d and d.count("<table") == 1      # legible spec table
-        assert "2e5d43" in d.lower()                         # garden green palette
-        assert "Dimensions (L × W × H)" in d                 # dimensions folded to one row
-        assert ">Item Length<" not in d
+        assert "2e5d43" in d.lower()                          # garden green palette
+        assert "flex:1 1 130px" in d                          # hero stat cards present
+        assert "<table" not in d                              # no spec table (eBay shows specifics natively)
+        assert len(d) < 4000                                  # fits the Inventory API description cap
 
     def test_house_brand_forced(self):
         out = finalize_garden_lifestyle_listing(

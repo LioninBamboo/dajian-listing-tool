@@ -22,7 +22,6 @@ from typing import Any, Dict, Mapping
 from src.services.auto_technical_prompt import (
     _combine_dimensions,
     _normalize_aspects,
-    _spec_block,
 )
 
 # Botanical palette: deep garden green + leaf accent + warm cream.
@@ -86,7 +85,7 @@ def _hero_band(aspects: Mapping[str, Any]) -> str:
             f'<div style="margin-top:6px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:{_MUTED};">{html.escape(key)}</div>'
             "</div>"
         )
-        if len(cards) == 4:
+        if len(cards) == 3:
             break
     if len(cards) < 2:
         return ""
@@ -168,22 +167,34 @@ def finalize_garden_lifestyle_listing(data: Mapping[str, Any], profile: Any) -> 
     elif not aspects.get("Brand"):
         aspects["Brand"] = [getattr(profile, "default_brand", "Unbranded")]
 
-    # Deterministic chrome. Idempotent on the brand name so nothing double-wraps.
+    # Deterministic chrome, idempotent on the brand name so nothing double-wraps.
     brand_l = str(getattr(profile, "brand_name", "") or "").lower()
+    head = ""
     if description and brand_l not in html.unescape(description).lower():
         banner = _banner_block(profile)
         hero = _hero_band(aspects)
-        head = f"{banner}\n{hero}" if hero else banner
-        description = f"{head}\n{description}"
+        head = f"{banner}\n{hero}\n" if hero else f"{banner}\n"
 
-    spec = _spec_block(aspects)
-    if description and spec and "<th" not in description:
-        description = f"{description}\n{spec}"
-
-    footer = _footer_block(profile)
+    footer = ""
     footer_marker = str(getattr(profile, "quality_footer_marker", "") or "").lower()
-    if description and footer and not (footer_marker and footer_marker in html.unescape(description).lower()):
-        description = f"{description}\n{footer}"
+    fblock = _footer_block(profile)
+    if description and fblock and not (footer_marker and footer_marker in html.unescape(description).lower()):
+        footer = fblock
+
+    # eBay's Inventory API caps the whole description at 4000 chars (unlike
+    # Trading). The banner + hero stat cards + inline-CSS prose + footer already
+    # fill most of that, so there is NO deterministic spec table here — eBay's
+    # native item-specifics panel shows the full spec grid, and the hero cards
+    # surface the key numbers. Hard-cap the body as a last resort.
+    body_html = description
+    parts = [p for p in (head + body_html, footer) if p]
+    description = "\n".join(parts)
+    if len(description) > 3990 and footer:
+        # trim the prose at a safe tag boundary, keep banner+hero+footer intact
+        keep = 3990 - len(head) - len(footer) - 2
+        cut = body_html[:max(0, keep)]
+        cut = cut[:cut.rfind("</")] if "</" in cut else cut
+        description = "\n".join(p for p in (head + cut, footer) if p)
 
     result["title"] = title
     result["description"] = description

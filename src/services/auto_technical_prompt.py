@@ -324,13 +324,14 @@ def _combine_dimensions(norm: Dict[str, str]) -> None:
     norm["Dimensions (L × W × H)"] = f"{' × '.join(nums)} {unit}".strip()
 
 
-def _spec_block(aspects: Mapping[str, Any]) -> str:
+def _spec_block(aspects: Mapping[str, Any], max_rows: int = _SPEC_MAX) -> str:
     """Deterministic HIGH-CONTRAST specifications table built from item specifics.
 
     The LLM cannot be trusted to keep dark text off dark fills, so the spec table
     — the part buyers actually scan — is rendered in code: dark header + white
     text, alternating white / #f6f7f9 rows, grey labels, bold dark values. Curated
-    to the core ~10 specs, with the three dimension rows folded into one.
+    to the core specs (``max_rows``, default 10), with dimension rows folded into
+    one. A smaller cap keeps the block light for the Inventory API's 4000-char limit.
     """
     norm: Dict[str, str] = {}
     for key, value in (aspects or {}).items():
@@ -348,7 +349,7 @@ def _spec_block(aspects: Mapping[str, Any]) -> str:
 
     order = {name: i for i, name in enumerate(_SPEC_CORE_ORDER)}
     ordered_keys = sorted(norm, key=lambda k: (order.get(k, len(order)), k))
-    rows = [(html.escape(k), html.escape(norm[k])) for k in ordered_keys[:_SPEC_MAX]]
+    rows = [(html.escape(k), html.escape(norm[k])) for k in ordered_keys[:max_rows]]
     if not rows:
         return ""
     body = ""

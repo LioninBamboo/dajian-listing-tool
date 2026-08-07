@@ -833,9 +833,13 @@ class QwenOptimizer:
             except json.JSONDecodeError:
                 data = json.loads(content.replace("```json", "").replace("```", "").strip())
 
+            # eBay Inventory API caps the whole description at 4000 chars, so keep
+            # the LLM prose small enough that prose + deterministic chrome fits.
+            # eBay Inventory API caps the whole description at 4000 chars, so keep
+            # the LLM prose small enough that prose + deterministic chrome fits.
             body = self._validate_and_fix_html(self._clean_placeholder_text(str(data.get("description") or "")))
-            if len(body) > 3300:
-                body = self._smart_truncate_html(body, 3300)
+            if len(body) > 1900:
+                body = self._smart_truncate_html(body, 1900)
             data["description"] = body
 
             result = finalize_garden_lifestyle_listing(data, profile)
