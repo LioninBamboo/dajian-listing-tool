@@ -54,7 +54,13 @@ def map_detail(detail: dict, price: float | None) -> dict:
         attrs.setdefault("Material", str(detail["mainMaterial"]))
     if detail.get("mainColor"):
         attrs.setdefault("Color", str(detail["mainColor"]))
-    imgs = [u for u in (detail.get("imageUrls") or []) if u][:24]
+    # eBay uses imageUrls[0] as the gallery main image; GigaCloud's imageUrls order
+    # often leads with a detail/lifestyle shot, so force mainImageUrl to the front.
+    imgs = [u for u in (detail.get("imageUrls") or []) if u]
+    main = detail.get("mainImageUrl")
+    if main:
+        imgs = [main] + [u for u in imgs if u != main]
+    imgs = imgs[:24]
     vids = [v for v in ([detail.get("productVideoUrl")] + list(detail.get("videoUrls") or [])) if v]
     return {
         "title": detail.get("productName", "") or "",
