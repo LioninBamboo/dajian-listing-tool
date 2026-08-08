@@ -2013,11 +2013,14 @@ def validate_listing_quality(
     video_info = source_facts.get("video") if isinstance(source_facts.get("video"), Mapping) else {}
     if video_info.get("present") and video_info.get("preflight_status") == "blocked":
         detail = ", ".join(video_info.get("issue_codes") or []) or "unknown reason"
+        # A non-publishable source video must NOT block the whole listing — publish
+        # it without the video (strictly better than not publishing). Warning only.
         issues.append(
             ListingQualityIssue(
                 "source_video_not_publishable",
                 f"source video exists but is not directly publishable: {detail}",
                 field="videos",
+                severity="WARNING",
             )
         )
 
