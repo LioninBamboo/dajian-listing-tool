@@ -50,7 +50,9 @@ def resolve_rule_provenance(conn, rule_ids):
 
 
 LISTING_QC_RULESET_VERSION = "listing-qc-v1"
-FACT_SHEET_BLOCKING_SEVERITIES = frozenset({"CRITICAL", "HIGH", "MEDIUM"})
+# MEDIUM = marketing / soft phrasing noise. Still reported as warnings for
+# operators, but must NOT block conversion-focused KEY FEATURES copy.
+FACT_SHEET_BLOCKING_SEVERITIES = frozenset({"CRITICAL", "HIGH"})
 
 
 def _dedupe(messages: list[str]) -> list[str]:
