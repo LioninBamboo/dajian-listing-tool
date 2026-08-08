@@ -839,12 +839,11 @@ class QwenOptimizer:
             except json.JSONDecodeError:
                 data = json.loads(content.replace("```json", "").replace("```", "").strip())
 
-            # eBay Inventory API caps the whole description at 4000 chars, so keep
-            # the LLM prose small enough that prose + deterministic chrome fits.
-            # The LLM returns only structured TEXT (intro / features / perfect_for);
-            # finalize builds the whole styled description deterministically. Fill
-            # Item L/W/H from the source BEFORE finalize so the hero carries the
-            # dimensions the QC requires (finalize runs before aspect completion).
+            # The LLM supplies only the 80-char SEO title + accurate aspects. The
+            # DESCRIPTION reuses the mature main-store layout (build_description_from_
+            # source: conversion bullets + KEY FEATURES / PERFECT FOR / SPECIFICATIONS
+            # / PACKAGE INCLUDES), themed green via the store profile — instead of a
+            # separate garden template that truncated content and mis-rendered chrome.
             try:
                 from src.utils.listing_quality_gate import _fill_measurement_aspects
                 data.setdefault("aspects", {})
@@ -852,7 +851,27 @@ class QwenOptimizer:
             except Exception:
                 pass
 
-            result = finalize_garden_lifestyle_listing(data, profile)
+            from src.services.auto_technical_prompt import _normalize_aspects
+            from src.services.semantic_rewrite import build_description_from_source
+            title = str(data.get("title") or original_title or "").strip()[:80]
+            aspects = _normalize_aspects(data.get("aspects"))
+            if getattr(profile, "force_house_brand", False):
+                aspects["Brand"] = [getattr(profile, "brand_name", "") or "Unbranded"]
+            # Garden categories require an MPN whenever Brand is set (eBay 25002).
+            if aspects.get("Brand") and not aspects.get("MPN"):
+                aspects["MPN"] = ["Does Not Apply"]
+            description = build_description_from_source(
+                title=title,
+                source_description=original_description or "",
+                attrs=attributes or {},
+                specs=specs or {},
+                aspects=aspects,
+            )
+            if not description:  # never publish an empty body
+                description = finalize_garden_lifestyle_listing(
+                    dict(data), profile).get("description", "")
+            result = {"title": title, "description": description,
+                      "aspects": aspects, "features": data.get("features") or []}
 
             try:
                 from src.services.ebay_category_matcher import create_category_matcher

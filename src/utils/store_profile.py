@@ -72,6 +72,16 @@ class StoreProfile:
     # Listing generation (v2). Defaults keep furniture/auto instances unchanged.
     template_style: str = "furniture_classic"   # furniture_classic | arttoy_hype
     footer_html: str = ""                        # whole-block footer; empty => line1/line2
+    # Description-template theme colors (furniture navy/gold defaults). A
+    # specialized instance (e.g. GrovePop garden) overrides these to REBRAND the
+    # SAME mature furniture layout — banner/footer/accent — instead of maintaining
+    # a separate template that drifts and breaks.
+    theme_banner_from: str = "#0d1b2a"           # banner/footer gradient start (navy)
+    theme_banner_to: str = "#1a365d"             # banner/footer gradient end
+    theme_accent: str = "#d4af37"                # brand name + accents (gold)
+    theme_ink: str = "#1a1a1a"                   # body text
+    theme_section_bg: str = "#f8f9fa"            # title bar / package-includes bg
+    theme_perfectfor_bg: str = "#f0f4f8"         # PERFECT FOR block bg
     banned_terms: tuple = ()                     # hard-blocked terms (empty => guard is a no-op)
     # True (furniture/auto): stamp the store brand as the product Brand aspect —
     # generic goods carry the house brand. False (art toys): each item keeps its
@@ -192,6 +202,12 @@ _SECTION_FIELD_MAP = {
         "footer_html",
         "banned_terms",
         "force_house_brand",
+        "theme_banner_from",
+        "theme_banner_to",
+        "theme_accent",
+        "theme_ink",
+        "theme_section_bg",
+        "theme_perfectfor_bg",
     },
     "pricing": {
         "pricing_strategy",

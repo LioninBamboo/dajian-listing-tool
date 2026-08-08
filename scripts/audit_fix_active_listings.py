@@ -2192,10 +2192,60 @@ def rebuild_specifications_table(attrs, specs, aspects, assembly_required="No"):
     return html
 
 
-def build_structured_description_from_source(title, source_description, attrs, specs, aspects):
-    feature_bullets = extract_source_feature_bullets(source_description)
-    if not feature_bullets:
+def build_structured_description_from_source(
+    title,
+    source_description,
+    attrs,
+    specs,
+    aspects,
+    *,
+    characteristics=None,
+    feature_bullets=None,
+):
+    """Build AquaVerve store-template HTML with conversion-oriented KEY FEATURES.
+
+    Prefer explicit ``feature_bullets``; otherwise build persuasive, product-
+    grounded bullets (not keyword soup). Always returns a full template shell
+    when possible so publish QC banner/footer checks pass.
+    """
+    from src.utils.conversion_copy import build_conversion_feature_bullets, is_thin_key_features_description
+
+    if feature_bullets:
+        bullets = [str(b).strip() for b in feature_bullets if str(b).strip()]
+    else:
+        bullets = extract_source_feature_bullets(source_description)
+        # Upgrade thin / soup bullets into conversion copy
+        joined = " ".join(bullets)
+        if (
+            not bullets
+            or len(bullets) < 3
+            or is_thin_key_features_description(
+                "<ul>" + "".join(f"<li>{b}</li>" for b in bullets) + "</ul>"
+            )
+            or (len(bullets) == 1 and len(joined.split()) >= 6 and "." not in joined)
+        ):
+            bullets = build_conversion_feature_bullets(
+                title=title or "",
+                source_description=source_description or "",
+                attributes=attrs or {},
+                specs=specs or {},
+                aspects=aspects or {},
+                characteristics=list(characteristics or []) or None,
+                limit=6,
+            )
+    if not bullets:
+        bullets = build_conversion_feature_bullets(
+            title=title or "",
+            source_description=source_description or "",
+            attributes=attrs or {},
+            specs=specs or {},
+            aspects=aspects or {},
+            characteristics=list(characteristics or []) or None,
+            limit=6,
+        )
+    if not bullets:
         return ""
+    feature_bullets = bullets
 
     assembly_required = first_aspect_text(aspects, "Assembly Required") or infer_source_assembly_required(
         attrs,
@@ -2222,36 +2272,45 @@ def build_structured_description_from_source(title, source_description, attrs, s
     from src.utils.store_profile import get_store_profile
 
     _profile = get_store_profile()
+    # Theme colors come from the profile so a specialized instance (GrovePop garden)
+    # rebrands this SAME mature layout instead of maintaining a separate template.
+    c_from = getattr(_profile, "theme_banner_from", "#0d1b2a")
+    c_to = getattr(_profile, "theme_banner_to", "#1a365d")
+    c_accent = getattr(_profile, "theme_accent", "#d4af37")
+    c_ink = getattr(_profile, "theme_ink", "#1a1a1a")
+    c_sect = getattr(_profile, "theme_section_bg", "#f8f9fa")
+    c_pf = getattr(_profile, "theme_perfectfor_bg", "#f0f4f8")
+    _grad = f"linear-gradient(135deg,{c_from} 0%,{c_to} 100%)"
     return (
-        '<div style="max-width:900px;margin:0 auto;font-family:Arial,sans-serif;color:#1a1a1a;line-height:1.7">'
-        '<div style="text-align:center;padding:30px 15px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
-        f'<h1 style="margin:0;font-size:28px;font-weight:300;letter-spacing:6px;color:#d4af37">{html.escape(_profile.brand_name.upper())}</h1>'
+        f'<div style="max-width:900px;margin:0 auto;font-family:Arial,sans-serif;color:{c_ink};line-height:1.7">'
+        f'<div style="text-align:center;padding:30px 15px;background:{_grad}">'
+        f'<h1 style="margin:0;font-size:28px;font-weight:300;letter-spacing:6px;color:{c_accent}">{html.escape(_profile.brand_name.upper())}</h1>'
         f'<p style="margin:8px 0 0;font-size:12px;color:#a0a0a0;letter-spacing:2px">{html.escape(_profile.brand_tagline)}</p>'
         '</div>'
-        '<div style="background:#f8f9fa;padding:25px;text-align:center;border-bottom:2px solid #d4af37">'
+        f'<div style="background:{c_sect};padding:25px;text-align:center;border-bottom:2px solid {c_accent}">'
         f'<h2 style="margin:0;font-size:20px;color:#2d3436;font-weight:500">{html.escape(title)}</h2>'
         '</div>'
         '<div style="padding:25px">'
-        '<h3 style="margin:0 0 15px;font-size:16px;color:#0d1b2a;border-left:4px solid #d4af37;padding-left:12px">KEY FEATURES</h3>'
+        f'<h3 style="margin:0 0 15px;font-size:16px;color:{c_from};border-left:4px solid {c_accent};padding-left:12px">KEY FEATURES</h3>'
         f'<ul style="margin:0;padding-left:20px;color:#4a4a4a">{bullet_html}</ul>'
         '</div>'
         # Whole block is conditional: with no source-grounded use-case copy the
         # section is omitted rather than rendered empty or padded with invention.
         + (
-            '<div style="padding:20px 25px;background:#f0f4f8">'
-            '<h3 style="margin:0 0 12px;font-size:14px;color:#0d1b2a">PERFECT FOR</h3>'
+            f'<div style="padding:20px 25px;background:{c_pf}">'
+            f'<h3 style="margin:0 0 12px;font-size:14px;color:{c_from}">PERFECT FOR</h3>'
             f'<p style="margin:0;color:#636e72">{perfect_for}</p>'
             '</div>'
             if perfect_for
             else ''
         ) +
         f'{specifications_html}'
-        '<div style="padding:20px 25px;background:#f8f9fa;border-top:1px solid #e0e0e0">'
-        '<h3 style="margin:0 0 10px;font-size:14px;color:#0d1b2a">PACKAGE INCLUDES</h3>'
+        f'<div style="padding:20px 25px;background:{c_sect};border-top:1px solid #e0e0e0">'
+        f'<h3 style="margin:0 0 10px;font-size:14px;color:{c_from}">PACKAGE INCLUDES</h3>'
         f'<p style="margin:0;color:#636e72">{package_includes}</p>'
         '</div>'
-        '<div style="text-align:center;padding:20px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
-        f'<p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">{html.escape(_profile.description_footer_line1)}</p>'
+        f'<div style="text-align:center;padding:20px;background:{_grad}">'
+        f'<p style="margin:0;font-size:12px;color:{c_accent};letter-spacing:1px">{html.escape(_profile.description_footer_line1)}</p>'
         f'<p style="margin:8px 0 0;font-size:11px;color:#808080">{html.escape(_profile.description_footer_line2)}</p>'
         '</div>'
         '</div>'
