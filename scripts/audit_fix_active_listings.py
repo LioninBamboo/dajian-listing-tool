@@ -2187,8 +2187,12 @@ def rebuild_specifications_table(attrs, specs, aspects, assembly_required="No"):
     rows.append(f'<tr{bg_style} data-assembly-note="true"><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72;width:40%">Assembly Required</td><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#2d3436">{assembly_str}</td></tr>')
     
     table_rows = "\n".join(rows)
-    
-    html = f'''<!-- Specifications Table --><div style="padding:25px;background:#fff"><h3 style="margin:0 0 15px;font-size:16px;color:#0d1b2a;border-left:4px solid #d4af37;padding-left:12px">SPECIFICATIONS</h3><table style="width:100%;border-collapse:collapse">{table_rows}</table></div>'''
+
+    from src.utils.store_profile import get_store_profile
+    _p = get_store_profile()
+    _hcol = getattr(_p, "theme_banner_from", "#0d1b2a")
+    _acc = getattr(_p, "theme_accent", "#d4af37")
+    html = f'''<!-- Specifications Table --><div style="padding:25px;background:#fff"><h3 style="margin:0 0 15px;font-size:16px;color:{_hcol};border-left:4px solid {_acc};padding-left:12px">SPECIFICATIONS</h3><table style="width:100%;border-collapse:collapse">{table_rows}</table></div>'''
     return html
 
 
