@@ -719,10 +719,18 @@ def compare_fact_sheets(
             )
 
     if live["capacity"] and not source["capacity"]:
-        # "1 person" on a chair / "2 person" on a loveseat is the product type
-        # itself, not a fabricated spec — only flag unsourced claims of 3+.
+        # A WEIGHT / LOAD rating ("880 lbs", "3 ton", "560 lb") is NOT occupancy
+        # capacity — the structured source capacity field is seats/persons only, so
+        # a load rating always looks "unsourced" here even though it sits in the
+        # source title/description. Don't flag it when its number is in the source
+        # text (grounded) — the car-jack "3Ton" and garden-cart "880lb" false positives.
+        _is_weight = bool(re.search(r"(lb|lbs|pound|ton|tonne|kg|oz)\b", live["capacity"], re.I))
+        _num = re.search(r"\d+(?:\.\d+)?", live["capacity"])
+        _num_in_source = bool(_num and source_text and _num.group(0) in source_text)
         live_range = _capacity_numbers(live["capacity"])
-        if live_range is None or live_range[1] >= 3:
+        if _is_weight and (_num_in_source or source_text is None):
+            pass  # grounded load rating (or source text unavailable) — not fabricated
+        elif live_range is None or live_range[1] >= 3:
             violations.append(
                 {
                     "claim_type": "semantic_capacity",
