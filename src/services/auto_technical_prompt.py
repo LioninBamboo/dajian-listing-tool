@@ -146,8 +146,10 @@ def build_auto_technical_system_prompt(profile: Any, mode: str) -> str:
    numbers), the SPECIFICATIONS table, and the footer from 'aspects'. YOUR description must contain
    ONLY the middle prose, in this order, and NOTHING else:
    - A one-sentence intro (14px #14161a) — what the part is and its headline benefit.
-   - KEY FEATURES: a title 15px bold UPPERCASE #ff5722 with a 1px #e5e7eb bottom rule, then 4–6
-     bullets, each 15px #14161a line-height 1.75, each starting with a <strong> lead-in then the detail.
+   - KEY FEATURES: a title 15px bold UPPERCASE #ff5722 with a 1px #e5e7eb bottom rule, then a
+     <ul style="margin:0;padding-left:20px"> containing 4–6 <li style="margin-bottom:8px;font-size:15px;
+     color:#14161a;line-height:1.75"> items — each MUST be an <li> (real bullet list, required by QC),
+     each starting with a <strong> lead-in then the detail.
    - {box_label}: one short line of exactly what ships in the box.
    Palette to match: ink #14161a · orange accent #ff5722 · hairline #e5e7eb. High contrast always.
    - Do NOT render a brand/header banner, a stat band, a SPECIFICATIONS table, any <table>/<th>/<td>,
@@ -173,6 +175,8 @@ rating the source is silent on (see FACT SAFETY).
 - Do NOT claim an INSTALL METHOD the source doesn't state — no "bolt-on", "no-drill", "no-cut", "weld-on",
   "direct bolt-on", "easy install" unless the source explicitly says so. "Vehicle Specific Fit" is NOT permission to
   infer bolt-on.
+- Do NOT invent a POWER / CONNECTIVITY feature — no "USB", "charging", "rechargeable", "Bluetooth", "app-controlled",
+  "wireless" unless the source names it. "12V" or "Electric" means it runs on vehicle power, NOT that it charges phones.
 - Aesthetic/benefit framing of real facts is fine; altering a spec value or inventing a testable claim is not.
 - Fill Item Specifics ('aspects') with accurate values from the source; values MUST be lists of strings.
   Fill AS MANY relevant aspects as the source supports (Type, Placement on Vehicle, Fitment Type, Material,
