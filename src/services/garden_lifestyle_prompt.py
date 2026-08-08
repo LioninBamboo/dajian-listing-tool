@@ -256,6 +256,13 @@ def finalize_garden_lifestyle_listing(data: Mapping[str, Any], profile: Any) -> 
     elif not aspects.get("Brand"):
         aspects["Brand"] = [getattr(profile, "default_brand", "Unbranded")]
 
+    # eBay requires an MPN whenever a Brand is set; many garden categories (Pots &
+    # Planters, Fence Panels, Fire Pits …) enforce it and reject the offer with
+    # errorId 25002 "BrandMPN … invalid or missing". A house-brand product has no
+    # manufacturer part number, so declare the standard "Does Not Apply".
+    if aspects.get("Brand") and not aspects.get("MPN"):
+        aspects["MPN"] = ["Does Not Apply"]
+
     intro = str(result.get("intro") or "").strip()
     perfect_for = str(result.get("perfect_for") or "").strip()
     features = result.get("features") if isinstance(result.get("features"), list) else []
