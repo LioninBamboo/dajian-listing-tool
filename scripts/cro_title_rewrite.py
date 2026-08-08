@@ -288,6 +288,39 @@ def _qwen_client():
     return _QWEN_CLIENT
 
 
+# Common vehicle makes — fitment is the highest-value keyword on an auto part and
+# must never be dropped by a rewrite (the hitch rewrite dropped "Ford Ranger Mazda").
+_VEHICLE_MAKES = {
+    "acura", "audi", "bmw", "buick", "cadillac", "chevrolet", "chevy", "chrysler",
+    "dodge", "fiat", "ford", "genesis", "gmc", "honda", "hyundai", "infiniti",
+    "isuzu", "jaguar", "jeep", "kia", "land", "lexus", "lincoln", "mazda",
+    "mercedes", "mercury", "mini", "mitsubishi", "nissan", "oldsmobile", "plymouth",
+    "pontiac", "porsche", "ram", "saab", "saturn", "scion", "subaru", "suzuki",
+    "tesla", "toyota", "volkswagen", "volvo", "vw",
+}
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9./-]*")
+
+
+def _protected_keywords(title: str, aspects: Dict[str, Any]) -> set:
+    """High-value tokens a rewrite must NOT drop: vehicle makes + the model tokens
+    that follow them, plus any year (4-digit) present in the original title.
+    Grounded in the ORIGINAL title so we only ever protect what was already there."""
+    words = _TOKEN_RE.findall(str(title or ""))
+    protected: set = set()
+    for i, w in enumerate(words):
+        wl = w.lower()
+        if wl in _VEHICLE_MAKES:
+            protected.add(wl)
+            # The 1–2 capitalized tokens after a make are almost always the model.
+            for j in (i + 1, i + 2):
+                if j < len(words) and words[j][:1].isupper():
+                    protected.add(words[j].lower())
+        if re.fullmatch(r"(19|20)\d{2}", w):  # model year
+            protected.add(wl)
+    return protected
+
+
 def build_rewritten_title(title: str, aspects: Dict[str, Any],
                           hot_keywords: Optional[List[str]] = None,
                           max_length: int = MAX_TITLE_LEN,
@@ -322,6 +355,9 @@ def build_rewritten_title(title: str, aspects: Dict[str, Any],
         "descriptors (size, material, color, style, count).\n"
         "- Use ONLY facts in CURRENT TITLE and ASPECTS. Do NOT invent materials, "
         "sizes, colors, counts, capacities, or features not listed there.\n"
+        "- PRESERVE every vehicle make/model/year and any proper noun already in the "
+        "current title (e.g. 'Ford Ranger', 'Mazda') — fitment is the top search term; "
+        "never drop it.\n"
         "- Weave in these trending keywords ONLY where they fit and are supported by "
         f"the facts: {', '.join(hot) if hot else '(none)'}\n"
         f"CURRENT TITLE: {base}\n"
@@ -348,6 +384,15 @@ def build_rewritten_title(title: str, aspects: Dict[str, Any],
     # (that drops keywords). Compare against the original capped at the eBay limit.
     if len(safe_title) < min(len(base), max_length) - 6:
         return None
+    # Fitment-preservation guard: never drop a vehicle make/model/year the original
+    # carried — that fitment is the top auto-parts search term. Reject if any is gone.
+    protected = _protected_keywords(base, aspects)
+    if protected:
+        new_tokens = {t.lower() for t in _TOKEN_RE.findall(safe_title)}
+        dropped = protected - new_tokens
+        if dropped:
+            logger.info("rewrite rejected — dropped protected keyword(s): %s", sorted(dropped))
+            return None
     return {"new_title": safe_title, "added_keywords": [], "added_hot_keywords": [],
             "mode": "rewrite"}
 

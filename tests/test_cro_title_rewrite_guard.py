@@ -5,6 +5,17 @@ import importlib
 cro = importlib.import_module("scripts.cro_title_rewrite")
 
 
+class TestFitmentPreservation:
+    def test_protects_vehicle_make_model_year(self):
+        prot = cro._protected_keywords(
+            "Trailer Hitch 2 Inch for 2015 Ford Ranger Mazda B-Series", {})
+        assert {"ford", "ranger", "mazda", "2015"} <= prot
+
+    def test_no_protection_for_furniture(self):
+        # No vehicle terms → nothing protected → full-rewrite is free to restructure.
+        assert cro._protected_keywords("Modern Wooden Dining Table for 6 People", {}) == set()
+
+
 class TestAspectGrounding:
     def test_only_appends_sku_own_aspect_values(self):
         # build_enriched_title never invents — every added token traces to an aspect.
