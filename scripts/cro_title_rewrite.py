@@ -268,6 +268,90 @@ def build_enriched_title(title: str, aspects: Dict[str, Any],
     }
 
 
+_QWEN_CLIENT = None
+
+
+def _qwen_client():
+    """Lazy OpenAI-compatible DashScope client (same endpoint as qwen_optimizer)."""
+    global _QWEN_CLIENT
+    if _QWEN_CLIENT is not None:
+        return _QWEN_CLIENT
+    key = os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
+    if not key:
+        return None
+    try:
+        from openai import OpenAI
+        _QWEN_CLIENT = OpenAI(
+            api_key=key, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+    except Exception:
+        _QWEN_CLIENT = None
+    return _QWEN_CLIENT
+
+
+def build_rewritten_title(title: str, aspects: Dict[str, Any],
+                          hot_keywords: Optional[List[str]] = None,
+                          max_length: int = MAX_TITLE_LEN,
+                          ) -> Optional[Dict[str, Any]]:
+    """Full LLM title rewrite (opt-in) — restructure + front-load, still grounded.
+
+    Unlike ``build_enriched_title`` (append-only), this asks the model to rebuild
+    the title from the CURRENT title + aspects, using ONLY facts present there, and
+    weaving in supported hot keywords. It exists for listings whose titles are
+    already keyword-complete (nothing to append) but poorly ordered/short. Every
+    result is still gated downstream by ``title_aspect_conflicts`` +
+    ``title_fact_guard`` (semantic FactSheet), so an un-sourced claim can never ship
+    — the safety net ADR-002 lacked. Returns None if unavailable or no improvement.
+    """
+    client = _qwen_client()
+    base = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not client or not base:
+        return None
+    asp_lines = []
+    for k, v in (aspects or {}).items():
+        val = _first_meaningful_value(v)
+        if val:
+            asp_lines.append(f"{k}: {val}")
+    hot = [str(k).strip() for k in (hot_keywords or []) if str(k).strip()][:15]
+    prompt = (
+        "You are an expert eBay SEO title optimizer. Rewrite the product title to "
+        "maximize Cassini search visibility.\n"
+        "RULES:\n"
+        f"- {max_length - 5}–{max_length} characters. Title Case. No brand name, no fluff "
+        "(New/Best/Sale/Hot/Free Shipping).\n"
+        "- FRONT-LOAD the highest-search buyer terms: product noun first, then key "
+        "descriptors (size, material, color, style, count).\n"
+        "- Use ONLY facts in CURRENT TITLE and ASPECTS. Do NOT invent materials, "
+        "sizes, colors, counts, capacities, or features not listed there.\n"
+        "- Weave in these trending keywords ONLY where they fit and are supported by "
+        f"the facts: {', '.join(hot) if hot else '(none)'}\n"
+        f"CURRENT TITLE: {base}\n"
+        f"ASPECTS:\n" + ("\n".join(asp_lines) if asp_lines else "(none)") + "\n"
+        "Return ONLY the new title text on one line, nothing else."
+    )
+    try:
+        resp = client.chat.completions.create(
+            model=os.getenv("QWEN_MODEL", "qwen-plus"),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3, timeout=60,
+        )
+        raw = (resp.choices[0].message.content or "").strip().strip('"').splitlines()[0]
+    except Exception as exc:
+        logger.warning("build_rewritten_title LLM failed: %s", exc)
+        return None
+    safe_title, _ = normalize_listing_title_for_ebay(
+        raw, source_title="", max_length=max_length)
+    safe_title = (safe_title or "").strip()
+    # Require a real change and a non-trivial length (avoid lateral churn / stubs).
+    if not safe_title or safe_title.lower() == base.lower() or len(safe_title) < 20:
+        return None
+    # Shrink-guard: a rewrite may reorder or EXPAND but must not lose title space
+    # (that drops keywords). Compare against the original capped at the eBay limit.
+    if len(safe_title) < min(len(base), max_length) - 6:
+        return None
+    return {"new_title": safe_title, "added_keywords": [], "added_hot_keywords": [],
+            "mode": "rewrite"}
+
+
 def title_fact_guard(cand: Dict[str, Any], new_title: str) -> Tuple[bool, List[Dict[str, Any]]]:
     """FactSheet backstop before any live title write.
 
@@ -748,7 +832,8 @@ def run(skus: List[str], apply_changes: bool, limit: int,
         db_path: Optional[Path] = None,
         logs_dir: Optional[Path] = None,
         cooldown_days: int = REWRITE_COOLDOWN_DAYS,
-        oauth=None) -> Dict[str, Any]:
+        oauth=None,
+        full_rewrite: bool = False) -> Dict[str, Any]:
     rewritten_recently = recently_rewritten_skus(
         days=cooldown_days, logs_dir=logs_dir)
     rep: Dict[str, Any] = {
@@ -784,6 +869,12 @@ def run(skus: List[str], apply_changes: bool, limit: int,
             continue
         proposal = build_enriched_title(
             cand["title"], cand["aspects"], cand.get("hot_keywords") or [])
+        # Full-rewrite fallback: when there is nothing safe to APPEND (the title is
+        # already keyword-complete but may be poorly ordered/short), let the LLM
+        # restructure it. Still gated by aspect-conflict + FactSheet below.
+        if not proposal and full_rewrite:
+            proposal = build_rewritten_title(
+                cand["title"], cand["aspects"], cand.get("hot_keywords") or [])
         if not proposal:
             rep["rows"].append({"sku": sku, "status": "skipped",
                                 "reason": "no safe keywords to add"})
@@ -794,6 +885,7 @@ def run(skus: List[str], apply_changes: bool, limit: int,
             "listing_id": cand["listing_id"],
             "old_title": cand["title"],
             "new_title": proposal["new_title"],
+            "mode": proposal.get("mode", "insert"),
             "added_keywords": proposal["added_keywords"],
             "added_hot_keywords": proposal.get("added_hot_keywords", []),
         }
@@ -847,11 +939,25 @@ def main() -> int:
                    help="Max SKUs per run (default 10)")
     p.add_argument("--email", action="store_true",
                    help="Send email summary after run")
+    p.add_argument("--full-rewrite", action="store_true",
+                   help="When nothing is safe to APPEND, let the LLM restructure the "
+                        "title (still gated by aspect-conflict + FactSheet guard)")
     p.add_argument("--out", help="Write JSON report to path")
     args = p.parse_args()
+    # Scheduler opt-in: SCHEDULED_TITLE_REWRITE_FULL=1 turns on rewrite fallback.
+    full_rewrite = args.full_rewrite or os.getenv(
+        "SCHEDULED_TITLE_REWRITE_FULL", "").strip().lower() in {"1", "true", "yes", "on"}
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(message)s")
+
+    # Load .env up front so QWEN_API_KEY (rewrite LLM + FactSheet guard) is present
+    # on dry-run too — previously it loaded only inside _build_oauth (apply path).
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(PROJECT_ROOT / ".env")
+    except Exception:
+        pass
 
     if args.apply and not args.yes:
         p.error("--apply requires --yes (run a dry-run preview first)")
@@ -868,7 +974,8 @@ def main() -> int:
             escalation_days=args.escalation_days,
         )
 
-    rep = run(skus, apply_changes=args.apply, limit=args.limit)
+    rep = run(skus, apply_changes=args.apply, limit=args.limit,
+              full_rewrite=full_rewrite)
     print(json.dumps({
         "input_skus": rep["input_skus"],
         "cooldown_skipped": rep["cooldown_skipped"],
