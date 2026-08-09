@@ -1039,22 +1039,37 @@ def build_description_from_source(
     aspects: Mapping[str, Any],
     characteristics: list[str] | None = None,
 ) -> str:
-    """Deterministic description rebuild (zero LLM)."""
+    """Deterministic description rebuild with conversion-oriented KEY FEATURES."""
     from scripts.audit_fix_active_listings import build_structured_description_from_source
+    from src.utils.conversion_copy import build_conversion_feature_bullets
 
-    # Prefer characteristics as explicit bullets when present
+    # Feed full source description (not only a thin fragment) so sentence mining
+    # and conversion expansion can produce real selling points.
+    source_blob = source_description or ""
     if characteristics:
-        li = "".join(f"<li>{_escape_basic(c)}</li>" for c in characteristics if str(c).strip())
-        fragment = f"<div><h3>Product Features</h3><ul>{li}</ul></div>"
-    else:
-        fragment = extract_product_features_fragment(source_description)
+        # Append grounded characteristics as text hints; do NOT dump as raw <li>
+        # keyword soup (that path produced "armrest easy to assemble ..." bullets).
+        extra = " ".join(str(c).strip() for c in characteristics if str(c).strip())
+        if extra:
+            source_blob = f"{source_blob}\n\nProduct Features: {extra}"
 
+    bullets = build_conversion_feature_bullets(
+        title=title or "",
+        source_description=source_blob,
+        attributes=dict(attrs or {}),
+        specs=dict(specs or {}),
+        aspects=dict(aspects or {}),
+        characteristics=list(characteristics or []) or None,
+        limit=6,
+    )
     html = build_structured_description_from_source(
         title,
-        fragment,
+        source_blob,
         dict(attrs or {}),
         dict(specs or {}),
         dict(aspects or {}),
+        characteristics=list(characteristics or []) or None,
+        feature_bullets=bullets,
     )
     return html or ""
 

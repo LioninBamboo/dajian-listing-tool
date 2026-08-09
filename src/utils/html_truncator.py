@@ -168,6 +168,42 @@ class SmartHTMLTruncator(HTMLParser):
         return ''.join(self.result), self.truncated
 
 
+def _extract_store_footer_suffix(html: str) -> tuple[str, str]:
+    """Split a store description into (body, footer_suffix) when a known footer is present.
+
+    Looks for the last footer block that carries the store's quality footer marker
+    (default: 'ships from'). Returns (html, '') when no footer can be isolated.
+    """
+    text = html or ""
+    if not text:
+        return "", ""
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        marker = str(get_store_profile().quality_footer_marker or "ships from").lower()
+    except Exception:
+        marker = "ships from"
+    lower = text.lower()
+    idx = lower.rfind(marker)
+    if idx < 0:
+        return text, ""
+    # Walk back to the opening <div of the footer block.
+    open_div = text.rfind("<div", 0, idx)
+    if open_div < 0:
+        return text, ""
+    # Prefer the last gradient/footer-style open before the marker.
+    search_from = max(0, idx - 800)
+    open_div = text.rfind("<div", search_from, idx)
+    if open_div < 0:
+        return text, ""
+    body = text[:open_div].rstrip()
+    footer = text[open_div:]
+    # Footer must still look like a closed trailing block.
+    if "</div>" not in footer.lower():
+        return text, ""
+    return body, footer
+
+
 def smart_truncate_html(html: str, max_length: int = 50000, min_length: int = 45000) -> str:
     """
     智能截断HTML描述
@@ -183,6 +219,39 @@ def smart_truncate_html(html: str, max_length: int = 50000, min_length: int = 45
     # 如果本身就不长，直接返回
     if len(html) <= max_length:
         return html
+
+    # Preserve store footer: truncate the body only, then re-append footer.
+    body, footer = _extract_store_footer_suffix(html)
+    if footer:
+        # Leave room for footer + a few closing wrappers.
+        reserve = len(footer) + 32
+        body_budget = max(200, max_length - reserve)
+        if len(body) > body_budget:
+            truncator = SmartHTMLTruncator(max_length=body_budget)
+            try:
+                truncator.feed(body)
+                body, was_truncated = truncator.get_result()
+            except Exception:
+                body = body[:body_budget]
+                was_truncated = True
+            # Close outer wrapper if body was cut mid-structure.
+            if body.count("<div") > body.lower().count("</div>"):
+                body = body + ("</div>" * (body.count("<div") - body.lower().count("</div>")))
+            result = body + footer
+            # Hard safety: if still over, shrink body further.
+            while len(result) > max_length and len(body) > 200:
+                body = body[: max(200, len(body) - (len(result) - max_length + 64))]
+                if body.count("<div") > body.lower().count("</div>"):
+                    body = body + ("</div>" * (body.count("<div") - body.lower().count("</div>")))
+                result = body + footer
+            if was_truncated or len(html) > max_length:
+                print(
+                    f"[Smart Truncator] HTML truncated from {len(html)} to {len(result)} chars "
+                    f"(footer preserved, {len(footer)} chars)"
+                )
+            if len(result) <= max_length:
+                return result
+            # Fall through to normal path if still too long (pathological footer).
     
     # 使用智能截断器
     truncator = SmartHTMLTruncator(max_length=max_length)
