@@ -19,6 +19,9 @@ PROTECTED_STORED_CATEGORY_IDS = {
     "262216",
     "262093",
     "85040",
+    # Keep specialized furniture leaves from being remapped to generic cabinets.
+    "20689",   # Wine Racks & Bottle Holders (bar / liquor cabinets)
+    "261263",  # Hall Trees & Stands
 }
 
 

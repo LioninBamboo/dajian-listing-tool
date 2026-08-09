@@ -36,6 +36,13 @@ FABRIC_KEYWORDS = {
     "polyester": "Polyester",
     "cotton": "Cotton",
     "microfiber": "Microfiber",
+    "microsuede": "Microfiber",
+    "chenille": "Chenille",
+    # Source-grounded free-text values. Do NOT map plush/foam → Microfiber:
+    # inventing Microfiber fails FactSheet semantic_material CRITICAL when the
+    # supplier only lists foam / plush fabric / spring.
+    "plush fabric": "Plush Fabric",
+    "plush": "Plush Fabric",
 }
 
 
@@ -127,10 +134,16 @@ def infer_upholstery_fabric(title: str, aspects: Dict[str, Any]) -> str:
         material = str(existing_material).lower()
 
     check_text = f"{material} {(title or '').lower()}"
+    # Longest / most specific keywords first (map order is insertion order).
     for keyword, value in FABRIC_KEYWORDS.items():
         if keyword in check_text:
             return value
-    return "Polyester"
+    # Bare "fabric" / foam fill is not evidence of a specific fiber. Prefer a
+    # generic Fabric claim over inventing Polyester/Microfiber (both trip
+    # FactSheet CRITICAL when the source only lists foam/plush fabric/spring).
+    if "fabric" in check_text:
+        return "Fabric"
+    return "Fabric"
 
 
 def _extract_title_length(title: str) -> Optional[str]:

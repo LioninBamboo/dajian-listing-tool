@@ -99,7 +99,9 @@ class EbayPublisher:
         "38208": {
             "required": ["Upholstery Fabric", "Brand", "Type", "Color", "Item Width", "Item Height", "Item Length"],
             "defaults": {
-                "Upholstery Fabric": "Polyester",
+                # Prefer generic Fabric over Polyester/Microfiber — inventing a
+                # specific fiber trips FactSheet semantic_material CRITICAL.
+                "Upholstery Fabric": "Fabric",
                 "Brand": "Unbranded",
                 "Type": "Sofa",
                 "Color": "Gray",
