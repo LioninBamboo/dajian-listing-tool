@@ -169,13 +169,11 @@ def test_windows_live_worker_handle_prevents_lock_deletion(tmp_path):
         with pytest.raises(PermissionError):
             lock_path.unlink()
     finally:
-        worker_pid = json.loads(handshake_path.read_text(encoding='utf-8'))['worker_pid']
-        subprocess.run(
-            ['taskkill', '/PID', str(worker_pid), '/F', '/T'],
-            capture_output=True,
-            timeout=5,
-        )
         if proc.poll() is None:
+            proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
             proc.kill()
-        proc.wait(timeout=5)
+            proc.wait(timeout=5)
         lock_path.unlink(missing_ok=True)
