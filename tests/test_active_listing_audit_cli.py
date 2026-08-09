@@ -151,6 +151,65 @@ def test_active_audit_flags_live_source_parameter_drift_for_trash_cabinet(monkey
     assert fixes["__source_parameter_rebuild__"] is True
 
 
+def test_active_audit_detects_w808_flat_pack_assembly_drift(monkeypatch):
+    class _Matcher:
+        def canonicalize_category(self, title_context, category_id, category_name, description=None):
+            return category_id, category_name
+
+        def is_category_plausible_for_text(self, title, category_id, category_name):
+            return True
+
+    monkeypatch.setattr(audit_fix_active_listings, "get_category_matcher", lambda: _Matcher())
+
+    source_attrs = {
+        "Assembled Length (in.)": "21.70",
+        "Assembled Width (in.)": "14.20",
+        "Assembled Height (in.)": "37.40",
+        "Product Weight (lbs.)": "41.33",
+        "Main Material": "Particle Board",
+    }
+    source_specs = {
+        "Package Length (in.)": "39.37",
+        "Package Width (in.)": "21.97",
+        "Package Height (in.)": "5.40",
+        "Package Weight (lbs.)": "45.88",
+    }
+    live_opt = {
+        "title": "13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet",
+        "description": (
+            "<div><h3>SPECIFICATIONS</h3><table>"
+            '<tr data-assembly-note="true"><td>Assembly Required</td><td>No</td></tr>'
+            "</table></div>"
+        ),
+        "categoryId": "20487",
+        "aspects": {
+            "Type": ["Storage Cabinet"],
+            "Material": ["Particle Board"],
+            "Item Length": ["21.7 in"],
+            "Item Width": ["14.2 in"],
+            "Item Height": ["37.4 in"],
+            "Item Weight": ["41.33 lbs"],
+        },
+    }
+
+    issues, fixes = audit_fix_active_listings.audit_single_product(
+        "W808P477209",
+        "13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet",
+        json.dumps(source_attrs),
+        json.dumps(source_specs),
+        json.dumps(live_opt),
+        "Made of Particle Board with a tilt-out cabinet design.",
+    )
+
+    assembly_issues = [issue for issue in issues if "assembly" in issue.get("type", "")]
+    assert {issue["type"] for issue in assembly_issues} >= {
+        "assembly_required_mismatch",
+        "assembly_description_contradiction",
+    }
+    assert fixes["Assembly Required"] == ["Yes"]
+    assert fixes["__assembly_desc_update__"] == "Yes"
+
+
 def test_fix_listing_rebuilds_description_after_source_parameter_correction(monkeypatch):
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
@@ -1255,6 +1314,9 @@ def test_fix_listing_keeps_full_offer_description_when_inventory_copy_is_truncat
     long_description = "<div>" + ("A" * 4300) + "</div>"
 
     class FakeClient:
+        def get_inventory_item(self, sku):
+            return {"sku": sku, "product": {"title": "Storage bed", "description": "<div>Original</div>"}}
+
         def get_offers_by_sku(self, sku):
             return [{"offerId": "offer-2", "listing": {"listingId": "456"}, "status": "PUBLISHED"}]
 

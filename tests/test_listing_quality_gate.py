@@ -2,6 +2,7 @@ from src.utils.listing_quality_gate import (
     description_contains_cjk,
     description_uses_store_template,
     ensure_store_description_template,
+    infer_assembly_decision,
     normalize_generated_listing,
     sanitize_generated_description_html,
     validate_listing_quality,
@@ -334,6 +335,136 @@ def test_quality_gate_blocks_assembly_required_mismatch_before_publish():
         "assembly_description_contradiction",
         "assembly_packaging_contradiction",
     }
+
+
+def test_flat_pack_rigid_product_overrides_generated_no_assembly_default():
+    attrs = {
+        "Assembled Length (in.)": "21.70",
+        "Assembled Width (in.)": "14.20",
+        "Assembled Height (in.)": "37.40",
+        "Product Weight (lbs.)": "41.33",
+        "Main Material": "Particle Board",
+    }
+    specs = {
+        "Package Length (in.)": "39.37",
+        "Package Width (in.)": "21.97",
+        "Package Height (in.)": "5.40",
+        "Package Weight (lbs.)": "45.88",
+    }
+    decision = infer_assembly_decision(
+        source_title="13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet",
+        source_description="Made of Particle Board with a tilt-out cabinet design.",
+        attributes=attrs,
+        specs=specs,
+        current_assembly="No",
+    )
+
+    assert decision["required"] == "Yes"
+    assert decision["source"] is None
+    assert decision["package"]["strong"] is True
+    assert decision["package"]["product_family"] == "rigid"
+
+
+def test_explicit_no_with_flat_pack_geometry_requires_manual_review():
+    decision = infer_assembly_decision(
+        source_title="Tilt Out Trash Cabinet",
+        source_description="Assembly Required: No",
+        attributes={
+            "Assembled Length (in.)": "21.70",
+            "Assembled Width (in.)": "14.20",
+            "Assembled Height (in.)": "37.40",
+        },
+        specs={
+            "Package Length (in.)": "39.37",
+            "Package Width (in.)": "21.97",
+            "Package Height (in.)": "5.40",
+        },
+        current_assembly="No",
+    )
+
+    assert decision["required"] is None
+    assert decision["status"] == "review"
+    assert decision["conflict"] is True
+
+
+def test_quality_gate_catches_w808_style_description_no_assembly_claim():
+    opt = {
+        "title": "13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet",
+        "description": (
+            "<div><h3>SPECIFICATIONS</h3><table>"
+            '<tr data-assembly-note="true"><td>Assembly Required</td><td>No</td></tr>'
+            "</table></div>"
+        ),
+        "categoryId": "20487",
+        "aspects": {
+            "Type": ["Storage Cabinet"],
+            "Material": ["Particle Board"],
+            "Item Length": ["21.7 in"],
+            "Item Width": ["14.2 in"],
+            "Item Height": ["37.4 in"],
+            "Item Weight": ["41.33 lbs"],
+        },
+    }
+    attrs = {
+        "Assembled Length (in.)": "21.70",
+        "Assembled Width (in.)": "14.20",
+        "Assembled Height (in.)": "37.40",
+        "Product Weight (lbs.)": "41.33",
+        "Main Material": "Particle Board",
+    }
+    specs = {
+        "Package Length (in.)": "39.37",
+        "Package Width (in.)": "21.97",
+        "Package Height (in.)": "5.40",
+        "Package Weight (lbs.)": "45.88",
+    }
+
+    issues = validate_listing_quality(
+        opt,
+        source_title="13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet",
+        source_description="Made of Particle Board with a tilt-out cabinet design.",
+        attributes=attrs,
+        specs=specs,
+        images=["img1", "img2"],
+    )
+
+    assert any(issue.code == "assembly_required_mismatch" for issue in issues)
+    assert any(issue.code == "assembly_description_contradiction" for issue in issues)
+
+
+def test_normalize_generated_listing_uses_flat_pack_assembly_evidence():
+    normalized = normalize_generated_listing(
+        {
+            "title": "13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet",
+            "description": "<div><h3>KEY FEATURES</h3><ul><li>Particle Board cabinet.</li></ul></div>",
+            "categoryId": "20487",
+            "aspects": {
+                "Type": ["Storage Cabinet"],
+                "Material": ["Particle Board"],
+                "Assembly Required": ["No"],
+            },
+        },
+        source_title="13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet",
+        source_description="Made of Particle Board with a tilt-out cabinet design.",
+        attributes={
+            "Assembled Length (in.)": "21.70",
+            "Assembled Width (in.)": "14.20",
+            "Assembled Height (in.)": "37.40",
+            "Product Weight (lbs.)": "41.33",
+            "Main Material": "Particle Board",
+        },
+        specs={
+            "Package Length (in.)": "39.37",
+            "Package Width (in.)": "21.97",
+            "Package Height (in.)": "5.40",
+            "Package Weight (lbs.)": "45.88",
+        },
+        images=["img1", "img2"],
+    )
+
+    assert normalized["aspects"]["Assembly Required"] == ["Yes"]
+    assert "Assembly Required" in normalized["description"]
+    assert "No - Ready for use without assembly" not in normalized["description"]
 
 
 def test_quality_gate_does_not_flag_no_assembly_required_as_contradiction():

@@ -83,7 +83,7 @@ from src.utils.listing_quality_gate import (
     classify_listing_profile,
     find_assembly_description_contradictions,
     has_expected_assembly_copy,
-    infer_source_assembly_required,
+    infer_assembly_decision,
     infer_source_assembly_status,
     rewrite_assembly_copy,
     sanitize_generated_description_html,
@@ -420,7 +420,12 @@ def _build_perfect_for_copy(
     return ""
 
 
-def _build_package_includes_copy(title: str, source_description: str, aspects: dict, assembly_required: str) -> str:
+def _build_package_includes_copy(
+    title: str,
+    source_description: str,
+    aspects: dict,
+    assembly_required: str | None,
+) -> str:
     package_items = []
     type_name = first_aspect_text(aspects, "Type") or title or "Main Product"
     package_items.append(f"1 x {type_name}")
@@ -1090,8 +1095,15 @@ def audit_single_product(
             fixes[f"__remove__{aspect_key}"] = True
 
     # ── 3.5 Source-protected assembly requirement ──
-    source_assembly = infer_source_assembly_required(attrs, specs, description)
     current_assembly = first_aspect_text(aspects, "Assembly Required")
+    assembly_decision = infer_assembly_decision(
+        source_title=title,
+        source_description=description,
+        attributes=attrs,
+        specs=specs,
+        current_assembly=current_assembly,
+    )
+    source_assembly = assembly_decision.get("required")
     current_assembly_status = first_aspect_text(aspects, "Assembly Status")
     source_assembly_status = infer_source_assembly_status(attrs, specs, description)
     if current_assembly_status and not source_assembly_status:
@@ -1105,7 +1117,22 @@ def audit_single_product(
         })
         fixes["__remove__Assembly Status"] = True
 
+    if assembly_decision.get("status") == "review" and assembly_decision.get("package", {}).get("strong"):
+        issues.append({
+            "type": "assembly_package_conflict",
+            "severity": "CRITICAL",
+            "field": "Assembly Required",
+            "current": current_assembly or None,
+            "expected": "manual review",
+            "detail": "Package geometry suggests a flat-pack product, but source/listing evidence also suggests no assembly; manual confirmation required",
+        })
+
     if source_assembly:
+        assembly_reason = (
+            f"because supplier source says Assembly Required {source_assembly}"
+            if assembly_decision.get("status") == "source"
+            else "because source dimensions strongly indicate a rigid flat-pack product"
+        )
         if current_assembly.lower() != source_assembly.lower():
             issues.append({
                 "type": "assembly_required_mismatch",
@@ -1113,7 +1140,7 @@ def audit_single_product(
                 "field": "Assembly Required",
                 "current": current_assembly or None,
                 "expected": source_assembly,
-                "detail": f"Assembly Required must be {source_assembly} because supplier source says Assembly Required {source_assembly}"
+                "detail": f"Assembly Required must be {source_assembly} {assembly_reason}"
             })
             fixes["Assembly Required"] = [source_assembly]
 
@@ -1140,7 +1167,11 @@ def audit_single_product(
             })
             fixes["__remove__Packaging"] = True
 
-    effective_assembly = source_assembly or (current_assembly if current_assembly in {"Yes", "No"} else None)
+    effective_assembly = source_assembly or (
+        current_assembly
+        if assembly_decision.get("status") in {"listing", "unknown"} and current_assembly in {"Yes", "No"}
+        else None
+    )
     if effective_assembly == "Yes" and not has_expected_assembly_copy(live_description, effective_assembly):
         issues.append({
             "type": "assembly_description_missing",
@@ -2180,7 +2211,7 @@ def _put_inventory_product_only(ebay_client, sku, title, description, aspects):
     return response, description, cleaned_aspects
 
 
-def rebuild_specifications_table(attrs, specs, aspects, assembly_required="No"):
+def rebuild_specifications_table(attrs, specs, aspects, assembly_required=None):
     from src.utils.dimension_helpers import extract_all_dimensions
     dims = extract_all_dimensions(attrs)
     dim_str = ""
@@ -2201,9 +2232,11 @@ def rebuild_specifications_table(attrs, specs, aspects, assembly_required="No"):
         if len(parts) >= 2:
             material_val = parts[1].strip()
             
-    assembly_str = "No"
+    assembly_str = ""
     if assembly_required == "Yes":
         assembly_str = "Yes - Hardware and instructions included; setup required before use."
+    elif assembly_required == "No":
+        assembly_str = "No"
         
     rows = []
     if dim_str:
@@ -2215,8 +2248,9 @@ def rebuild_specifications_table(attrs, specs, aspects, assembly_required="No"):
     if material_val:
         rows.append(f'<tr{bg_style}><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72">Material</td><td style="padding:10px;border-bottom:1px solid #e0e0e0;font-weight:500">{material_val}</td></tr>')
         
-    bg_style = ' style="background:#fafafa"' if len(rows) % 2 == 1 else ''
-    rows.append(f'<tr{bg_style} data-assembly-note="true"><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72;width:40%">Assembly Required</td><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#2d3436">{assembly_str}</td></tr>')
+    if assembly_str:
+        bg_style = ' style="background:#fafafa"' if len(rows) % 2 == 1 else ''
+        rows.append(f'<tr{bg_style} data-assembly-note="true"><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72;width:40%">Assembly Required</td><td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#2d3436">{assembly_str}</td></tr>')
     
     table_rows = "\n".join(rows)
 
@@ -2283,11 +2317,14 @@ def build_structured_description_from_source(
         return ""
     feature_bullets = bullets
 
-    assembly_required = first_aspect_text(aspects, "Assembly Required") or infer_source_assembly_required(
-        attrs,
-        specs,
-        source_description,
-    ) or "No"
+    assembly_decision = infer_assembly_decision(
+        source_title=title,
+        source_description=source_description,
+        attributes=attrs,
+        specs=specs,
+        current_assembly=first_aspect_text(aspects, "Assembly Required"),
+    )
+    assembly_required = assembly_decision.get("required")
     bullet_html = "".join(
         f'<li style="margin-bottom:10px">{html.escape(bullet)}</li>'
         for bullet in feature_bullets
@@ -2494,6 +2531,8 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
             "__source_parameter_rebuild__",
             "__rebuild_description_from_source__",
             "__semantic_rebuild_from_source__",
+            "Assembly Required",
+            "__assembly_desc_update__",
         )
     ):
         try:
@@ -2508,6 +2547,8 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
             backup_dir = ROOT / "logs" / "source_parameter_backups"
             backup_dir.mkdir(parents=True, exist_ok=True)
             backup_path = backup_dir / f"{sku}.json"
+            if backup_path.exists():
+                backup_path = backup_dir / f"{sku}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             backup_path.write_text(
                 json.dumps(
                     {
@@ -2839,16 +2880,18 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
                 if dims.get("weight"):
                     results.append(f"Description weight updated to {dims['weight']} lbs")
             elif dims.get("length") and dims.get("width") and dims.get("height"):
-                assembly_required = first_aspect_text(aspects, "Assembly Required") or infer_source_assembly_required(
-                    attrs,
-                    source_specs,
-                    source_description,
-                )
+                assembly_required = infer_assembly_decision(
+                    source_title=source_title or title,
+                    source_description=source_description,
+                    attributes=attrs,
+                    specs=source_specs,
+                    current_assembly=first_aspect_text(aspects, "Assembly Required"),
+                ).get("required")
                 rebuilt_table = rebuild_specifications_table(
                     attrs,
                     source_specs,
                     aspects,
-                    assembly_required=assembly_required or "No",
+                    assembly_required=assembly_required,
                 )
                 description = replace_specifications_table_html(description, rebuilt_table)
                 description_changed = True
@@ -3210,7 +3253,13 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
             if len(parts) >= 2:
                 description = parts[0].strip()
                 # 3. Rebuild a 100% complete Specifications Table HTML
-                assembly_required = infer_source_assembly_required(attrs, source_specs, source_description)
+                assembly_required = infer_assembly_decision(
+                    source_title=source_title or title,
+                    source_description=source_description,
+                    attributes=attrs,
+                    specs=source_specs,
+                    current_assembly=first_aspect_text(aspects, "Assembly Required"),
+                ).get("required")
                 new_table = rebuild_specifications_table(attrs, source_specs, aspects, assembly_required)
                 description = replace_specifications_table_html(description, new_table)
                 results.append("Description HTML specifications table rebuilt from scratch")
@@ -3248,16 +3297,18 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
     dims = extract_all_dimensions(attrs)
     has_rebuildable_dimensions = bool(dims.get("length") and dims.get("width") and dims.get("height"))
     if description_changed and has_rebuildable_dimensions:
-        assembly_required = first_aspect_text(aspects, "Assembly Required") or infer_source_assembly_required(
-            attrs,
-            source_specs,
-            source_description,
-        )
+        assembly_required = infer_assembly_decision(
+            source_title=source_title or title,
+            source_description=source_description,
+            attributes=attrs,
+            specs=source_specs,
+            current_assembly=first_aspect_text(aspects, "Assembly Required"),
+        ).get("required")
         rebuilt_table = rebuild_specifications_table(
             attrs,
             source_specs,
             aspects,
-            assembly_required=assembly_required or "No",
+            assembly_required=assembly_required,
         )
         if not _description_has_substantive_copy(description):
             fallback_base = source_description or description

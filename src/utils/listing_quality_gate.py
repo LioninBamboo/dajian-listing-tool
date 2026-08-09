@@ -503,8 +503,230 @@ def infer_source_assembly_required(
     return None
 
 
+_PACKAGE_ASSEMBLY_DIMENSION_KEYS = {
+    "assembled": (
+        ("length", ("Assembled Length (in.)", "Product Length (in.)")),
+        ("width", ("Assembled Width (in.)", "Product Width (in.)")),
+        ("height", ("Assembled Height (in.)", "Product Height (in.)")),
+    ),
+    "package": (
+        ("length", ("Package Length (in.)", "Shipping Length", "Carton Length")),
+        ("width", ("Package Width (in.)", "Shipping Width", "Carton Width")),
+        ("height", ("Package Height (in.)", "Shipping Height", "Carton Height")),
+    ),
+}
+
+_ASSEMBLY_NEGATIVE_CUE_PATTERNS = (
+    ("no_assembly", r"\bno\s+assembly\s+required\b"),
+    ("assembly_required_no", r"\bassembly\s+required\s*[:：]?\s*no\b"),
+    ("assembly_free", r"\bassembly[-\s]?free\b"),
+    ("fully_assembled", r"\b(?:ships?\s+)?fully\s+assembled\b"),
+    ("pre_assembled", r"\bpre[-\s]?assembled\b"),
+    ("ready_out_of_box", r"\bready\s+to\s+use\s+right\s+out\s+of\s+the\s+box\b"),
+)
+
+_ASSEMBLY_FLEXIBLE_PRODUCT_PATTERNS = (
+    r"\bcompressed\b",
+    r"\bcompression\b",
+    r"\bfold(?:able|ing)\b",
+    r"\bcollapsible\b",
+    r"\bmattress\b",
+    r"\binflatable\b",
+    r"\bbean\s*bag\b",
+    r"\bstroller\b",
+    r"\btreadmill\b",
+    r"\bcamping\b",
+)
+
+_ASSEMBLY_POSITIVE_CUE_PATTERNS = (
+    ("assembly_action", r"\b(?:requires?|must)\s+(?:be\s+)?assembled\b"),
+    ("assemble_action", r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+(?:to\s+)?assemble\b"),
+    ("install_action", r"\b(?:easy|simple|straightforward)\s+(?:to\s+)?install(?:ation)?\b"),
+    ("assembly_instructions", r"\b(?:assembly|installation)\s+(?:instructions|guide|manual)\b"),
+    ("assembly_hardware", r"\bassembly\s+hardware\b"),
+    ("setup_action", r"\bsetup\s+(?:required|instructions|guide)\b"),
+)
+
+_ASSEMBLY_RIGID_PRODUCT_PATTERNS = (
+    r"\bcabinet\b",
+    r"\b(?:table|desk)\b",
+    r"\b(?:shelf|shelves|bookshelf|bookcase)\b",
+    r"\bsideboard\b",
+    r"\bpantry\b",
+    r"\bconsole\b",
+    r"\bnightstand\b",
+    r"\bdresser\b",
+    r"\b(?:kitchen|storage)\s+island\b",
+    r"\b(?:storage|coat)\s+rack\b",
+    r"\bmirror\s+cabinet\b",
+    r"\bchicken\s+coop\b",
+    r"\bgreenhouse\b",
+)
+
+
+def _first_numeric_source_value(source: Mapping[str, Any] | None, keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = (source or {}).get(key)
+        match = re.search(r"-?\d+(?:\.\d+)?", str(value or ""))
+        if not match:
+            continue
+        try:
+            number = float(match.group(0))
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return None
+
+
+def infer_package_assembly_evidence(
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Estimate whether package geometry is strong evidence of assembly.
+
+    A thin carton is not proof by itself: compressed sofas and foldable goods
+    are common counterexamples.  The returned evidence therefore separates the
+    geometry signal (``strong``) from the product-family and copy cues used to
+    decide whether an automatic ``Yes`` is safe.
+    """
+    dimensions: dict[str, list[float | None]] = {}
+    for group_name, axis_specs in _PACKAGE_ASSEMBLY_DIMENSION_KEYS.items():
+        source = attributes if group_name == "assembled" else specs
+        dimensions[group_name] = [
+            _first_numeric_source_value(source, keys)
+            for _axis, keys in axis_specs
+        ]
+
+    assembled = dimensions["assembled"]
+    package = dimensions["package"]
+    available = all(value is not None for value in assembled + package)
+    title_text = _plain_text(source_title).lower()
+    text = _plain_text(f"{source_title} {source_description}").lower()
+    negative_cues = [
+        name for name, pattern in _ASSEMBLY_NEGATIVE_CUE_PATTERNS
+        if re.search(pattern, text, flags=re.IGNORECASE)
+    ]
+    flexible_cues = [
+        pattern for pattern in _ASSEMBLY_FLEXIBLE_PRODUCT_PATTERNS
+        if re.search(pattern, text, flags=re.IGNORECASE)
+    ]
+    positive_cues = [
+        name for name, pattern in _ASSEMBLY_POSITIVE_CUE_PATTERNS
+        if re.search(pattern, text, flags=re.IGNORECASE)
+    ]
+    rigid_cues = [
+        pattern for pattern in _ASSEMBLY_RIGID_PRODUCT_PATTERNS
+        if re.search(pattern, title_text or text, flags=re.IGNORECASE)
+    ]
+    product_family = (
+        "flexible_or_preassembled"
+        if flexible_cues
+        else "rigid"
+        if rigid_cues
+        else "unknown"
+    )
+
+    evidence: dict[str, Any] = {
+        "available": available,
+        "strong": False,
+        "assembled": assembled,
+        "package": package,
+        "negative_cues": negative_cues,
+        "flexible_cues": flexible_cues,
+        "positive_cues": positive_cues,
+        "rigid_cues": rigid_cues,
+        "product_family": product_family,
+    }
+    if not available:
+        return evidence
+
+    assembled_sorted = sorted(float(value) for value in assembled if value is not None)
+    package_sorted = sorted(float(value) for value in package if value is not None)
+    long_ratio = package_sorted[-1] / assembled_sorted[-1]
+    thin_ratio = package_sorted[0] / assembled_sorted[0]
+    middle_ratio = package_sorted[1] / assembled_sorted[1]
+    evidence.update(
+        {
+            "assembled_sorted": assembled_sorted,
+            "package_sorted": package_sorted,
+            "long_ratio": round(long_ratio, 4),
+            "thin_ratio": round(thin_ratio, 4),
+            "middle_ratio": round(middle_ratio, 4),
+            "strong": (
+                long_ratio >= 0.80
+                and thin_ratio <= 0.60
+                and middle_ratio <= 1.60
+            ),
+        }
+    )
+    return evidence
+
+
+def infer_assembly_decision(
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    current_assembly: Any = None,
+) -> dict[str, Any]:
+    """Return a conservative, auditable assembly decision.
+
+    Explicit source ``Yes`` wins.  Explicit source ``No`` remains valid unless
+    strong package geometry conflicts with it; that conflict is review-only so
+    the system does not invent a buyer-facing claim.  When source evidence is
+    absent, a rigid product with strong flat-pack geometry is safely promoted
+    to ``Yes``.  Unknown geometry falls back to an existing normalized aspect,
+    but never creates a new default ``No``.
+    """
+    source = infer_source_assembly_required(attributes, specs, source_description)
+    package = infer_package_assembly_evidence(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    current = _normalize_yes_no(current_assembly)
+
+    if source == "Yes":
+        return {"required": "Yes", "status": "source", "source": source, "package": package}
+
+    if source == "No":
+        if package["strong"]:
+            return {
+                "required": None,
+                "status": "review",
+                "source": source,
+                "package": package,
+                "conflict": True,
+            }
+        return {"required": "No", "status": "source", "source": source, "package": package}
+
+    if package["strong"]:
+        if (
+            package["product_family"] == "rigid" or package["positive_cues"]
+        ) and not package["negative_cues"]:
+            return {"required": "Yes", "status": "package", "source": None, "package": package}
+        return {
+            "required": None,
+            "status": "review",
+            "source": None,
+            "package": package,
+            "conflict": bool(package["negative_cues"]),
+        }
+
+    if current:
+        return {"required": current, "status": "listing", "source": None, "package": package}
+    return {"required": None, "status": "unknown", "source": None, "package": package}
+
+
 ASSEMBLY_NO_REQUIRED_PATTERNS = (
     r"\bno\s+assembly\s+required\b",
+    r"\bassembly\s+required\s*[:：]?\s*no\b",
     r"\bassembly[-\s]?free\b",
     r"\bships?\s+fully\s+assembled\b",
     r"\bfully\s+assembled\b",
@@ -765,6 +987,7 @@ def rewrite_assembly_copy(description: str, expected: str | None) -> str:
 def apply_source_assembly_requirement(
     opt: dict[str, Any],
     *,
+    source_title: str = "",
     source_description: str = "",
     attributes: Mapping[str, Any] | None = None,
     specs: Mapping[str, Any] | None = None,
@@ -773,7 +996,15 @@ def apply_source_assembly_requirement(
     if "Assembly Status" in aspects and not infer_source_assembly_status(attributes, specs, source_description):
         aspects.pop("Assembly Status", None)
 
-    expected = infer_source_assembly_required(attributes, specs, source_description)
+    current = first_aspect_text(aspects, "Assembly Required")
+    decision = infer_assembly_decision(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+        current_assembly=current,
+    )
+    expected = decision.get("required")
     if not expected:
         return None
 
@@ -1550,6 +1781,7 @@ def normalize_generated_listing(
     # Assembly note must land AFTER template ensure so rebuild/wrap cannot wipe it.
     apply_source_assembly_requirement(
         opt,
+        source_title=source_title,
         source_description=source_description,
         attributes=attributes,
         specs=specs,
@@ -1931,13 +2163,29 @@ def validate_listing_quality(
         field_match = re.search(r"Item (?:Length|Width|Height|Weight)", error)
         issues.append(ListingQualityIssue(code, error, field=field_match.group(0) if field_match else None))
 
-    expected_assembly = source_facts.get("assembly_required") or infer_source_assembly_required(
-        attributes,
-        specs,
-        source_description,
+    current_assembly = first_aspect_text(aspects, "Assembly Required")
+    assembly_decision = infer_assembly_decision(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+        current_assembly=current_assembly,
     )
+    expected_assembly = assembly_decision.get("required")
+    if not expected_assembly and assembly_decision.get("status") == "unknown":
+        expected_assembly = _normalize_yes_no(source_facts.get("assembly_required"))
+
+    if assembly_decision.get("status") == "review" and assembly_decision.get("package", {}).get("strong"):
+        issues.append(
+            ListingQualityIssue(
+                "assembly_package_conflict",
+                "package geometry suggests a flat-pack product but source/listing copy also suggests no assembly; manual confirmation required",
+                severity="BLOCKER",
+                field="Assembly Required",
+            )
+        )
+
     if expected_assembly:
-        current_assembly = first_aspect_text(aspects, "Assembly Required")
         if current_assembly.lower() != expected_assembly.lower():
             issues.append(
                 ListingQualityIssue(
