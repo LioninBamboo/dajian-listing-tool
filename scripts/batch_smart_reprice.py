@@ -61,6 +61,78 @@ log = logging.getLogger("batch_reprice")
 TRANSIENT_HTTP_STATUS = {429, 500, 502, 503, 504}
 
 
+# ═══════════════════════════════════════════════════════════════
+# 成交冷静期护栏 (2026-08)
+# ───────────────────────────────────────────────────────────────
+# 出单是"当前价能成交"的直接证据. 这条双周全库重定价是钝器 (类目均价驱动,
+# 每次重新采样, 与单条链接自身表现无关), 不该去扰动一条正在赢的链接:
+# 降价 = 白送已到手的毛利; 涨价 = 有掐死正在跑的转化的风险.
+# CRO 队列 (--from-cro-queue) 那条链路本身看转化, 不受此护栏影响.
+#   REPRICE_SALES_COOLDOWN_DAYS : 近 N 天有成交则进入冷静期 (0 = 关闭护栏, 回到旧行为)
+#   REPRICE_SALES_COOLDOWN_MODE : hold        → 冷静期内完全不改价 (默认, 最保守)
+#                                 no_downside → 冷静期内只许涨价, 禁止降价
+# ═══════════════════════════════════════════════════════════════
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(0, int(str(os.getenv(name, str(default))).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+SALES_COOLDOWN_DAYS = _int_env("REPRICE_SALES_COOLDOWN_DAYS", 14)
+SALES_COOLDOWN_MODE = (os.getenv("REPRICE_SALES_COOLDOWN_MODE", "hold") or "hold").strip().lower()
+
+
+def cooldown_decision(in_cooldown: bool, price_diff: float,
+                      mode: str = SALES_COOLDOWN_MODE) -> tuple[bool, str]:
+    """Decide whether a repricing move is allowed for a possibly-in-cooldown SKU.
+
+    Returns ``(allow_change, hold_reason)``; ``hold_reason`` is '' when allowed.
+    A SKU that sold within the cooldown window has proven the current price
+    converts, so the blanket biweekly reprice should leave it alone.
+      - mode 'hold':        block any change while in cooldown.
+      - mode 'no_downside': block only price *drops*; still allow raising price
+                            (capture margin on proven demand, never give it away).
+    """
+    if not in_cooldown:
+        return True, ""
+    if mode == "no_downside":
+        if price_diff < 0:
+            return False, "recent_sale_no_downside"
+        return True, ""
+    return False, "recent_sale_hold"
+
+
+def fetch_recently_sold_skus(cooldown_days: int, performance_service=None) -> tuple[set, dict]:
+    """Best-effort set of SKUs with >=1 sale in the last ``cooldown_days``.
+
+    Never hard-fails: on any error returns ``(set(), meta)`` with
+    ``available=False`` and logs loudly, so a research/API hiccup degrades to the
+    legacy behaviour (reprice everything) rather than silently holding — or
+    silently dropping the guard without anyone noticing.
+    """
+    meta = {"available": False, "days": cooldown_days, "sku_count": 0, "error": None}
+    if cooldown_days <= 0:
+        meta["error"] = "disabled"
+        return set(), meta
+    try:
+        if performance_service is None:
+            from src.services.ebay_performance import EbayPerformanceService
+            performance_service = EbayPerformanceService()
+        sales = performance_service.fetch_sales_data(days=cooldown_days) or {}
+        by_sku = sales.get("by_sku", {}) or {}
+        skus = {
+            str(sku)
+            for sku, info in by_sku.items()
+            if sku and float((info or {}).get("qty", 0) or 0) > 0
+        }
+        meta.update(available=True, sku_count=len(skus))
+        return skus, meta
+    except Exception as e:  # research must never hard-fail pricing
+        meta["error"] = str(e)
+        return set(), meta
+
+
 def _ensure_reprice_email_ledger(conn) -> None:
     conn.execute(
         """
@@ -870,11 +942,15 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
                 'price_up': 0,
                 'price_down': 0,
                 'no_change': 0,
+                'held_recent_sale': 0,
                 'no_market_data': 0,
                 'errors': 0,
                 'strategies': {},
                 'market_sources': {},
             },
+            'cooldown': {'available': False, 'days': SALES_COOLDOWN_DAYS,
+                         'mode': SALES_COOLDOWN_MODE, 'sku_count': 0,
+                         'error': 'no_products'},
             'market_research': {},
             'results': [],
             'changed_rows': [],
@@ -907,6 +983,22 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
                 insights_probe.get('error'),
             )
 
+    # ── Sales cooldown guard: protect SKUs that recently converted ──
+    recent_sold_skus, cooldown_meta = fetch_recently_sold_skus(SALES_COOLDOWN_DAYS)
+    cooldown_meta['mode'] = SALES_COOLDOWN_MODE
+    if SALES_COOLDOWN_DAYS <= 0:
+        log.info("Sales cooldown guard: DISABLED (REPRICE_SALES_COOLDOWN_DAYS=0)")
+    elif cooldown_meta.get('available'):
+        log.info(
+            f"Sales cooldown guard: {len(recent_sold_skus)} SKUs sold in last "
+            f"{SALES_COOLDOWN_DAYS}d protected (mode={SALES_COOLDOWN_MODE})"
+        )
+    else:
+        log.warning(
+            "⚠️ Sales cooldown guard INACTIVE: could not load recent sales "
+            f"(error={cooldown_meta.get('error')}); repricing ALL SKUs (legacy behaviour)"
+        )
+
     # Group products by category for efficient market research
     by_cat = defaultdict(list)
     for p in products:
@@ -925,6 +1017,7 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
     price_down = 0
     errors = 0
     no_market = 0
+    held_recent_sale = 0
 
     # Phase 1: Market research by category
     log.info("\n" + "=" * 50)
@@ -1026,6 +1119,22 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
             results.append(result)
             continue
 
+        # Sales cooldown: don't disturb a listing that just proved its price.
+        allow_change, hold_reason = cooldown_decision(
+            sku in recent_sold_skus, price_diff, SALES_COOLDOWN_MODE
+        )
+        if not allow_change:
+            result['status'] = 'held_recent_sale'
+            result['hold_reason'] = hold_reason
+            held_recent_sale += 1
+            log.info(
+                f"  [{processed}/{total}] {sku}: HELD @ ${current_price or '?'} "
+                f"(sold within {SALES_COOLDOWN_DAYS}d, {hold_reason}); "
+                f"skipped move to ${new_price:.2f}"
+            )
+            results.append(result)
+            continue
+
         if price_diff > 0:
             direction = "↑"
             price_up += 1
@@ -1098,6 +1207,9 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
     log.info(f"Total products:     {total}")
     log.info(f"Price changes:      {price_changes} (↑{price_up} / ↓{price_down})")
     log.info(f"No change needed:   {no_change}")
+    if SALES_COOLDOWN_DAYS > 0:
+        log.info(f"Held (recent sale): {held_recent_sale} "
+                 f"(sold within {SALES_COOLDOWN_DAYS}d, mode={SALES_COOLDOWN_MODE})")
     log.info(f"No market data:     {no_market} (used STANDARD 15% margin)")
     if not dry_run:
         updated = sum(1 for r in results if r['status'] == 'updated')
@@ -1143,11 +1255,13 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
             'price_up': price_up,
             'price_down': price_down,
             'no_change': no_change,
+            'held_recent_sale': held_recent_sale,
             'no_market_data': no_market,
             'errors': errors,
             'strategies': dict(strategy_counts),
             'market_sources': dict(source_counts),
         },
+        'cooldown': cooldown_meta,
         'market_research': market_cache,
         'results': results,
         'changed_rows': changed_rows,
