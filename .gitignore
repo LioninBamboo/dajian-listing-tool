@@ -132,6 +132,45 @@ debug_server.log
 debug_*.html
 debug_*.json
 *.jsonl
+*.ndjson
+
+# Local credentials and exported operator tokens
+*_token*.json
+credentials*.json
+*.pem
+*.key
+
+# Generated presentation exports and rendered slide images
+*.pptx
+*.pptx.inspect.ndjson
+CommercePilot_Suite_Interview_CN/
+CommercePilot_Suite_Interview_EN/
+CommercePilot_Suite_Interview_CN_Watermarked_FullLoop/
+CommercePilot_Suite_Interview_EN_Watermarked_FullLoop/
+
+# Local publish/run evidence (keep source scripts and reusable docs reviewable)
+/disposition.csv
+/manifest_canary.csv
+/run_task8.py
+/verify_live.py
+/tasks/canary_remediation.md
+/tasks/executor_prompt.txt
+/tasks/plan.md
+/tasks/todo.md
+/scripts/batch_dry_run.py
+/scripts/deep_fix_remaining_drafts.py
+/scripts/fix_draft_aspects_from_source.py
+/scripts/freeze_scope.py
+/scripts/get_errors.py
+/scripts/get_specs.py
+/scripts/re_analyze_errors.py
+/scripts/reparse.py
+/scripts/rebuild_conversion_descriptions.py
+/scripts/rebuild_store_descriptions.py
+/scripts/remediate_ready_drafts.py
+/scripts/run_audit.py
+/scripts/revise_live_category.py
+tools/local_diagnostics/_*.py
 
 # Root runtime/operator state
 favorite_progress.json
