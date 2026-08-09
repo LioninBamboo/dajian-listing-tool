@@ -102,6 +102,7 @@ from src.utils.claim_diff_engine import (
     build_source_constraints,
     detect_claim_violations,
 )
+from src.utils.source_parameter_alignment import find_source_parameter_mismatches
 from src.utils.title_sanitizer import (
     normalize_listing_title_for_ebay,
     sanitize_listing_title,
@@ -1044,6 +1045,37 @@ def audit_single_product(
                 "detail": f"Item Weight: listing={weight_num} vs source={source_weight}"
             })
             fixes["Item Weight"] = [f"{source_weight} lbs"]
+
+    # ── 2.5 Source-parameter alignment ──
+    # Dimensions/weight have dedicated checks above.  Material, color and a
+    # small set of deterministic product-family types need the same live-vs-
+    # source reconciliation; otherwise stale optimizer defaults can ship while
+    # the text-only claim checks still pass (W808P477209).
+    source_parameter_rebuild_needed = False
+    for parameter in find_source_parameter_mismatches(
+        source_attributes=attrs,
+        source_title=title,
+        source_description=description or "",
+        candidate_aspects=aspects,
+        category_id=stored_category,
+    ):
+        field = parameter["field"]
+        issues.append(
+            {
+                "type": "source_aspect_mismatch",
+                "severity": "CRITICAL",
+                "field": field,
+                "current": parameter["current"],
+                "expected": parameter["expected"],
+                "detail": f"[SourceParameter] {parameter['detail']}",
+            }
+        )
+        fixes[field] = [str(parameter["expected"])]
+        source_parameter_rebuild_needed = True
+    if source_parameter_rebuild_needed:
+        # Insert after every direct aspect fix so the rebuilt description sees
+        # the complete corrected aspect set, not the first field only.
+        fixes["__source_parameter_rebuild__"] = True
 
     # ── 3. Non-applicable Aspects ──
     for aspect_key, should_remove_fn in NON_APPLICABLE_RULES.items():
@@ -2453,6 +2485,48 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
     reused_existing_live_video = False
     video_removed = False
 
+    # Source-parameter repair is a buyer-visible multi-field rewrite.  Capture
+    # the complete live inventory item and selected offer before any PUT so a
+    # failed readback has a local, rollback-ready record.
+    if any(
+        key in fixes
+        for key in (
+            "__source_parameter_rebuild__",
+            "__rebuild_description_from_source__",
+            "__semantic_rebuild_from_source__",
+        )
+    ):
+        try:
+            protected_inventory = ebay_client.get_inventory_item(sku) or {}
+            protected_offers = ebay_client.get_offers_by_sku(sku) or []
+            protected_offer = _select_best_offer(
+                protected_offers,
+                expected_listing_id=product_row.get("listing_id") if isinstance(product_row, dict) else None,
+            )
+            if not protected_inventory or not protected_offer:
+                return [f"ERROR [{sku}]: protected live snapshot unavailable; no write attempted"]
+            backup_dir = ROOT / "logs" / "source_parameter_backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / f"{sku}.json"
+            backup_path.write_text(
+                json.dumps(
+                    {
+                        "sku": sku,
+                        "created_at": datetime.now().isoformat(),
+                        "inventory": protected_inventory,
+                        "offer": protected_offer,
+                        "local_optimization": stored_opt,
+                        "requested_fixes": fixes,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            results.append(f"Protected live snapshot saved: {backup_path}")
+        except Exception as exc:
+            return [f"ERROR [{sku}]: protected live snapshot failed ({exc}); no write attempted"]
+
     # Apply aspect fixes
     for key, value in fixes.items():
         if key == "categoryId":
@@ -2532,6 +2606,40 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
                 description = sanitized_description
                 description_changed = True
                 results.append("Live description HTML artifacts sanitized")
+            continue
+        if key == "__source_parameter_rebuild__":
+            # Rebuild the buyer-facing template after source-backed aspect
+            # corrections.  The old live description can contain the same
+            # stale Material/Color/Type defaults, so editing aspects alone
+            # would leave the visible listing inconsistent.
+            source_feature_bullets = extract_source_feature_bullets(source_description)
+            feature_source = source_description
+            if source_feature_bullets:
+                # Do not pass the full supplier specification dump into the
+                # conversion-copy helper.  It can otherwise echo Chinese
+                # field labels into PERFECT FOR and trigger the raw-source
+                # guard after an otherwise correct rebuild.
+                feature_source = (
+                    "<h3>Product Features</h3><ul>"
+                    + "".join(f"<li>{html.escape(bullet)}</li>" for bullet in source_feature_bullets)
+                    + "</ul>"
+                )
+            rebuilt_description = build_structured_description_from_source(
+                title or source_title or "",
+                feature_source,
+                attrs,
+                source_specs,
+                aspects,
+                feature_bullets=source_feature_bullets or None,
+            )
+            if rebuilt_description:
+                rebuilt_description = sanitize_generated_description_html(rebuilt_description)
+                if rebuilt_description != description:
+                    description = rebuilt_description
+                    description_changed = True
+                results.append("Description rebuilt from source after structured parameter correction")
+            else:
+                results.append(f"ERROR [{sku}]: source parameter description rebuild produced no content")
             continue
         if key == "__rebuild_description_from_source__":
             # W6018 accident closure: rebuild store template from fresh source.

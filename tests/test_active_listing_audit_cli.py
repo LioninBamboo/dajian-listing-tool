@@ -89,6 +89,208 @@ def test_live_listing_snapshot_prefers_ebay_title_description_aspects_and_catego
     assert snapshot["categoryId"] == "222"
 
 
+def test_active_audit_flags_live_source_parameter_drift_for_trash_cabinet(monkeypatch):
+    class _Matcher:
+        def canonicalize_category(self, title_context, category_id, category_name, description=None):
+            return category_id, category_name
+
+        def is_category_plausible_for_text(self, title, category_id, category_name):
+            return True
+
+    monkeypatch.setattr(audit_fix_active_listings, "get_category_matcher", lambda: _Matcher())
+
+    source_attrs = {
+        "Variant": "13 Gallon White",
+        "Assembled Length (in.)": "21.70",
+        "Assembled Width (in.)": "14.20",
+        "Assembled Height (in.)": "37.40",
+        "Product Weight (lbs.)": "41.33",
+        "Main Color": "Antique Brown+White",
+        "Main Material": "Particle Board",
+    }
+    live_opt = {
+        "title": "13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet Wood Garbage",
+        "description": (
+            "<div><h3>KEY FEATURES</h3><ul>"
+            "<li>Product Type: Apothecary Cabinet.</li>"
+            "<li>Material: Wood.</li>"
+            "<li>Color: White.</li>"
+            "</ul></div>"
+        ),
+        "categoryId": "20487",
+        "aspects": {
+            "Type": ["Apothecary Cabinet"],
+            "Material": ["Wood"],
+            "Color": ["White"],
+            "Item Length": ["21.7 in"],
+            "Item Width": ["14.2 in"],
+            "Item Height": ["37.4 in"],
+            "Item Weight": ["41.33 lbs"],
+        },
+    }
+
+    issues, fixes = audit_fix_active_listings.audit_single_product(
+        "W808P477209",
+        "13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet Wood Garbage",
+        json.dumps(source_attrs),
+        json.dumps({}),
+        json.dumps(live_opt),
+        "Made of Particle Board; fits up to 10 gallons.",
+    )
+
+    drift = {
+        issue["field"]: issue
+        for issue in issues
+        if issue.get("type") == "source_aspect_mismatch"
+    }
+    assert set(drift) == {"Type", "Material", "Color"}
+    assert all(issue["severity"] == "CRITICAL" for issue in drift.values())
+    assert fixes["Type"] == ["Storage Cabinet"]
+    assert fixes["Material"] == ["Particle Board"]
+    assert fixes["Color"] == ["Antique Brown+White"]
+    assert fixes["__source_parameter_rebuild__"] is True
+
+
+def test_fix_listing_rebuilds_description_after_source_parameter_correction(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    stored_opt = {
+        "title": "13 Gallon Tilt Out Trash Cabinet",
+        "description": "<div>old</div>",
+        "categoryId": "20487",
+        "aspects": {
+            "Type": ["Apothecary Cabinet"],
+            "Material": ["Wood"],
+            "Color": ["White"],
+        },
+    }
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        ("W808P477209", json.dumps(stored_opt)),
+    )
+    conn.commit()
+
+    captured = {}
+
+    def fake_put(client, sku, title, description, aspects):
+        captured.update({"title": title, "description": description, "aspects": aspects})
+        return object(), description, aspects
+
+    monkeypatch.setattr(audit_fix_active_listings, "_put_inventory_product_only", fake_put)
+
+    class _Client:
+        def get_inventory_item(self, sku):
+            return {
+                "condition": "NEW",
+                "availability": {"shipToLocationAvailability": {"quantity": 1}},
+                "product": {
+                    "title": stored_opt["title"],
+                    "description": stored_opt["description"],
+                    "aspects": stored_opt["aspects"],
+                    "imageUrls": ["https://example.test/image.jpg"],
+                },
+            }
+
+        def get_offers_by_sku(self, sku):
+            return [{
+                "offerId": "offer-w808",
+                "categoryId": "20487",
+                "listing": {"listingId": "366588540313"},
+                "status": "PUBLISHED",
+            }]
+
+        def update_offer_category(self, offer_id, category_id, listing_description=None):
+            captured["offer_description"] = listing_description
+            return True
+
+        def publish_offer(self, offer_id):
+            return {"listingId": "366588540313"}
+
+    product_row = {
+        "sku": "W808P477209",
+        "title": "13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet",
+        "description": (
+            "<div>产品规格 产品类型: Single Box Product 材质: Particle Board</div>"
+            "<h3>Product Features</h3><ul>"
+            "<li>High Quality: Made of Particle Board and fits up to 10 gallons trash can.</li>"
+            "</ul>"
+        ),
+        "attributes": json.dumps({
+            "Assembled Length (in.)": "21.70",
+            "Assembled Width (in.)": "14.20",
+            "Assembled Height (in.)": "37.40",
+            "Product Weight (lbs.)": "41.33",
+            "Main Color": "Antique Brown+White",
+            "Main Material": "Particle Board",
+        }),
+        "specs": json.dumps({
+            "Package Length (in.)": "39.37",
+            "Package Width (in.)": "21.97",
+            "Package Height (in.)": "5.40",
+            "Package Weight (lbs.)": "45.88",
+        }),
+        "optimization": json.dumps(stored_opt),
+        "images": "[]",
+        "videos": "[]",
+        "price": 51.15,
+        "suggested_price": 136.03,
+        "listing_id": "366588540313",
+    }
+
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "W808P477209",
+        product_row,
+        {
+            "Material": ["Particle Board"],
+            "Color": ["Antique Brown+White"],
+            "Type": ["Storage Cabinet"],
+            "__source_parameter_rebuild__": True,
+        },
+        _Client(),
+        conn,
+    )
+
+    assert not any(item.startswith("ERROR") for item in results), results
+    assert captured["aspects"]["Material"] == ["Particle Board"]
+    assert captured["aspects"]["Color"] == ["Antique Brown+White"]
+    assert captured["aspects"]["Type"] == ["Storage Cabinet"]
+    assert "Apothecary Cabinet" not in captured["description"]
+    assert "产品规格" not in captured["description"]
+    assert "Particle Board" in captured["description"]
+    assert "up to 10 gallons" in captured["description"]
+
+
+def test_source_parameter_type_rule_only_reclassifies_stale_apothecary_default():
+    from src.utils.source_parameter_alignment import find_source_parameter_mismatches
+
+    intentional_type = find_source_parameter_mismatches(
+        source_attributes={"Main Material": "MDF", "Main Color": "Black"},
+        source_title="Kitchen Island with Trash Can Storage Cabinet",
+        source_description="Rolling kitchen island with a trash can cabinet.",
+        candidate_aspects={
+            "Type": ["Kitchen Island"],
+            "Material": ["MDF"],
+            "Color": ["Black"],
+        },
+        category_id="20487",
+    )
+    assert not any(item["field"] == "Type" for item in intentional_type)
+
+    stale_type = find_source_parameter_mismatches(
+        source_attributes={"Main Material": "MDF", "Main Color": "Walnut"},
+        source_title="Corner Cabinet with Storage Shelf",
+        source_description="A compact corner cabinet.",
+        candidate_aspects={
+            "Type": ["Apothecary Cabinet"],
+            "Material": ["MDF"],
+            "Color": ["White"],
+        },
+        category_id="20487",
+    )
+    assert {item["field"] for item in stale_type} == {"Color", "Type"}
+    assert next(item for item in stale_type if item["field"] == "Type")["expected"] == "Corner Cabinet"
+
+
 def test_audit_parser_supports_scheduled_live_email_mode():
     parser = audit_fix_active_listings.create_parser()
 
