@@ -91,6 +91,41 @@ class EbayAdService:
             offset += 100
         return campaigns
 
+    # ─── 创建 campaign（推广活动）───
+
+    def create_campaign(self, name, bid_percentage=5.0, marketplace_id='EBAY_US'):
+        """Create a Promoted Listings Standard (COST_PER_SALE) campaign, manual/
+        key-targeted so listings are added by id via create_ad/batch_create_ads.
+        COST_PER_SALE = you pay the ad rate ONLY when a promoted item sells.
+        Returns the campaignId string, or None on failure.
+        """
+        from datetime import datetime, timezone
+        payload = {
+            "campaignName": name,
+            "marketplaceId": marketplace_id,
+            "fundingStrategy": {
+                "fundingModel": "COST_PER_SALE",
+                "bidPercentage": f"{float(bid_percentage):.1f}",
+            },
+            "startDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        }
+        url = f"{self.base}/sell/marketing/v1/ad_campaign"
+        try:
+            r = requests.post(url, headers=self._headers(), json=payload, timeout=60, verify=False)
+        except Exception as e:
+            logger.error(f"create_campaign failed: {e}")
+            return None
+        if r.status_code in (200, 201):
+            loc = r.headers.get('Location', '') or ''
+            if '/ad_campaign/' in loc:
+                return loc.rstrip('/').rsplit('/', 1)[-1]
+            try:
+                return (r.json() or {}).get('campaignId')
+            except Exception:
+                return None
+        logger.error(f"create_campaign {r.status_code}: {r.text[:300]}")
+        return None
+
     # ─── 获取 campaign 内的广告链接 ───
 
     def fetch_campaign_ads(self, campaign_id):
