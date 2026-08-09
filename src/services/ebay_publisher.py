@@ -38,6 +38,7 @@ from src.utils.publish_aspect_completion import (
     infer_upholstery_fabric,
 )
 from src.utils.html_truncator import smart_truncate_html
+from src.utils.listing_quality_gate import enforce_store_brand_aspect
 
 
 class PublishStatus(Enum):
@@ -1883,6 +1884,7 @@ class EbayPublisher:
 
         sanitize_placeholder_aspects(completed, title=title, category_id=category_id)
         sanitize_single_value_aspects(completed)
+        enforce_store_brand_aspect(completed)
         
         return completed
     

@@ -183,6 +183,7 @@ def test_active_audit_detects_w808_flat_pack_assembly_drift(monkeypatch):
         ),
         "categoryId": "20487",
         "aspects": {
+            "Brand": ["Unbranded"],
             "Type": ["Storage Cabinet"],
             "Material": ["Particle Board"],
             "Item Length": ["21.7 in"],
@@ -208,6 +209,8 @@ def test_active_audit_detects_w808_flat_pack_assembly_drift(monkeypatch):
     }
     assert fixes["Assembly Required"] == ["Yes"]
     assert fixes["__assembly_desc_update__"] == "Yes"
+    assert fixes["Brand"] == ["AquaVerve"]
+    assert any(issue["type"] == "store_brand_mismatch" for issue in issues)
 
 
 def test_fix_listing_rebuilds_description_after_source_parameter_correction(monkeypatch):

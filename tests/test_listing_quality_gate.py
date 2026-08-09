@@ -1,3 +1,6 @@
+from types import SimpleNamespace
+
+import src.utils.listing_quality_gate as listing_quality_gate
 from src.utils.listing_quality_gate import (
     description_contains_cjk,
     description_uses_store_template,
@@ -465,6 +468,62 @@ def test_normalize_generated_listing_uses_flat_pack_assembly_evidence():
     assert normalized["aspects"]["Assembly Required"] == ["Yes"]
     assert "Assembly Required" in normalized["description"]
     assert "No - Ready for use without assembly" not in normalized["description"]
+
+
+def test_normalize_generated_listing_replaces_unbranded_with_house_brand(monkeypatch):
+    profile = SimpleNamespace(
+        brand_name="AquaVerve",
+        default_brand="AquaVerve",
+        force_house_brand=True,
+        template_style="furniture_classic",
+        quality_banner_marker="aquaverve",
+        quality_footer_marker="ships from",
+        brand_tagline="PREMIUM HOME FURNISHINGS",
+        description_footer_line1="Ships from US Warehouse",
+        description_footer_line2="Quality Guaranteed",
+        footer_html="",
+    )
+    monkeypatch.setattr(listing_quality_gate, "_store_profile_or_none", lambda: profile)
+
+    normalized = listing_quality_gate.normalize_generated_listing(
+        {
+            "title": "Tilt Out Trash Cabinet",
+            "description": "<div><h3>KEY FEATURES</h3><ul><li>Storage cabinet.</li></ul></div>",
+            "categoryId": "20487",
+            "aspects": {"Brand": ["Unbranded"], "Type": ["Cabinet"]},
+        },
+        source_title="Tilt Out Trash Cabinet",
+        source_description="Particle board storage cabinet.",
+        attributes={},
+        specs={},
+        images=["img1", "img2"],
+    )
+
+    assert normalized["aspects"]["Brand"] == ["AquaVerve"]
+
+
+def test_quality_gate_blocks_unbranded_house_brand(monkeypatch):
+    profile = SimpleNamespace(
+        brand_name="AquaVerve",
+        default_brand="AquaVerve",
+        force_house_brand=True,
+        quality_banner_marker="aquaverve",
+        quality_footer_marker="ships from",
+    )
+    monkeypatch.setattr(listing_quality_gate, "_store_profile_or_none", lambda: profile)
+
+    issues = validate_listing_quality(
+        {
+            "title": "Tilt Out Trash Cabinet",
+            "description": "<div>aquaverve <h3>KEY FEATURES</h3><ul><li>Storage cabinet.</li></ul>ships from</div>",
+            "categoryId": "20487",
+            "aspects": {"Brand": ["Unbranded"]},
+        },
+        source_title="Tilt Out Trash Cabinet",
+        images=["img1", "img2"],
+    )
+
+    assert any(issue.code == "store_brand_missing" for issue in issues)
 
 
 def test_quality_gate_does_not_flag_no_assembly_required_as_contradiction():

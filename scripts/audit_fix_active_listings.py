@@ -56,7 +56,7 @@ LOG_DIR.mkdir(exist_ok=True)
 
 QUALITY_GATE_META_KEY = "_quality_gate"
 QUALITY_GATE_META_VERSION = 1
-QUALITY_GATE_RULESET_VERSION = 1
+QUALITY_GATE_RULESET_VERSION = 2
 TRANSPORT_ISSUE_TYPES = {
     "live_fetch_failed",
     "live_inventory_missing",
@@ -81,10 +81,12 @@ from src.utils.publish_autofix import (
 from src.utils.html_truncator import smart_truncate_html
 from src.utils.listing_quality_gate import (
     classify_listing_profile,
+    expected_store_brand,
     find_assembly_description_contradictions,
     has_expected_assembly_copy,
     infer_assembly_decision,
     infer_source_assembly_status,
+    is_store_brand_placeholder,
     rewrite_assembly_copy,
     sanitize_generated_description_html,
 )
@@ -1081,6 +1083,19 @@ def audit_single_product(
         # Insert after every direct aspect fix so the rebuilt description sees
         # the complete corrected aspect set, not the first field only.
         fixes["__source_parameter_rebuild__"] = True
+
+    expected_brand = expected_store_brand()
+    current_brand = first_aspect_text(aspects, "Brand")
+    if expected_brand and is_store_brand_placeholder(current_brand):
+        issues.append({
+            "type": "store_brand_mismatch",
+            "severity": "CRITICAL",
+            "field": "Brand",
+            "current": current_brand or None,
+            "expected": expected_brand,
+            "detail": f"Store brand must be {expected_brand}; live/listing value is {current_brand or 'missing'}",
+        })
+        fixes["Brand"] = [expected_brand]
 
     # ── 3. Non-applicable Aspects ──
     for aspect_key, should_remove_fn in NON_APPLICABLE_RULES.items():
@@ -2533,6 +2548,7 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
             "__semantic_rebuild_from_source__",
             "Assembly Required",
             "__assembly_desc_update__",
+            "Brand",
         )
     ):
         try:

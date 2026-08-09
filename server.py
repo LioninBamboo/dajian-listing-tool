@@ -1527,6 +1527,8 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             category_required_aspects=EbayPublisher.CATEGORY_REQUIRED_ASPECTS,
             log=print,
         )
+        from src.utils.listing_quality_gate import enforce_store_brand_aspect
+        enforce_store_brand_aspect(completed_aspects)
 
         sanitize_single_value_aspects(completed_aspects, log=print)
 

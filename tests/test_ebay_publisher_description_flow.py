@@ -1,4 +1,5 @@
 import logging
+from types import SimpleNamespace
 
 from src.services.ebay_publisher import EbayPublisher
 
@@ -66,3 +67,25 @@ def test_create_offer_forwards_listing_description():
 
     assert result == {"offerId": "offer-1"}
     assert captured["listing_description"] == "<div>full description</div>"
+
+
+def test_ensure_required_aspects_replaces_unbranded_for_house_brand(monkeypatch):
+    publisher = _make_publisher()
+    profile = SimpleNamespace(
+        brand_name="AquaVerve",
+        default_brand="AquaVerve",
+        force_house_brand=True,
+    )
+    monkeypatch.setattr(
+        "src.utils.listing_quality_gate._store_profile_or_none",
+        lambda: profile,
+    )
+
+    completed = publisher._ensure_required_aspects(
+        "20487",
+        {"Brand": ["Unbranded"]},
+        "Tilt Out Trash Cabinet",
+        {},
+    )
+
+    assert completed["Brand"] == ["AquaVerve"]

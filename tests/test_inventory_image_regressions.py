@@ -297,6 +297,7 @@ def test_active_audit_surfaces_description_only_fixes(monkeypatch):
                 "categoryId": "46289",
                 "categoryName": "Chicken Coops",
                 "aspects": {
+                    "Brand": ["AquaVerve"],
                     "Item Length": ["80 in"],
                     "Item Width": ["26 in"],
                     "Item Height": ["44 in"],

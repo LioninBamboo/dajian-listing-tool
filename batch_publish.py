@@ -51,6 +51,7 @@ from src.utils.publish_validation import (
     measurement_validation_errors as _measurement_validation_errors,
 )
 from src.utils.listing_quality_gate import (
+    enforce_store_brand_aspect,
     normalize_generated_listing as _normalize_generated_listing,
 )
 from src.services.listing_qc import run_listing_qc
@@ -703,6 +704,7 @@ def enrich_aspects(product: dict) -> dict:
         category_required_aspects=EbayPublisher.CATEGORY_REQUIRED_ASPECTS,
         log=lambda message: logger.info(f"  {message}"),
     )
+    enforce_store_brand_aspect(aspects)
 
     # 8. Pre-publish sanitization: enforce single-value for most aspects
     sanitize_placeholder_aspects(

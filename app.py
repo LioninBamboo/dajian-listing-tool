@@ -964,6 +964,8 @@ def publish_with_auto_category(product: dict) -> dict:
                 category_required_aspects=EbayPublisher.CATEGORY_REQUIRED_ASPECTS,
                 log=print,
             )
+            from src.utils.listing_quality_gate import enforce_store_brand_aspect
+            enforce_store_brand_aspect(completed_aspects)
             
             # 1. Create Inventory Item
             # 使用智能HTML截断器，保持描述结构完整

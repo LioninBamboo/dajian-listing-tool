@@ -118,7 +118,7 @@ def test_publish_uploads_source_video_before_inventory_put(monkeypatch):
             "warnings": [],
             "source_fingerprint": "source",
             "candidate_fingerprint": "candidate",
-            "ruleset_version": "listing-qc-v1",
+            "ruleset_version": "listing-qc-v2",
             "fact_sheet_version": 4,
         },
     )

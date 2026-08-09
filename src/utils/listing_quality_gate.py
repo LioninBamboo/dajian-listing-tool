@@ -1766,6 +1766,7 @@ def normalize_generated_listing(
     _apply_profile_rules(opt, profile)
     sanitize_placeholder_aspects(opt["aspects"], title=opt["title"], category_id=str(opt.get("categoryId") or ""))
     _apply_profile_rules(opt, profile)
+    enforce_store_brand_aspect(opt["aspects"])
     opt["description"] = sanitize_generated_description_html(opt.get("description", ""))
     opt["description"] = _sanitize_specifications_table_html(opt.get("description", ""))
     # Hard requirement: English buyer copy + store banner/footer shell.
@@ -1903,6 +1904,42 @@ def _store_profile_or_none():
         return get_store_profile()
     except Exception:
         return None
+
+
+_STORE_BRAND_PLACEHOLDERS = frozenset({"", "unbranded", "generic", "no brand", "none"})
+
+
+def expected_store_brand() -> str | None:
+    """Return the configured house brand when this store owns generic goods."""
+    profile = _store_profile_or_none()
+    if not bool(getattr(profile, "force_house_brand", False)):
+        return None
+    brand = _clean_text(
+        str(
+            getattr(profile, "default_brand", None)
+            or getattr(profile, "brand_name", None)
+            or ""
+        )
+    )
+    if not brand or brand.casefold() in _STORE_BRAND_PLACEHOLDERS:
+        return None
+    return brand
+
+
+def is_store_brand_placeholder(value: Any) -> bool:
+    return _clean_text(str(value or "")).casefold() in _STORE_BRAND_PLACEHOLDERS
+
+
+def enforce_store_brand_aspect(aspects: dict[str, Any]) -> str | None:
+    """Replace generic placeholder brands with the configured house brand."""
+    expected = expected_store_brand()
+    if not expected:
+        return None
+    current = first_aspect_text(aspects, "Brand")
+    if is_store_brand_placeholder(current):
+        aspects["Brand"] = [expected]
+        return expected
+    return None
 
 
 def description_has_store_banner(text: str | None, profile: Any = None) -> bool:
@@ -2074,6 +2111,16 @@ def validate_listing_quality(
     description = _clean_text(opt.get("description") or source_description or "")
     image_count = len(images or [])
     issues: list[ListingQualityIssue] = []
+    expected_brand = expected_store_brand()
+    current_brand = first_aspect_text(aspects, "Brand")
+    if expected_brand and is_store_brand_placeholder(current_brand):
+        issues.append(
+            ListingQualityIssue(
+                "store_brand_missing",
+                f"Brand must be {expected_brand} for this store; listing currently uses {current_brand or 'missing'}",
+                field="Brand",
+            )
+        )
     source_facts = opt.get("source_facts") if isinstance(opt.get("source_facts"), dict) else build_source_facts(
         source_title=source_title,
         source_description=source_description,
