@@ -888,6 +888,14 @@ class QwenOptimizer:
             except Exception as cat_err:
                 print(f"   [WARN] category matcher unavailable: {cat_err}")
 
+            # The category matcher REPLACES aspects with its category-required set,
+            # dropping the Item L/W/H we filled earlier — re-fill them on the final
+            # aspects so the measurement QC passes (was blocking ~96/300 of a batch).
+            try:
+                _fill_measurement_aspects(result["aspects"], {**(attributes or {}), **(specs or {})})
+            except Exception:
+                pass
+
             print(f"✅ Garden-lifestyle optimization complete. Title: {result.get('title','')[:50]}...")
             return result
 
