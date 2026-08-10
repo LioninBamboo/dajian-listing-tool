@@ -55,6 +55,9 @@ _SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"water resistant", "water-resistant", "withstand rain", "rain resistant"}),
     frozenset({"assembly required", "setup required", "needs assembly"}),
     frozenset({"adjustable height", "height adjustable", "hydraulic adjustment", "hydraulic lift"}),
+    # MGO is the abbreviation for magnesium oxide (a concrete-like planter/board
+    # material); source often spells it out while the title uses "MGO" — same thing.
+    frozenset({"mgo", "magnesium oxide", "magnesium oxide (mgo)", "mgo cement", "magnesia"}),
     # Surface treatment wording (trellis W1586*: source says "powder coating",
     # live/extractor often says "powder coated" — not a material upgrade).
     frozenset({
@@ -663,6 +666,11 @@ def compare_fact_sheets(
         # extractor inferred it; the listing does not claim it.
         if live_text is not None and not _claim_in_text(material, live_text):
             continue
+        # Grounding D: synonym-group equivalence (MGO == magnesium oxide) — a live
+        # material and a source material in the SAME group are the same material.
+        _live_grp = _matches_synonym_group(material)
+        if _live_grp and any(_matches_synonym_group(sm) == _live_grp for sm in source["materials"]):
+            continue
         if not _supported_by_any(material, source["materials"], source_blob_tokens, source_blob_text):
             violations.append(
                 {
@@ -1022,6 +1030,24 @@ def check_fact_sheet_violations(
         "",
         source_description_for_fact_sheet,
         flags=re.IGNORECASE,
+    )
+    source_description_for_fact_sheet = re.sub(
+        r"<li\b[^>]*>\s*(?:<[^>]+>\s*)*"
+        r"(?:package|shipping|carton|box)\s+"
+        r"(?:length|width|height|weight|dimensions?|size)\b.*?</li>",
+        "",
+        source_description_for_fact_sheet,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Supplier raw descriptions also carry carton measurements under Chinese
+    # labels.  Those are shipping/package dimensions, not assembled item
+    # dimensions; remove that section before FactSheet extraction so a box
+    # value cannot be compared with live Item Length/Width/Height.
+    source_description_for_fact_sheet = re.sub(
+        r"(?:包装尺寸|包装规格|包装重量).*?(?=(?:产品特点|产品特征|图文描述|$))",
+        "",
+        source_description_for_fact_sheet,
+        flags=re.IGNORECASE | re.DOTALL,
     )
 
     # Seat/counter/bar height is a labeled product attribute, not the
