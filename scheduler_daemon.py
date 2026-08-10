@@ -83,6 +83,7 @@ LOG_DIR.mkdir(exist_ok=True)
 TASK_TIMEOUT = {
     'title_optimize': 7200,    # 2小时
     'listing_audit': 10800,    # 3小时 (全量 live eBay/GIGA 内容审计)
+    'source_aspect_autofix': 7200,   # 2小时 (定向写回,逐 SKU live 调用)
     'daily_tasks': 10800,      # 3小时 (含库存同步 + 智能调价)
     'auto_analyze': 3600,      # 1小时
     'smart_reprice': 7200,     # 2小时
@@ -649,6 +650,54 @@ def task_listing_audit():
             '--exit-zero-on-issues',
         ],
         timeout_sec=TASK_TIMEOUT['listing_audit'],
+    )
+
+
+def task_source_aspect_autofix():
+    """把 GIGA 源参数写回 live 属性 — 严格限定 fix key。
+
+    12:10,在 11:30 审计之后、12:30 语义改写之前。
+
+    为什么单独一个任务而不是给 listing_audit 加 --fix:审计不传 --fix-key 时
+    会应用该 SKU 的【全部】待修项,2026-07-27 就是这样把两条室内软包储物凳
+    改判进 Outdoor Daybeds 并 republish 上线的。这里只放三个确定性、源直供的
+    key,categoryId 永远不在其中。
+
+    没有这个任务时,source_aspect_mismatch 这类问题只被检出不被修复:
+    2026-08-10 审计报了 252 条,其中 195 条带着可用修复项躺着没人执行。
+    """
+    if _task_succeeded_today('source_aspect_autofix'):
+        logger.info("↪ 跳过源参数自动修复: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from scripts.semantic_rewrite import pick_latest_full_corpus_audit
+        picked = pick_latest_full_corpus_audit(list((PROJECT_ROOT / 'logs').glob('listing_audit_fix_*.json')))
+    except Exception as exc:
+        logger.warning("↪ 跳过源参数自动修复: 无法定位审计报告 (%s)", exc)
+        return True, f'Skipped (no audit report: {exc})'
+    if not picked:
+        logger.info("↪ 跳过源参数自动修复: 尚无全量审计报告")
+        return True, 'Skipped (no full-corpus audit report)'
+
+    report_path, _scores = picked
+    run_task(
+        'source_aspect_autofix',
+        [
+            str(PROJECT_ROOT / 'scripts' / 'audit_fix_active_listings.py'),
+            '--live',
+            '--ignore-clean-freeze',
+            '--exit-zero-on-issues',
+            '--source-report', str(report_path),
+            '--issue-type', 'source_aspect_mismatch',
+            # 白名单,不是黑名单:新增 key 必须是明确决定。
+            '--fix-key', 'Color',
+            '--fix-key', 'Material',
+            '--fix-key', '__source_parameter_rebuild__',
+            '--fix',
+        ],
+        timeout_sec=TASK_TIMEOUT['source_aspect_autofix'],
     )
 
 
@@ -1540,6 +1589,7 @@ def setup_schedule():
     schedule.every().day.at("11:30").do(task_listing_audit).tag('daily', 'listing_audit')
 
     # 12:30 — 语义改写闭环 (读当日 audit 增量队列, 限 40; 需 SEMANTIC_REWRITE_APPLY_ENABLED=1)
+    schedule.every().day.at("12:10").do(task_source_aspect_autofix).tag('daily', 'source_aspect_autofix')
     schedule.every().day.at("12:30").do(task_semantic_rewrite).tag('daily', 'semantic_rewrite')
 
     # 每 6 小时 — 出单源复核 (新订单 SKU 源重抓 + live 声明比对, 发货前拦退款)
@@ -1573,6 +1623,7 @@ def setup_schedule():
     logger.info("  10:45  CRO 标题热词优化 dry-run (显式 env 才 live apply)")
     logger.info("  10:55  源内容刷新 (source_content_refresh --email — 卖家漂移检测)")
     logger.info("  11:30  eBay/GIGA live listing 内容审计 (audit_fix_active_listings --live --email)")
+    logger.info("  12:10  源参数写回 live (audit --source-report --issue-type source_aspect_mismatch --fix,限定 Color/Material/描述重建)")
     logger.info("  12:30  语义改写闭环 (semantic_rewrite --from-daily-audit --limit 40 --apply --email)")
     logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 48 --email)")
     logger.info("  20:00  销售健康诊断 (health_check --auto-fix --email)")
@@ -2063,6 +2114,7 @@ def main():
         task_map = {
             'title': task_title_optimize,
             'listing_audit': task_listing_audit,
+            'source_aspect_autofix': task_source_aspect_autofix,
             'daily': task_daily_full,
             'analyze': task_auto_analyze,
             'reprice': task_smart_reprice,

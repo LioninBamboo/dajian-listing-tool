@@ -147,6 +147,16 @@ def main() -> int:
         help="permit categoryId/categoryName rows (each must be human-approved)",
     )
     parser.add_argument("--stop-on-error", action="store_true", default=True)
+    parser.add_argument(
+        "--max-consecutive-errors",
+        type=int,
+        default=3,
+        help=(
+            "Stop after this many CONSECUTIVE per-SKU apply errors (default 3). "
+            "One SKU whose eBay availability record is missing must not strand "
+            "the other 113 rows; a run where everything fails still stops fast."
+        ),
+    )
     args = parser.parse_args()
 
     # The audit's output carries the store footer (✦), emoji severity markers and
@@ -168,6 +178,8 @@ def main() -> int:
     print()
 
     failures = 0
+    consecutive = 0
+    item_errors: list[str] = []
     for index, row in enumerate(rows, start=1):
         sku, keys = row["sku"], row["fix_keys"]
         print(f"[{index}/{len(rows)}] {sku}  keys={keys}" + (f"  # {row['note']}" if row["note"] else ""))
@@ -195,12 +207,25 @@ def main() -> int:
 
         apply_errors = _apply_errors_for_sku(sku) if args.apply else []
         if apply_errors:
+            # Per-SKU data conditions (missing eBay availability record, dead
+            # offer) are item-level, not systematic: on 2026-08-10 one such SKU
+            # at row 2 stopped a 115-row batch with zero writes. Record, skip,
+            # keep going — a genuine systemic break shows up as a RUN of
+            # consecutive failures and still halts the batch.
             failures += 1
+            consecutive += 1
             for error in apply_errors:
                 print(f"      ! {error}")
-            if args.stop_on_error:
-                print(f"\n[STOP] {sku}: audit report recorded an apply error.")
+            item_errors.append(f"{sku}: {apply_errors[0][:120]}")
+            if args.stop_on_error and consecutive >= args.max_consecutive_errors:
+                print(
+                    f"\n[STOP] {consecutive} consecutive apply errors "
+                    f"(last: {sku}) — looks systematic, not per-item."
+                )
                 return 1
+            print()
+            continue
+        consecutive = 0
 
         if result.returncode != 0:
             failures += 1
@@ -213,6 +238,10 @@ def main() -> int:
         print()
 
     print(f"done: {len(rows)} row(s), {failures} failure(s)")
+    if item_errors:
+        print("\nper-SKU errors (skipped, batch continued):")
+        for line in item_errors:
+            print(f"  - {line}")
     return 1 if failures else 0
 
 
