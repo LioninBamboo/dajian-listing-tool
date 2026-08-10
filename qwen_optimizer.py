@@ -744,14 +744,39 @@ class QwenOptimizer:
             except json.JSONDecodeError:
                 data = json.loads(content.replace("```json", "").replace("```", "").strip())
 
-            # Same HTML hygiene as the furniture path, then truncate BEFORE the
-            # footer is appended so the footer always survives eBay's char limit.
-            body = self._validate_and_fix_html(self._clean_placeholder_text(str(data.get("description") or "")))
-            if len(body) > 3300:
-                body = self._smart_truncate_html(body, 3300)
-            data["description"] = body
-
-            result = finalize_auto_technical_listing(data, profile, mode)
+            # The LLM supplies only the 80-char title + accurate aspects. The
+            # DESCRIPTION reuses the mature main-store builder (build_description_from_
+            # source: conversion bullets from REAL source features + KEY FEATURES /
+            # SPECIFICATIONS / PACKAGE INCLUDES), themed via the store profile — so the
+            # copy can no longer invent a lift range or an unsourced feature the guard
+            # blocks. Vehicle fitment stays in the Trading ItemCompatibilityList, never
+            # the description. Mirrors the GrovePop garden migration.
+            from src.services.auto_technical_prompt import _normalize_aspects
+            from src.services.semantic_rewrite import build_description_from_source
+            title = str(data.get("title") or original_title or "").strip()[:80]
+            aspects = _normalize_aspects(data.get("aspects"))
+            if getattr(profile, "force_house_brand", False):
+                aspects["Brand"] = [getattr(profile, "brand_name", "") or "Unbranded"]
+            if aspects.get("Brand") and not aspects.get("MPN"):
+                aspects["MPN"] = ["Does Not Apply"]
+            try:
+                from src.utils.listing_quality_gate import _fill_measurement_aspects
+                _fill_measurement_aspects(aspects, {**(attributes or {}), **(specs or {})})
+            except Exception:
+                pass
+            description = build_description_from_source(
+                title=title,
+                source_description=original_description or "",
+                attrs=attributes or {},
+                specs=specs or {},
+                aspects=aspects,
+            )
+            if not description:  # never publish an empty body
+                data["description"] = self._validate_and_fix_html(
+                    self._clean_placeholder_text(str(data.get("description") or "")))
+                description = finalize_auto_technical_listing(dict(data), profile, mode).get("description", "")
+            result = {"title": title, "description": description, "aspects": aspects,
+                      "features": data.get("features") or [], "mode": mode}
 
             # Share the category matcher so generation-time taxonomy agrees with publish.
             try:
@@ -768,6 +793,13 @@ class QwenOptimizer:
                     result["aspects"] = matched_aspects or result.get("aspects", {})
             except Exception as cat_err:
                 print(f"   [WARN] category matcher unavailable: {cat_err}")
+
+            # The matcher REPLACES aspects with its category-required set; re-fill
+            # Item L/W/H so the measurement QC passes (same fix as garden).
+            try:
+                _fill_measurement_aspects(result["aspects"], {**(attributes or {}), **(specs or {})})
+            except Exception:
+                pass
 
             print(f"✅ Auto-technical optimization complete ({mode}). Title: {result.get('title','')[:50]}...")
             return result
