@@ -147,7 +147,13 @@ def test_active_audit_flags_live_source_parameter_drift_for_trash_cabinet(monkey
     assert all(issue["severity"] == "CRITICAL" for issue in drift.values())
     assert fixes["Type"] == ["Storage Cabinet"]
     assert fixes["Material"] == ["Particle Board"]
-    assert fixes["Color"] == ["Antique Brown+White"]
+    # 2026-08-10: was ["Antique Brown+White"]. Color is a SINGLE_VALUE_ASPECT, so
+    # writing the combined supplier string back produces a value no buyer facet
+    # matches (33 of 130 queued Color corrections looked like this). The fix now
+    # carries the primary component; the issue detail still shows the full
+    # source value so an operator can see what the supplier actually said.
+    assert fixes["Color"] == ["Antique Brown"]
+    assert "Antique Brown+White" in drift["Color"]["detail"]
     assert fixes["__source_parameter_rebuild__"] is True
 
 
@@ -322,6 +328,56 @@ def test_fix_listing_rebuilds_description_after_source_parameter_correction(monk
     assert "up to 10 gallons" in captured["description"]
 
 
+def test_product_only_update_preserves_combined_source_material_and_color():
+    """Source-backed combined values must not be truncated to their first component."""
+    from types import SimpleNamespace
+
+    captured = {}
+
+    class _Session:
+        def put(self, url, headers=None, json=None, timeout=None):
+            captured["payload"] = json
+            return SimpleNamespace(status_code=204, text="")
+
+    class _Client:
+        base_url = "https://api.ebay.example"
+        oauth = SimpleNamespace(get_valid_token=lambda: "token")
+        session = _Session()
+
+        def get_inventory_item(self, sku):
+            return {
+                "condition": "NEW",
+                "availability": {"shipToLocationAvailability": {"quantity": 1}},
+                "product": {
+                    "title": "Storage Cabinet",
+                    "description": "<div>old</div>",
+                    "imageUrls": ["https://example.test/image.jpg"],
+                    "aspects": {
+                        "Material": ["MDF"],
+                        "Color": ["Black"],
+                        "Type": ["Storage Cabinet"],
+                    },
+                },
+            }
+
+    _, _, cleaned = audit_fix_active_listings._put_inventory_product_only(
+        _Client(),
+        "SKU-COMBINED",
+        "Storage Cabinet",
+        "<div>updated</div>",
+        {
+            "Material": ["MDF,Rubber Wood"],
+            "Color": ["Black,Espresso"],
+            "Type": ["Storage Cabinet"],
+        },
+    )
+
+    assert cleaned["Material"] == ["MDF,Rubber Wood"]
+    assert cleaned["Color"] == ["Black,Espresso"]
+    assert captured["payload"]["product"]["aspects"]["Material"] == ["MDF,Rubber Wood"]
+    assert captured["payload"]["product"]["aspects"]["Color"] == ["Black,Espresso"]
+
+
 def test_source_parameter_type_rule_only_reclassifies_stale_apothecary_default():
     from src.utils.source_parameter_alignment import find_source_parameter_mismatches
 
@@ -351,6 +407,42 @@ def test_source_parameter_type_rule_only_reclassifies_stale_apothecary_default()
     )
     assert {item["field"] for item in stale_type} == {"Color", "Type"}
     assert next(item for item in stale_type if item["field"] == "Type")["expected"] == "Corner Cabinet"
+
+
+def test_source_parameter_type_rule_repairs_wagon_stroller_wheelbarrow_drift():
+    from src.utils.source_parameter_alignment import find_source_parameter_mismatches
+
+    mismatches = find_source_parameter_mismatches(
+        source_attributes={"Main Material": "Steel", "Main Color": "Gray"},
+        source_title='Wagon Stroller for 2 Kids with 8" All-Terrain PU Wheels',
+        source_description="Foldable wagon stroller for two children.",
+        candidate_aspects={
+            "Type": ["2-Wheeled Wheelbarrow"],
+            "Material": ["Steel"],
+            "Color": ["Gray"],
+        },
+        category_id="66700",
+    )
+
+    type_mismatch = next(item for item in mismatches if item["field"] == "Type")
+    assert type_mismatch["expected"] == "Wagon Stroller"
+
+
+def test_source_parameter_alignment_prefers_specific_faux_leather_source_field():
+    from src.utils.source_parameter_alignment import find_source_parameter_mismatches
+
+    mismatches = find_source_parameter_mismatches(
+        source_attributes={
+            "Main Material": "Leather",
+            "Upholstery Material": "Faux Leather",
+            "Variant": "Black PU",
+        },
+        source_title="Black PU Leather Accent Chair",
+        source_description="PU upholstery with a faux leather finish.",
+        candidate_aspects={"Material": ["Faux Leather"], "Color": ["Black PU"]},
+    )
+
+    assert not any(item["field"] == "Material" for item in mismatches)
 
 
 def test_audit_parser_supports_scheduled_live_email_mode():

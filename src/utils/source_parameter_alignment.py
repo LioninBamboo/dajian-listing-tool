@@ -62,6 +62,26 @@ def _split_components(value: Any) -> list[str]:
     return [part.strip(" .;:()[]") for part in raw if part.strip(" .;:()[]")]
 
 
+def primary_component(value: Any) -> str:
+    """Leading component of a multi-part supplier value, preserving its casing.
+
+    Color and Material are SINGLE_VALUE_ASPECTS on eBay, but GIGA ships combined
+    values like "Black+Gold", "Natural Wood+Brown", "Beige,Light Brown". Feeding
+    the raw string back as the corrected aspect writes a value no buyer facet can
+    match — 33 of 130 Color corrections queued on 2026-08-10 looked like this.
+    The first component is the primary/dominant one by supplier convention.
+    """
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    parts = re.split(r"\s*(?:\+|,|/|&|\band\b)\s*", text, flags=re.IGNORECASE)
+    for part in parts:
+        cleaned = part.strip(" .;:()[]")
+        if cleaned:
+            return cleaned
+    return text
+
+
 def _normalize_material_component(value: str) -> str:
     compact = re.sub(r"[^a-z0-9]+", "", value.lower())
     if compact in _MATERIAL_COMPONENT_ALIASES:
@@ -127,11 +147,6 @@ def _infer_type(
     category_id: str = "",
     current_type: str = "",
 ) -> str:
-    # This guard targets the known stale category default.  A product that
-    # already has a different intentional type (for example Kitchen Island)
-    # must not be reclassified merely because the copy mentions a trash bin.
-    if current_type and current_type.casefold() != "apothecary cabinet":
-        return ""
     source_text = " ".join(
         [
             str(source_title or ""),
@@ -139,6 +154,21 @@ def _infer_type(
             " ".join(str(value) for value in attributes.values()),
         ]
     ).lower()
+
+    # A stale category default can turn a wagon stroller into a wheelbarrow
+    # type.  The source title is explicit enough to repair this deterministic
+    # product-family drift, and it also prevents the FactSheet guard from
+    # reading the leading "2" as a wheel-count claim.
+    if re.search(r"\b(?:wagon\s+stroller|stroller\s+wagon)\b", source_text):
+        current_type_lower = (current_type or "").casefold()
+        if not current_type_lower or "wheelbarrow" in current_type_lower or "wheeled" in current_type_lower:
+            return "Wagon Stroller"
+
+    # This guard targets the known stale category default.  A product that
+    # already has a different intentional type (for example Kitchen Island)
+    # must not be reclassified merely because the copy mentions a trash bin.
+    if current_type and current_type.casefold() != "apothecary cabinet":
+        return ""
     if re.search(r"\b(?:trash|garbage|recycling)\b", source_text) and "cabinet" in source_text:
         return "Sideboard" if str(category_id) == "183322" else "Storage Cabinet"
     if "corner cabinet" in source_text:
@@ -166,6 +196,22 @@ def find_source_parameter_mismatches(
     mismatches: list[dict[str, Any]] = []
 
     source_material = _source_value(attributes, "Main Material", "Material", "材质")
+    specific_upholstery = _source_value(
+        attributes,
+        "Upholstery Material",
+        "Upholstery Fabric",
+        "Fabric Type",
+    )
+    # GIGA sometimes emits the generic material as Leather while the more
+    # specific upholstery field and variant identify PU/Faux Leather.  Prefer
+    # that specific source evidence so the QC gate does not force a genuine
+    # leather claim back onto the listing.
+    if (
+        source_material.casefold() in {"leather", "genuine leather"}
+        and specific_upholstery
+        and any(token in specific_upholstery.casefold() for token in ("faux", "pu"))
+    ):
+        source_material = specific_upholstery
     live_material = _aspect_values(aspects.get("Material"))
     if source_material and not _material_components_supported(source_material, live_material):
         mismatches.append(
@@ -173,7 +219,8 @@ def find_source_parameter_mismatches(
                 "field": "Material",
                 "source_key": "Main Material",
                 "current": live_material,
-                "expected": source_material,
+                # Single-value aspect: never hand back "Wood+Metal" verbatim.
+                "expected": primary_component(source_material),
                 "detail": (
                     f"Material is not source-faithful: live={live_material or 'missing'} "
                     f"vs GIGA Main Material={source_material}"
@@ -189,7 +236,8 @@ def find_source_parameter_mismatches(
                 "field": "Color",
                 "source_key": "Main Color",
                 "current": live_color,
-                "expected": source_color,
+                # Single-value aspect: never hand back "Black+Gold" verbatim.
+                "expected": primary_component(source_color),
                 "detail": (
                     f"Color is not source-faithful: live={live_color or 'missing'} "
                     f"vs GIGA Main Color={source_color}"

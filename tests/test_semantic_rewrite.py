@@ -1725,3 +1725,62 @@ class TestOnlySeriousClaimsMayRewriteLiveTitle:
     def test_missing_severity_is_treated_as_not_serious(self):
         violations = [{"claim_text": "cabinet", "claim_type": "semantic_feature"}]
         assert sr.title_contains_violation(self.TITLE, violations) is False
+
+
+class TestQueueCoversEveryActionableDetector:
+    """2026-08-09 新增 source_aspect_mismatch / assembly_* 三个检测器后,当天
+    376 条 CRITICAL 里 373 条属于新类型,而队列筛选是硬编码前缀白名单
+    (semantic_/claim_/hallucin),一条都没匹配上。结果:本该有几百个候选的一次
+    改写只处理了 1 个 SKU。新检测器没有任何出口,也不报错,积压就此停止移动。"""
+
+    def _audit(self, *types):
+        return {
+            "issues": [
+                {
+                    "sku": "W1",
+                    "issues": [{"type": t, "severity": "CRITICAL"} for t in types],
+                }
+            ]
+        }
+
+    def test_new_detectors_reach_the_queue(self):
+        from scripts.semantic_rewrite import _score_audit_for_queue
+
+        for t in (
+            "source_aspect_mismatch",
+            "assembly_package_conflict",
+            "assembly_description_contradiction",
+            "assembly_required_mismatch",
+        ):
+            assert _score_audit_for_queue(self._audit(t)) == {"W1": 1}, t
+
+    def test_original_prefix_families_still_reach_the_queue(self):
+        from scripts.semantic_rewrite import _score_audit_for_queue
+
+        for t in ("semantic_material", "claim_diff", "hallucinated_leather"):
+            assert _score_audit_for_queue(self._audit(t)) == {"W1": 1}, t
+
+    def test_non_actionable_type_is_still_excluded(self):
+        """category_mismatch 必须留在队列外——类目改动是本仓库后果最重的一类,
+        历史上出过室内长凳->户外日间床、床头柜->床架,只能走人工清单。"""
+        from scripts.semantic_rewrite import _score_audit_for_queue
+
+        assert _score_audit_for_queue(self._audit("category_mismatch")) == {}
+
+    def test_non_critical_severity_never_counts(self):
+        from scripts.semantic_rewrite import _score_audit_for_queue
+
+        audit = {
+            "issues": [
+                {"sku": "W1", "issues": [{"type": "source_aspect_mismatch", "severity": "MEDIUM"}]}
+            ]
+        }
+        assert _score_audit_for_queue(audit) == {}
+
+    def test_actionable_predicate_is_explicit_about_membership(self):
+        from scripts.semantic_rewrite import queue_type_is_actionable
+
+        assert queue_type_is_actionable("source_aspect_mismatch") is True
+        assert queue_type_is_actionable("category_mismatch") is False
+        assert queue_type_is_actionable("") is False
+        assert queue_type_is_actionable(None) is False

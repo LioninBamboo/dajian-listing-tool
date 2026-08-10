@@ -70,6 +70,36 @@ def _read_sku_file(path: str) -> list[str]:
     return skus
 
 
+# Issue types this pipeline can act on. Prefix matching alone silently drops
+# any detector that does not happen to be named "semantic_*"/"claim_*": when
+# source_aspect_mismatch and assembly_* landed on 2026-08-09 they produced 373
+# of 376 CRITICAL rows and NONE of them reached the queue, so a run that should
+# have had hundreds of candidates processed exactly one SKU. New detector, no
+# route to any fixer, no error — the backlog just stopped moving.
+_QUEUE_TYPE_PREFIXES: tuple[str, ...] = ("semantic_", "claim_")
+_QUEUE_TYPE_SUBSTRINGS: tuple[str, ...] = ("hallucin",)
+# Named explicitly so adding a detector is a deliberate decision, not an
+# accident of naming. Keep in sync with audit_fix_active_listings issue types.
+_QUEUE_TYPE_NAMES: frozenset[str] = frozenset({
+    "source_aspect_mismatch",
+    "assembly_required_mismatch",
+    "assembly_package_conflict",
+    "assembly_description_contradiction",
+    "description_raw_source_dump",
+    "incomplete_title",
+})
+
+
+def queue_type_is_actionable(issue_type: str) -> bool:
+    """Can the rewrite pipeline do anything about this issue type?"""
+    t = str(issue_type or "")
+    if t in _QUEUE_TYPE_NAMES:
+        return True
+    if any(t.startswith(p) for p in _QUEUE_TYPE_PREFIXES):
+        return True
+    return any(s in t for s in _QUEUE_TYPE_SUBSTRINGS)
+
+
 def _score_audit_for_queue(data: dict) -> dict[str, int]:
     scores: dict[str, int] = {}
     for row in data.get("issues") or []:
@@ -80,11 +110,8 @@ def _score_audit_for_queue(data: dict) -> dict[str, int]:
         for iss in row.get("issues") or []:
             if not isinstance(iss, dict):
                 continue
-            t = str(iss.get("type") or "")
             sev = str(iss.get("severity") or "")
-            if sev.upper() == "CRITICAL" and (
-                t.startswith("semantic_") or t.startswith("claim_") or "hallucin" in t
-            ):
+            if sev.upper() == "CRITICAL" and queue_type_is_actionable(iss.get("type")):
                 crit += 1
         if crit:
             scores[sku] = scores.get(sku, 0) + crit
