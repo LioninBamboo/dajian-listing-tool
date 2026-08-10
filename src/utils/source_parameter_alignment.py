@@ -95,6 +95,12 @@ def _normalize_color_component(value: str) -> str:
     return _COLOR_COMPONENT_ALIASES.get(normalized, normalized)
 
 
+def _primary_normalized(source_value: str, normalizer) -> str:
+    """Normalized leading component of a possibly multi-part source value."""
+    prim = primary_component(source_value)
+    return normalizer(prim) if prim else ""
+
+
 def _material_components_supported(source_value: str, live_values: list[str]) -> bool:
     source = {
         _normalize_material_component(component)
@@ -109,6 +115,16 @@ def _material_components_supported(source_value: str, live_values: list[str]) ->
         return False
 
     if source <= live:
+        return True
+
+    # Material/Color are SINGLE_VALUE_ASPECTS on eBay. When the source is a
+    # multi-part value ("Acacia Wood,Polyester") the field can hold only one
+    # component, so source <= live can never be satisfied and the listing was
+    # flagged forever even though it already carried the primary material
+    # (2026-08-10: 93 such perpetual false positives, each re-entering the daily
+    # autofix to write the value it already had). A single-value field holding
+    # the primary source component is faithful.
+    if _primary_normalized(source_value, _normalize_material_component) in live:
         return True
 
     # A generic source family may be represented by its standard eBay generic
@@ -136,7 +152,13 @@ def _color_components_supported(source_value: str, live_values: list[str]) -> bo
         for value in live_values
         for component in _split_components(value)
     }
-    return bool(source) and bool(live) and source <= live
+    if not source or not live:
+        return False
+    if source <= live:
+        return True
+    # Single-value Color field holding the primary source color is faithful —
+    # see _material_components_supported for the multi-value rationale.
+    return _primary_normalized(source_value, _normalize_color_component) in live
 
 
 def _infer_type(
