@@ -1132,7 +1132,16 @@ def audit_single_product(
         })
         fixes["__remove__Assembly Status"] = True
 
-    if assembly_decision.get("status") == "review" and assembly_decision.get("package", {}).get("strong"):
+    if (
+        assembly_decision.get("status") == "review"
+        and assembly_decision.get("package", {}).get("strong")
+        # Flat-pack geometry implies assembly IS needed. When the listing already
+        # declares "Assembly Required: Yes" the two signals AGREE and the buyer
+        # is correctly warned — there is no contradiction and no refund risk, so
+        # flagging it CRITICAL is noise. On 2026-08-10, 53 of 112 flags were of
+        # this kind. Fire only when the listing says "No" or omits the aspect.
+        and (current_assembly or "").strip().lower() != "yes"
+    ):
         issues.append({
             "type": "assembly_package_conflict",
             "severity": "CRITICAL",

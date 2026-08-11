@@ -2222,7 +2222,16 @@ def validate_listing_quality(
     if not expected_assembly and assembly_decision.get("status") == "unknown":
         expected_assembly = _normalize_yes_no(source_facts.get("assembly_required"))
 
-    if assembly_decision.get("status") == "review" and assembly_decision.get("package", {}).get("strong"):
+    if (
+        assembly_decision.get("status") == "review"
+        and assembly_decision.get("package", {}).get("strong")
+        # Mirror of the audit guard: when the listing already declares
+        # "Assembly Required: Yes" the flat-pack geometry AGREES with it, so there
+        # is no buyer-facing contradiction to confirm. Fire only when the listing
+        # says "No" or omits the aspect (2026-08-10: 53 of 112 flags already said
+        # Yes). Two engines, same guard — see product_context_signals note.
+        and (current_assembly or "").strip().lower() != "yes"
+    ):
         issues.append(
             ListingQualityIssue(
                 "assembly_package_conflict",

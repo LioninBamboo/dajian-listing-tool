@@ -1903,3 +1903,60 @@ class TestIndoorCopyBeatsAnIncidentalOutdoorMention:
             "38204",
         )
         assert profile.kind == "outdoor_daybed"
+
+
+def _flatpack_conflict_inputs(assembly_value):
+    """Flat-pack geometry + source text that reads as no-assembly = 'review' state.
+    assembly_value is what the listing's Assembly Required aspect currently holds."""
+    opt = {
+        "title": "13 Gallon Tilt Out Trash Cabinet Freestanding Bin Cabinet",
+        "aspects": {"Assembly Required": [assembly_value]} if assembly_value else {},
+    }
+    attrs = {
+        "Assembled Length (in.)": "21.70",
+        "Assembled Width (in.)": "14.20",
+        "Assembled Height (in.)": "37.40",
+        "Main Material": "Particle Board",
+    }
+    specs = {
+        "Package Length (in.)": "39.37",
+        "Package Width (in.)": "21.97",
+        "Package Height (in.)": "5.40",
+    }
+    return opt, attrs, specs
+
+
+def _has_conflict(issues):
+    return any(i.code == "assembly_package_conflict" for i in issues)
+
+
+def test_assembly_conflict_suppressed_when_listing_already_says_yes():
+    """2026-08-10: 53/112 assembly_package_conflict 的 listing 已标 Assembly
+    Required=Yes,flat-pack 几何与之一致,买家已被告知,无退款风险 -> 不应报 CRITICAL。"""
+    opt, attrs, specs = _flatpack_conflict_inputs("Yes")
+    issues = validate_listing_quality(
+        opt, source_title="Tilt Out Trash Cabinet",
+        source_description="A tilt-out cabinet. Assembly Required: No",
+        attributes=attrs, specs=specs,
+    )
+    assert not _has_conflict(issues)
+
+
+def test_assembly_conflict_still_fires_when_listing_says_no():
+    opt, attrs, specs = _flatpack_conflict_inputs("No")
+    issues = validate_listing_quality(
+        opt, source_title="Tilt Out Trash Cabinet",
+        source_description="A tilt-out cabinet. Assembly Required: No",
+        attributes=attrs, specs=specs,
+    )
+    assert _has_conflict(issues)
+
+
+def test_assembly_conflict_still_fires_when_aspect_missing():
+    opt, attrs, specs = _flatpack_conflict_inputs(None)
+    issues = validate_listing_quality(
+        opt, source_title="Tilt Out Trash Cabinet",
+        source_description="A tilt-out cabinet. Assembly Required: No",
+        attributes=attrs, specs=specs,
+    )
+    assert _has_conflict(issues)
