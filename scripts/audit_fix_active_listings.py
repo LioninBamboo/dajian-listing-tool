@@ -77,6 +77,7 @@ from src.utils.publish_autofix import (
     SINGLE_VALUE_ASPECTS,
     prepare_ebay_aspects,
     sanitize_single_value_aspects,
+    source_combined_aspect_keys,
 )
 from src.utils.html_truncator import smart_truncate_html
 from src.utils.listing_quality_gate import (
@@ -422,6 +423,17 @@ def _build_perfect_for_copy(
     return ""
 
 
+def _store_hides_assembly() -> bool:
+    """Auto-parts / tools stores don't ship flat-pack furniture — the whole
+    'Assembly Required' concept is off-category, so suppress it from the copy."""
+    try:
+        from src.utils.store_profile import get_store_profile
+        p = get_store_profile()
+        return getattr(p, "store_kind", "") == "auto" or getattr(p, "template_style", "") == "auto_technical"
+    except Exception:
+        return False
+
+
 def _build_package_includes_copy(
     title: str,
     source_description: str,
@@ -436,7 +448,7 @@ def _build_package_includes_copy(
     if "lumbar pillow" in source_text:
         package_items.append("1 x Detachable Lumbar Pillow")
 
-    if assembly_required == "Yes":
+    if assembly_required == "Yes" and not _store_hides_assembly():
         package_items.append("1 x Hardware Kit")
         package_items.append("1 x Assembly Instructions")
 
@@ -1966,6 +1978,26 @@ def _render_audit_fix_items(fixes, *, limit=10):
     return "\n".join(rendered) or "<li>无自动修复</li>"
 
 
+_ACTIONABLE_SEVERITIES = {"CRITICAL", "HIGH"}
+
+
+def _filter_actionable(items):
+    """Keep only rows that carry a CRITICAL/HIGH issue, and within each row drop
+    the MEDIUM/LOW noise. The inspection email exists to surface what will be
+    acted on; MEDIUM findings are deliberately not fixed, so showing them just
+    buries the real signal."""
+    out = []
+    for item in items or []:
+        keep = [i for i in (item.get("issues") or [])
+                if str(i.get("severity", "")).upper() in _ACTIONABLE_SEVERITIES]
+        if not keep:
+            continue
+        trimmed = dict(item)
+        trimmed["issues"] = keep
+        out.append(trimmed)
+    return out
+
+
 def _render_audit_table_rows(items, *, include_fixes=False, max_rows=200):
     rows = []
     truncated = False
@@ -2005,9 +2037,15 @@ def _send_audit_email(report, report_path):
     issues = report.get("issues", [])
     transport_issues = report.get("transport_issues", [])
     fixed_items = [item for item in issues if item.get("fixes_applied")]
-    manual_items = [item for item in issues if not item.get("fixes_applied")]
+    # Only surface rows that still need a human — CRITICAL/HIGH. MEDIUM/LOW are
+    # deliberately not fixed, so they're excluded from the body to keep the focus.
+    manual_items = _filter_actionable([item for item in issues if not item.get("fixes_applied")])
+    actionable_all = _filter_actionable(issues)
+    n_critical = int(severity_counts.get("CRITICAL", 0))
+    n_high = int(severity_counts.get("HIGH", 0))
+    n_action_rows = len(actionable_all)
 
-    summary = f"检查 {total_published} 条，发现 {total_with_issues} 条 listing 有内容问题"
+    summary = f"检查 {total_published} 条，{n_action_rows} 条需处理（CRITICAL {n_critical} / HIGH {n_high}）"
     if total_transport_failures:
         summary = f"{summary}，另有 {total_transport_failures} 条抓取/availability 异常"
     if mode == "fix":
@@ -2018,7 +2056,7 @@ def _send_audit_email(report, report_path):
 
     fixed_rows, fixed_rows_truncated = _render_audit_table_rows(fixed_items, include_fixes=True)
     manual_rows, manual_rows_truncated = _render_audit_table_rows(manual_items, include_fixes=False)
-    issue_rows, issue_rows_truncated = _render_audit_table_rows(issues, include_fixes=False)
+    issue_rows, issue_rows_truncated = _render_audit_table_rows(actionable_all, include_fixes=False)
 
     fixed_section = ""
     if mode == "fix":
@@ -2088,15 +2126,18 @@ def _send_audit_email(report, report_path):
             rows=transport_rows,
         )
 
+    _banner_bg = "#c0392b" if (n_critical or n_high) else "#27ae60"
+    _banner_txt = (f"需处理 {n_action_rows} 条：CRITICAL {n_critical} · HIGH {n_high}"
+                   if (n_critical or n_high) else "本次无需人工处理的 CRITICAL/HIGH 问题 ✅")
     html_body = """
     <h2>eBay/GIGA 刊登内容审计</h2>
+    <div style="background:{banner_bg};color:#fff;padding:14px 18px;border-radius:6px;font-size:18px;font-weight:700;margin:8px 0 14px;">{banner_txt}</div>
     <p>{summary}</p>
     <ul>
       <li>模式: {mode}</li>
-      <li>CRITICAL: {critical}</li>
-      <li>HIGH: {high}</li>
-      <li>MEDIUM: {medium}</li>
-      <li>LOW: {low}</li>
+      <li><b style="color:#c0392b;">CRITICAL: {critical}</b></li>
+      <li><b style="color:#e67e22;">HIGH: {high}</b></li>
+      <li style="color:#999;">MEDIUM/LOW: {medium}/{low}（不修改，正文不展示）</li>
       <li>抓取 / Availability 异常: {transport_failures}</li>
       <li>报告文件: <code>{report_path}</code></li>
     </ul>
@@ -2116,6 +2157,8 @@ def _send_audit_email(report, report_path):
     </table>
     {transport_section}
     """.format(
+        banner_bg=_banner_bg,
+        banner_txt=html.escape(_banner_txt),
         summary=html.escape(summary),
         mode=html.escape(mode),
         critical=int(severity_counts.get("CRITICAL", 0)),
@@ -2131,6 +2174,102 @@ def _send_audit_email(report, report_path):
         transport_section=transport_section,
     )
     return send_email(subject, html_body, attachments=[str(report_path)])
+
+
+def resolve_inventory_availability_for_product_put(
+    live_inventory,
+    *,
+    offer_quantity=None,
+    allow_unresolved: bool = False,
+    fallback_quantity=None,
+) -> dict | None:
+    """Build a valid availability block for product-only inventory PUT.
+
+    eBay Inventory PUT is replacement-style. Omitting availability triggers 25604
+    "Availability not found". Stock safety rules (conservative):
+
+    1. Prefer live inventory quantity when present (including explicit 0).
+    2. Else use live offer availableQuantity when present (including 0).
+    3. Else do NOT invent stock: return None (caller should skip the PUT),
+       unless allow_unresolved=True and fallback_quantity is explicitly provided.
+
+    Default never synthesizes quantity=1. That avoided 25604 but could leave eBay
+    sellable when GIGA/Dajian is OOS and both quantity sources were unreadable.
+    """
+    live = live_inventory if isinstance(live_inventory, dict) else {}
+    avail = live.get("availability") if isinstance(live.get("availability"), dict) else {}
+
+    qty = None
+    allocation = None
+    qty_source = None
+    ship = avail.get("shipToLocationAvailability") if isinstance(avail, dict) else None
+    if isinstance(ship, dict):
+        raw_qty = ship.get("quantity")
+        if raw_qty is not None and str(raw_qty).strip() != "":
+            try:
+                qty = int(float(raw_qty))
+                qty_source = "live_inventory"
+            except (TypeError, ValueError):
+                qty = None
+        allocation = ship.get("allocationByFormat")
+
+    if qty is None and offer_quantity is not None and str(offer_quantity).strip() != "":
+        try:
+            qty = int(float(offer_quantity))
+            qty_source = "live_offer"
+        except (TypeError, ValueError):
+            qty = None
+
+    if qty is None:
+        if allow_unresolved and fallback_quantity is not None and str(fallback_quantity).strip() != "":
+            try:
+                qty = int(float(fallback_quantity))
+                qty_source = "explicit_fallback"
+            except (TypeError, ValueError):
+                return None
+        else:
+            return None
+
+    if qty < 0:
+        qty = 0
+
+    ship_block = {"quantity": qty}
+    if isinstance(allocation, dict) and allocation:
+        ship_block["allocationByFormat"] = allocation
+    elif qty > 0:
+        # Match the shape eBay returns for healthy fixed-price inventory items.
+        ship_block["allocationByFormat"] = {"auction": 0, "fixedPrice": qty}
+
+    result = {}
+    if isinstance(avail, dict):
+        for key, value in avail.items():
+            if key != "shipToLocationAvailability":
+                result[key] = value
+    result["shipToLocationAvailability"] = ship_block
+    result["_quantity_source"] = qty_source  # stripped before PUT
+    return result
+
+
+def _offer_quantity_hint(ebay_client, sku) -> int | None:
+    """Best-effort live offer quantity when inventory availability is incomplete."""
+    getter = getattr(ebay_client, "get_offers_by_sku", None)
+    if not callable(getter):
+        return None
+    try:
+        offers = getter(sku) or []
+    except Exception:
+        return None
+    for offer in offers:
+        if not isinstance(offer, dict):
+            continue
+        raw = offer.get("availableQuantity")
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            return int(float(raw))
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def _put_inventory_product_only(ebay_client, sku, title, description, aspects):
@@ -2156,10 +2295,12 @@ def _put_inventory_product_only(ebay_client, sku, title, description, aspects):
             cleaned_aspects[str(key)] = values
 
     forced_single = set(SINGLE_VALUE_ASPECTS) | {"Care Instructions", "Fill Material"}
+    preserved_source_aspects = source_combined_aspect_keys(cleaned_aspects)
     sanitize_single_value_aspects(
         cleaned_aspects,
         log=lambda message: logging.info(f"[SANITIZE] {sku}: {message}"),
-        multi_value_aspects={key for key in cleaned_aspects if key not in forced_single},
+        multi_value_aspects={key for key in cleaned_aspects if key not in forced_single}
+        | preserved_source_aspects,
     )
     prepare_ebay_aspects(
         cleaned_aspects,
@@ -2214,11 +2355,29 @@ def _put_inventory_product_only(ebay_client, sku, title, description, aspects):
         if pkg:
             payload["packageWeightAndSize"] = pkg
 
-    # Inventory PUT is a replacement-style request. Preserve the live
-    # availability block so a product-only aspect/description edit cannot
-    # republish an otherwise in-stock listing as OUT_OF_STOCK.
-    if live_inventory.get("availability") is not None:
-        payload["availability"] = live_inventory["availability"]
+    # Inventory PUT is replacement-style: always send a valid availability block
+    # so eBay does not return 25604 "Availability not found".
+    # Conservative stock rule: only use live inventory qty or live offer qty.
+    # If neither is known, skip the PUT rather than inventing quantity=1 (GIGA OOS risk).
+    offer_qty = _offer_quantity_hint(ebay_client, sku)
+    availability = resolve_inventory_availability_for_product_put(
+        live_inventory,
+        offer_quantity=offer_qty,
+    )
+    if not availability:
+        raise RuntimeError(
+            f"{sku}: skip product-only inventory update — cannot resolve availability "
+            f"from live inventory or offer (refusing to invent stock; avoids 25604 false-fix "
+            f"and GIGA-OOS / eBay-in-stock mismatch)"
+        )
+    qty_source = availability.pop("_quantity_source", None)
+    payload["availability"] = availability
+    if qty_source:
+        logging.info(
+            f"[AVAIL] {sku}: product-only PUT availability quantity="
+            f"{availability.get('shipToLocationAvailability', {}).get('quantity')} "
+            f"source={qty_source}"
+        )
 
     token = ebay_client.oauth.get_valid_token()
     headers = {
@@ -2257,10 +2416,11 @@ def rebuild_specifications_table(attrs, specs, aspects, assembly_required=None):
             material_val = parts[1].strip()
             
     assembly_str = ""
-    if assembly_required == "Yes":
-        assembly_str = "Yes - Hardware and instructions included; setup required before use."
-    elif assembly_required == "No":
-        assembly_str = "No"
+    if not _store_hides_assembly():
+        if assembly_required == "Yes":
+            assembly_str = "Yes - Hardware and instructions included; setup required before use."
+        elif assembly_required == "No":
+            assembly_str = "No"
         
     rows = []
     if dim_str:

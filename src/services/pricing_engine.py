@@ -2,14 +2,21 @@ from decimal import Decimal, ROUND_HALF_UP
 
 class PricingEngine:
     """
-    Dajian -> eBay Pricing Calculator (storefront financial model)
+    GIGA/Dajian procurement + storefront pricing calculator.
+
+    Procurement cost is ALWAYS based on the GIGA order (product + shipping),
+    never on eBay/Wayfair selling price.
     """
 
-    # --- Constants ---
+    # --- GIGA order-side constants (applied to GIGA order amount) ---
     RETURN_INSURANCE_RATE = Decimal("0.02")      # 2% 退货保障
     LOGISTICS_INSURANCE_EXPRESS = Decimal("0.032") # 3.2% 快递物流保障
     LOGISTICS_INSURANCE_FREIGHT = Decimal("0.05")  # 5% 卡车/大件物流保障
-    PAYMENT_FEE_RATE = Decimal("0.0083")         # 0.83% 支付手续费
+    PAYMENT_FEE_RATE = Decimal("0.0083")         # 0.83% 支付宝支付手续费 (GIGA 付款)
+    # Compatibility alias — same as Alipay rate on GIGA pay.
+    ALIPAY_FEE_RATE = PAYMENT_FEE_RATE
+    # Wayfair Net-30 remittance fee (sales settlement, not GIGA product price).
+    WAYFAIR_NET30_REMIT_RATE = Decimal("0.02")   # 2% 30天汇款
 
     # eBay Costs
     EBAY_FEE_RATE = Decimal("0.1325") # 13.25%
@@ -20,33 +27,97 @@ class PricingEngine:
     STORE_DISCOUNT_RATE = Decimal("0.05")  # 5% 买家折扣
 
     @staticmethod
-    def calculate_dajian_cost(product_price: float, shipping_cost: float, is_oversize: bool = False) -> dict:
+    def calculate_dajian_cost(
+        product_price: float,
+        shipping_cost: float,
+        is_oversize: bool = False,
+        *,
+        include_alipay_fee: bool = True,
+        include_wayfair_net30_fee: bool = False,
+    ) -> dict:
+        """Calculate total procurement / all-in cost from a GIGA order.
+
+        Base is always the GIGA order (product + shipping), NEVER the listing
+        sell price.
+
+        Components:
+          1) GIGA order base = product_price + shipping_cost
+          2) Insurance (purchased on order base):
+               - return insurance 2%
+               - logistics insurance 3.2% express / 5% freight(oversize)
+          3) Alipay payment fee 0.83% on (base + insurance) when paying GIGA
+          4) Optional Wayfair Net-30 remittance fee 2% on (base + insurance)
+             — use for Wayfair-channel economics / 30-day remittance orders
+
+        Args:
+            product_price: GIGA order product amount (not eBay sell price)
+            shipping_cost: GIGA order shipping amount
+            is_oversize: use freight logistics insurance rate
+            include_alipay_fee: apply 0.83% Alipay fee (default True)
+            include_wayfair_net30_fee: apply 2% Wayfair Net-30 remittance fee
         """
-        Calculate Total Acquisition Cost from Dajian.
-        """
-        base_cost = Decimal(str(product_price)) + Decimal(str(shipping_cost))
-        
-        # 1. Return Insurance
+        try:
+            product = Decimal(str(product_price or 0))
+        except Exception:
+            product = Decimal("0")
+        try:
+            shipping = Decimal(str(shipping_cost or 0))
+        except Exception:
+            shipping = Decimal("0")
+        if product < 0 or shipping < 0:
+            raise ValueError(
+                f"GIGA order amounts must be non-negative, got product={product_price!r} shipping={shipping_cost!r}"
+            )
+
+        # 1) GIGA order base — not sell price
+        base_cost = product + shipping
+
+        # 2) Insurance purchased on the GIGA order
         return_ins = base_cost * PricingEngine.RETURN_INSURANCE_RATE
-        
-        # 2. Logistics Insurance
-        logistics_rate = PricingEngine.LOGISTICS_INSURANCE_FREIGHT if is_oversize else PricingEngine.LOGISTICS_INSURANCE_EXPRESS
+        logistics_rate = (
+            PricingEngine.LOGISTICS_INSURANCE_FREIGHT
+            if is_oversize
+            else PricingEngine.LOGISTICS_INSURANCE_EXPRESS
+        )
         logistics_ins = base_cost * logistics_rate
-        
-        # 3. Payment Fee (Applied to Base + Insurance)
-        subtotal = base_cost + return_ins + logistics_ins
-        payment_fee = subtotal * PricingEngine.PAYMENT_FEE_RATE
-        
-        total_dajian_cost = subtotal + payment_fee
-        
+        insured_subtotal = base_cost + return_ins + logistics_ins
+
+        # 3) Alipay 0.83% — fee when paying the GIGA order
+        alipay_fee = (
+            insured_subtotal * PricingEngine.ALIPAY_FEE_RATE
+            if include_alipay_fee
+            else Decimal("0")
+        )
+
+        # 4) Wayfair Net-30 remittance 2% (optional; sales settlement leg)
+        wayfair_remit_fee = (
+            insured_subtotal * PricingEngine.WAYFAIR_NET30_REMIT_RATE
+            if include_wayfair_net30_fee
+            else Decimal("0")
+        )
+
+        # Legacy field name payment_fee = Alipay only (keeps older callers stable)
+        payment_fee = alipay_fee
+        total_dajian_cost = insured_subtotal + alipay_fee + wayfair_remit_fee
+
         return {
-            "product_price": float(Decimal(str(product_price))),
-            "shipping_cost": float(Decimal(str(shipping_cost))),
+            "product_price": float(product),
+            "shipping_cost": float(shipping),
             "base_cost": float(base_cost),
+            "giga_order_base": float(base_cost),
             "return_insurance": float(return_ins),
             "logistics_insurance": float(logistics_ins),
+            "logistics_insurance_rate": float(logistics_rate),
+            "insured_subtotal": float(insured_subtotal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
             "payment_fee": float(payment_fee),
-            "total_dajian_cost": float(total_dajian_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+            "alipay_fee": float(alipay_fee.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)),
+            "alipay_fee_rate": float(PricingEngine.ALIPAY_FEE_RATE) if include_alipay_fee else 0.0,
+            "wayfair_net30_fee": float(wayfair_remit_fee.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)),
+            "wayfair_net30_fee_rate": float(PricingEngine.WAYFAIR_NET30_REMIT_RATE) if include_wayfair_net30_fee else 0.0,
+            "include_alipay_fee": bool(include_alipay_fee),
+            "include_wayfair_net30_fee": bool(include_wayfair_net30_fee),
+            "cost_basis": "giga_order",
+            "total_dajian_cost": float(total_dajian_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
         }
 
     # ════════════════════════════════════════════════════════════════════

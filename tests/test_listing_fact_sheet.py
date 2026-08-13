@@ -220,6 +220,56 @@ def test_check_fact_sheet_ignores_package_dimensions_for_item_semantics(monkeypa
     assert "Package Length" not in descriptions[0]
 
 
+def test_check_fact_sheet_ignores_chinese_package_dimensions_for_item_semantics(monkeypatch):
+    monkeypatch.setenv("QWEN_API_KEY", "test")
+    monkeypatch.setenv("AUDIT_SEMANTIC_FACT_SHEET", "1")
+    source_with_package_dims = dict(
+        SOURCE_SHEET,
+        dimensions={"length": 22.8, "width": 21.6, "height": 15.3, "weight": 48.89},
+    )
+    source_without_item_dims = dict(SOURCE_SHEET, dimensions={})
+    live_item_dims = dict(
+        SOURCE_SHEET,
+        dimensions={"length": 21.45, "width": 21.45, "height": 42.32, "weight": None},
+    )
+    descriptions = []
+
+    def fake_fact_sheet_for_content(conn, title, description, structured):
+        descriptions.append(description)
+        return source_with_package_dims if "包装尺寸" in description else (
+            source_without_item_dims if len(descriptions) == 1 else live_item_dims
+        )
+
+    monkeypatch.setattr(lfs, "fact_sheet_for_content", fake_fact_sheet_for_content)
+
+    result = lfs.check_fact_sheet_violations(
+        conn=object(),
+        source_title="Hair Beauty Salon Equipment Black Hydraulic Barber Styling Chair",
+        source_description=(
+            "<div>包装尺寸 长度 22.8 宽度 21.6 高度 15.3</div>"
+            "<div>产品特点 Hydraulic pump</div>"
+            "<ul><li><strong>Package Length (in.):</strong> 22.8</li>"
+            "<li><strong>Package Height (in.):</strong> 15.3</li></ul>"
+        ),
+        source_attributes={"Main Material": "PU"},
+        source_specs={
+            "Package Length (in.)": "22.8",
+            "Package Width (in.)": "21.6",
+            "Package Height (in.)": "15.3",
+        },
+        candidate_title="Hair Beauty Salon Equipment Black Hydraulic Barber Styling Chair",
+        candidate_description="21.45 x 21.45 x 42.32 in",
+        candidate_aspects={
+            "Item Length": ["21.45 in"],
+            "Item Width": ["21.45 in"],
+            "Item Height": ["42.32 in"],
+        },
+    )
+
+    assert result["status"] == "pass"
+    assert "包装尺寸" not in descriptions[0]
+
+
 def test_check_fact_sheet_ignores_labeled_seat_height_for_item_semantics(monkeypatch):
     monkeypatch.setenv("QWEN_API_KEY", "test")
     monkeypatch.setenv("AUDIT_SEMANTIC_FACT_SHEET", "1")

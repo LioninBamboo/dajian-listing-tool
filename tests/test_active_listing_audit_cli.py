@@ -376,7 +376,132 @@ def test_product_only_update_preserves_combined_source_material_and_color():
     assert cleaned["Color"] == ["Black,Espresso"]
     assert captured["payload"]["product"]["aspects"]["Material"] == ["MDF,Rubber Wood"]
     assert captured["payload"]["product"]["aspects"]["Color"] == ["Black,Espresso"]
+    # Always includes availability to avoid eBay 25604
+    assert captured["payload"]["availability"]["shipToLocationAvailability"]["quantity"] == 1
 
+
+def test_resolve_availability_preserves_live_quantity_including_zero():
+    resolved = audit_fix_active_listings.resolve_inventory_availability_for_product_put(
+        {"availability": {"shipToLocationAvailability": {"quantity": 0}}},
+    )
+    assert resolved["shipToLocationAvailability"]["quantity"] == 0
+    assert resolved["_quantity_source"] == "live_inventory"
+
+
+def test_resolve_availability_returns_none_when_no_qty_source():
+    """Conservative: do not invent qty=1 when inventory and offer are both unknown."""
+    resolved = audit_fix_active_listings.resolve_inventory_availability_for_product_put(
+        {"product": {"title": "x"}},
+    )
+    assert resolved is None
+
+
+def test_resolve_availability_prefers_offer_quantity_when_inventory_incomplete():
+    resolved = audit_fix_active_listings.resolve_inventory_availability_for_product_put(
+        {"availability": {}},
+        offer_quantity=3,
+    )
+    assert resolved["shipToLocationAvailability"]["quantity"] == 3
+    assert resolved["_quantity_source"] == "live_offer"
+
+
+def test_resolve_availability_explicit_fallback_only_when_allowed():
+    assert (
+        audit_fix_active_listings.resolve_inventory_availability_for_product_put(
+            {},
+            fallback_quantity=0,
+        )
+        is None
+    )
+    resolved = audit_fix_active_listings.resolve_inventory_availability_for_product_put(
+        {},
+        allow_unresolved=True,
+        fallback_quantity=0,
+    )
+    assert resolved["shipToLocationAvailability"]["quantity"] == 0
+    assert resolved["_quantity_source"] == "explicit_fallback"
+
+
+def test_product_only_update_injects_availability_from_offer_when_live_missing():
+    """When live availability is missing, use offer qty (not invented stock)."""
+    from types import SimpleNamespace
+
+    captured = {}
+
+    class _Session:
+        def put(self, url, headers=None, json=None, timeout=None):
+            captured["payload"] = json
+            return SimpleNamespace(status_code=204, text="")
+
+    class _Client:
+        base_url = "https://api.ebay.example"
+        oauth = SimpleNamespace(get_valid_token=lambda: "token")
+        session = _Session()
+
+        def get_inventory_item(self, sku):
+            # Live inventory exists but availability block is missing (25604 setup).
+            return {
+                "condition": "NEW",
+                "product": {
+                    "title": "Bench",
+                    "description": "<div>old</div>",
+                    "imageUrls": ["https://example.test/image.jpg"],
+                    "aspects": {"Type": ["Bench"]},
+                },
+            }
+
+        def get_offers_by_sku(self, sku):
+            return [{"status": "PUBLISHED", "availableQuantity": 2}]
+
+    audit_fix_active_listings._put_inventory_product_only(
+        _Client(),
+        "SKU-25604",
+        "Bench",
+        "<div>updated</div>",
+        {"Type": ["Bench"]},
+    )
+
+    avail = captured["payload"]["availability"]["shipToLocationAvailability"]
+    assert avail["quantity"] == 2
+    assert "_quantity_source" not in captured["payload"]["availability"]
+    assert "product" in captured["payload"]
+
+
+def test_product_only_update_skips_when_quantity_unresolvable():
+    """Refuse PUT when neither inventory nor offer has a quantity — no phantom stock."""
+    from types import SimpleNamespace
+
+    class _Session:
+        def put(self, *args, **kwargs):
+            raise AssertionError("PUT must not be called when quantity is unknown")
+
+    class _Client:
+        base_url = "https://api.ebay.example"
+        oauth = SimpleNamespace(get_valid_token=lambda: "token")
+        session = _Session()
+
+        def get_inventory_item(self, sku):
+            return {
+                "condition": "NEW",
+                "product": {
+                    "title": "Bench",
+                    "description": "<div>old</div>",
+                    "imageUrls": ["https://example.test/image.jpg"],
+                    "aspects": {"Type": ["Bench"]},
+                },
+            }
+
+        def get_offers_by_sku(self, sku):
+            return []
+
+    with pytest.raises(RuntimeError, match="skip product-only inventory update"):
+        audit_fix_active_listings._put_inventory_product_only(
+            _Client(),
+            "SKU-SKIP",
+            "Bench",
+            "<div>updated</div>",
+            {"Type": ["Bench"]},
+        )
 
 def test_source_parameter_type_rule_only_reclassifies_stale_apothecary_default():
     from src.utils.source_parameter_alignment import find_source_parameter_mismatches

@@ -72,6 +72,7 @@ class SyncResult:
     old_value: str = ""
     new_value: str = ""
     message: str = ""
+    supplier_in_stock: Optional[bool] = None
 
 
 class InventorySyncService:
@@ -84,6 +85,8 @@ class InventorySyncService:
         self._price_cache: Dict[str, Dict] = {}
         self._inventory_cache: Dict[str, Dict] = {}
         self._last_dajian_connection_error = ""
+        self.last_sync_scope_count = 0
+        self.last_sync_skipped_count = 0
         self._init_sync_table()
 
     def _get_dajian_client(self):
@@ -1015,6 +1018,8 @@ class InventorySyncService:
         """
         results = []
         products = self.get_published_products()
+        self.last_sync_scope_count = len(products)
+        self.last_sync_skipped_count = 0
         
         # 过滤今日已同步的 SKU
         skipped_count = 0
@@ -1024,6 +1029,7 @@ class InventorySyncService:
                 original_count = len(products)
                 products = [p for p in products if p['sku'] not in already_synced]
                 skipped_count = original_count - len(products)
+                self.last_sync_skipped_count = skipped_count
                 self.logger.info(f"跳过今日已同步的 {skipped_count} 个产品")
         
         if limit > 0:
@@ -1062,6 +1068,10 @@ class InventorySyncService:
                               favorites_set: set = None) -> SyncResult:
         """同步单个产品"""
         sku = product['sku']
+
+        def _set_ebay_quantity_zero() -> bool:
+            """Return whether the requested zero-quantity write succeeded."""
+            return dry_run or bool(self.update_ebay_quantity(sku, 0))
         
         try:
             # 1. 可选：检查 eBay 状态（跳过可加速同步）
@@ -1090,14 +1100,20 @@ class InventorySyncService:
                 if favorites_set and sku not in favorites_set:
                     # 产品不在收藏夹 → 已下架/停产，确认无库存
                     self.logger.warning(f"  {sku}: API异常且不在收藏夹 → 产品已停产，下架")
-                    if not dry_run:
-                        self.update_ebay_quantity(sku, 0)
+                    if not _set_ebay_quantity_zero():
+                        return SyncResult(
+                            sku=sku,
+                            action='error',
+                            message='产品已从大建平台下架，但 eBay 库存归零失败',
+                            supplier_in_stock=None,
+                        )
                     return SyncResult(
                         sku=sku,
                         action='out_of_stock',
                         old_value='有库存',
                         new_value='库存设为0',
-                        message='产品已从大建平台下架 (不在收藏夹中)'
+                        message='产品已从大建平台下架 (不在收藏夹中)',
+                        supplier_in_stock=None,
                     )
                 
                 # 产品在收藏夹中但API异常 → 短暂故障，用连续失败计数
@@ -1105,14 +1121,20 @@ class InventorySyncService:
                 if consecutive_skips >= 2:
                     self.logger.warning(
                         f"  {sku}: 连续 {consecutive_skips+1} 次无法获取库存信息，视为无库存并下架")
-                    if not dry_run:
-                        self.update_ebay_quantity(sku, 0)
+                    if not _set_ebay_quantity_zero():
+                        return SyncResult(
+                            sku=sku,
+                            action='error',
+                            message='连续获取大建库存失败，且 eBay 库存归零失败',
+                            supplier_in_stock=None,
+                        )
                     return SyncResult(
                         sku=sku,
                         action='out_of_stock',
                         old_value='有库存',
                         new_value='库存设为0',
-                        message=f'连续 {consecutive_skips+1} 次无法获取大建库存，已将 eBay 库存设为 0'
+                        message=f'连续 {consecutive_skips+1} 次无法获取大建库存，已将 eBay 库存设为 0',
+                        supplier_in_stock=None,
                     )
                 return SyncResult(
                     sku=sku,
@@ -1122,15 +1144,21 @@ class InventorySyncService:
             
             # 3. 处理无库存情况
             if not in_stock:
-                if not dry_run:
-                    self.update_ebay_quantity(sku, 0)
+                if not _set_ebay_quantity_zero():
+                    return SyncResult(
+                        sku=sku,
+                        action='error',
+                        message='大建无库存，但 eBay 库存归零失败',
+                        supplier_in_stock=False,
+                    )
                 
                 return SyncResult(
                     sku=sku,
                     action='out_of_stock',
                     old_value='有库存',
                     new_value='库存设为0',
-                    message='大建无库存，已将 eBay 库存设为 0'
+                    message='大建无库存，已将 eBay 库存设为 0',
+                    supplier_in_stock=False,
                 )
             
             # 3.5 检查是否从缺货恢复 → 自动重新上架
@@ -1138,8 +1166,16 @@ class InventorySyncService:
             if last_action == 'out_of_stock' and in_stock:
                 self.logger.info(f"  {sku}: 从缺货恢复，重新上架")
                 restore_quantity = 1
+                restored = True
                 if not dry_run:
-                    self.update_ebay_quantity(sku, restore_quantity)
+                    restored = bool(self.update_ebay_quantity(sku, restore_quantity))
+                if not restored:
+                    return SyncResult(
+                        sku=sku,
+                        action='error',
+                        message='大建已补货，但 eBay 库存恢复失败',
+                        supplier_in_stock=True,
+                    )
                 
                 # 同时检查价格是否有变化
                 price_msg = ""
@@ -1154,7 +1190,8 @@ class InventorySyncService:
                     action='restocked',
                     old_value='库存为0',
                     new_value=f'库存恢复为{restore_quantity}',
-                    message=f'大建已补货，eBay 库存已恢复为 {restore_quantity}{price_msg}'
+                    message=f'大建已补货，eBay 库存已恢复为 {restore_quantity}{price_msg}',
+                    supplier_in_stock=True,
                 )
             
             # 4. 检查是否只有库存但无价格数据 (幽灵/异常状态)
@@ -1164,7 +1201,8 @@ class InventorySyncService:
                 return SyncResult(
                     sku=sku,
                     action='data_missing',
-                    message='大建有库存但价格数据不可用，请人工检查'
+                    message='大建有库存但价格数据不可用，请人工检查',
+                    supplier_in_stock=True,
                 )
 
             # 5. 检查价格变化
@@ -1180,19 +1218,22 @@ class InventorySyncService:
                     action='price_updated',
                     old_value=f'成本${old_base_cost:.2f} (商品${old_cost.get("product_price", 0):.2f}+运费${old_cost.get("shipping_cost", 0):.2f})',
                     new_value=f'成本${new_base_cost:.2f} (商品${current_price:.2f}+运费${shipping_cost or 0:.2f}), 新售价${price_result:.2f}',
-                    message='大建价格变化，已更新 eBay 售价'
+                    message='大建价格变化，已更新 eBay 售价',
+                    supplier_in_stock=True,
                 )
             
             # 6. 无变化
             return SyncResult(
                 sku=sku,
                 action='no_change',
-                message='库存正常，价格无变化'
+                message='库存正常，价格无变化',
+                supplier_in_stock=True,
             )
             
         except Exception as e:
             return SyncResult(
                 sku=sku,
                 action='error',
-                message=str(e)
+                message=str(e),
+                supplier_in_stock=None,
             )

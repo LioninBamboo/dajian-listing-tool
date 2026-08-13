@@ -35,7 +35,7 @@ def _num(v):
 
 
 def retry_request(fn, *args, attempts=6, base_delay=12, sleep=time.sleep, **kwargs):
-    """Retry a burst-limited upstream request and report terminal failures safely."""
+    """Retry a burst-limited upstream request without leaking response details."""
     attempts = max(1, int(attempts))
     for attempt in range(attempts):
         try:
@@ -111,7 +111,12 @@ def main():
         pr = retry_request(c.get_product_prices, chunk) or []
         for p in pr:
             if isinstance(p, dict) and p.get("sku"):
-                prices[p["sku"]] = _num(p.get("price") or p.get("sellPrice") or p.get("sellingPrice"))
+                # Capture the GigaCloud dropship freight too — pricing MUST include
+                # it or the listing goes out priced below true landed cost.
+                prices[p["sku"]] = {
+                    "price": _num(p.get("price") or p.get("sellPrice") or p.get("sellingPrice")),
+                    "ship": _num(p.get("shippingFee") or (p.get("shippingFeeRange") or {}).get("maxAmount")) or 0.0,
+                }
         print(f"  fetched {len(details)}/{len(skus)}", flush=True)
         time.sleep(8)
 
@@ -121,20 +126,22 @@ def main():
         det = details.get(sku)
         if not det:
             print(f"  {sku}: no detail, skip"); continue
-        m = map_detail(det, prices.get(sku))
+        pinfo = prices.get(sku) or {}
+        ship = float(pinfo.get("ship") or 0.0)
+        m = map_detail(det, pinfo.get("price"))
         row = db.query(CollectedProduct).filter_by(sku=sku).first()
         if row:
             row.title, row.description = m["title"], m["description"]
             row.attributes, row.specs = m["attributes"], m["specs"]
             row.images, row.videos = m["images"], m["videos"]
-            row.price, row.shipping, row.stock = m["price"], 0.0, 10
+            row.price, row.shipping, row.stock = m["price"], ship, 10
             row.status = "COLLECTED"
             for f in ("attributes", "specs", "images", "videos"):
                 from sqlalchemy.orm.attributes import flag_modified
                 flag_modified(row, f)
         else:
             db.add(CollectedProduct(
-                sku=sku, title=m["title"], price=m["price"], shipping=0.0, stock=10,
+                sku=sku, title=m["title"], price=m["price"], shipping=ship, stock=10,
                 description=m["description"], images=m["images"], videos=m["videos"],
                 attributes=m["attributes"], specs=m["specs"], url="",
                 status="COLLECTED", logs=["pilot_collect_garden"],

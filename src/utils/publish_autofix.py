@@ -276,6 +276,28 @@ SINGLE_VALUE_ASPECTS: frozenset[str] = frozenset({
     "Best for", "Resistance Type", "Sport/Activity",
 })
 
+SOURCE_COMBINED_ASPECT_KEYS: frozenset[str] = frozenset({"Material", "Color"})
+
+
+def source_combined_aspect_keys(aspects: Mapping[str, Any]) -> set[str]:
+    """Return source fields whose combined value must stay one eBay value.
+
+    GIGA source parameters commonly encode multiple material/color components in
+    one string (for example ``MDF,Rubber Wood``).  eBay still expects these as a
+    single aspect value in this pipeline.  The generic single-value sanitizer
+    splits comma/semicolon/slash/pipe-delimited values, so callers that write
+    source-backed aspects must explicitly preserve these fields.
+    """
+    preserved: set[str] = set()
+    if not isinstance(aspects, Mapping):
+        return preserved
+    for key in SOURCE_COMBINED_ASPECT_KEYS:
+        values = aspects.get(key)
+        raw_values = values if isinstance(values, (list, tuple, set)) else [values]
+        if any(re.search(r"[,;/|]", str(value or "")) for value in raw_values):
+            preserved.add(key)
+    return preserved
+
 EBAY_MAX_ASPECTS: int = 45
 
 _PRIORITY_ASPECT_KEYS: frozenset[str] = frozenset({

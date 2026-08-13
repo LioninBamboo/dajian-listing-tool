@@ -26,6 +26,7 @@ from src.utils.publish_autofix import (
     SINGLE_VALUE_ASPECTS,
     sanitize_single_value_aspects,
     prepare_ebay_aspects,
+    source_combined_aspect_keys,
 )
 from src.utils.title_sanitizer import normalize_listing_title_for_ebay
 from src.utils.store_profile import get_store_profile
@@ -544,10 +545,12 @@ class RealEbayClient:
                 cleaned_aspects[k] = [value] if value else []
 
         # Enforce single-value aspects and run pre-flight truncation/trimming
+        preserved_source_aspects = source_combined_aspect_keys(cleaned_aspects)
         sanitize_single_value_aspects(
             cleaned_aspects,
             log=print,
-            multi_value_aspects={key for key in cleaned_aspects if key not in SINGLE_VALUE_ASPECTS},
+            multi_value_aspects={key for key in cleaned_aspects if key not in SINGLE_VALUE_ASPECTS}
+            | preserved_source_aspects,
         )
         _sanitize_assembly_aspects(cleaned_aspects)
         prepare_ebay_aspects(cleaned_aspects, required_aspect_names, log=print)

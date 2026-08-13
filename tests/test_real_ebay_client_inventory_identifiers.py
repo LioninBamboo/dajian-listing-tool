@@ -55,6 +55,34 @@ def test_create_inventory_item_promotes_identifiers_from_aspects(monkeypatch):
     assert client.session.last_json["product"]["upc"] == ["018239357260"]
 
 
+def test_create_inventory_item_preserves_combined_source_material_and_color():
+    client = object.__new__(RealEbayClient)
+    client.base_url = "https://api.ebay.example"
+    client.oauth = _DummyOauth()
+    client.session = _Session()
+    client._prepare_inventory_image_urls = lambda sku, image_urls, max_images=24: image_urls
+    client._verify_inventory_image_urls = lambda sku, expected_count: None
+
+    result = client.create_or_replace_inventory_item(
+        "SKU123",
+        {
+            "title": "Storage Cabinet",
+            "description": "<div>ok</div>",
+            "image_urls": ["https://example.com/a.jpg"],
+            "quantity": 1,
+            "condition": "NEW",
+            "aspects": {
+                "Material": ["MDF,Rubber Wood"],
+                "Color": ["Black,Espresso"],
+            },
+        },
+    )
+
+    assert result["status"] == "success"
+    assert client.session.last_json["product"]["aspects"]["Material"] == ["MDF,Rubber Wood"]
+    assert client.session.last_json["product"]["aspects"]["Color"] == ["Black,Espresso"]
+
+
 def test_create_inventory_item_preserves_existing_video_ids_when_new_payload_omits_video_urls():
     client = object.__new__(RealEbayClient)
     client.base_url = "https://api.ebay.example"

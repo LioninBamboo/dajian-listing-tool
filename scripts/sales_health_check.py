@@ -31,7 +31,6 @@ import sqlite3
 import warnings
 from pathlib import Path
 from datetime import datetime, timedelta
-from collections import defaultdict
 from html import escape as html_escape
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -44,6 +43,10 @@ from src.utils.report_images import (
     build_thumbnail_img_html,
     make_ebay_listing_url,
     normalize_thumbnail_url,
+)
+from src.utils.inventory_audit_contract import (
+    AUDIT_SCOPE_FULL_OOS,
+    empty_inventory_audit,
 )
 
 warnings.filterwarnings('ignore')
@@ -79,6 +82,164 @@ AUTO_PRICE_CUT_PCT = 5  # 降价 5%
 MIN_MARGIN = 0.10  # 10%
 
 
+# ═══════════════════════════════════════════════════════════════
+# Auto-fix pricing guards (pure helpers — unit-tested)
+# ═══════════════════════════════════════════════════════════════
+
+def resolve_total_cost(cost_breakdown, product_price=None, shipping_cost=None) -> float:
+    """Prefer stored total_dajian_cost; else recompute from collect price + shipping.
+
+    Missing cost was the root cause of under-cost health auto-fixes (floor became 0).
+    """
+    cb = cost_breakdown or {}
+    if isinstance(cb, str):
+        try:
+            cb = json.loads(cb) if cb else {}
+        except Exception:
+            cb = {}
+    if not isinstance(cb, dict):
+        cb = {}
+
+    try:
+        stored = float(cb.get('total_dajian_cost') or 0)
+    except (TypeError, ValueError):
+        stored = 0.0
+    if stored > 0:
+        return stored
+
+    try:
+        pp = float(product_price if product_price is not None else (cb.get('product_price') or 0) or 0)
+    except (TypeError, ValueError):
+        pp = 0.0
+    try:
+        if shipping_cost is not None:
+            sc = float(shipping_cost or 0)
+        else:
+            sc = float(cb.get('shipping_cost') or cb.get('shipping') or 0)
+    except (TypeError, ValueError):
+        sc = 0.0
+
+    if pp <= 0:
+        return 0.0
+
+    try:
+        from src.services.pricing_engine import PricingEngine
+        return float(PricingEngine.calculate_dajian_cost(pp, sc)['total_dajian_cost'])
+    except Exception:
+        # Last-resort bare sum so a floor still exists when PricingEngine is unavailable.
+        return round(pp + sc, 2)
+
+
+def health_price_floor(total_cost, min_margin: float = MIN_MARGIN):
+    """Listing-price floor for health auto-fix, or None if cost is unknown.
+
+    Callers must skip price cuts when this returns None — never treat missing
+    cost as floor=0.
+    """
+    try:
+        cost = float(total_cost or 0)
+    except (TypeError, ValueError):
+        return None
+    if cost <= 0:
+        return None
+    try:
+        from src.services.pricing_engine import PricingEngine
+        return float(PricingEngine.safe_floor_price(cost, min_margin))
+    except Exception:
+        # Mirror PricingEngine discount denom: (1-5% store) * (1-13.25% fvf - 5% ad)
+        discount_denom = 0.95 * 0.8175
+        fixed_fee = 0.30
+        return round((cost * (1 + float(min_margin)) + fixed_fee) / discount_denom, 2)
+
+
+def evaluate_live_loss(ebay_price: float, total_cost: float) -> dict | None:
+    """Return loss details when live listing price cannot cover cost after fees/discount.
+
+    Used by price-integrity checks so under-cost listings appear in daily email
+    even when local suggested_price is 0 / missing (the W3118 blind spot).
+    """
+    try:
+        live = float(ebay_price or 0)
+        cost = float(total_cost or 0)
+    except (TypeError, ValueError):
+        return None
+    if live <= 0 or cost <= 0:
+        return None
+    # Same worst-case net as integrity check: 5% store discount + FVF + ad + fixed fee
+    worst_net = live * 0.95 * 0.8175 - 0.30
+    if worst_net >= cost:
+        return None
+    return {
+        'ebay_price': round(live, 2),
+        'total_cost': round(cost, 2),
+        'worst_net': round(worst_net, 2),
+        'loss': round(cost - worst_net, 2),
+        'actual_margin': round((worst_net - cost) / worst_net * 100, 1) if worst_net > 0 else -999.0,
+    }
+
+
+def plan_auto_reprice(
+    *,
+    current_price: float,
+    total_cost: float,
+    market_avg: float = 0,
+    mode: str = 'overpriced',
+    min_margin: float = MIN_MARGIN,
+    auto_cut_pct: float = AUTO_PRICE_CUT_PCT,
+):
+    """Decide a health auto-fix price cut, or None to skip.
+
+    Rules:
+    - Unknown / non-positive total_cost → skip (never cut without a floor)
+    - new_price = max(strategy_target, cost_floor)
+    - Only cuts (overpriced: ≥3% drop; low_conversion: ≥1% drop); never auto-raise
+    """
+    try:
+        current = float(current_price or 0)
+    except (TypeError, ValueError):
+        return None
+    if current <= 0:
+        return None
+
+    floor = health_price_floor(total_cost, min_margin=min_margin)
+    if floor is None:
+        return None
+
+    mode = (mode or 'overpriced').strip().lower()
+    if mode == 'overpriced':
+        try:
+            mkt = float(market_avg or 0)
+        except (TypeError, ValueError):
+            mkt = 0.0
+        if mkt <= 0:
+            return None
+        target = mkt * 0.95
+        new_price = max(target, floor)
+        # Require a meaningful cut; floor-only "raise" is out of scope for auto-fix.
+        if new_price >= current * 0.97:
+            return None
+        return {
+            'new_price': round(new_price, 2),
+            'floor': round(floor, 2),
+            'target': round(target, 2),
+            'reason': '定价偏高 → 跟价',
+        }
+
+    if mode == 'low_conversion':
+        new_price = current * (1 - float(auto_cut_pct) / 100.0)
+        new_price = max(new_price, floor)
+        if new_price >= current * 0.99:
+            return None
+        return {
+            'new_price': round(new_price, 2),
+            'floor': round(floor, 2),
+            'target': round(current * (1 - float(auto_cut_pct) / 100.0), 2),
+            'reason': '低转化 → 降价5%',
+        }
+
+    return None
+
+
 class SalesHealthChecker:
     """销售健康诊断器"""
 
@@ -104,8 +265,9 @@ class SalesHealthChecker:
             'qty_zero_restocked': [],          # eBay 库存为0但大建有货，已自动恢复
         }
         self.actions_taken = []
+        self.quantity_audit = empty_inventory_audit(AUDIT_SCOPE_FULL_OOS)
 
-    def run(self, auto_fix=False):
+    def run(self, auto_fix=False, *, run_quantity_audit=True):
         """执行完整健康检查"""
         log.info("=" * 70)
         log.info("SALES HEALTH CHECK — 销售健康诊断")
@@ -189,7 +351,25 @@ class SalesHealthChecker:
                 # 判断偏贵还是标题问题
                 if market_avg > 0 and current_price > market_avg * (1 + OVERPRICED_THRESHOLD):
                     pct_over = ((current_price / market_avg) - 1) * 100
-                    diagnosis['recommendation'] = f'定价高于市场{pct_over:.0f}%，建议降价至${market_avg * 0.95:.2f}'
+                    market_target = market_avg * 0.95
+                    floor = health_price_floor(cost)
+                    if floor is not None:
+                        suggested = max(market_target, floor)
+                        if suggested >= current_price * 0.97:
+                            diagnosis['recommendation'] = (
+                                f'定价高于市场{pct_over:.0f}%，但成本底价 ${floor:.2f} '
+                                f'已接近/高于现价，禁止自动降价'
+                            )
+                        else:
+                            diagnosis['recommendation'] = (
+                                f'定价高于市场{pct_over:.0f}%，建议降价至${suggested:.2f} '
+                                f'(成本底 ${floor:.2f})'
+                            )
+                    else:
+                        diagnosis['recommendation'] = (
+                            f'定价高于市场{pct_over:.0f}%，建议降价至${market_target:.2f}；'
+                            f'缺少成本数据，自动改价将跳过'
+                        )
                     diagnosis['issue'] += ' + 定价偏高'
                     self.results['overpriced'].append(diagnosis)
                 else:
@@ -215,7 +395,19 @@ class SalesHealthChecker:
         self._check_price_integrity()
 
         # 5.6 eBay 库存完整性检查 (检测 qty=0 但大建有货的幽灵下架)
-        self._check_quantity_integrity(auto_fix=auto_fix)
+        # 日报主流程已经在独立的全量库存审核步骤完成此检查时跳过，避免重复
+        # 拉取全部 eBay 数量并再次触发恢复动作。
+        if run_quantity_audit:
+            self._check_quantity_integrity(auto_fix=auto_fix)
+        else:
+            # The daily main flow owns the single full audit and injects its
+            # result into the inventory section. Keep the health report's
+            # legacy field explicit so callers do not mistake omission for a
+            # second audit or stale data.
+            self.quantity_audit = empty_inventory_audit(
+                AUDIT_SCOPE_FULL_OOS,
+                error_count=0,
+            )
 
         # 6. 输出汇总
         self._print_summary()
@@ -232,7 +424,8 @@ class SalesHealthChecker:
         conn.row_factory = sqlite3.Row
 
         rows = conn.execute("""
-            SELECT sku, title, listing_id, cost_breakdown, optimization, images, suggested_price, price
+            SELECT sku, title, listing_id, cost_breakdown, optimization, images,
+                   suggested_price, price, shipping
             FROM collected_products
             WHERE status = 'PUBLISHED'
             ORDER BY sku
@@ -246,11 +439,21 @@ class SalesHealthChecker:
             # 提取第一张图片作为缩略图
             image_url = self._extract_first_image_url(r['images'])
 
+            # Prefer stored total_dajian_cost; fall back to recompute from collect+ship
+            # so auto-fix never sees total_cost=0 solely because cost_breakdown was wiped.
+            total_cost = resolve_total_cost(
+                cost,
+                product_price=r['price'],
+                shipping_cost=r['shipping'] if 'shipping' in r.keys() else 0,
+            )
+
             products.append({
                 'sku': r['sku'],
                 'title': opt.get('title', '') or r['title'] or '',
                 'listing_id': r['listing_id'],
-                'total_cost': cost.get('total_dajian_cost', 0),
+                'total_cost': total_cost,
+                'product_price': float(r['price'] or 0),
+                'shipping': float(r['shipping'] or 0) if 'shipping' in r.keys() else 0.0,
                 'selling_price': (
                     r['suggested_price']
                     or cost.get('selling_price')
@@ -622,11 +825,9 @@ class SalesHealthChecker:
         conn.row_factory = sqlite3.Row
 
         rows = conn.execute("""
-            SELECT sku, listing_id, suggested_price, cost_breakdown
+            SELECT sku, listing_id, suggested_price, cost_breakdown, price, shipping
             FROM collected_products
             WHERE status = 'PUBLISHED'
-              AND cost_breakdown IS NOT NULL
-              AND suggested_price IS NOT NULL
         """).fetchall()
 
         latest_sync_meta = self._load_latest_price_sync_meta(conn, [r['sku'] for r in rows])
@@ -635,15 +836,26 @@ class SalesHealthChecker:
         checked = 0
         mismatches = 0
         losses = 0
+        skipped_no_cost = 0
 
         for r in rows:
             sku = r['sku']
             listing_id = str(r['listing_id'] or '')
-            db_price = float(r['suggested_price'] or 0)
+            try:
+                db_price = float(r['suggested_price'] or 0)
+            except (TypeError, ValueError):
+                db_price = 0.0
             cost_data = json.loads(r['cost_breakdown']) if r['cost_breakdown'] else {}
-            total_cost = cost_data.get('total_dajian_cost', 0) or 0
+            total_cost = resolve_total_cost(
+                cost_data,
+                product_price=r['price'] if 'price' in r.keys() else None,
+                shipping_cost=r['shipping'] if 'shipping' in r.keys() else None,
+            )
 
-            if db_price <= 0 or total_cost <= 0:
+            # Critical: never require suggested_price > 0 to detect live under-cost.
+            # The W3118 cohort had suggested_price=0 and was silently skipped for weeks.
+            if total_cost <= 0:
+                skipped_no_cost += 1
                 continue
 
             # 获取 eBay 实际价格
@@ -658,44 +870,66 @@ class SalesHealthChecker:
 
                 checked += 1
 
-                # 计算实际利润率 (考虑5%店铺折扣)
-                worst_net = ebay_price * 0.95 * 0.8175 - 0.30
-                actual_margin = (worst_net - total_cost) / worst_net * 100 if worst_net > 0 else -999
+                loss_info = evaluate_live_loss(ebay_price, total_cost)
+                actual_margin = (
+                    loss_info['actual_margin']
+                    if loss_info
+                    else round(((ebay_price * 0.95 * 0.8175 - 0.30) - total_cost)
+                               / max(ebay_price * 0.95 * 0.8175 - 0.30, 0.01) * 100, 1)
+                )
 
-                # 检查1: 偏差 > 5%
-                diff_pct = abs(ebay_price - db_price) / db_price * 100
-                if diff_pct > 5:
-                    source_type, source_reason = self._classify_price_mismatch(
-                        sku=sku,
-                        listing_id=listing_id,
-                        ebay_price=ebay_price,
-                        db_price=db_price,
-                        cost_data=cost_data,
-                        sync_meta=latest_sync_meta.get(sku),
-                        promo_meta=promo_map.get(listing_id),
-                    )
+                # 检查1: 偏差 > 5% (only when local suggested is usable)
+                if db_price > 0:
+                    diff_pct = abs(ebay_price - db_price) / db_price * 100
+                    if diff_pct > 5:
+                        source_type, source_reason = self._classify_price_mismatch(
+                            sku=sku,
+                            listing_id=listing_id,
+                            ebay_price=ebay_price,
+                            db_price=db_price,
+                            cost_data=cost_data,
+                            sync_meta=latest_sync_meta.get(sku),
+                            promo_meta=promo_map.get(listing_id),
+                        )
+                        mismatches += 1
+                        self.results['price_mismatch'].append({
+                            'sku': sku,
+                            'listing_id': listing_id,
+                            'ebay_price': ebay_price,
+                            'db_price': db_price,
+                            'diff_pct': round(diff_pct, 1),
+                            'total_cost': total_cost,
+                            'actual_margin': actual_margin,
+                            'source_type': source_type,
+                            'source_reason': source_reason,
+                        })
+                elif abs(ebay_price) > 0:
+                    # Local price missing/zero but live has a price — still surface mismatch
                     mismatches += 1
                     self.results['price_mismatch'].append({
                         'sku': sku,
                         'listing_id': listing_id,
                         'ebay_price': ebay_price,
                         'db_price': db_price,
-                        'diff_pct': round(diff_pct, 1),
+                        'diff_pct': 100.0,
                         'total_cost': total_cost,
-                        'actual_margin': round(actual_margin, 1),
-                        'source_type': source_type,
-                        'source_reason': source_reason,
+                        'actual_margin': actual_margin,
+                        'source_type': '本地售价缺失',
+                        'source_reason': (
+                            f"suggested_price={db_price}，但 eBay live=${ebay_price:.2f}"
+                        ),
                     })
 
                 # 检查2: 实际售价扣完 eBay 费用后是否亏损
-                if worst_net < total_cost:
+                if loss_info:
                     losses += 1
                     self.results['loss_making'].append({
                         'sku': sku,
-                        'ebay_price': ebay_price,
-                        'total_cost': total_cost,
-                        'worst_net': round(worst_net, 2),
-                        'loss': round(total_cost - worst_net, 2),
+                        'listing_id': listing_id,
+                        'ebay_price': loss_info['ebay_price'],
+                        'total_cost': loss_info['total_cost'],
+                        'worst_net': loss_info['worst_net'],
+                        'loss': loss_info['loss'],
                     })
 
             except Exception:
@@ -708,7 +942,8 @@ class SalesHealthChecker:
         conn.close()
 
         log.info(f"  已检查: {checked}")
-        log.info(f"  价格偏差 >5%: {mismatches}")
+        log.info(f"  跳过(无可用成本): {skipped_no_cost}")
+        log.info(f"  价格偏差 >5% / 本地价缺失: {mismatches}")
         log.info(f"  潜在亏损: {losses}")
 
         if self.results['price_mismatch']:
@@ -731,9 +966,17 @@ class SalesHealthChecker:
               但大建仍然有货，sync 因 last_action 不是 out_of_stock 而跳过恢复。
         """
         import requests
+        self.quantity_audit = empty_inventory_audit(AUDIT_SCOPE_FULL_OOS)
         log.info("\n" + "-" * 50)
         log.info("QUANTITY INTEGRITY CHECK — 库存完整性检查")
         log.info("-" * 50)
+
+        conn = sqlite3.connect(str(self.db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT sku, listing_id FROM collected_products WHERE status = 'PUBLISHED'
+        """).fetchall()
+        self.quantity_audit["scope_count"] = len(rows)
 
         try:
             from src.services.ebay_auth import EbayOAuthService
@@ -741,26 +984,29 @@ class SalesHealthChecker:
             token = oauth.get_valid_token()
         except Exception as e:
             log.warning(f"无法获取 eBay 令牌, 跳过库存完整性检查: {e}")
-            return
+            conn.close()
+            self.quantity_audit = empty_inventory_audit(
+                AUDIT_SCOPE_FULL_OOS,
+                scope_count=len(rows),
+                error_count=1,
+                error=str(e),
+            )
+            return self.quantity_audit
 
         headers = {
             'Authorization': f'Bearer {token}',
             'Content-Type': 'application/json',
         }
 
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("""
-            SELECT sku, listing_id FROM collected_products WHERE status = 'PUBLISHED'
-        """).fetchall()
-
         checked = 0
+        error_count = 0
         qty_zero = []
         trading_quantity_map = self._fetch_trading_active_quantity_map()
 
         for r in rows:
             sku = r['sku']
             listing_id = r['listing_id']
+            checked += 1
             try:
                 trading_state = trading_quantity_map.get(sku) or {}
                 qty = None
@@ -770,13 +1016,16 @@ class SalesHealthChecker:
                     url = f"https://api.ebay.com/sell/inventory/v1/inventory_item/{sku}"
                     resp = requests.get(url, headers=headers, timeout=15, verify=False)
                     if resp.status_code != 200:
+                        error_count += 1
                         continue
                     item = resp.json()
                     qty = item.get('availability', {}).get('shipToLocationAvailability', {}).get('quantity')
                     if qty == 0:
                         trading_available = self._fetch_trading_listing_available_quantity(listing_id)
 
-                checked += 1
+                if qty is None and trading_available is None:
+                    error_count += 1
+                    continue
 
                 is_out_of_stock = (
                     qty == 0
@@ -792,6 +1041,7 @@ class SalesHealthChecker:
                     qty_zero.append(sku)
 
             except Exception:
+                error_count += 1
                 continue
 
             if checked % 30 == 0:
@@ -801,9 +1051,13 @@ class SalesHealthChecker:
 
         log.info(f"  已检查: {checked}")
         log.info(f"  eBay 库存为0: {len(qty_zero)}")
+        self.quantity_audit["checked_count"] = checked
+        self.quantity_audit["qty_zero_count"] = len(qty_zero)
+        self.quantity_audit["qty_zero_skus"] = list(qty_zero)
+        self.quantity_audit["error_count"] = error_count
 
         if not qty_zero:
-            return
+            return self.quantity_audit
 
         # 交叉验证：检查大建是否有货
         try:
@@ -812,15 +1066,21 @@ class SalesHealthChecker:
             client_secret = os.getenv("DAJIAN_API_SECRET")
             if not client_id or not client_secret:
                 log.warning("大建 API 凭证未配置, 跳过交叉验证")
-                return
+                self.quantity_audit["error_count"] += 1
+                self.quantity_audit["error"] = "大建 API 凭证未配置"
+                return self.quantity_audit
             dajian = DaJianClient(client_id, client_secret)
         except Exception as e:
             log.warning(f"大建客户端初始化失败: {e}")
-            return
+            self.quantity_audit["error_count"] += 1
+            self.quantity_audit["error"] = str(e)
+            return self.quantity_audit
 
         from src.plugins.inventory_sync.sync_service import InventorySyncService
         svc = InventorySyncService()
 
+        supplier_oos_skus = []
+        restocked_items = []
         for sku in qty_zero:
             try:
                 # 先检查 eBay offer 状态 — 如果已结束/下架则跳过，不自动恢复
@@ -843,6 +1103,7 @@ class SalesHealthChecker:
                         conn2.close()
                     except Exception as db_err:
                         log.warning(f"    → DB 状态更新失败: {db_err}")
+                        self.quantity_audit["error_count"] += 1
                     continue
 
                 from src.utils.ebay_quantity import normalize_ebay_listing_quantity
@@ -860,15 +1121,31 @@ class SalesHealthChecker:
                     else:
                         status = '待修复'
 
-                    self.results['qty_zero_restocked'].append({
+                    restock_item = {
                         'sku': sku,
                         'status': status,
-                    })
+                    }
+                    restocked_items.append(restock_item)
+                    self.results['qty_zero_restocked'].append(restock_item)
+                    if status == '已恢复':
+                        self.quantity_audit["restocked_count"] += 1
+                    elif status == '恢复失败':
+                        self.quantity_audit["error_count"] += 1
+                elif in_stock is False:
+                    supplier_oos_skus.append(sku)
+                else:
+                    self.quantity_audit["error_count"] += 1
             except Exception as e:
                 log.warning(f"  {sku}: 大建库存检查失败: {e}")
+                self.quantity_audit["error_count"] += 1
+
+        self.quantity_audit["supplier_oos_count"] = len(supplier_oos_skus)
+        self.quantity_audit["supplier_oos_skus"] = supplier_oos_skus
+        self.quantity_audit["restocked_items"] = restocked_items
 
         if self.results['qty_zero_restocked']:
             log.warning(f"⚠️ 发现 {len(self.results['qty_zero_restocked'])} 个幽灵下架产品")
+        return self.quantity_audit
 
     def _print_summary(self):
         """输出诊断汇总"""
@@ -952,45 +1229,81 @@ class SalesHealthChecker:
                         return True
             return False
 
-        # 合并: 定价偏高 + 部分高展示零转化
+        # 合并: 定价偏高 + 低转化 (均经 plan_auto_reprice 成本底价护栏)
         to_reprice = []
-        # 折扣后的有效分母: (1-5%折扣) × (1-18.25%eBay费) = 0.95 × 0.8175 = 0.776625
-        DISCOUNT_DENOM = 0.95 * 0.8175  # 考虑店铺5%折扣
-        FIXED_FEE = 0.30
+        skipped_no_cost = 0
+        skipped_floor = 0
 
         for d in self.results['overpriced']:
             if _repriced_today(d):
                 log.info(f"  {d['sku']}: 今日已执行过重定价，跳过二次改价")
                 continue
-            target = d.get('market_avg', 0) * 0.95
-            if target > 0:
-                floor = (d['total_cost'] * (1 + MIN_MARGIN) + FIXED_FEE) / DISCOUNT_DENOM if d['total_cost'] > 0 else 0
-                new_price = max(target, floor)
-                if new_price < d['current_price'] * 0.97:  # 至少降 3%
-                    to_reprice.append({
-                        'sku': d['sku'],
-                        'listing_id': d.get('listing_id'),
-                        'old_price': d['current_price'],
-                        'new_price': round(new_price, 2),
-                        'reason': '定价偏高 → 跟价',
-                    })
+            plan = plan_auto_reprice(
+                current_price=d.get('current_price') or 0,
+                total_cost=d.get('total_cost') or 0,
+                market_avg=d.get('market_avg') or 0,
+                mode='overpriced',
+            )
+            if plan is None:
+                # Distinguish log noise: no cost vs floor blocked a cut
+                if health_price_floor(d.get('total_cost') or 0) is None:
+                    skipped_no_cost += 1
+                    log.warning(
+                        f"  {d['sku']}: 跳过自动降价 — 缺少可用成本 "
+                        f"(total_cost={d.get('total_cost')!r})"
+                    )
+                else:
+                    skipped_floor += 1
+                    log.info(
+                        f"  {d['sku']}: 跳过自动降价 — 成本底价保护 "
+                        f"(price={d.get('current_price')}, cost={d.get('total_cost')}, "
+                        f"market={d.get('market_avg')})"
+                    )
+                continue
+            to_reprice.append({
+                'sku': d['sku'],
+                'listing_id': d.get('listing_id'),
+                'old_price': d['current_price'],
+                'new_price': plan['new_price'],
+                'reason': plan['reason'],
+            })
 
         for d in self.results['low_conversion']:
             if _repriced_today(d):
                 log.info(f"  {d['sku']}: 今日已执行过重定价，跳过二次改价")
                 continue
-            new_price = d['current_price'] * (1 - AUTO_PRICE_CUT_PCT / 100)
-            if d['total_cost'] > 0:
-                floor = (d['total_cost'] * (1 + MIN_MARGIN) + FIXED_FEE) / DISCOUNT_DENOM
-                new_price = max(new_price, floor)
-            if new_price < d['current_price'] * 0.99:  # 有实际降幅
-                to_reprice.append({
-                    'sku': d['sku'],
-                    'listing_id': d.get('listing_id'),
-                    'old_price': d['current_price'],
-                    'new_price': round(new_price, 2),
-                    'reason': '低转化 → 降价5%',
-                })
+            plan = plan_auto_reprice(
+                current_price=d.get('current_price') or 0,
+                total_cost=d.get('total_cost') or 0,
+                mode='low_conversion',
+            )
+            if plan is None:
+                if health_price_floor(d.get('total_cost') or 0) is None:
+                    skipped_no_cost += 1
+                    log.warning(
+                        f"  {d['sku']}: 跳过自动降价 — 缺少可用成本 "
+                        f"(total_cost={d.get('total_cost')!r})"
+                    )
+                else:
+                    skipped_floor += 1
+                    log.info(
+                        f"  {d['sku']}: 跳过自动降价 — 成本底价保护 "
+                        f"(price={d.get('current_price')}, cost={d.get('total_cost')})"
+                    )
+                continue
+            to_reprice.append({
+                'sku': d['sku'],
+                'listing_id': d.get('listing_id'),
+                'old_price': d['current_price'],
+                'new_price': plan['new_price'],
+                'reason': plan['reason'],
+            })
+
+        if skipped_no_cost or skipped_floor:
+            log.info(
+                f"自动改价护栏: 无成本跳过 {skipped_no_cost}, "
+                f"底价保护跳过 {skipped_floor}"
+            )
 
         if not to_reprice:
             log.info("没有需要自动修复的链接")
@@ -1130,6 +1443,7 @@ class SalesHealthChecker:
             },
             'details': self.results,
             'actions_taken': self.actions_taken,
+            'quantity_audit': self.quantity_audit,
         }
 
     def _load_sku_thumbnails(self, skus: list) -> dict:
@@ -1371,48 +1685,26 @@ class SalesHealthChecker:
                 </table>"""
 
             if self.results['price_mismatch']:
-                mismatch_skus = [m['sku'] for m in self.results['price_mismatch'][:10]]
-                mismatch_thumbs = self._load_sku_thumbnails(mismatch_skus)
-                source_counts = defaultdict(int)
-                mismatch_rows = ''
+                source_counts = {}
                 for m in self.results['price_mismatch']:
-                    source_counts[m.get('source_type') or '未分类'] += 1
+                    source = m.get('source_type') or '未分类'
+                    source_counts[source] = source_counts.get(source, 0) + 1
 
-                for m in self.results['price_mismatch'][:10]:
-                    thumb_html = _thumb_html(mismatch_thumbs.get(m['sku'], ''))
-                    sku_html = _sku_link(m['sku'], m.get('listing_id'))
-                    mismatch_rows += f"""<tr>
-                        <td style="padding:4px 8px;border:1px solid #ddd;text-align:center;">{thumb_html}</td>
-                        <td style="padding:4px 8px;border:1px solid #ddd;">{sku_html}</td>
-                        <td style="padding:4px 8px;border:1px solid #ddd;text-align:right;white-space:nowrap;">${m['ebay_price']:.2f}</td>
-                        <td style="padding:4px 8px;border:1px solid #ddd;text-align:right;white-space:nowrap;">${m['db_price']:.2f}</td>
-                        <td style="padding:4px 8px;border:1px solid #ddd;text-align:right;color:#b42318;font-weight:bold;white-space:nowrap;">{m['diff_pct']:.1f}%</td>
-                        <td style="padding:4px 8px;border:1px solid #ddd;white-space:nowrap;">{html_escape(str(m.get('source_type', '未分类') or '未分类'))}</td>
-                        <td style="padding:4px 8px;border:1px solid #ddd;font-size:12px;line-height:1.35;">{html_escape(str(m.get('source_reason', '') or ''))}</td>
-                    </tr>"""
-
+                source_order = ('人工改价', '促销改价', '历史遗留不同步', '本地售价缺失', '未分类')
+                ordered_sources = sorted(
+                    source_counts.items(),
+                    key=lambda item: (
+                        source_order.index(item[0]) if item[0] in source_order else len(source_order),
+                        item[0],
+                    ),
+                )
                 badges = ''.join(
                     f'<span style="display:inline-block;margin:0 8px 8px 0;padding:4px 10px;border-radius:999px;background:#f8f9fc;border:1px solid #d0d5dd;font-size:12px;">{label} {count}</span>'
-                    for label, count in (
-                        ('人工改价', source_counts.get('人工改价', 0)),
-                        ('促销改价', source_counts.get('促销改价', 0)),
-                        ('历史遗留不同步', source_counts.get('历史遗留不同步', 0)),
-                    ) if count
+                    for label, count in ordered_sources
                 )
                 integrity_html += f"""
                 <p style="color:#b42318;font-weight:bold;">⚠️ 价格偏差产品: {len(self.results['price_mismatch'])} 个</p>
-                <div style="margin:6px 0 8px;">{badges}</div>
-                <table style="border-collapse:collapse;width:100%;font-size:12px;">
-                    <tr style="background:#fef3f2;">
-                        <th style="padding:5px 8px;border:1px solid #ddd;">图片</th>
-                        <th style="padding:5px 8px;border:1px solid #ddd;">SKU</th>
-                        <th style="padding:5px 8px;border:1px solid #ddd;">eBay售价</th>
-                        <th style="padding:5px 8px;border:1px solid #ddd;">DB目标价</th>
-                        <th style="padding:5px 8px;border:1px solid #ddd;">偏差</th>
-                        <th style="padding:5px 8px;border:1px solid #ddd;">来源</th>
-                        <th style="padding:5px 8px;border:1px solid #ddd;">原因说明</th>
-                    </tr>{mismatch_rows}
-                </table>"""
+                <div style="margin:6px 0 8px;">{badges}</div>"""
             html += integrity_html
 
         # 幽灵下架恢复

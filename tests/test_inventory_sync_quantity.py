@@ -41,6 +41,26 @@ def test_sync_single_product_restocks_with_default_quantity_one():
     assert "恢复为 1" in result.message
 
 
+def test_sync_single_product_reports_zero_quantity_write_failure_as_error():
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    service = InventorySyncService.__new__(InventorySyncService)
+    service.logger = logging.getLogger(__name__)
+    service.check_dajian_stock = lambda sku: (False, 120.0, 25.0, 0)
+    service.update_ebay_quantity = lambda sku, quantity: False
+
+    result = service._sync_single_product(
+        {"sku": "SKU-OOS-WRITE-FAIL", "cost_breakdown": {}},
+        dry_run=False,
+        skip_ebay_check=True,
+        favorites_set=set(),
+    )
+
+    assert result.action == "error"
+    assert result.supplier_in_stock is False
+    assert "归零失败" in result.message
+
+
 def test_dajian_connection_uses_env_retry_budget_for_transient_dns(monkeypatch):
     import src.plugins.inventory_sync.sync_service as sync_mod
     from src.plugins.inventory_sync.sync_service import InventorySyncService
