@@ -336,13 +336,20 @@ scheduler_daemon.py
 `daily_tasks.py` 的真实职责包括：
 
 - 分析 `COLLECTED` 商品
-- 库存同步
-- 幽灵缺货恢复
+- 增量库存同步
+- 全量缺货审核与幽灵缺货恢复（每日主流程只执行一次）
 - 智能调价
 - listing audit
 - 销售健康检查
 - MI snapshot / alert / digest
 - 每日汇总邮件
+
+库存日报使用两个明确的审计范围：`incremental_inventory_sync` 只表示本次实际同步的
+SKU，`full_oos_audit` 表示全部 `PUBLISHED` 链接的 eBay 数量复核及供应商交叉检查。
+两者都返回统一的 `audit_scope`、`checked_count`、`qty_zero_count`、
+`supplier_oos_count`、`restocked_count`、`error_count` 字段。`daily_tasks` 先执行
+全量缺货审核，随后调用销售健康诊断时传入 `run_quantity_audit=False`，避免再次拉取
+全量 eBay 数量和重复恢复库存。
 
 这意味着多数独立脚本虽然仍可单独运行，但已经不再是“首选主入口”。
 
@@ -396,6 +403,17 @@ flowchart TD
 - 文件：快照 30 天保留、digest 3 天保留、长周期 trend 14 条保留
 - 日志：`logs/_scheduler_health.json` 记录最近一次 MI 自检
 - UI：Streamlit MI 页面实时读取最新快照和 digest；Dashboard 会对 MI 自动起草的 READY 草稿显示来源标记，无需重启 FastAPI
+
+### 运行期产物保留
+
+`src/utils/report_retention.py` 是 `reports/` 与 `logs/` 的统一保留策略入口；MI
+快照清理和邮件报告清理也委托到这个模块。每日主任务启动时执行一次实际清理，
+`scripts/report_retention.py` 提供独立的 dry-run 和显式 `--apply` 操作。清理只匹配
+带日期的白名单模式：日报/邮件侧
+产物保留 3 天，MI 快照保留 30 天，普通运营报告和日志保留 30 天，关键审计、
+整改、恢复和核验产物保留 180 天。除已登记的命名规则外，带日期的常规文本产物
+走 30 天安全兜底；无日期、状态、锁、数据库、密钥、图片和不支持扩展名的文件
+默认不动。删除依据文件名日期而不是 mtime，避免备份/复制改变时间后误删。
 
 ## 安全扩展点
 

@@ -52,3 +52,35 @@ class TestInventoryItemLevelErrors:
     def test_inventory_never_ran_still_failed(self):
         from src.utils.task_result_status import classify_daily_task_outcome
         assert classify_daily_task_outcome({"inventory": {"checked": 0, "errors": 3}}) == "failed"
+
+    def test_nested_full_audit_item_errors_are_partial(self):
+        from src.utils.task_result_status import classify_daily_task_outcome
+
+        results = {
+            "inventory": {
+                "audit_scope": "incremental_inventory_sync",
+                "checked_count": 129,
+                "error_count": 0,
+                "full_oos_audit": {
+                    "audit_scope": "full_oos_audit",
+                    "checked_count": 1000,
+                    "error_count": 2,
+                },
+            }
+        }
+        assert classify_daily_task_outcome(results) == "partial_success"
+
+    def test_nested_full_audit_error_without_checked_scope_still_failed(self):
+        from src.utils.task_result_status import classify_daily_task_outcome
+
+        results = {
+            "inventory": {
+                "checked_count": 129,
+                "error_count": 0,
+                "full_oos_audit": {
+                    "checked_count": 0,
+                    "error_count": 1,
+                },
+            }
+        }
+        assert classify_daily_task_outcome(results) == "failed"

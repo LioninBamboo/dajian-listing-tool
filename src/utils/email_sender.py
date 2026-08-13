@@ -23,7 +23,7 @@ import re
 import smtplib
 import ssl
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -34,21 +34,13 @@ from typing import Optional, List, Tuple
 
 import requests
 from dotenv import load_dotenv
+from src.utils.report_retention import EMAIL_REPORT_PATTERNS, purge_named_artifacts
 
 logger = logging.getLogger(__name__)
 IMG_SRC_PATTERN = re.compile(r'(<img\b[^>]*?\bsrc=["\'])(https?://[^"\']+)(["\'][^>]*>)', re.IGNORECASE)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _ENV_LOADED = False
 EMAIL_REPORT_RETENTION_DAYS = int(os.getenv("EMAIL_REPORT_RETENTION_DAYS", "3") or 3)
-EMAIL_REPORT_PATTERNS = (
-    "daily_report_*.html",
-    "mi_digest_*.html",
-    "health_check_*.json",
-    "reprice_report_*.json",
-    "reprice_changes_*.html",
-    "reprice_changes_*.csv",
-)
-
 # ---------------------------------------------------------------------------
 # SMTP 提供商配置: (显示名, 主机, 端口, 是否SSL, 是否STARTTLS)
 # ---------------------------------------------------------------------------
@@ -355,23 +347,12 @@ def _purge_old_email_report_artifacts(
     if keep_days < 0 or not reports_dir.exists():
         return 0
 
-    current_time = now or datetime.now()
-    cutoff = current_time - timedelta(days=keep_days)
-    removed = 0
-    seen: set[Path] = set()
-
-    for pattern in EMAIL_REPORT_PATTERNS:
-        for path in reports_dir.glob(pattern):
-            if path in seen or not path.is_file():
-                continue
-            seen.add(path)
-            try:
-                modified_at = datetime.fromtimestamp(path.stat().st_mtime)
-                if modified_at < cutoff:
-                    path.unlink()
-                    removed += 1
-            except OSError as exc:
-                logger.warning(f"清理过期邮件报告失败: {path.name} ({exc})")
+    removed = purge_named_artifacts(
+        reports_dir,
+        EMAIL_REPORT_PATTERNS,
+        keep_days,
+        now=now or datetime.now(),
+    )
 
     if removed:
         logger.info(f"🧹 已清理 {removed} 份超过 {keep_days} 天的邮件报告产物")

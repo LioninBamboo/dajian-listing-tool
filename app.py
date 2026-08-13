@@ -1172,7 +1172,7 @@ st.sidebar.title("🛍️ Dajian Listing Tool")
 st.sidebar.markdown("---")
 
 # 主应用页面
-main_pages = ["🏠 首页", "📊 Dashboard", "📈 竞争监控", "🚦 CRO 状态", "🛡️ 守门员", "🔐 eBay 授权", "📦 产品管理", "🚀 批量发布", "🎯 市场智能", "📦 库存管理", "⚙️ 设置"]
+main_pages = ["🏠 首页", "📊 Dashboard", "📈 竞争监控", "🚦 CRO 状态", "🛡️ 守门员", "💰 财务", "🔐 eBay 授权", "📦 产品管理", "🚀 批量发布", "🎯 市场智能", "📦 库存管理", "⚙️ 设置"]
 
 # 添加插件页面
 plugin_pages = [f"{p.icon} {p.name}" for p in _plugins.values()] if _plugins else []
@@ -1994,6 +1994,15 @@ elif page == "🛡️ 守门员":
         render_pricing_guard_dashboard()
     except Exception as e:
         st.error(f"守门员仪表盘加载失败: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+elif page == "💰 财务":
+    try:
+        from src.web.pages.finance_dashboard import render_finance_dashboard
+        render_finance_dashboard()
+    except Exception as e:
+        st.error(f"财务页加载失败: {e}")
         import traceback
         st.code(traceback.format_exc())
 

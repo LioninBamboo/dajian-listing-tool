@@ -487,31 +487,19 @@ def cleanup_old_snapshots(
 ) -> int:
     """删除超过 keep_days 的 mi_opportunities_*.json 快照，返回删除数量。
 
-    数据安全：
-    - 仅匹配本模块写入的命名格式，避免误删其它 reports/*.json。
-    - 仅基于文件名时间戳判定，避免依赖 mtime（可能被备份/恢复修改）。
-    - 任意单个文件删除失败时记录但继续处理后续文件。
+    数据安全：统一委托运行期产物保留模块，沿用相同的文件名日期、白名单和
+    单文件失败继续策略，避免 MI 页面、日报任务各自维护一套删除语义。
     """
     if project_root is None:
         project_root = Path(__file__).resolve().parents[3]
-    snap_dir = project_root / "reports"
-    if not snap_dir.exists():
-        return 0
-    if now is None:
-        now = datetime.now()
-    cutoff = now - timedelta(days=keep_days)
+    from src.utils.report_retention import purge_named_artifacts
 
-    deleted = 0
-    for path in snap_dir.glob("mi_opportunities_*.json"):
-        ts = _parse_snapshot_timestamp(path.name)
-        if ts is None or ts >= cutoff:
-            continue
-        try:
-            path.unlink()
-            deleted += 1
-        except OSError:
-            continue
-    return deleted
+    return purge_named_artifacts(
+        project_root / "reports",
+        ("mi_opportunities_*.json",),
+        keep_days,
+        now=now or datetime.now(),
+    )
 
 
 _SPARK_BARS = "▁▂▃▄▅▆▇█"

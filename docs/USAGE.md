@@ -101,7 +101,7 @@ PUBLISHED
 
 | 时间 | 任务标签 | 说明 |
 |------|----------|------|
-| `09:30` | `daily_tasks` | 全量工作负载，含分析、同步、审计、日报、MI 快照；智能调价仅周一/周四执行 |
+| `09:30` | `daily_tasks` | 全量工作负载，含分析、增量库存同步、全量缺货审核、审计、日报、MI 快照；智能调价仅周一/周四执行 |
 | `09:40` | `ad_restore` | 广告恢复审计与修复 |
 | `10:05` | `mi_check` | MI 自检，检查快照 / digest / 长周期 trend / 状态文件 |
 | `11:30` | `listing_audit` | `scripts/audit_fix_active_listings.py --live --email`，detect-only；对 live eBay listing 与 GIGA 原文做内容核对并发邮件 |
@@ -230,10 +230,20 @@ python daily_tasks.py --sync-only
 python daily_tasks.py --audit-only
 ```
 
+### 库存日报口径
+
+每日库存结果拆成两个互不混淆的审计范围：
+
+- `增量库存同步`：只统计本次实际进入 `InventorySyncService.sync_all()` 的 SKU；`检查数`是本次实际处理数，另显示本次范围总数和跳过数。
+- `全量缺货审核`：独立复核全部 `PUBLISHED` 链接的 eBay 实时数量，再交叉检查供应商库存；`检查数`是全量审核实际完成数。
+
+两栏统一返回 `audit_scope`、`checked_count`、`qty_zero_count`、`supplier_oos_count`、`restocked_count`、`error_count`。每日主流程只执行一次全量缺货审核，销售健康诊断复用结果但不再重复调用数量审核。
+
 说明：
 
 - `python daily_tasks.py` 会走默认全量工作负载，其中已经包含 `run_mi_snapshot()`。
 - 同一条默认链路也会运行 `run_cro_diagnose()`，写出 CRO 漏斗诊断和动作队列。
+- `20:00` 的独立 `health_check` 是另一条诊断任务，可独立执行全量数量审核；它不属于 `09:30` 主流程内的重复调用。
 - 当前没有 `--mi-only` 参数；如果需要独立诊断 MI，请用 `scripts/mi_diagnose.py`。
 
 ### 跑 CRO 主线
@@ -287,6 +297,30 @@ python scripts/sales_health_check.py --auto-fix --email
 - 快照保留 30 天
 - digest HTML 保留 3 天
 - 长周期 trend 保留 14 条
+
+### 运行期报告与日志清理
+
+每日主任务启动时会调用统一清理器；MI 快照清理和邮件报告清理也复用同一入口。
+已登记的报告/日志命名按专用规则处理，未登记但带日期的常规文本产物走 30 天安全兜底：
+
+- 日报、邮件报告、健康检查、调价报告：3 天
+- MI 快照：30 天
+- Terapeak、CRO、compare、普通 audit/reprice/dropship 报告：30 天
+- 关键整改、恢复、删除/重刊核验和关键审计产物：180 天
+- 带日期的普通日志：30 天；关键审计/恢复/故障日志：180 天
+
+无日期文件、状态文件、锁文件、数据库、图片、密钥和不支持扩展名的文件不会自动删除。
+
+```bash
+# 只查看候选，不删除
+python scripts/report_retention.py --dry-run
+
+# 按白名单实际删除过期产物
+python scripts/report_retention.py --apply
+```
+
+清理实现位于 `src/utils/report_retention.py`，规则和变更原因见
+`tasks/report_retention_plan.md`。
 
 ### MI 邮件与 UI
 

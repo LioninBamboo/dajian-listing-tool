@@ -40,7 +40,7 @@ def has_task_failure(result: Any) -> bool:
             if normalized == "status" and str(value).strip().lower() in _FAILURE_STATUSES:
                 return True
             if (
-                normalized in {"error", "errors", "exception", "exceptions", "failed", "failures"}
+                normalized in {"error", "errors", "error_count", "exception", "exceptions", "failed", "failures"}
                 or normalized.endswith("_error")
                 or normalized.endswith("_errors")
             ) and _has_failure_payload(value):
@@ -76,26 +76,40 @@ def _is_reprice_item_level_failure(result: Any) -> bool:
 
 
 def _is_inventory_item_level_failure(result: Any) -> bool:
-    """Return True for a completed inventory sync with per-SKU error rows.
+    """Return True for completed inventory audits with per-SKU error rows.
 
-    The sync reports ``checked`` (total SKUs) alongside an ``errors`` counter of
-    individual Dajian/eBay lookup failures (dead links, API flakes). A run that
-    checked hundreds of SKUs and updated prices has already done its work and
-    had side effects; counting those per-SKU errors as a task failure made the
-    scheduler alarm ❌ every single day and buried real failures in noise
-    (2026-07-18..22: daily_tasks "failed" on 18/873 error rows).
+    The canonical contract reports ``checked_count`` and ``error_count`` for
+    both the incremental sync and nested full out-of-stock audit. Legacy
+    ``checked``/``errors`` aliases remain supported for older callers.
     """
 
     if not isinstance(result, Mapping):
         return False
     if str(result.get("status") or "").strip().lower() in _FAILURE_STATUSES:
         return False
-    try:
-        checked = int(result.get("checked") or 0)
-        errors = int(result.get("errors") or 0)
-    except (TypeError, ValueError):
-        return False
-    return checked > 0 and errors > 0
+    audits = [result]
+    full_audit = result.get("full_oos_audit")
+    if isinstance(full_audit, Mapping):
+        audits.append(full_audit)
+
+    saw_item_level_failure = False
+    for audit in audits:
+        if str(audit.get("status") or "").strip().lower() in _FAILURE_STATUSES:
+            return False
+        if audit.get("error"):
+            return False
+        try:
+            checked_value = audit.get("checked_count")
+            checked = int(checked_value if checked_value is not None else audit.get("checked") or 0)
+            error_value = audit.get("error_count")
+            errors = int(error_value if error_value is not None else audit.get("errors") or 0)
+        except (TypeError, ValueError):
+            return False
+        if errors > 0:
+            if checked <= 0:
+                return False
+            saw_item_level_failure = True
+    return saw_item_level_failure
 
 
 # Sub-task name -> recognizer for "completed run with item-level errors only".

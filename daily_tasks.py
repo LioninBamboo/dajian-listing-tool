@@ -53,6 +53,15 @@ from src.utils.mi_draft_origin import (
 )
 from src.db.database_safety import assert_runtime_not_in_maintenance, validate_runtime_database
 from src.utils.task_result_status import classify_daily_task_outcome
+from src.utils.report_retention import cleanup_runtime_artifacts
+from src.utils.report_retention import purge_named_artifacts
+from src.utils.inventory_audit_contract import (
+    AUDIT_SCOPE_FULL_OOS,
+    AUDIT_SCOPE_INCREMENTAL,
+    audit_scope_label,
+    empty_inventory_audit,
+    summarize_incremental_sync_results,
+)
 from src.utils.store_profile import get_store_profile
 
 UTC = getattr(datetime, "UTC", timezone.utc)
@@ -83,6 +92,35 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def run_report_retention_cleanup() -> dict:
+    """清理已过期的白名单报告/日志，不阻断每日主任务。"""
+    try:
+        summary = cleanup_runtime_artifacts(
+            project_root=PROJECT_ROOT,
+            dry_run=False,
+        )
+        logger.info(
+            "运行期产物清理完成: 候选 %s, 删除 %s, 失败 %s",
+            summary.get("candidate_count", 0),
+            summary.get("removed_count", 0),
+            summary.get("error_count", 0),
+        )
+        for error in summary.get("errors", []):
+            logger.warning("运行期产物清理失败: %s (%s)", error.get("path"), error.get("error"))
+        return summary
+    except Exception as exc:
+        logger.exception("运行期产物清理异常，继续执行每日主任务")
+        return {
+            "dry_run": False,
+            "candidate_count": 0,
+            "removed_count": 0,
+            "error_count": 1,
+            "errors": [{"path": "", "error": str(exc)}],
+            "candidates": [],
+            "removed": [],
+        }
 
 
 def _utcnow_naive() -> datetime:
@@ -325,15 +363,35 @@ def sync_inventory() -> dict:
     
     try:
         service = InventorySyncService()
+        scope_count = len(service.get_published_products())
 
         if not service.test_dajian_connection():
             reason = service.last_dajian_connection_error
             error_msg = f"大建 API 连接失败: {reason}" if reason else "大建 API 连接失败"
             logger.error(error_msg)
-            return {'error': error_msg}
+            return {
+                **empty_inventory_audit(
+                    AUDIT_SCOPE_INCREMENTAL,
+                    scope_count=scope_count,
+                    error_count=1,
+                    error=error_msg,
+                ),
+                'error': error_msg,
+                'checked': 0,
+                'errors': 1,
+                'out_of_stock': [],
+                'price_changed': [],
+                'data_missing': [],
+                'no_change': 0,
+            }
         
         # 执行同步
         results = service.sync_all(skip_ebay_check=True, skip_synced_today=True)
+        summary = summarize_incremental_sync_results(
+            results,
+            scope_count=getattr(service, 'last_sync_scope_count', scope_count),
+            skipped_count=getattr(service, 'last_sync_skipped_count', 0),
+        )
         
         out_of_stock = [r.sku for r in results if r.action == 'out_of_stock']
         # 保留完整价格变动详情（旧价/新价/消息）
@@ -349,7 +407,7 @@ def sync_inventory() -> dict:
         # 幽灵产品 / 数据异常
         data_missing = [r.sku for r in results if r.action == 'data_missing']
         no_change = sum(1 for r in results if r.action == 'no_change')
-        errors = sum(1 for r in results if r.action == 'error')
+        errors = summary['error_count']
         
         logger.info(f"同步完成:")
         logger.info(f"  已检查: {len(results)}")
@@ -368,19 +426,35 @@ def sync_inventory() -> dict:
                 logger.info(f"  💰 {pc['sku']}: {pc['old_value']} → {pc['new_value']}")
         
         return {
-            'checked': len(results),
+            **summary,
+            # Compatibility aliases for existing scheduler/result consumers.
+            'checked': summary['checked_count'],
             'out_of_stock': out_of_stock,
             'price_changed': price_changed_details,
             'data_missing': data_missing,
             'no_change': no_change,
-            'errors': errors
+            'errors': errors,
         }
         
     except Exception as e:
         logger.error(f"库存同步失败: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        return {'error': str(e)}
+        error_msg = str(e)
+        return {
+            **empty_inventory_audit(
+                AUDIT_SCOPE_INCREMENTAL,
+                error_count=1,
+                error=error_msg,
+            ),
+            'error': error_msg,
+            'checked': 0,
+            'errors': 1,
+            'out_of_stock': [],
+            'price_changed': [],
+            'data_missing': [],
+            'no_change': 0,
+        }
 
 
 def run_ghost_oos_recovery(auto_fix: bool = True) -> dict:
@@ -394,15 +468,27 @@ def run_ghost_oos_recovery(auto_fix: bool = True) -> dict:
         from sales_health_check import SalesHealthChecker
 
         checker = SalesHealthChecker()
-        checker._check_quantity_integrity(auto_fix=auto_fix)
-        restocked = checker.results.get('qty_zero_restocked', [])
+        audit = checker._check_quantity_integrity(auto_fix=auto_fix)
+        if not isinstance(audit, dict):
+            audit = getattr(checker, 'quantity_audit', None)
+        if not isinstance(audit, dict):
+            audit = empty_inventory_audit(
+                AUDIT_SCOPE_FULL_OOS,
+                error_count=1,
+                error='全量缺货审核未返回标准结果',
+            )
+        restocked = audit.get('restocked_items', [])
 
         logger.info("幽灵缺货恢复检查完成:")
-        logger.info(f"  已恢复/待修复: {len(restocked)}")
+        logger.info(f"  eBay 库存为0: {audit.get('qty_zero_count', 0)}")
+        logger.info(f"  供应商无货: {audit.get('supplier_oos_count', 0)}")
+        logger.info(f"  已恢复: {audit.get('restocked_count', 0)}")
+        logger.info(f"  错误: {audit.get('error_count', 0)}")
         if restocked:
             logger.warning(f"  幽灵缺货 SKU: {[item.get('sku') for item in restocked]}")
 
         return {
+            **audit,
             'status': 'ok',
             'auto_fix': auto_fix,
             'qty_zero_restocked': restocked,
@@ -412,6 +498,11 @@ def run_ghost_oos_recovery(auto_fix: bool = True) -> dict:
         import traceback
         logger.error(traceback.format_exc())
         return {
+            **empty_inventory_audit(
+                AUDIT_SCOPE_FULL_OOS,
+                error_count=1,
+                error=str(e),
+            ),
             'status': 'error',
             'error': str(e),
             'qty_zero_restocked': [],
@@ -842,7 +933,11 @@ def run_listing_audit(
         return {"error": str(e)}
 
 
-def run_sales_health_check(auto_fix: bool = False) -> dict:
+def run_sales_health_check(
+    auto_fix: bool = False,
+    *,
+    run_quantity_audit: bool = True,
+) -> dict:
     """运行销售健康诊断（每日汇总默认只读，不自动改价）"""
     logger.info("="*60)
     logger.info("开始销售健康诊断")
@@ -853,7 +948,10 @@ def run_sales_health_check(auto_fix: bool = False) -> dict:
         from sales_health_check import SalesHealthChecker
 
         checker = SalesHealthChecker()
-        report = checker.run(auto_fix=auto_fix)
+        report = checker.run(
+            auto_fix=auto_fix,
+            run_quantity_audit=run_quantity_audit,
+        )
 
         s = report.get('summary', {})
         logger.info(f"健康诊断完成:")
@@ -1043,12 +1141,22 @@ def send_daily_summary_email(results: dict):
     else:
         health_html = ''
 
+    # 财务摘要（F1：订单 PnL + GIGA 履约阶段；读本地表，非阻塞）
+    try:
+        from src.services.finance_orders import render_finance_email_html
+
+        finance_html = render_finance_email_html()
+    except Exception as _fin_exc:
+        logger.warning(f"渲染财务摘要失败 (非阻塞): {_fin_exc}")
+        finance_html = f'<h3>💰 财务摘要</h3><p style="color:red;">⚠️ 渲染失败: {html_escape(str(_fin_exc))}</p>'
+
     # 库存同步详情
     oos_skus = inv.get('out_of_stock', [])
     price_items = inv.get('price_changed', [])
     data_missing_skus = inv.get('data_missing', [])
     ghost_restocked = inv.get('ghost_restocked', [])
     ghost_restock_error = inv.get('ghost_restock_error', '')
+    full_oos_audit = inv.get('full_oos_audit') or empty_inventory_audit(AUDIT_SCOPE_FULL_OOS)
     # 缺货 SKU 表格（含缩略图）
     if oos_skus:
         oos_thumbs = _load_product_thumbnails(oos_skus)
@@ -1259,38 +1367,50 @@ def send_daily_summary_email(results: dict):
         <div style="margin:10px 0 12px;padding:14px 16px;border-radius:10px;background:#fff7ed;border:2px solid #fdba74;color:#9a3412;font-weight:800;font-size:16px;line-height:1.4;">⏰ 本次每日主任务未执行智能调价</div>
         <p style="margin:0;color:#9a3412;font-size:13px;font-weight:600;">未发现最近一次智能调价结果，说明该步骤没有执行完成。</p>'''
 
-    if inv.get('error'):
-        inventory_html = '<p style="color:red;">⚠️ ' + inv.get('error', '') + '</p>'
-    else:
-        inventory_html = (
-            f"""
-    <table style="border-collapse:collapse;width:100%;">
-      <tr style="background:#f5f5f5;"><td style="padding:8px;border:1px solid #ddd;">总检查</td>
-          <td style="padding:8px;border:1px solid #ddd;">{inv.get('checked', 0)}</td></tr>
-      <tr><td style="padding:8px;border:1px solid #ddd;">✅ 无变化</td>
-          <td style="padding:8px;border:1px solid #ddd;">{inv.get('no_change', 0)}</td></tr>
-      <tr style="background:#ffebee;"><td style="padding:8px;border:1px solid #ddd;">🔴 缺货</td>
-          <td style="padding:8px;border:1px solid #ddd;color:red;font-weight:bold;">{len(oos_skus)}</td></tr>
-      <tr style="background:#fff3e0;"><td style="padding:8px;border:1px solid #ddd;">💰 价格变动</td>
-          <td style="padding:8px;border:1px solid #ddd;color:orange;font-weight:bold;">{len(price_items)}</td></tr>
-      <tr style="background:#fff8e1;"><td style="padding:8px;border:1px solid #ddd;">⚠️ 数据异常</td>
-          <td style="padding:8px;border:1px solid #ddd;color:#cc6600;font-weight:bold;">{len(data_missing_skus)}</td></tr>
-      <tr style="background:#ecfdf3;"><td style="padding:8px;border:1px solid #ddd;">🟢 幽灵下架恢复</td>
-          <td style="padding:8px;border:1px solid #ddd;color:#067647;font-weight:bold;">{len(ghost_restocked)}</td></tr>
-      <tr><td style="padding:8px;border:1px solid #ddd;">❌ 错误</td>
-          <td style="padding:8px;border:1px solid #ddd;">{inv.get('errors', 0)}</td></tr>
-    </table>
-    """
-            + (f'<details><summary>🔴 缺货 SKU 列表</summary>{oos_html}</details>' if oos_skus else '')
-            + (
-                f'<details><summary>⚠️ 数据异常 SKU (有库存但无价格，需人工检查)</summary><ul>{data_missing_html}</ul></details>'
-                if data_missing_skus
-                else ''
+    def _audit_table(title, audit, *, show_supplier_skus=False):
+        details = ''
+        if show_supplier_skus and audit.get('supplier_oos_skus'):
+            details += (
+                '<details><summary>供应商无货 SKU</summary><ul>'
+                + ''.join(f'<li>{html_escape(str(sku))}</li>' for sku in audit['supplier_oos_skus'])
+                + '</ul></details>'
             )
-            + (f'<details><summary>🟢 幽灵下架恢复明细</summary><ul>{ghost_restock_html}</ul></details>' if ghost_restocked else '')
-            + (f'<p style="color:#b42318;">幽灵下架恢复检查失败: {html_escape(ghost_restock_error)}</p>' if ghost_restock_error else '')
-            + (f'<details open><summary>💰 价格变动明细</summary>{price_html}</details>' if price_items else '')
+        if audit.get('qty_zero_skus'):
+            details += (
+                '<details><summary>eBay 库存为 0 SKU</summary><ul>'
+                + ''.join(f'<li>{html_escape(str(sku))}</li>' for sku in audit['qty_zero_skus'])
+                + '</ul></details>'
+            )
+        if audit.get('error_count'):
+            details += f'<p style="color:#b42318;">错误数: {audit.get("error_count", 0)}</p>'
+        if audit.get('error'):
+            details += f'<p style="color:#b42318;">审核异常: {html_escape(str(audit["error"]))}</p>'
+        return f'''
+        <h4>{title}</h4>
+        <table style="border-collapse:collapse;width:100%;font-size:13px;margin-bottom:8px;">
+          <tr style="background:#f5f5f5;"><td style="padding:7px;border:1px solid #ddd;">检查范围</td><td style="padding:7px;border:1px solid #ddd;">{html_escape(audit_scope_label(audit.get('audit_scope')))}</td></tr>
+          <tr><td style="padding:7px;border:1px solid #ddd;">范围总数</td><td style="padding:7px;border:1px solid #ddd;">{audit.get('scope_count', audit.get('checked_count', 0))}</td></tr>
+          <tr><td style="padding:7px;border:1px solid #ddd;">本次跳过</td><td style="padding:7px;border:1px solid #ddd;">{audit.get('skipped_count', 0)}</td></tr>
+          <tr><td style="padding:7px;border:1px solid #ddd;">检查数</td><td style="padding:7px;border:1px solid #ddd;font-weight:bold;">{audit.get('checked_count', 0)}</td></tr>
+          <tr style="background:#ffebee;"><td style="padding:7px;border:1px solid #ddd;">eBay 库存为 0</td><td style="padding:7px;border:1px solid #ddd;color:#b42318;font-weight:bold;">{audit.get('qty_zero_count', 0)}</td></tr>
+          <tr style="background:#fff8e1;"><td style="padding:7px;border:1px solid #ddd;">供应商无货</td><td style="padding:7px;border:1px solid #ddd;color:#b54708;font-weight:bold;">{audit.get('supplier_oos_count', 0)}</td></tr>
+          <tr style="background:#ecfdf3;"><td style="padding:7px;border:1px solid #ddd;">恢复数</td><td style="padding:7px;border:1px solid #ddd;color:#067647;font-weight:bold;">{audit.get('restocked_count', 0)}</td></tr>
+          <tr><td style="padding:7px;border:1px solid #ddd;">错误数</td><td style="padding:7px;border:1px solid #ddd;">{audit.get('error_count', 0)}</td></tr>
+        </table>{details}'''
+
+    inventory_html = (
+        _audit_table('增量库存同步', inv, show_supplier_skus=True)
+        + _audit_table('全量缺货审核', full_oos_audit)
+        + (f'<details><summary>🔴 增量同步缺货 SKU 列表</summary>{oos_html}</details>' if oos_skus else '')
+        + (
+            f'<details><summary>⚠️ 数据异常 SKU (有库存但无价格，需人工检查)</summary><ul>{data_missing_html}</ul></details>'
+            if data_missing_skus
+            else ''
         )
+        + (f'<details><summary>🟢 幽灵下架恢复明细</summary><ul>{ghost_restock_html}</ul></details>' if ghost_restocked else '')
+        + (f'<p style="color:#b42318;">幽灵下架恢复检查失败: {html_escape(ghost_restock_error)}</p>' if ghost_restock_error else '')
+        + (f'<details open><summary>💰 价格变动明细</summary>{price_html}</details>' if price_items else '')
+    )
 
     html = f"""
     <html><body style="font-family:Arial,sans-serif;padding:20px;max-width:700px;">
@@ -1307,12 +1427,14 @@ def send_daily_summary_email(results: dict):
     </table>
     {'<p style="color:red;">⚠️ ' + analyze.get('error', '') + '</p>' if analyze.get('error') else ''}
 
-    <h3>2️⃣ 库存同步</h3>
+    <h3>2️⃣ 库存与缺货审核</h3>
     {inventory_html}
 
         {smart_reprice_html}
 
     {health_html}
+
+    {finance_html}
 
     {guard_activity_html}
 
@@ -1344,7 +1466,7 @@ def send_daily_summary_email(results: dict):
     health_icon = '🔴' if health_problems > 5 else ('🟡' if health_problems > 0 else '🟢')
     smart_reprice_count = len(smart_reprice_items) if smart_reprice_status == 'ok' else 0
     subject = (f"📋 {get_store_profile().brand_name} 每日汇总 - {date_str} | "
-               f"同步{inv.get('checked', 0)}个 缺货{len(oos_skus)} 恢复{len(ghost_restocked)} "
+               f"增量同步{inv.get('checked_count', inv.get('checked', 0))}个 全量审核{full_oos_audit.get('checked_count', 0)}个 "
                f"调价{smart_reprice_count} "
                f"{health_icon}健康{health_problems}问题 "
                f"🎯CRO {cro_summary.get('avg_cro_score', 0):.0f}分/P1队{cro.get('p1_queued', 0)}")
@@ -1980,18 +2102,12 @@ def _archive_mi_digest_html(html: str, keep_days: int = 3,
     out.write_text(html, encoding="utf-8")
     logger.info(f"[MI DIGEST] 已归档: {out.name}")
 
-    # 清理旧归档
-    cutoff = ts - timedelta(days=keep_days)
-    removed = 0
-    for p in target_dir.glob("mi_digest_*.html"):
-        try:
-            stem = p.stem.replace("mi_digest_", "")
-            d = datetime.strptime(stem, "%Y%m%d")
-            if d < cutoff:
-                p.unlink()
-                removed += 1
-        except (ValueError, OSError):
-            continue
+    removed = purge_named_artifacts(
+        target_dir,
+        ("mi_digest_*.html",),
+        keep_days,
+        now=ts,
+    )
     if removed:
         logger.info(f"[MI DIGEST] 清理 {removed} 份过期归档（>{keep_days}d）")
     return out
@@ -2014,6 +2130,10 @@ def main():
         database_report.link_count,
         database_report.page_count,
     )
+
+    # 运行期产物清理只做 housekeeping，不进入 task results，避免清理单文件失败
+    # 触发每日业务任务重跑或被判定为业务失败。
+    run_report_retention_cleanup()
     
     logger.info("="*60)
     logger.info(f"每日任务开始 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -2047,17 +2167,39 @@ def main():
             results['inventory'] = sync_inventory()
         except Exception as e:
             logger.error(f"库存同步异常: {e}")
-            results['inventory'] = {'error': str(e)}
+            results['inventory'] = {
+                **empty_inventory_audit(
+                    AUDIT_SCOPE_INCREMENTAL,
+                    error_count=1,
+                    error=str(e),
+                ),
+                'error': str(e),
+                'checked': 0,
+                'errors': 1,
+                'out_of_stock': [],
+                'price_changed': [],
+                'data_missing': [],
+                'no_change': 0,
+            }
 
         try:
             ghost_recovery = run_ghost_oos_recovery(auto_fix=True)
             results.setdefault('inventory', {})
+            results['inventory']['full_oos_audit'] = ghost_recovery
             results['inventory']['ghost_restocked'] = ghost_recovery.get('qty_zero_restocked', [])
             if ghost_recovery.get('error'):
                 results['inventory']['ghost_restock_error'] = ghost_recovery.get('error')
         except Exception as e:
             logger.error(f"幽灵缺货恢复异常: {e}")
             results.setdefault('inventory', {})
+            results['inventory']['full_oos_audit'] = {
+                **empty_inventory_audit(
+                    AUDIT_SCOPE_FULL_OOS,
+                    error_count=1,
+                    error=str(e),
+                ),
+                'status': 'error',
+            }
             results['inventory']['ghost_restock_error'] = str(e)
 
         try:
@@ -2078,7 +2220,10 @@ def main():
 
         # 4. 销售健康诊断 (每日汇总启用自动修复)
         try:
-            results['health_check'] = run_sales_health_check(auto_fix=True)
+            results['health_check'] = run_sales_health_check(
+                auto_fix=True,
+                run_quantity_audit=False,
+            )
         except Exception as e:
             logger.error(f"健康诊断异常: {e}")
             results['health_check'] = {'error': str(e)}
@@ -2104,6 +2249,38 @@ def main():
         except Exception as e:
             logger.error(f"CRO 诊断异常: {e}")
             results['cro'] = {'error': str(e)}
+
+        # 8. 财务数字刷新 (eBay 订单 PnL → 本地表; 日报「💰 财务摘要」读此表)
+        #    scheduler 09:15 / 每 4h 也会跑; 这里再刷一次保证邮件用最新数.
+        try:
+            from src.services.finance_orders import sync_orders_from_ebay, query_finance_summary
+            import sqlite3 as _sq_fin
+
+            fin_report = sync_orders_from_ebay(days=30)
+            _conn_fin = _sq_fin.connect(str(PROJECT_ROOT / "ebay_collection.db"))
+            fin_summary = query_finance_summary(_conn_fin)
+            _conn_fin.close()
+            results['finance'] = {
+                'status': 'ok',
+                'sync': {
+                    'orders_pulled': fin_report.get('orders_pulled'),
+                    'upserted': fin_report.get('upserted'),
+                    'errors': fin_report.get('errors'),
+                    'giga_links_updated': fin_report.get('giga_links_updated'),
+                },
+                'summary': fin_summary,
+            }
+            logger.info(
+                "财务同步: pulled=%s upserted=%s GMV=$%.2f net(est)=$%.2f not_pushed=%s",
+                fin_report.get('orders_pulled'),
+                fin_report.get('upserted'),
+                fin_summary.get('gmv', 0),
+                fin_summary.get('net', 0),
+                fin_summary.get('not_pushed', 0),
+            )
+        except Exception as e:
+            logger.error(f"财务同步异常 (非阻塞): {e}")
+            results['finance'] = {'error': str(e)}
     
     logger.info("\n" + "="*60)
     logger.info("任务完成汇总")
