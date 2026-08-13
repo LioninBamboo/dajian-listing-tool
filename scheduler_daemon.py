@@ -17,11 +17,12 @@ Dajian Listing Tool — 后台调度守护进程
 - 异常邮件通知
 
 时间表 (可修改):
-  (已停用) 09:00  标题优化 (daily_optimize.py --batch-size 50 --email)
-  09:30  每日全量任务 (daily_tasks.py，含库存同步；智能调价仅周一/周四在此流程中执行)
-  10:45  CRO 标题热词优化 dry-run (默认只生成报告; 显式 env 才 apply)
-  11:30  eBay/GIGA live listing 内容审计 (audit_fix_active_listings.py --live --email)
-  (已移除) 10:00  库存同步 — 已合并到 09:30 daily_tasks.py
+  09:15  财务同步 (finance_sync_orders)
+  09:18  GIGA 推单 (默认 dry-run，显式开关后 apply)
+  09:22  GIGA→eBay 运单回写 (默认 dry-run，显式开关后 apply)
+  09:30  每日全量任务 (daily_tasks.py，含库存同步+财务再刷+日报)
+  11:30  eBay/GIGA live listing 内容审计
+  每4h   履约闭环 (push + sync + finance_sync)
   每2h   自动分析 (daily_tasks.py --analyze-only)
 
 使用:
@@ -108,6 +109,9 @@ TASK_TIMEOUT = {
     'source_refresh': 1800,    # 30分钟 (全量 PUBLISHED 源快照刷新, 批量 detailInfo)
     'order_recheck': 900,      # 15分钟 (出单源复核: GetOrders + 单 SKU 源重抓比对)
     'semantic_rewrite': 3600,  # 1小时 (语义改写管线: 日审增量队列, 默认限 40)
+    'finance_sync': 900,       # 15分钟 (eBay 订单 → 财务 PnL 本地表)
+    'giga_dropship_push': 1800,  # 30分钟 (PAID 未履约 → GIGA 推单)
+    'giga_dropship_sync': 1800,  # 30分钟 (GIGA 运单 → eBay 标发)
 }
 
 # Windows execution-state flags. Do not use ES_DISPLAY_REQUIRED: the scheduler
@@ -760,6 +764,61 @@ def task_order_recheck():
         ],
         timeout_sec=TASK_TIMEOUT['order_recheck'],
     )
+
+
+def _env_flag_enabled(name: str, default: bool = True) -> bool:
+    """Parse env feature flags. Empty/unset → default; 0/false/no/off → False."""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == '':
+        return default
+    return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def task_finance_sync():
+    """财务数字刷新: eBay 已付款订单 → finance_orders PnL + GIGA 关联.
+
+    只写本地库, 不改 eBay/GIGA. 日报邮件与 Streamlit「💰 财务」依赖此表.
+    """
+    run_task(
+        'finance_sync',
+        [
+            str(PROJECT_ROOT / 'scripts' / 'finance_sync_orders.py'),
+            '--days', '30',
+        ],
+        timeout_sec=TASK_TIMEOUT['finance_sync'],
+    )
+
+
+def task_giga_dropship_push():
+    """已成交单推 GIGA 一件代发.
+
+    默认 dry-run. 开启: ENABLE_GIGA_DROPSHIP_PUSH=1 → live apply.
+    推单后 GIGA 侧可能仍为 Unpaid, 需在 GIGA 付款后由 sync 回写运单.
+    """
+    cmd = [
+        str(PROJECT_ROOT / 'scripts' / 'giga_dropship_push.py'),
+        '--days', '14',
+    ]
+    if _env_flag_enabled('ENABLE_GIGA_DROPSHIP_PUSH', default=False):
+        cmd.append('--apply')
+        logger.info("[GIGA PUSH] live apply 已显式启用")
+    else:
+        logger.info("[GIGA PUSH] dry-run only (设置 ENABLE_GIGA_DROPSHIP_PUSH=1 才写入)")
+    run_task('giga_dropship_push', cmd, timeout_sec=TASK_TIMEOUT['giga_dropship_push'])
+
+
+def task_giga_dropship_sync():
+    """GIGA 状态/运单 → eBay createShippingFulfillment.
+
+    默认 dry-run. 开启: ENABLE_GIGA_EBAY_FULFILL=1 → 写入 eBay.
+    """
+    cmd = [str(PROJECT_ROOT / 'scripts' / 'giga_dropship_sync.py')]
+    if _env_flag_enabled('ENABLE_GIGA_EBAY_FULFILL', default=False):
+        cmd.append('--apply')
+        logger.info("[GIGA SYNC] eBay 标发 apply 已显式启用")
+    else:
+        logger.info("[GIGA SYNC] dry-run only (设置 ENABLE_GIGA_EBAY_FULFILL=1 才写入)")
+    run_task('giga_dropship_sync', cmd, timeout_sec=TASK_TIMEOUT['giga_dropship_sync'])
 
 
 def task_daily_full():
@@ -1516,6 +1575,15 @@ def task_mi_self_check():
 
 def setup_schedule():
     """配置任务调度时间表"""
+    # 09:15 — 财务订单同步 (eBay → finance_orders), 赶在 09:30 日报前刷新数字
+    schedule.every().day.at("09:15").do(task_finance_sync).tag('daily', 'finance_sync')
+
+    # 09:18 — 已成交未履约 → GIGA 推单 (默认 dry-run; 显式设 1 才 apply)
+    schedule.every().day.at("09:18").do(task_giga_dropship_push).tag('daily', 'giga_push')
+
+    # 09:22 — GIGA 运单回写 eBay (默认 dry-run; 显式设 1 才 apply)
+    schedule.every().day.at("09:22").do(task_giga_dropship_sync).tag('daily', 'giga_sync')
+
     # 每天 09:30 — 全量任务 (分析+同步+报告)
     #   注意: daily_tasks.py 已包含库存同步；智能调价在同一流程里仅周一/周四执行
     schedule.every().day.at("09:30").do(task_daily_full).tag('daily', 'full')
@@ -1596,6 +1664,12 @@ def setup_schedule():
     # 单量不高, 6h 一轮足够; lookback 8h 留重叠, order_recheck_log 去重防重复告警
     schedule.every(6).hours.do(task_order_recheck).tag('recurring', 'order_recheck')
 
+    # 每 4 小时 — 履约闭环: 推未推单 + 轮询运单回写 eBay + 刷新财务关联
+    # 与 09:18/09:22 日班叠加; 推单/标发幂等 (本地 giga_fulfillment_orders 去重)
+    schedule.every(4).hours.do(task_giga_dropship_push).tag('recurring', 'giga_push')
+    schedule.every(4).hours.do(task_giga_dropship_sync).tag('recurring', 'giga_sync')
+    schedule.every(4).hours.do(task_finance_sync).tag('recurring', 'finance_sync')
+
     # ⚠️ (旧) 10:00 库存同步已移除 — daily_tasks.py (09:30) 已包含库存同步
     # 之前 10:00 的 task_inventory_sync 会导致重复发送库存报告邮件 (内容不同)
     # 如果需要单独测试库存同步: python scheduler_daemon.py --task inventory
@@ -1611,6 +1685,9 @@ def setup_schedule():
 
     logger.info("调度表已配置:")
     logger.info("  标题优化: 已停用 (不会定时/补跑/手动执行优化脚本)")
+    logger.info("  09:15  财务同步 (finance_sync_orders --days 30)")
+    logger.info("  09:18  GIGA 推单 (默认 dry-run; ENABLE_GIGA_DROPSHIP_PUSH=1 才 apply)")
+    logger.info("  09:22  GIGA→eBay 运单回写 (默认 dry-run; ENABLE_GIGA_EBAY_FULFILL=1 才 apply)")
     logger.info("  09:30  每日全量任务 (daily_tasks.py — 含库存同步+报告；智能调价仅周一/周四)")
     logger.info("  10:05  MI 流水线自检 (F32 — 异常发邮件)")
     logger.info("  09:40  广告恢复审计 (ad_restore_audit --apply --email)")
@@ -1626,6 +1703,7 @@ def setup_schedule():
     logger.info("  12:10  源参数写回 live (audit --source-report --issue-type source_aspect_mismatch --fix,限定 Color/Material/描述重建)")
     logger.info("  12:30  语义改写闭环 (semantic_rewrite --from-daily-audit --limit 40 --apply --email)")
     logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 48 --email)")
+    logger.info("  每 4h  履约闭环 (giga push + sync + finance_sync)")
     logger.info("  20:00  销售健康诊断 (health_check --auto-fix --email)")
     logger.info("  每 2h  自动分析 (daily_tasks.py --analyze-only)")
     logger.info("  每 6h  促销轮转 (auto_rotate_promotions.py)")
@@ -1689,6 +1767,30 @@ def recover_missed_tasks(log_when_clean=True):
         # 定义需要在 daemon 重启后补跑的关键定时任务。
         # 判断标准是: 已经过了今日的恢复窗口，且自今日计划时间之后还没有成功过。
         critical_tasks = [
+            {
+                'name': 'finance_sync',
+                'scheduled_time': '09:15',
+                'recovery_grace_minutes': 15,
+                'func': task_finance_sync,
+                'label': '财务订单同步',
+                'priority': 12,
+            },
+            {
+                'name': 'giga_dropship_push',
+                'scheduled_time': '09:18',
+                'recovery_grace_minutes': 15,
+                'func': task_giga_dropship_push,
+                'label': 'GIGA 推单',
+                'priority': 14,
+            },
+            {
+                'name': 'giga_dropship_sync',
+                'scheduled_time': '09:22',
+                'recovery_grace_minutes': 15,
+                'func': task_giga_dropship_sync,
+                'label': 'GIGA 运单回写 eBay',
+                'priority': 16,
+            },
             {
                 'name': 'daily_tasks',
                 'scheduled_time': '09:30',
@@ -2075,7 +2177,7 @@ def main():
     parser.add_argument('--once', action='store_true',
                        help='立即执行全部任务一次后退出')
     parser.add_argument('--task', type=str,
-                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_snapshot', 'mi_self_check', 'listing_status_sync', 'auto_publish', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_title_rewrite', 'cro_lifecycle_evaluate', 'cro_send_offer', 'source_refresh', 'order_recheck', 'semantic_rewrite'],
+                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_snapshot', 'mi_self_check', 'listing_status_sync', 'auto_publish', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_title_rewrite', 'cro_lifecycle_evaluate', 'cro_send_offer', 'source_refresh', 'order_recheck', 'semantic_rewrite', 'finance_sync', 'giga_dropship_push', 'giga_dropship_sync'],
                        help='立即执行指定单个任务后退出')
     parser.add_argument('--status', action='store_true',
                        help='显示守护进程状态')
@@ -2144,6 +2246,9 @@ def main():
             'source_refresh': task_source_refresh,
             'order_recheck': task_order_recheck,
             'semantic_rewrite': task_semantic_rewrite,
+            'finance_sync': task_finance_sync,
+            'giga_dropship_push': task_giga_dropship_push,
+            'giga_dropship_sync': task_giga_dropship_sync,
         }
         task_map[args.task]()
         return

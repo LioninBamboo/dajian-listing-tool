@@ -511,6 +511,71 @@ def test_task_auto_publish_scopes_to_latest_mi_ready_skus(monkeypatch):
     assert kwargs['timeout_sec'] == scheduler_daemon.TASK_TIMEOUT['auto_publish']
 
 
+def test_env_flag_enabled_defaults():
+    assert scheduler_daemon._env_flag_enabled('NO_SUCH_FLAG_XYZ', default=True) is True
+    assert scheduler_daemon._env_flag_enabled('NO_SUCH_FLAG_XYZ', default=False) is False
+
+
+def test_task_giga_dropship_push_defaults_to_dry_run(monkeypatch):
+    calls = []
+    monkeypatch.delenv('ENABLE_GIGA_DROPSHIP_PUSH', raising=False)
+    monkeypatch.setattr(scheduler_daemon, 'run_task', lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    scheduler_daemon.task_giga_dropship_push()
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == 'giga_dropship_push'
+    command = [str(part) for part in args[1]]
+    assert '--apply' not in command
+    assert kwargs['timeout_sec'] == scheduler_daemon.TASK_TIMEOUT['giga_dropship_push']
+
+
+def test_task_giga_dropship_push_requires_explicit_enable(monkeypatch):
+    calls = []
+    monkeypatch.setenv('ENABLE_GIGA_DROPSHIP_PUSH', '1')
+    monkeypatch.setattr(scheduler_daemon, 'run_task', lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    scheduler_daemon.task_giga_dropship_push()
+
+    command = [str(part) for part in calls[0][0][1]]
+    assert '--apply' in command
+
+
+def test_task_giga_dropship_sync_defaults_to_dry_run(monkeypatch):
+    calls = []
+    monkeypatch.delenv('ENABLE_GIGA_EBAY_FULFILL', raising=False)
+    monkeypatch.setattr(scheduler_daemon, 'run_task', lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    scheduler_daemon.task_giga_dropship_sync()
+
+    command = [str(part) for part in calls[0][0][1]]
+    assert '--apply' not in command
+
+
+def test_task_giga_dropship_sync_requires_explicit_enable(monkeypatch):
+    calls = []
+    monkeypatch.setenv('ENABLE_GIGA_EBAY_FULFILL', '1')
+    monkeypatch.setattr(scheduler_daemon, 'run_task', lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    scheduler_daemon.task_giga_dropship_sync()
+
+    command = [str(part) for part in calls[0][0][1]]
+    assert '--apply' in command
+
+
+def test_task_finance_sync_invokes_script(monkeypatch):
+    calls = []
+    monkeypatch.setattr(scheduler_daemon, 'run_task', lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    scheduler_daemon.task_finance_sync()
+
+    assert calls[0][0][0] == 'finance_sync'
+    command = [str(part) for part in calls[0][0][1]]
+    assert 'finance_sync_orders.py' in command[0] or command[0].endswith('finance_sync_orders.py')
+    assert '--days' in command
+
+
 def test_latest_mi_ready_skus_reads_top_level_list_snapshot(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
     (tmp_path / 'mi_opportunities_20260511_100000.json').write_text(

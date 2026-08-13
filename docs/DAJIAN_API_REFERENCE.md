@@ -1,7 +1,11 @@
 # GigaCloud (大建) Open API 2.0 技术文档
 
-> 最后更新: 2026-02-05  
+> 最后更新: 2026-08-11
 > 基于官方文档: https://www.gigab2b.com/index.php?route=information/open_api
+>
+> **履约扩展（2025-08 起）**：仓库地址、发货物流、订单状态、一件代发导入、上门取货上传 Label
+> 已单独沉淀 → [`docs/GIGA_FULFILLMENT_API.md`](GIGA_FULFILLMENT_API.md)
+> eBay 功能计划 → [`docs/GIGA_FULFILLMENT_FEATURE_PLAN.md`](GIGA_FULFILLMENT_FEATURE_PLAN.md)
 
 ---
 

@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import re
 import socket
 import string
 from urllib.parse import urlparse
@@ -102,7 +103,7 @@ def _is_local_proxy_available(proxy_url: str, timeout: float = 0.3) -> bool:
         return False
 
 
-def _create_dajian_session():
+def _create_dajian_session(*, retry_transport: bool = True):
     """Create a requests session with retry + verify=False for Dajian API.
     
     注意: urllib3 层已处理重试, _request() 方法不再需要额外重试连接错误。
@@ -111,9 +112,10 @@ def _create_dajian_session():
     session = requests.Session()
     session.verify = False
     session.trust_env = False
+    retry_total = 3 if retry_transport else 0
     retry_strategy = Retry(
-        total=3,
-        connect=3,
+        total=retry_total,
+        connect=retry_total,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["POST", "GET"],
@@ -170,8 +172,9 @@ class DaJianClient:
         signature = base64.b64encode(hmac_hex.encode()).decode()
         return signature
     
-    def _request(self, method: str, endpoint: str, json_data: Optional[Dict] = None, 
-                params: Optional[Dict] = None, retries: int = 4, use_prefix: bool = True) -> Dict:
+    def _request(self, method: str, endpoint: str, json_data: Optional[Dict] = None,
+                params: Optional[Dict] = None, retries: int = 4, use_prefix: bool = True,
+                retry_transport: bool = True) -> Dict:
         """发送 API 请求"""
         # 根据文档，完整路径需要包含 API 前缀
         full_endpoint = f"{self.API_PREFIX}{endpoint}" if use_prefix else endpoint
@@ -215,8 +218,10 @@ class DaJianClient:
                 raise Exception(f"API Error: {error_msg}")
             return result.get("data", result)
 
+        request_session = self.session if retry_transport else _create_dajian_session(retry_transport=False)
+
         def request_direct():
-            return parse_response(self.session.request(
+            return parse_response(request_session.request(
                 method=method,
                 url=url,
                 headers=headers,
@@ -227,7 +232,7 @@ class DaJianClient:
             ))
         
         try:
-            response = self.session.request(
+            response = request_session.request(
                 method=method,
                 url=url,
                 headers=headers,
@@ -239,7 +244,7 @@ class DaJianClient:
             return parse_response(response)
             
         except requests.exceptions.Timeout as e:
-            if proxies:
+            if proxies and retry_transport:
                 logger.warning(
                     "DAJIAN proxy timed out; retrying once with direct connection: %s",
                     e,
@@ -248,10 +253,18 @@ class DaJianClient:
             # urllib3 已处理连接重试, 这里只重试应用层超时
             if retries > 0:
                 time.sleep(2)
-                return self._request(method, endpoint, json_data, params, retries - 1)
+                return self._request(
+                    method,
+                    endpoint,
+                    json_data,
+                    params,
+                    retries - 1,
+                    use_prefix,
+                    retry_transport,
+                )
             raise Exception(f"API Timeout: {url}")
         except requests.exceptions.ProxyError as e:
-            if proxies:
+            if proxies and retry_transport:
                 logger.warning("DAJIAN proxy request failed; retrying direct connection: %s", e)
                 return request_direct()
             raise Exception(f"Proxy Error: {e}")
@@ -470,6 +483,261 @@ class DaJianClient:
         """获取单个产品库存"""
         results = self.get_inventory([sku])
         return results[0] if results else None
+
+    # ==================== 履约 API (2025-08+) ====================
+    # 文档: docs/GIGA_FULFILLMENT_API.md
+    # 一件代发由 GIGA 选仓发货，调用方通常无需指定 warehouse。
+
+    WAREHOUSE_ADDRESS_CHUNK = 200
+    ORDER_QUERY_CHUNK = 100
+
+    @staticmethod
+    def _chunk_list(items: List[Any], size: int) -> List[List[Any]]:
+        if size <= 0:
+            raise ValueError("chunk size must be positive")
+        return [items[i:i + size] for i in range(0, len(items), size)]
+
+    def query_warehouse_addresses(self, warehouse_codes: List[str]) -> List[Dict]:
+        """查询仓库地址。
+
+        API: POST /buyer/warehouse/query-address/v1
+        限流: 10秒/20次；单次最多 200 个 code。
+        """
+        codes = [str(c).strip() for c in (warehouse_codes or []) if str(c).strip()]
+        if not codes:
+            raise ValueError("warehouse_codes is required")
+
+        endpoint = "/buyer/warehouse/query-address/v1"
+        out: List[Dict] = []
+        for chunk in self._chunk_list(codes, self.WAREHOUSE_ADDRESS_CHUNK):
+            result = self._request("POST", endpoint, json_data={"warehouseCodes": chunk})
+            if isinstance(result, list):
+                out.extend(result)
+            elif result:
+                out.append(result)
+        return out
+
+    def query_order_tracking(self, order_nos: List[str]) -> List[Dict]:
+        """查询发货物流（运单号/承运商/发货仓）。
+
+        API: POST /buyer/order/track-no/v1
+        限流: 10秒/20次；单次最多 100 个订单号。
+        """
+        nos = [str(n).strip() for n in (order_nos or []) if str(n).strip()]
+        if not nos:
+            raise ValueError("order_nos is required")
+
+        endpoint = "/buyer/order/track-no/v1"
+        out: List[Dict] = []
+        for chunk in self._chunk_list(nos, self.ORDER_QUERY_CHUNK):
+            result = self._request("POST", endpoint, json_data={"orderNo": chunk})
+            if isinstance(result, list):
+                out.extend(result)
+            elif result:
+                out.append(result)
+        return out
+
+    def query_order_status(self, order_nos: List[str]) -> List[Dict]:
+        """查询发货订单状态。
+
+        API: POST /buyer/order/status/v1
+        限流: 10秒/20次；单次最多 100 个订单号。
+        """
+        nos = [str(n).strip() for n in (order_nos or []) if str(n).strip()]
+        if not nos:
+            raise ValueError("order_nos is required")
+
+        endpoint = "/buyer/order/status/v1"
+        out: List[Dict] = []
+        for chunk in self._chunk_list(nos, self.ORDER_QUERY_CHUNK):
+            result = self._request("POST", endpoint, json_data={"orderNo": chunk})
+            if isinstance(result, list):
+                out.extend(result)
+            elif result:
+                out.append(result)
+        return out
+
+    @staticmethod
+    def validate_dropship_payload(payload: Dict[str, Any]) -> List[str]:
+        """轻量校验一件代发 payload，返回错误列表（空=通过）。
+
+        一件代发由 GIGA 选仓发货，不要求 warehouseCode。
+        """
+        errors: List[str] = []
+        if not isinstance(payload, dict):
+            return ["payload must be a dict"]
+
+        for key in ("orderDate", "orderNo", "shipName", "shipPhone", "shipAddress1",
+                    "shipCity", "shipCountry", "shipZipCode"):
+            if not str(payload.get(key) or "").strip():
+                errors.append(f"missing required field: {key}")
+
+        lines = payload.get("orderLines")
+        if not isinstance(lines, list) or not lines:
+            errors.append("orderLines must be a non-empty list")
+        else:
+            for i, line in enumerate(lines):
+                if not isinstance(line, dict):
+                    errors.append(f"orderLines[{i}] must be an object")
+                    continue
+                if not str(line.get("sku") or "").strip():
+                    errors.append(f"orderLines[{i}].sku is required")
+                try:
+                    qty = int(line.get("qty"))
+                    if qty < 1:
+                        errors.append(f"orderLines[{i}].qty must be >= 1")
+                except (TypeError, ValueError):
+                    errors.append(f"orderLines[{i}].qty must be an integer")
+                if line.get("itemPrice") is None or str(line.get("itemPrice")).strip() == "":
+                    errors.append(f"orderLines[{i}].itemPrice is required")
+
+        order_no = str(payload.get("orderNo") or "")
+        if order_no and not all(c.isalnum() or c in "._-" for c in order_no):
+            errors.append("orderNo may only contain letters, digits, . _ -")
+
+        address_text = " ".join(
+            str(payload.get(key) or "") for key in ("shipAddress1", "shipAddress2")
+        )
+        if re.search(r"\bP\.?\s*O\.?\s+BOX\b", address_text, re.IGNORECASE):
+            errors.append("PO Box addresses are not supported by GIGA dropship")
+
+        # eBay channel: Item Number + Transaction ID required for defect-rate recognition
+        channel = str(payload.get("salesChannel") or "").strip().lower()
+        if channel in ("ebay", "e bay"):
+            txn = str(payload.get("ebayTransactionID") or "").strip()
+            if not txn or not txn.isdigit():
+                errors.append(
+                    "ebayTransactionID is required for eBay channel "
+                    "(must be eBay Transaction ID / Fulfillment lineItemId, pure digits)"
+                )
+            if isinstance(lines, list):
+                for i, line in enumerate(lines):
+                    if not isinstance(line, dict):
+                        continue
+                    item = str(line.get("ebayItemCode") or "").strip()
+                    if not item or not item.isdigit():
+                        errors.append(
+                            f"orderLines[{i}].ebayItemCode is required for eBay channel "
+                            f"(must be eBay Item Number / legacyItemId, pure digits)"
+                        )
+
+        return errors
+
+    def import_dropship_order(
+        self,
+        payload: Dict[str, Any],
+        *,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """导入一件代发订单到 GIGA。
+
+        API: POST /buyer/order/dropShip-sync/v1
+
+        GIGA 负责选仓与承运，调用方一般**不需要**传 warehouse。
+        dry_run=True 时只校验并返回将发送的 payload，不调 API。
+        """
+        endpoint = "/buyer/order/dropShip-sync/v1"
+        errors = self.validate_dropship_payload(payload)
+        if errors:
+            raise ValueError("dropship payload invalid: " + "; ".join(errors))
+
+        # Strip internal bookkeeping keys before GIGA call
+        api_payload = {
+            k: v for k, v in payload.items() if not str(k).startswith("_")
+        }
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "endpoint": f"{self.API_PREFIX}{endpoint}",
+                "note": (
+                    "GIGA selects warehouse for dropship; warehouseCode not required. "
+                    "eBay channel requires ebayItemCode=Item Number and "
+                    "ebayTransactionID=Transaction ID (lineItemId)."
+                ),
+                "payload": api_payload,
+                "meta": {k: v for k, v in payload.items() if str(k).startswith("_")},
+            }
+
+        # Order import is a non-idempotent write. Never replay it after an
+        # ambiguous timeout or connection failure.
+        data = self._request(
+            "POST",
+            endpoint,
+            json_data=api_payload,
+            retries=0,
+            retry_transport=False,
+        )
+        return {"dry_run": False, "endpoint": f"{self.API_PREFIX}{endpoint}", "data": data}
+
+    @staticmethod
+    def validate_pickup_label_payload(payload: Dict[str, Any]) -> List[str]:
+        """轻量校验上门取货+label payload。"""
+        errors: List[str] = []
+        if not isinstance(payload, dict):
+            return ["payload must be a dict"]
+
+        for key in ("orderDate", "orderNo", "shipMethod", "salesChannel"):
+            if not str(payload.get(key) or "").strip():
+                errors.append(f"missing required field: {key}")
+
+        lines = payload.get("orderLines")
+        if not isinstance(lines, list) or not lines:
+            errors.append("orderLines must be a non-empty list")
+        else:
+            for i, line in enumerate(lines):
+                if not isinstance(line, dict):
+                    errors.append(f"orderLines[{i}] must be an object")
+                    continue
+                if not str(line.get("sku") or "").strip():
+                    errors.append(f"orderLines[{i}].sku is required")
+                try:
+                    qty = int(line.get("qty"))
+                    if qty < 1:
+                        errors.append(f"orderLines[{i}].qty must be >= 1")
+                except (TypeError, ValueError):
+                    errors.append(f"orderLines[{i}].qty must be an integer")
+
+        labels = payload.get("labelFile")
+        if labels is None or (isinstance(labels, list) and len(labels) == 0) or (
+            isinstance(labels, str) and not labels.strip()
+        ):
+            errors.append("labelFile is required for pickup-label import (base64)")
+
+        return errors
+
+    def import_pickup_label_order(
+        self,
+        payload: Dict[str, Any],
+        *,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """导入上门取货订单并上传物流 label（美国站）。
+
+        API: POST /buyer/order/pickUpSellLabel-sync/v1
+        dry_run=True 时只校验，不调 API。
+        """
+        endpoint = "/buyer/order/pickUpSellLabel-sync/v1"
+        errors = self.validate_pickup_label_payload(payload)
+        if errors:
+            raise ValueError("pickup-label payload invalid: " + "; ".join(errors))
+
+        if dry_run:
+            # Avoid dumping huge base64 in logs by default
+            preview = dict(payload)
+            lf = preview.get("labelFile")
+            if isinstance(lf, list):
+                preview["labelFile"] = [f"<base64 len={len(str(x))}>" for x in lf]
+            elif isinstance(lf, str) and lf:
+                preview["labelFile"] = f"<base64 len={len(lf)}>"
+            return {
+                "dry_run": True,
+                "endpoint": f"{self.API_PREFIX}{endpoint}",
+                "payload_preview": preview,
+            }
+
+        data = self._request("POST", endpoint, json_data=payload)
+        return {"dry_run": False, "endpoint": f"{self.API_PREFIX}{endpoint}", "data": data}
     
     # ==================== 便捷方法 ====================
     
