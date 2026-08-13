@@ -147,6 +147,10 @@ CommercePilot_Suite_Interview_CN/
 CommercePilot_Suite_Interview_EN/
 CommercePilot_Suite_Interview_CN_Watermarked_FullLoop/
 CommercePilot_Suite_Interview_EN_Watermarked_FullLoop/
+Dajian_Listing_Tool_Project_Introduction/
+
+# Local API-document extraction intermediates (curated Markdown is versioned)
+/docs/giga_api_extract/
 
 # Local publish/run evidence (keep source scripts and reusable docs reviewable)
 /disposition.csv

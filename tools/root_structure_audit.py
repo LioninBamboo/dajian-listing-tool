@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 ROOT_KEEP_FILES = {
+    '.gitattributes',
     '.gitignore',
     'README.md',
     'agent.md',
@@ -34,12 +35,15 @@ ROOT_KEEP_DIRS = {
     '.github',
     'archive',
     'cache',
+    'config',
+    'data',
     'docs',
     'extension',
     'logs',
     'reports',
     'scripts',
     'src',
+    'tasks',
     'tests',
     'tools',
 }
