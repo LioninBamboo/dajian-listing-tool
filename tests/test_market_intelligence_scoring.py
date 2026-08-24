@@ -25,6 +25,15 @@ from src.plugins.terapeak_research.scoring import (
     compute_demand_signal,
 )
 from src.plugins.terapeak_research._cache import TTLCache
+from daily_tasks import format_mi_alert_subject, format_mi_digest_subject
+
+
+def test_mi_email_subjects_include_store_brand():
+    digest = format_mi_digest_subject("GrovePop", 30)
+    assert digest.startswith("📋 GrovePop MI 日报")
+    assert "30 条机会" in digest
+    alert = format_mi_alert_subject("AquaRides", 2, high=True)
+    assert alert.startswith("🚨 AquaRides MI 告警")
 
 
 # ---------------------------------------------------------------------------
@@ -1304,6 +1313,8 @@ class TestF24DailyDigest:
         assert "未刊登候选" in html
         # subject
         assert "MI 日报" in sent["subject"]
+        from src.utils.store_profile import get_store_profile
+        assert get_store_profile().brand_name in sent["subject"]
 
     def test_digest_archives_but_does_not_email_when_no_opportunities(self, monkeypatch):
         import daily_tasks

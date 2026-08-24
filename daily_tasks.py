@@ -1782,6 +1782,19 @@ def _check_persistent_falling_trend(history: list, min_days: int = 3) -> dict | 
     return None
 
 
+def format_mi_digest_subject(brand: str, count: int, when: datetime | None = None) -> str:
+    """MI daily digest subject; brand first so multi-store inboxes stay distinguishable."""
+    stamp = (when or datetime.now()).strftime("%Y-%m-%d")
+    return f"📋 {brand} MI 日报 - {stamp} - {count} 条机会"
+
+
+def format_mi_alert_subject(brand: str, count: int, *, high: bool, when: datetime | None = None) -> str:
+    """MI alert subject; brand first, same inbox-splitting rule as the digest."""
+    stamp = (when or datetime.now()).strftime("%Y-%m-%d")
+    icon = "🚨" if high else "⚠️"
+    return f"{icon} {brand} MI 告警 - {stamp} - 共 {count} 项"
+
+
 def _send_mi_alert_email(alerts: list, kpi: dict, snap_name: str,
                          opportunities: list | None = None) -> bool:
     """F18 — 发送 MI 异常告警邮件，复用 send_email 通道。
@@ -1802,7 +1815,7 @@ def _send_mi_alert_email(alerts: list, kpi: dict, snap_name: str,
 
         html = f"""
         <html><body style="font-family: 'Microsoft YaHei', Arial, sans-serif;">
-        <h2>{icon} 市场情报 异常告警</h2>
+        <h2>{icon} {get_store_profile().brand_name} 市场情报 异常告警</h2>
         <p>快照文件: <code>{snap_name}</code></p>
         <p><b>当前 KPI</b>: 机会数={kpi.get('current_count')} ·
            14d 均值={kpi.get('avg_recent_count')} ·
@@ -1823,7 +1836,9 @@ def _send_mi_alert_email(alerts: list, kpi: dict, snap_name: str,
         </p>
         </body></html>
         """
-        subject = f"{icon} MI 告警 - {datetime.now():%Y-%m-%d} - 共 {len(alerts)} 项"
+        subject = format_mi_alert_subject(
+            get_store_profile().brand_name, len(alerts), high=(sev_max == "high")
+        )
         return send_email(subject, html)
     except Exception as e:
         logger.error(f"MI 告警邮件发送失败: {e}")
@@ -2055,9 +2070,10 @@ def _send_mi_daily_digest(opportunities: list, kpi: dict, snap_name: str,
                （基于 {long_window['snapshots_long']} 份 30d 快照）</p>
             """
 
+        brand = get_store_profile().brand_name
         html = f"""
         <html><body style="font-family: 'Microsoft YaHei', Arial, sans-serif;">
-        <h2>📋 市场情报 每日摘要 - {datetime.now():%Y-%m-%d}</h2>
+        <h2>📋 {brand} 市场情报 每日摘要 - {datetime.now():%Y-%m-%d}</h2>
         <p>快照文件: <code>{snap_name}</code> · 共发现 <b>{len(opportunities)}</b> 条机会</p>
         <p><b>当前 KPI</b>:
            14d 均值={kpi.get('avg_recent_count')} ·
@@ -2075,7 +2091,7 @@ def _send_mi_daily_digest(opportunities: list, kpi: dict, snap_name: str,
         </p>
         </body></html>
         """
-        subject = f"📋 MI 日报 - {datetime.now():%Y-%m-%d} - {len(opportunities)} 条机会"
+        subject = format_mi_digest_subject(brand, len(opportunities))
         # F25 — 归档 HTML 到 reports/，保留 3 天
         try:
             _archive_mi_digest_html(html, keep_days=3)

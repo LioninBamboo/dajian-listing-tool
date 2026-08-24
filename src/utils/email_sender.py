@@ -21,6 +21,7 @@ import logging
 import mimetypes
 import re
 import smtplib
+import socket
 import ssl
 import time
 from datetime import datetime
@@ -79,6 +80,25 @@ def detect_provider(email: str) -> str:
     elif "@qq." in email:
         return "qq"
     return "163"  # 默认用 163
+
+
+def _smtp_local_hostname() -> str:
+    """Return an EHLO/HELO name 163 and other picky SMTPs will accept.
+
+    Windows DHCP/NetBIOS names can become ``LioninBamboo.DHCP HOST`` (space
+    included). 163 replies ``500 Error: bad syntax`` to that EHLO and then
+    every scheduled email silently fails.
+    """
+    raw = (socket.getfqdn() or socket.gethostname() or "").strip()
+    if (
+        not raw
+        or " " in raw
+        or any(ord(ch) > 127 for ch in raw)
+        or raw.startswith(".")
+        or raw.endswith(".")
+    ):
+        return "localhost"
+    return raw
 
 
 def get_smtp_attempts(email: str) -> List[Tuple[str, str, int, bool, bool]]:
@@ -299,19 +319,28 @@ def _send_via_smtp(
     成功则静默返回；失败则抛出异常供调用方处理。
     """
     ctx = ssl.create_default_context()
+    local_hostname = _smtp_local_hostname()
 
     if use_ssl:
-        server = smtplib.SMTP_SSL(host, port, timeout=30, context=ctx)
+        server = smtplib.SMTP_SSL(
+            host, port, timeout=30, context=ctx, local_hostname=local_hostname
+        )
     else:
-        server = smtplib.SMTP(host, port, timeout=30)
+        server = smtplib.SMTP(host, port, timeout=30, local_hostname=local_hostname)
         if use_starttls:
-            server.ehlo()
+            server.ehlo(local_hostname)
             server.starttls(context=ctx)
-            server.ehlo()
 
     try:
+        ehlo_code, _resp = server.ehlo(local_hostname)
+        if ehlo_code >= 400:
+            server.helo(local_hostname)
+        # 163 advertises PLAIN but rejects the initial AUTH PLAIN blob, and
+        # after a failed EHLO it advertises nothing. Force LOGIN either way.
+        if host.endswith("163.com") or not server.esmtp_features.get("auth"):
+            server.esmtp_features["auth"] = "LOGIN"
         server.login(sender, password)
-        server.sendmail(sender, to_email, msg.as_string())
+        server.send_message(msg)
     finally:
         try:
             server.quit()

@@ -592,3 +592,46 @@ def test_latest_mi_ready_skus_reads_top_level_list_snapshot(tmp_path, monkeypatc
     )
 
     assert scheduler_daemon._latest_mi_ready_skus(10, tmp_path) == ['MI-1', 'MI-2']
+
+
+def test_source_aspect_autofix_cmd_includes_first_batch_safe_types():
+    cmd = scheduler_daemon.build_source_aspect_autofix_cmd(Path("logs/listing_audit_fix_demo.json"))
+    text = cmd
+    for issue_type in (
+        "source_aspect_mismatch",
+        "desc_dimension_mismatch",
+        "desc_weight_mismatch",
+        "wrong_dimension",
+        "description_structure_missing_key_features",
+        "wrong_weight",
+        "missing_weight",
+        "missing_dimension",
+        "description_raw_source_dump",
+        "assembly_description_missing",
+        "assembly_status_unsupported",
+        "assembly_required_mismatch",
+        "non_applicable_aspect",
+        "incomplete_title",
+    ):
+        assert issue_type in text
+    for fix_key in (
+        "Color",
+        "Material",
+        "__source_parameter_rebuild__",
+        "Item Length",
+        "Item Width",
+        "Item Height",
+        "Item Weight",
+        "__desc_needs_update__",
+        "__restore_live_description_from_local__",
+        "__rebuild_description_from_source__",
+        "__assembly_desc_update__",
+        "__remove__Assembly Status",
+        "Assembly Required",
+        "__title__",
+    ):
+        assert fix_key in text
+    assert "categoryId" not in text
+    assert "missing_foldable" not in text
+    assert "assembly_package_conflict" not in text
+    assert "--fix" in text

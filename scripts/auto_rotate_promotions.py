@@ -176,6 +176,52 @@ def show_status(service):
     print("=" * 60)
 
 
+def format_promotion_created_subject(brand: str, pct: float = DISCOUNT_PCT, days: int = DURATION_DAYS) -> str:
+    return f"🏷️ {brand} 店铺折扣新一期 - {int(pct)}% off {days}天"
+
+
+def notify_promotion_created(result: dict) -> None:
+    """Email the operator whenever a new 2-day 5% period is created."""
+    from src.utils.email_sender import send_email
+
+    brand = get_store_profile().brand_name
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    html = f"""
+                <h3>🏷️ {brand} 新促销已自动创建</h3>
+                <p>时间: {now_str}</p>
+                <table style="border-collapse:collapse;width:80%;margin:10px 0;">
+                    <tr style="background:#f5f5f5;">
+                        <td style="padding:8px;border:1px solid #ddd;">店铺</td>
+                        <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">{brand}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px;border:1px solid #ddd;">名称</td>
+                        <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">{result.get('name', 'N/A')}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px;border:1px solid #ddd;">折扣</td>
+                        <td style="padding:8px;border:1px solid #ddd;color:green;">{DISCOUNT_PCT}% off</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px;border:1px solid #ddd;">开始</td>
+                        <td style="padding:8px;border:1px solid #ddd;">{utc_to_beijing(result.get('start_date', 'N/A'))}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px;border:1px solid #ddd;">结束</td>
+                        <td style="padding:8px;border:1px solid #ddd;">{utc_to_beijing(result.get('end_date', 'N/A'))}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px;border:1px solid #ddd;">链接数</td>
+                        <td style="padding:8px;border:1px solid #ddd;">{result.get('listing_count', 'N/A')}</td>
+                    </tr>
+                </table>
+                <p style="color:#999;font-size:12px;">此邮件由 auto_rotate_promotions.py 在新建一期时发送</p>
+                """
+    sent = send_email(format_promotion_created_subject(brand), html)
+    if not sent:
+        logger.warning("促销通知邮件未送达，已保留本地 reports 副本")
+
+
 def rotate():
     """主函数: 检查并轮转促销"""
     from src.services.ebay_discount_service import EbayDiscountService
@@ -203,41 +249,7 @@ def rotate():
         result = create_next_promotion(service, start_after)
         if result.get('success'):
             logger.info(f"✅ 新促销已创建: {result.get('name', 'N/A')} (ID: {result.get('promotion_id', 'N/A')})")
-            
-            # Send notification
-            try:
-                from src.utils.email_sender import send_email
-                now_str = datetime.now().strftime('%Y-%m-%d %H:%M')
-                html = f"""
-                <h3>🏷️ 新促销已自动创建</h3>
-                <p>时间: {now_str}</p>
-                <table style="border-collapse:collapse;width:80%;margin:10px 0;">
-                    <tr style="background:#f5f5f5;">
-                        <td style="padding:8px;border:1px solid #ddd;">名称</td>
-                        <td style="padding:8px;border:1px solid #ddd;font-weight:bold;">{result.get('name', 'N/A')}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding:8px;border:1px solid #ddd;">折扣</td>
-                        <td style="padding:8px;border:1px solid #ddd;color:green;">{DISCOUNT_PCT}% off</td>
-                    </tr>
-                    <tr>
-                        <td style="padding:8px;border:1px solid #ddd;">开始</td>
-                        <td style="padding:8px;border:1px solid #ddd;">{utc_to_beijing(result.get('start_date', 'N/A'))}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding:8px;border:1px solid #ddd;">结束</td>
-                        <td style="padding:8px;border:1px solid #ddd;">{utc_to_beijing(result.get('end_date', 'N/A'))}</td>
-                    </tr>
-                    <tr>
-                        <td style="padding:8px;border:1px solid #ddd;">链接数</td>
-                        <td style="padding:8px;border:1px solid #ddd;">{result.get('listing_count', 'N/A')}</td>
-                    </tr>
-                </table>
-                <p style="color:#999;font-size:12px;">此邮件由 auto_rotate_promotions.py 自动发送</p>
-                """
-                send_email(f"🏷️ 新促销已创建 - {DISCOUNT_PCT}% off {DURATION_DAYS}天", html)
-            except Exception as e:
-                logger.warning(f"促销通知邮件发送失败: {e}")
+            notify_promotion_created(result)
         else:
             logger.error(f"❌ 创建促销失败: {result.get('error', 'Unknown error')}")
     else:
@@ -265,6 +277,7 @@ def main():
         result = create_next_promotion(service)
         if result.get('success'):
             print(f"✅ 新促销已创建: {result.get('name')} (ID: {result.get('promotion_id')})")
+            notify_promotion_created(result)
         else:
             print(f"❌ 创建失败: {result.get('error')}")
         return

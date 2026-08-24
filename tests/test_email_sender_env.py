@@ -60,3 +60,65 @@ def test_purge_old_email_report_artifacts_keeps_recent_files(tmp_path):
     assert keep.exists()
     assert digest_keep.exists()
     assert unrelated.exists()
+
+
+def test_smtp_local_hostname_rejects_spaces(monkeypatch):
+    monkeypatch.setattr(
+        email_sender.socket,
+        "getfqdn",
+        lambda: "LioninBamboo.DHCP HOST",
+    )
+    monkeypatch.setattr(email_sender.socket, "gethostname", lambda: "LioninBamboo")
+    assert email_sender._smtp_local_hostname() == "localhost"
+
+
+def test_smtp_local_hostname_keeps_clean_fqdn(monkeypatch):
+    monkeypatch.setattr(email_sender.socket, "getfqdn", lambda: "grove.example.com")
+    assert email_sender._smtp_local_hostname() == "grove.example.com"
+
+
+def test_send_via_smtp_uses_safe_hostname_and_send_message(monkeypatch):
+    captured = {}
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout=30, context=None, local_hostname=None):
+            captured["local_hostname"] = local_hostname
+            captured["auth"] = None
+            self.esmtp_features = {}
+
+        def ehlo(self, name=None):
+            captured["ehlo"] = name
+            return (250, b"ok")
+
+        def login(self, user, password, initial_response_ok=True):
+            captured["login"] = (user, initial_response_ok)
+            captured["auth"] = self.esmtp_features.get("auth")
+
+        def send_message(self, msg):
+            captured["sent_with"] = "send_message"
+
+        def sendmail(self, *args, **kwargs):
+            captured["sent_with"] = "sendmail"
+
+        def quit(self):
+            captured["quit"] = True
+
+    monkeypatch.setattr(email_sender.smtplib, "SMTP_SSL", FakeSMTP)
+    monkeypatch.setattr(email_sender, "_smtp_local_hostname", lambda: "localhost")
+
+    email_sender._send_via_smtp(
+        "smtp.163.com",
+        465,
+        True,
+        False,
+        "lioninbamboo@163.com",
+        "secret",
+        "lioninbamboo@163.com",
+        object(),
+    )
+
+    assert captured["local_hostname"] == "localhost"
+    assert captured["ehlo"] == "localhost"
+    assert captured["auth"] == "LOGIN"
+    assert captured["sent_with"] == "send_message"
+    assert captured["quit"] is True

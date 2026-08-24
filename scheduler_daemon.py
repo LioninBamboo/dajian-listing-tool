@@ -657,6 +657,59 @@ def task_listing_audit():
     )
 
 
+# 12:10 自动修白名单。新增类型/key 必须单独决定;categoryId 永远不在其中。
+SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES = (
+    "source_aspect_mismatch",
+    "desc_dimension_mismatch",
+    "desc_weight_mismatch",
+    "wrong_dimension",
+    "description_structure_missing_key_features",
+    "wrong_weight",
+    "missing_weight",
+    "missing_dimension",
+    "description_raw_source_dump",
+    "assembly_description_missing",
+    "assembly_status_unsupported",
+    "assembly_required_mismatch",
+    "non_applicable_aspect",
+    "incomplete_title",
+)
+SOURCE_ASPECT_AUTOFIX_FIX_KEYS = (
+    "Color",
+    "Material",
+    "__source_parameter_rebuild__",
+    "Item Length",
+    "Item Width",
+    "Item Height",
+    "Item Weight",
+    "__desc_needs_update__",
+    "__restore_live_description_from_local__",
+    "__rebuild_description_from_source__",
+    "__assembly_desc_update__",
+    "__remove__Assembly Status",
+    "Assembly Required",
+    "__title__",
+)
+
+
+def build_source_aspect_autofix_cmd(report_path) -> list[str]:
+    """Build the scoped live-fix command for the 12:10 source-aspect job."""
+    cmd = [
+        str(PROJECT_ROOT / "scripts" / "audit_fix_active_listings.py"),
+        "--live",
+        "--ignore-clean-freeze",
+        "--exit-zero-on-issues",
+        "--source-report",
+        str(report_path),
+    ]
+    for issue_type in SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES:
+        cmd.extend(["--issue-type", issue_type])
+    for fix_key in SOURCE_ASPECT_AUTOFIX_FIX_KEYS:
+        cmd.extend(["--fix-key", fix_key])
+    cmd.append("--fix")
+    return cmd
+
+
 def task_source_aspect_autofix():
     """把 GIGA 源参数写回 live 属性 — 严格限定 fix key。
 
@@ -664,11 +717,14 @@ def task_source_aspect_autofix():
 
     为什么单独一个任务而不是给 listing_audit 加 --fix:审计不传 --fix-key 时
     会应用该 SKU 的【全部】待修项,2026-07-27 就是这样把两条室内软包储物凳
-    改判进 Outdoor Daybeds 并 republish 上线的。这里只放三个确定性、源直供的
+    改判进 Outdoor Daybeds 并 republish 上线的。这里只放确定性、源直供的
     key,categoryId 永远不在其中。
 
-    没有这个任务时,source_aspect_mismatch 这类问题只被检出不被修复:
-    2026-08-10 审计报了 252 条,其中 195 条带着可用修复项躺着没人执行。
+    第一批扩展(2026-08-13):描述尺寸/重量不一致、错误 Item L/W/H、
+    缺 KEY FEATURES。
+    第二批扩展:错误/缺失 Item Weight、占位尺寸、中文源描述倾倒。
+    第三批扩展:描述缺组装句、无来源 Assembly Status、源/几何明确的 Assembly Required、
+    不适用属性、截断标题。类目、折叠、package_conflict、semantic_feature 仍不自动修。
     """
     if _task_succeeded_today('source_aspect_autofix'):
         logger.info("↪ 跳过源参数自动修复: 今日已成功执行")
@@ -688,19 +744,7 @@ def task_source_aspect_autofix():
     report_path, _scores = picked
     run_task(
         'source_aspect_autofix',
-        [
-            str(PROJECT_ROOT / 'scripts' / 'audit_fix_active_listings.py'),
-            '--live',
-            '--ignore-clean-freeze',
-            '--exit-zero-on-issues',
-            '--source-report', str(report_path),
-            '--issue-type', 'source_aspect_mismatch',
-            # 白名单,不是黑名单:新增 key 必须是明确决定。
-            '--fix-key', 'Color',
-            '--fix-key', 'Material',
-            '--fix-key', '__source_parameter_rebuild__',
-            '--fix',
-        ],
+        build_source_aspect_autofix_cmd(report_path),
         timeout_sec=TASK_TIMEOUT['source_aspect_autofix'],
     )
 
@@ -874,7 +918,7 @@ def task_promotion_rotate():
     """自动轮转 5% 店铺促销 (2天一期)"""
     run_task(
         'promotion_rotate',
-        [str(PROJECT_ROOT / 'scripts' / 'auto_rotate_promotions.py')],
+        [str(PROJECT_ROOT / 'scripts' / 'auto_rotate_promotions.py'), '--email'],
         timeout_sec=1800,
     )
 
