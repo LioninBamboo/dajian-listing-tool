@@ -149,6 +149,18 @@ def build_source_snapshot(detail: Mapping[str, Any] | None) -> SourceSnapshot | 
     characteristics = [
         _clean_text(item) for item in (detail.get("characteristics") or []) if _clean_text(item)
     ]
+    combo_info = detail.get("comboInfo") or []
+    if isinstance(combo_info, list) and combo_info:
+        specs["Combo Box Count"] = str(len(combo_info))
+        if detail.get("comboFlag"):
+            attributes.setdefault("Product Type", "Combo Item")
+        combo_note = (
+            f"Ships as {len(combo_info)} separate carton(s); "
+            "components must be connected before use."
+        )
+        if combo_note not in characteristics:
+            characteristics.append(combo_note)
+
     description_html = _build_description_html(detail, characteristics, attributes, specs)
 
     return SourceSnapshot(

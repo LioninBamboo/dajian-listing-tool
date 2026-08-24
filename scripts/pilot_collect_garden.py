@@ -81,9 +81,19 @@ def map_detail(detail: dict, price: float | None) -> dict:
         imgs = [main] + [u for u in imgs if u != main]
     imgs = imgs[:24]
     vids = [v for v in ([detail.get("productVideoUrl")] + list(detail.get("videoUrls") or [])) if v]
+    # GigaCloud usually leaves `description` empty and puts the real product copy
+    # in `characteristics` (a list of feature paragraphs). Without this fallback the
+    # listing is generated from the title alone, which produces thin descriptions and
+    # starves the semantic fact-guard of source facts (capacity/features it then
+    # flags as NOT_FOUND). Join characteristics when description is blank.
+    description = (detail.get("description") or "").strip()
+    if not description:
+        chars = detail.get("characteristics") or []
+        if isinstance(chars, list) and chars:
+            description = "\n\n".join(str(x).strip() for x in chars if str(x).strip())
     return {
         "title": detail.get("productName", "") or "",
-        "description": detail.get("description", "") or "",
+        "description": description,
         "attributes": attrs, "specs": specs,
         "images": imgs, "videos": vids,
         "price": price or 0.0,

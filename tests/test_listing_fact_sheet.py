@@ -324,6 +324,12 @@ def test_four_season_unsupported_without_source_evidence():
     assert any(v["claim_type"] == "semantic_feature" and "4 season" in v["claim_text"] for v in violations)
 
 
+def test_drop_leaf_supports_foldable_feature():
+    source = dict(SOURCE_SHEET, features=["drop leaf", "storage"])
+    live = dict(SOURCE_SHEET, features=["foldable"])
+    assert compare_fact_sheets(source, live) == []
+
+
 def test_hydraulic_adjustment_supports_adjustable_height():
     source = dict(SOURCE_SHEET, features=["hydraulic adjustment"])
     live = dict(SOURCE_SHEET, features=["adjustable height"])

@@ -139,6 +139,23 @@ def test_build_snapshot_maps_dims_material_videos_mpn():
     assert "600D Oxford cloth" in snapshot.description_html
 
 
+def test_build_snapshot_records_combo_box_count_for_multi_carton_skus():
+    detail = dict(
+        W3636_DETAIL,
+        comboFlag=True,
+        comboInfo=[
+            {"sku": "PART-1", "qty": 1},
+            {"sku": "PART-2", "qty": 1},
+            {"sku": "PART-3", "qty": 1},
+        ],
+    )
+    snapshot = build_source_snapshot(detail)
+    assert snapshot is not None
+    assert snapshot.specs["Combo Box Count"] == "3"
+    assert snapshot.attributes["Product Type"] == "Combo Item"
+    assert any("3 separate carton" in item for item in snapshot.characteristics)
+
+
 def test_build_snapshot_rejects_empty_detail():
     assert build_source_snapshot(None) is None
     assert build_source_snapshot({}) is None

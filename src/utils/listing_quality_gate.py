@@ -473,7 +473,15 @@ def infer_source_assembly_required(
     specs: Mapping[str, Any] | None = None,
     source_description: str = "",
 ) -> str | None:
-    """Return Yes/No only when the supplier source explicitly states assembly."""
+    """Return Yes/No only when the supplier source explicitly states assembly.
+
+    Supplier copy does not use one canonical field.  In addition to the
+    ``Assembly Required`` row, common catalogue wording includes phrases such
+    as ``assembly is required``, ``easy assembly``, ``partially pre-assembled``
+    and ``no assembly required``.  Packaging dimensions are deliberately not
+    considered here; they are handled by :func:`infer_assembly_decision` so a
+    compressed or foldable product cannot be mistaken for a flat-pack item.
+    """
     for source in (attributes or {}, specs or {}):
         for key, value in source.items():
             normalized_key = _clean_text(key).lower()
@@ -483,7 +491,7 @@ def infer_source_assembly_required(
                     return parsed
 
     text = _plain_text(source_description)
-    patterns = (
+    keyed_patterns = (
         r"\bassembly\s+required\s*[:：]?\s*(yes|no)\b",
         r"\brequires\s+assembly\s*[:：]?\s*(yes|no)\b",
         (
@@ -493,13 +501,54 @@ def infer_source_assembly_required(
             r"(\u662f|\u5426|\u9700\u8981|\u4e0d\u9700\u8981|\u65e0\u9700|yes|no)"
         ),
     )
-    for pattern in patterns:
+    for pattern in keyed_patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
         if not match:
             continue
         parsed = _normalize_yes_no(match.group(1))
         if parsed:
             return parsed
+
+    negative_patterns = (
+        r"\bno\s+assembly(?:\s+is)?\s+(?:required|needed|necessary)\b",
+        r"\bno\s+tools?\s+or\s+assembly\s+required\b",
+        r"\bassembly\s+(?:is\s+)?(?:not|required\s*[:：]?\s*no)\b",
+        r"\bassembly[-\s]?free\b",
+        r"\b(?:ships?\s+)?fully\s+(?:pre[-\s]?assembled|assembled)\b",
+        r"\bready\s+to\s+use\s+right\s+out\s+of\s+the\s+box\b",
+    )
+    positive_patterns = (
+        r"\bassembly\s+(?:is\s+)?required\b",
+        r"\b(?:requires?|must)\s+(?:be\s+)?assembled\b",
+        r"\bassembly\s+(?:is\s+)?needed\b",
+        r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+(?:to\s+)?assemble\b",
+        r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+assembly\b",
+        r"\b(?:tool[-\s]?free)\s+(?:installation|assembly)\b",
+        r"\b(?:full|complete|partial)\s+assembly\b",
+        r"\bassembly\s+(?:time|instructions|guide|manual|hardware)\b",
+        r"\b(?:installation|assembly)\s+instructions\b",
+        r"\bpartially\s+pre[-\s]?assembled\b",
+        r"\bpre[-\s]?assembled\b[^.]{0,100}\b(?:backrest|seat|board|leg|component|part)\b",
+        r"\b(?:backrest|seat|board|leg|component|part)\b[^.]{0,100}\bpre[-\s]?assembled\b",
+        r"\b(?:attach|install)\s+(?:the\s+)?(?:remaining\s+)?(?:legs?|feet|backrest|seat|base|parts?|components?)\b",
+        r"\bmost\s+assembled\b[^.]{0,100}\bassemble\b",
+        r"\bcomponents?\s+must\s+be\s+connected\b",
+        r"\bships?\s+as\s+\d+\s+separate\s+(?:carton|box)es?\b",
+    )
+    has_negative = any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in negative_patterns)
+    positive_scan_text = text
+    for pattern in negative_patterns:
+        positive_scan_text = re.sub(pattern, " ", positive_scan_text, flags=re.IGNORECASE)
+    has_positive = any(
+        re.search(pattern, positive_scan_text, flags=re.IGNORECASE)
+        for pattern in positive_patterns
+    )
+    if has_negative and has_positive:
+        return None
+    if has_positive:
+        return "Yes"
+    if has_negative:
+        return "No"
     return None
 
 
@@ -519,9 +568,10 @@ _PACKAGE_ASSEMBLY_DIMENSION_KEYS = {
 _ASSEMBLY_NEGATIVE_CUE_PATTERNS = (
     ("no_assembly", r"\bno\s+assembly\s+required\b"),
     ("assembly_required_no", r"\bassembly\s+required\s*[:：]?\s*no\b"),
+    ("assembly_not_required", r"\bassembly\s+(?:is\s+)?not\s+required\b"),
+    ("no_tools_or_assembly", r"\bno\s+tools?\s+or\s+assembly\s+required\b"),
     ("assembly_free", r"\bassembly[-\s]?free\b"),
-    ("fully_assembled", r"\b(?:ships?\s+)?fully\s+assembled\b"),
-    ("pre_assembled", r"\bpre[-\s]?assembled\b"),
+    ("fully_assembled", r"\b(?:ships?\s+)?fully\s+(?:pre[-\s]?assembled|assembled)\b"),
     ("ready_out_of_box", r"\bready\s+to\s+use\s+right\s+out\s+of\s+the\s+box\b"),
 )
 
@@ -536,14 +586,31 @@ _ASSEMBLY_FLEXIBLE_PRODUCT_PATTERNS = (
     r"\bstroller\b",
     r"\btreadmill\b",
     r"\bcamping\b",
+    r"\bvacuum[-\s]?packed\b",
 )
 
 _ASSEMBLY_POSITIVE_CUE_PATTERNS = (
     ("assembly_action", r"\b(?:requires?|must)\s+(?:be\s+)?assembled\b"),
+    ("assembly_is_required", r"\bassembly\s+(?:is\s+)?required\b"),
     ("assemble_action", r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+(?:to\s+)?assemble\b"),
+    ("easy_assembly", r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+assembly\b"),
     ("install_action", r"\b(?:easy|simple|straightforward)\s+(?:to\s+)?install(?:ation)?\b"),
+    ("tool_free_installation", r"\btool[-\s]?free\s+(?:installation|assembly)\b"),
+    ("assembly_time", r"\bassembly\s+time\b"),
     ("assembly_instructions", r"\b(?:assembly|installation)\s+(?:instructions|guide|manual)\b"),
     ("assembly_hardware", r"\bassembly\s+hardware\b"),
+    ("full_assembly", r"\b(?:full|complete|partial)\s+assembly\b"),
+    ("partial_preassembly", r"\bpartially\s+pre[-\s]?assembled\b"),
+    (
+        "preassembled_components",
+        r"(?:\bpre[-\s]?assembled\b[^.]{0,100}\b(?:backrest|seat|board|leg|component|part)\b|"
+        r"\b(?:backrest|seat|board|leg|component|part)\b[^.]{0,100}\bpre[-\s]?assembled\b)",
+    ),
+    (
+        "assembly_action_components",
+        r"\b(?:attach|install)\s+(?:the\s+)?(?:remaining\s+)?(?:legs?|feet|backrest|seat|base|parts?|components?)\b",
+    ),
+    ("treadmill_setup", r"\bmost\s+assembled\b[^.]{0,100}\bassemble\b"),
     ("setup_action", r"\bsetup\s+(?:required|instructions|guide)\b"),
 )
 
@@ -562,6 +629,21 @@ _ASSEMBLY_RIGID_PRODUCT_PATTERNS = (
     r"\bchicken\s+coop\b",
     r"\bgreenhouse\b",
 )
+
+
+def _combo_box_count_from_specs(specs: Mapping[str, Any] | None) -> int | None:
+    for key in ("Combo Box Count", "combo box count"):
+        value = (specs or {}).get(key)
+        match = re.search(r"\d+", str(value or ""))
+        if not match:
+            continue
+        try:
+            count = int(match.group(0))
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            return count
+    return None
 
 
 def _first_numeric_source_value(source: Mapping[str, Any] | None, keys: tuple[str, ...]) -> float | None:
@@ -614,9 +696,12 @@ def infer_package_assembly_evidence(
         pattern for pattern in _ASSEMBLY_FLEXIBLE_PRODUCT_PATTERNS
         if re.search(pattern, text, flags=re.IGNORECASE)
     ]
+    positive_scan_text = text
+    for _name, pattern in _ASSEMBLY_NEGATIVE_CUE_PATTERNS:
+        positive_scan_text = re.sub(pattern, " ", positive_scan_text, flags=re.IGNORECASE)
     positive_cues = [
         name for name, pattern in _ASSEMBLY_POSITIVE_CUE_PATTERNS
-        if re.search(pattern, text, flags=re.IGNORECASE)
+        if re.search(pattern, positive_scan_text, flags=re.IGNORECASE)
     ]
     rigid_cues = [
         pattern for pattern in _ASSEMBLY_RIGID_PRODUCT_PATTERNS
@@ -630,6 +715,100 @@ def infer_package_assembly_evidence(
         else "unknown"
     )
 
+    no_assembly_family: str | None = None
+    compressed_delivery = (
+        bool(re.search(r"\b(?:compressed|compression|vacuum[-\s]?packed)\b", text, flags=re.IGNORECASE))
+        and bool(
+            re.search(
+                r"\b(?:unpack|unbox|unwrap|regain\s+(?:its\s+)?shape|restore\s+(?:its\s+)?shape|"
+                r"\d+\s+hours?|without\s+(?:complex|complicated)\s+installation)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+    )
+    unboxed_furniture = (
+        bool(negative_cues)
+        and bool(re.search(r"\b(?:sofa|couch|sectional|ottoman|modular)\b", text, flags=re.IGNORECASE))
+        and bool(re.search(r"\b(?:unpack|unbox|unwrap|vacuum[-\s]?packed)\b", text, flags=re.IGNORECASE))
+    )
+    if (compressed_delivery or unboxed_furniture) and not positive_cues:
+        no_assembly_family = "compressed_delivery"
+    elif (
+        bool(re.search(r"\b(?:camping|portable)\s+chairs?\b", title_text or text, flags=re.IGNORECASE))
+        and bool(re.search(r"\b(?:fold(?:able|ing)|carry\s+bag|unfold|portable)\b", text, flags=re.IGNORECASE))
+        and not positive_cues
+    ):
+        no_assembly_family = "folding_portable_chair"
+
+    compressed_title = bool(
+        re.search(
+            r"\b(?:compressed|compression|vacuum[-\s]?packed|cloud\s+couch)\b",
+            title_text or text,
+            flags=re.IGNORECASE,
+        )
+    )
+    combo_box_count = _combo_box_count_from_specs(specs)
+    seating_context = bool(
+        re.search(
+            r"\b(?:sofa|couch|sectional|ottoman|loveseat|chaise)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    modular_sectional = bool(
+        re.search(
+            r"\b(?:modular\s+sectional|sectional\s+sofa|sofa\s+set|matching\s+ottoman|"
+            r"individual\s+matching\s+ottoman)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    separate_piece = bool(
+        re.search(
+            r"\b(?:separate,?\s+matching\s+ottoman|individual\s+matching\s+ottoman|"
+            r"comes\s+with\s+(?:a\s+)?separate|multiple\s+boxes|multi[\s-]?piece|"
+            r"components?\s+must\s+be\s+connected)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    combo_item = bool(re.search(r"\bcombo\s+item\b", text, flags=re.IGNORECASE))
+
+    required_family: str | None = None
+    if (
+        re.search(r"\btreadmill\b", title_text or text, flags=re.IGNORECASE)
+        and not negative_cues
+    ):
+        required_family = "exercise_equipment_setup"
+    elif (
+        not negative_cues
+        and not compressed_title
+        and combo_box_count is not None
+        and combo_box_count >= 2
+        and seating_context
+    ):
+        required_family = "multi_box_combo"
+    elif (
+        not negative_cues
+        and not compressed_title
+        and modular_sectional
+        and (combo_item or separate_piece or (combo_box_count is not None and combo_box_count >= 2))
+    ):
+        required_family = "modular_combo_sectional"
+    elif (
+        all(value is not None for value in assembled + package)
+        and bool(re.search(r"\b(?:chair|armchair)\b", title_text or text, flags=re.IGNORECASE))
+        and bool(re.search(r"\b(?:metal|steel)\s+frame\b", text, flags=re.IGNORECASE))
+        and bool(re.search(r"\b(?:wooden\s+)?armrests?\b", text, flags=re.IGNORECASE))
+        and not negative_cues
+    ):
+        # A structured metal-frame chair with separate wooden armrests is a
+        # component-built seating item, not a foldable/cushion-only product.
+        # Keep this family narrow: generic chairs, benches, and trunks remain
+        # review-only without an explicit source assembly statement.
+        required_family = "structured_seating_frame"
+
     evidence: dict[str, Any] = {
         "available": available,
         "strong": False,
@@ -640,6 +819,8 @@ def infer_package_assembly_evidence(
         "positive_cues": positive_cues,
         "rigid_cues": rigid_cues,
         "product_family": product_family,
+        "no_assembly_family": no_assembly_family,
+        "required_family": required_family,
     }
     if not available:
         return evidence
@@ -677,11 +858,13 @@ def infer_assembly_decision(
     """Return a conservative, auditable assembly decision.
 
     Explicit source ``Yes`` wins.  Explicit source ``No`` remains valid unless
-    strong package geometry conflicts with it; that conflict is review-only so
-    the system does not invent a buyer-facing claim.  When source evidence is
-    absent, a rigid product with strong flat-pack geometry is safely promoted
-    to ``Yes``.  Unknown geometry falls back to an existing normalized aspect,
-    but never creates a new default ``No``.
+    strong package geometry conflicts with it.  Known compression-delivery and
+    folding-portable-chair families are exceptions because the thin package is
+    the product's storage or shipping state, not evidence of assembly.  When
+    source evidence is absent, a rigid product or a known setup-required device
+    with strong flat-pack geometry is promoted to ``Yes``.  Unknown geometry
+    falls back to an existing normalized aspect, but never creates a new
+    default ``No``.
     """
     source = infer_source_assembly_required(attributes, specs, source_description)
     package = infer_package_assembly_evidence(
@@ -696,6 +879,8 @@ def infer_assembly_decision(
         return {"required": "Yes", "status": "source", "source": source, "package": package}
 
     if source == "No":
+        if package.get("no_assembly_family"):
+            return {"required": "No", "status": "source", "source": source, "package": package}
         if package["strong"]:
             return {
                 "required": None,
@@ -705,6 +890,23 @@ def infer_assembly_decision(
                 "conflict": True,
             }
         return {"required": "No", "status": "source", "source": source, "package": package}
+
+    if package.get("no_assembly_family"):
+        return {"required": "No", "status": "family", "source": None, "package": package}
+
+    unconditional_required_families = {
+        "exercise_equipment_setup",
+        "multi_box_combo",
+        "modular_combo_sectional",
+    }
+    if package.get("required_family") and (
+        package["required_family"] in unconditional_required_families
+        or package.get("strong")
+    ):
+        return {"required": "Yes", "status": "family", "source": None, "package": package}
+
+    if package["positive_cues"] and not package["negative_cues"]:
+        return {"required": "Yes", "status": "package", "source": None, "package": package}
 
     if package["strong"]:
         if (
@@ -726,17 +928,29 @@ def infer_assembly_decision(
 
 ASSEMBLY_NO_REQUIRED_PATTERNS = (
     r"\bno\s+assembly\s+required\b",
+    r"\bno\s+assembly\s+is\s+required\b",
+    r"\bno\s+tools?\s+or\s+assembly\s+required\b",
+    r"\bno\s+assembly\s+(?:is\s+)?(?:needed|necessary)\b",
+    r"\bassembly\s+(?:is\s+)?not\s+required\b",
+    r"\bdoes\s+not\s+require\s+assembly\b",
     r"\bassembly\s+required\s*[:：]?\s*no\b",
     r"\bassembly[-\s]?free\b",
-    r"\bships?\s+fully\s+assembled\b",
-    r"\bfully\s+assembled\b",
+    r"\bships?\s+fully\s+(?:pre[-\s]?assembled|assembled)\b",
+    r"\bfully\s+(?:pre[-\s]?assembled|assembled)\b",
     r"\bready\s+to\s+use\s+right\s+out\s+of\s+the\s+box\b",
 )
 
 ASSEMBLY_YES_REQUIRED_PATTERNS = (
     r"\brequires\s+assembly\b",
+    r"\bassembly\s+(?:is\s+)?required\b",
     r"\bassembly\s+(?:is\s+)?needed\b",
     r"\bmust\s+be\s+assembled\b",
+    r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+(?:to\s+)?assemble\b",
+    r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+assembly\b",
+    r"\b(?:tool[-\s]?free)\s+(?:installation|assembly)\b",
+    r"\b(?:full|complete|partial)\s+assembly\b",
+    r"\bpartially\s+pre[-\s]?assembled\b",
+    r"\bassembly\s+(?:time|instructions|guide|manual|hardware)\b",
 )
 
 ASSEMBLY_STATUS_PATTERNS = (
@@ -785,6 +999,12 @@ def has_expected_assembly_copy(description: str, expected: str | None) -> bool:
             r"\bassembly\s+(?:is\s+)?required\b",
             r"\bassembly\s+(?:is\s+)?needed\b",
             r"\bmust\s+be\s+assembled\b",
+            r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+(?:to\s+)?assemble\b",
+            r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+assembly\b",
+            r"\b(?:tool[-\s]?free)\s+(?:installation|assembly)\b",
+            r"\b(?:full|complete|partial)\s+assembly\b",
+            r"\bpartially\s+pre[-\s]?assembled\b",
+            r"\bassembly\s+(?:time|instructions|guide|manual|hardware)\b",
             r"\bready\s+to\s+use\s+after\s+assembly\b",
         )
         return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in positive_patterns)
@@ -792,10 +1012,13 @@ def has_expected_assembly_copy(description: str, expected: str | None) -> bool:
     negative_patterns = (
         r"\bassembly\s+required\s*[:：]?\s*no\b",
         r"\bno\s+assembly\s+required\b",
+        r"\bno\s+tools?\s+or\s+assembly\s+required\b",
+        r"\bno\s+assembly\s+(?:is\s+)?(?:needed|necessary)\b",
+        r"\bassembly\s+(?:is\s+)?not\s+required\b",
         r"\bdoes\s+not\s+require\s+assembly\b",
         r"\bassembly[-\s]?free\b",
-        r"\bships?\s+fully\s+assembled\b",
-        r"\bfully\s+assembled\b",
+        r"\bships?\s+fully\s+(?:pre[-\s]?assembled|assembled)\b",
+        r"\bfully\s+(?:pre[-\s]?assembled|assembled)\b",
     )
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in negative_patterns)
 
@@ -915,16 +1138,35 @@ def find_assembly_description_contradictions(description: str, expected: str | N
         found: list[str] = []
         for match in re.finditer(r"\bassembly\s+required\b", text, flags=re.IGNORECASE):
             before = text[max(0, match.start() - 30): match.start()]
-            after = text[match.end(): match.end() + 16]
+            after = text[match.end(): match.end() + 120]
             if re.search(r"\b(?:no|not)\b", before):
                 continue
-            if re.match(r"\s*[:：]?\s*(?:no|not\s+required|false)\b", after):
+            if re.search(r"\b(?:no|not\s+required|not\s+needed|false)\b", after, flags=re.IGNORECASE):
                 continue
             found.append(r"\bassembly\s+required\b")
             break
+        positive_scan_text = text
+        for pattern in ASSEMBLY_NO_REQUIRED_PATTERNS:
+            positive_scan_text = re.sub(pattern, " ", positive_scan_text, flags=re.IGNORECASE)
+        # Stale package-includes lines from an earlier Yes rewrite are not
+        # assembly-required claims when the aspect already says No.
+        positive_scan_text = re.sub(
+            r"\b1\s*x\s+(?:assembly\s+instructions?|hardware\s+kit)\b",
+            " ",
+            positive_scan_text,
+            flags=re.IGNORECASE,
+        )
         for pattern in ASSEMBLY_YES_REQUIRED_PATTERNS:
-            if re.search(pattern, text, flags=re.IGNORECASE):
+            matched = False
+            for match in re.finditer(pattern, positive_scan_text, flags=re.IGNORECASE):
+                before = positive_scan_text[max(0, match.start() - 30): match.start()]
+                if re.search(r"\b(?:no|not)\b", before):
+                    continue
                 found.append(pattern)
+                matched = True
+                break
+            if matched:
+                break
         return list(dict.fromkeys(found))
 
     patterns = ASSEMBLY_NO_REQUIRED_PATTERNS
@@ -980,6 +1222,25 @@ def rewrite_assembly_copy(description: str, expected: str | None) -> str:
     updated = description
     for pattern, replacement in replacements:
         updated = re.sub(pattern, replacement, updated, flags=re.IGNORECASE)
+
+    if expected == "No":
+        updated = re.sub(r",?\s*1 x Assembly Instructions", "", updated, flags=re.IGNORECASE)
+        updated = re.sub(r",?\s*1 x Hardware Kit", "", updated, flags=re.IGNORECASE)
+
+        def _drop_false_assembly_bullet(match: re.Match[str]) -> str:
+            block = match.group(0)
+            if re.search(r"\bno\s+assembly\s+required\b", block, flags=re.IGNORECASE):
+                return block
+            if re.search(r"\bassembly\s+required\b", block, flags=re.IGNORECASE):
+                return ""
+            return block
+
+        updated = re.sub(
+            r"<li\b[^>]*>.*?</li>",
+            _drop_false_assembly_bullet,
+            updated,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
 
     return _upsert_assembly_specs_row(updated, expected)
 

@@ -51,9 +51,12 @@ _DIMENSION_TOLERANCE = {"length": 1.0, "width": 1.0, "height": 1.0, "weight": 2.
 # matches a group, it is supported if the source sheet matches the same group.
 _SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"4 season", "four season", "all season", "year round", "year-round", "all year"}),
-    frozenset({"foldable", "folding", "collapsible"}),
+    frozenset({"foldable", "folding", "collapsible", "drop leaf", "drop-leaf"}),
     frozenset({"water resistant", "water-resistant", "withstand rain", "rain resistant"}),
     frozenset({"assembly required", "setup required", "needs assembly"}),
+    # Supplier titles and marketing copy use "modular" for sectional / sofa-set
+    # families; the live rewrite often shortens that to "modular design".
+    frozenset({"modular", "modular design", "modular sectional", "modular living room furniture"}),
     frozenset({"adjustable height", "height adjustable", "hydraulic adjustment", "hydraulic lift"}),
     # MGO is the abbreviation for magnesium oxide (a concrete-like planter/board
     # material); source often spells it out while the title uses "MGO" — same thing.
@@ -68,6 +71,10 @@ _SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
         "powder-coating",
         "powder coat",
     }),
+    # PU is the ubiquitous shorthand for polyurethane (air hoses, coatings, foam,
+    # PU leather). Source often writes "PU" while the generated copy expands it to
+    # "polyurethane" — same material, not a hallucinated upgrade.
+    frozenset({"pu", "polyurethane", "pu (polyurethane)", "polyurethane (pu)"}),
 )
 
 # Generalization is safe, specialization is the hallucination direction:

@@ -390,6 +390,201 @@ def test_explicit_no_with_flat_pack_geometry_requires_manual_review():
     assert decision["conflict"] is True
 
 
+def test_compressed_sofa_no_assembly_text_overrides_flat_pack_geometry():
+    decision = infer_assembly_decision(
+        source_title="43-inch Round Corduroy Compressed Sofa",
+        source_description=(
+            "Compressed shipping. Unpack the sofa and wait 72 hours for it to regain shape. "
+            "No Assembly Required."
+        ),
+        attributes={
+            "Assembled Length (in.)": "43",
+            "Assembled Width (in.)": "43",
+            "Assembled Height (in.)": "36",
+        },
+        specs={
+            "Package Length (in.)": "46",
+            "Package Width (in.)": "14",
+            "Package Height (in.)": "13",
+        },
+        current_assembly="No",
+    )
+
+    assert decision["required"] == "No"
+    assert decision["status"] == "source"
+    assert decision["package"]["strong"] is True
+    assert decision["package"]["no_assembly_family"] == "compressed_delivery"
+
+
+def test_compressed_sofa_setup_copy_is_a_no_assembly_family_signal():
+    decision = infer_assembly_decision(
+        source_title="Modular Compression Sofa, Legless Floor-Hugging",
+        source_description="Easy to unpack and set up without complex installation.",
+        attributes={
+            "Assembled Length (in.)": "37.5",
+            "Assembled Width (in.)": "37.5",
+            "Assembled Height (in.)": "33",
+        },
+        specs={
+            "Package Length (in.)": "11.1",
+            "Package Width (in.)": "11.1",
+            "Package Height (in.)": "41.4",
+        },
+    )
+
+    assert decision["required"] == "No"
+    assert decision["status"] == "family"
+    assert decision["package"]["no_assembly_family"] == "compressed_delivery"
+
+
+def test_folding_camping_chair_with_carry_bag_is_not_flat_pack_assembly():
+    decision = infer_assembly_decision(
+        source_title="Folding Camping Chairs with Carry Bag, Portable Outdoor Chairs",
+        source_description="Fold and unfold in seconds for transport and storage.",
+        attributes={
+            "Assembled Length (in.)": "16.5",
+            "Assembled Width (in.)": "20.1",
+            "Assembled Height (in.)": "25.6",
+        },
+        specs={
+            "Package Length (in.)": "26.38",
+            "Package Width (in.)": "6.30",
+            "Package Height (in.)": "6.30",
+        },
+    )
+
+    assert decision["required"] == "No"
+    assert decision["status"] == "family"
+    assert decision["package"]["no_assembly_family"] == "folding_portable_chair"
+
+
+def test_structured_metal_frame_armchair_is_a_narrow_setup_required_family():
+    decision = infer_assembly_decision(
+        source_title="Modern Accent Chair with Plush Cushions, Metal Frame and Wooden Armrests",
+        source_description="A structured upholstered accent chair for the living room.",
+        attributes={
+            "Assembled Length (in.)": "27.56",
+            "Assembled Width (in.)": "30.31",
+            "Assembled Height (in.)": "33.07",
+        },
+        specs={
+            "Package Length (in.)": "33.20",
+            "Package Width (in.)": "27.80",
+            "Package Height (in.)": "10.60",
+        },
+    )
+
+    assert decision["required"] == "Yes"
+    assert decision["status"] == "family"
+    assert decision["package"]["required_family"] == "structured_seating_frame"
+
+
+def test_modular_sofa_set_with_matching_ottoman_requires_assembly():
+    decision = infer_assembly_decision(
+        source_title=(
+            "Modern Green Chenille Sofa Set, 3-Seat Couch with Individual Matching Ottoman, "
+            "Modular Living Room Furniture with Built-in USB Ports and Side Pockets."
+        ),
+        source_description=(
+            "Flexible Individual Ottoman: Comes with a separate, matching ottoman "
+            "that can be used as a footrest or extra seat."
+        ),
+        attributes={
+            "Assembled Length (in.)": "107.87",
+            "Assembled Width (in.)": "51.97",
+            "Assembled Height (in.)": "33.86",
+            "Product Weight (lbs.)": "145.51",
+        },
+        specs={},
+        current_assembly="No",
+    )
+
+    assert decision["required"] == "Yes"
+    assert decision["status"] == "family"
+    assert decision["package"]["required_family"] == "modular_combo_sectional"
+
+
+def test_multi_box_combo_requires_assembly_without_package_dimensions():
+    decision = infer_assembly_decision(
+        source_title="Green Chenille Sofa Set with Ottoman",
+        source_description=(
+            "Ships as 3 separate cartons; components must be connected before use."
+        ),
+        attributes={
+            "Assembled Length (in.)": "107.87",
+            "Assembled Width (in.)": "51.97",
+            "Assembled Height (in.)": "33.86",
+        },
+        specs={"Combo Box Count": "3"},
+        current_assembly="No",
+    )
+
+    assert decision["required"] == "Yes"
+    assert decision["status"] in {"family", "source"}
+    assert decision["package"]["required_family"] == "multi_box_combo"
+
+
+def test_natural_language_assembly_required_and_partial_preassembly_are_yes():
+    for description in (
+        "Assembly is required before use. Follow the included instructions.",
+        "The chair arrives partially pre-assembled for quick, easy setup.",
+        "Pre-assembled backrest and seat board; attach the remaining parts.",
+    ):
+        decision = infer_assembly_decision(
+            source_title="Outdoor Wood Chair",
+            source_description=description,
+            attributes={
+                "Assembled Length (in.)": "29",
+                "Assembled Width (in.)": "34",
+                "Assembled Height (in.)": "33",
+            },
+            specs={
+                "Package Length (in.)": "35.43",
+                "Package Width (in.)": "21.65",
+                "Package Height (in.)": "5.51",
+            },
+        )
+
+        assert decision["required"] == "Yes", description
+        assert decision["status"] == "source", description
+
+
+def test_tool_free_full_assembly_and_treadmill_setup_are_yes():
+    stroller = infer_assembly_decision(
+        source_title="Foldable Pet Stroller",
+        source_description=(
+            "Quick and tool-free installation. Supports full assembly in just a few minutes."
+        ),
+        attributes={
+            "Assembled Length (in.)": "19.69",
+            "Assembled Width (in.)": "26.38",
+            "Assembled Height (in.)": "42.13",
+        },
+        specs={
+            "Package Length (in.)": "35.43",
+            "Package Width (in.)": "16.54",
+            "Package Height (in.)": "7.87",
+        },
+    )
+    treadmill = infer_assembly_decision(
+        source_title="Foldable Treadmill",
+        source_description="Most assembled; it takes roughly 15 minutes to assemble the rest with the tool bag included.",
+        attributes={
+            "Assembled Length (in.)": "66.73",
+            "Assembled Width (in.)": "29.52",
+            "Assembled Height (in.)": "48.81",
+        },
+        specs={
+            "Package Length (in.)": "70.66",
+            "Package Width (in.)": "30.31",
+            "Package Height (in.)": "12.99",
+        },
+    )
+
+    assert stroller["required"] == "Yes"
+    assert treadmill["required"] == "Yes"
+
+
 def test_quality_gate_catches_w808_style_description_no_assembly_claim():
     opt = {
         "title": "13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet",
@@ -661,6 +856,30 @@ def test_quality_gate_does_not_treat_no_tools_as_no_assembly():
 
     assert not any(issue.code == "assembly_description_contradiction" for issue in yes_issues)
     assert not any(issue.code == "assembly_description_contradiction" for issue in no_issues)
+
+
+def test_no_assembly_spec_table_and_stale_package_lines_are_not_contradictions():
+    from src.utils.listing_quality_gate import (
+        find_assembly_description_contradictions,
+        rewrite_assembly_copy,
+    )
+
+    description = (
+        "<div><ul><li>assembly required: compressed packaging requires no assembly.</li></ul>"
+        "<table><tr><td>Assembly Required</td><td>No - Ready for use without assembly.</td></tr></table>"
+        "<p>1 x Sectional, 1 x Hardware Kit, 1 x Assembly Instructions</p></div>"
+    )
+    cleaned = rewrite_assembly_copy(description, "No")
+    assert "Hardware Kit" not in cleaned
+    assert "Assembly Instructions" not in cleaned
+    assert find_assembly_description_contradictions(cleaned, "No") == []
+
+
+def test_no_assembly_is_required_phrase_is_not_contradiction():
+    from src.utils.listing_quality_gate import find_assembly_description_contradictions
+
+    text = "This bench comes ready to use. No assembly is required. Dimensions: 48 in."
+    assert find_assembly_description_contradictions(text, "No") == []
 
 
 def test_quality_gate_adds_missing_assembly_required_copy_and_removes_unsupported_status():
