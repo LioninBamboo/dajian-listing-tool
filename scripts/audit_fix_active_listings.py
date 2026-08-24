@@ -111,6 +111,7 @@ from src.utils.title_sanitizer import (
     sanitize_listing_title,
     title_has_incomplete_trailing_fragment,
 )
+from src.clients.real_ebay_client import lookup_stored_video_id
 
 
 _CATEGORY_MATCHER = None
@@ -777,6 +778,7 @@ def audit_single_product(
     images_raw=None,
     videos_raw=None,
     live_inventory=None,
+    accept_package_conflict_as=None,
 ):
     """Audit a single product. Returns (issues, fixes) where fixes are actionable corrections."""
     issues = []
@@ -1162,14 +1164,22 @@ def audit_single_product(
             "expected": "manual review",
             "detail": "Package geometry suggests a flat-pack product, but source/listing evidence also suggests no assembly; manual confirmation required",
         })
+        if str(accept_package_conflict_as or "").strip() == "Yes":
+            fixes["Assembly Required"] = ["Yes"]
+            fixes["__assembly_desc_update__"] = "Yes"
 
     if source_assembly:
-        assembly_reason = (
-            f"because supplier source says Assembly Required {source_assembly}"
-            if assembly_decision.get("status") == "source"
-            else "because source dimensions strongly indicate a rigid flat-pack product"
-        )
-        if current_assembly.lower() != source_assembly.lower():
+        if assembly_decision.get("status") == "source":
+            assembly_reason = f"because supplier source says Assembly Required {source_assembly}"
+        elif assembly_decision.get("status") == "family":
+            family = (
+                assembly_decision.get("package", {}).get("required_family")
+                or "known setup-required product family"
+            )
+            assembly_reason = f"because the product-family rule '{family}' requires setup"
+        else:
+            assembly_reason = "because source dimensions strongly indicate a rigid flat-pack product"
+        if (current_assembly or "").strip().lower() != source_assembly.lower():
             issues.append({
                 "type": "assembly_required_mismatch",
                 "severity": "CRITICAL",
@@ -1289,8 +1299,16 @@ def audit_single_product(
     # ── 6. Motors Compatibility ──
     compat_title = opt_title or title
     compat_desc = live_description
-    if stored_category in EBAY_MOTORS_CATEGORIES:
-        compatibility = analyze_ebay_motors_compatibility(stored_category, compat_title, compat_desc, aspects)
+    from src.utils.store_profile import get_store_profile
+    is_motors_store = get_store_profile().is_motors
+    if stored_category in EBAY_MOTORS_CATEGORIES or is_motors_store:
+        compatibility = analyze_ebay_motors_compatibility(
+            stored_category,
+            compat_title,
+            compat_desc,
+            aspects,
+            is_motors_store=is_motors_store,
+        )
         expected_aspects = apply_compatibility_aspects(stored_category, aspects, compatibility)
         current_meta = opt.get("motorsCompatibility", {}) if isinstance(opt, dict) else {}
 
@@ -1402,6 +1420,26 @@ def audit_single_product(
                 })
                 # Add support for semantic rebuild if we encounter FactSheet violations
                 fixes["__semantic_rebuild_from_source__"] = True
+                if (
+                    _sv["claim_type"] == "semantic_feature"
+                    and str(_sv.get("claim_text") or "").strip().lower()
+                    in {"foldable", "collapsible", "folding"}
+                    and not re.search(
+                        r"\b(?:foldable|collapsible|folding|foldaway|fold)\b",
+                        str(_sv.get("source_evidence") or ""),
+                        flags=re.IGNORECASE,
+                    )
+                    and not re.search(
+                        r"\bdrop\s+leaf\b|\bleaf\s+tabletop\b|\bfolding\s+mechanism\b",
+                        str(_sv.get("source_evidence") or ""),
+                        flags=re.IGNORECASE,
+                    )
+                ):
+                    # The semantic rebuild guard may intentionally retain a
+                    # stale Foldable aspect when source evidence is only
+                    # "easy setup" or an inflatable frame.  Route this exact
+                    # unsupported claim to the deterministic cleanup handler.
+                    fixes["__hallucinated_foldable__"] = True
     except Exception as e:
         print(f"FactSheet guard error for sku {sku}: {e}")
     
@@ -1673,10 +1711,51 @@ def _fill_missing_required_aspects(aspects, category_id, title):
     return aspects
 
 
+def _fill_dynamic_required_aspects(aspects, required_aspect_names, title):
+    """Complete live taxonomy-required aspects using conservative title clues."""
+    title_lower = str(title or "").lower()
+    for aspect_name in required_aspect_names or []:
+        name = str(aspect_name or "").strip()
+        if not name:
+            continue
+        detected = _detect_aspect_from_title(name, title_lower)
+        current = aspects.get(name)
+        current_values = current if isinstance(current, list) else [current]
+        current_text = str(current_values[0]).strip().lower() if current_values and current_values[0] else ""
+        conflicting_power_source = (
+            name == "Power Source"
+            and detected
+            and current_text
+            and current_text != str(detected).lower()
+            and (
+                {current_text, str(detected).lower()} <= {"battery", "gasoline"}
+                or {current_text, str(detected).lower()} <= {"battery", "corded electric"}
+                or {current_text, str(detected).lower()} <= {"gasoline", "corded electric"}
+            )
+        )
+        if current_text and not conflicting_power_source:
+            continue
+        if detected:
+            aspects[name] = [detected]
+    return aspects
+
+
 def _detect_aspect_from_title(aspect_name, title_lower):
     """Detect an aspect value from the product title."""
     if aspect_name in {"Number of Items in Set", "Number of Pieces"}:
         return infer_number_of_items_in_set(title_lower)
+    if aspect_name == "Type":
+        if "chainsaw" in title_lower or "chain saw" in title_lower:
+            return "Chainsaw"
+        if "glue gun" in title_lower:
+            return "Glue Gun"
+    if aspect_name == "Power Source":
+        if any(token in title_lower for token in ("gasoline", "gas-powered", "gas powered", "2-cycle", "2 cycle", "petrol")):
+            return "Gasoline"
+        if "battery" in title_lower or "cordless" in title_lower:
+            return "Battery"
+        if any(token in title_lower for token in ("corded", "electric", "plug-in", "plug in")):
+            return "Corded Electric"
     if aspect_name == "Compatible Mattress Size" or aspect_name == "Size":
         for size in ["California King", "King", "Queen", "Full", "Twin XL", "Twin"]:
             if size.lower() in title_lower:
@@ -1789,6 +1868,13 @@ def create_parser():
         help="Issue type to select from --source-report (repeatable)",
     )
     parser.add_argument(
+        "--severity",
+        action="append",
+        dest="severity_levels",
+        choices=["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+        help="Severity to select from --source-report and permit for generated fixes (repeatable)",
+    )
+    parser.add_argument(
         "--fix-key",
         action="append",
         dest="fix_keys",
@@ -1823,6 +1909,11 @@ def create_parser():
         help="Exit 0 when the audit completes even if mismatches are found",
     )
     parser.add_argument("--report", help="Optional custom JSON report path")
+    parser.add_argument(
+        "--accept-package-conflict-as",
+        choices=["Yes"],
+        help="Operator override: emit Assembly Required=Yes for assembly_package_conflict. Requires --sku or --sku-file.",
+    )
     return parser
 
 
@@ -1841,6 +1932,8 @@ def validate_fix_scope(args, parser) -> None:
         parser.error("--source-report requires at least one --issue-type")
     if args.issue_types and not args.source_report:
         parser.error("--issue-type requires --source-report")
+    if args.severity_levels and not args.source_report:
+        parser.error("--severity requires --source-report")
     if args.local_video_statuses and not args.source_report:
         parser.error("--local-video-status requires --source-report")
     if args.fix and not args.live and is_full_published_scope(args):
@@ -1852,6 +1945,8 @@ def validate_fix_scope(args, parser) -> None:
         parser.error("--record-clean-state requires --live")
     if args.ignore_clean_freeze and not args.live:
         parser.error("--ignore-clean-freeze requires --live")
+    if args.accept_package_conflict_as and not args.sku and not args.sku_file:
+        parser.error("--accept-package-conflict-as requires --sku or --sku-file")
 
 
 def _fetch_live_listing_context(ebay_client, sku, expected_listing_id=None):
@@ -1875,17 +1970,27 @@ def _load_skus_from_file(path: str) -> list[str]:
     return values
 
 
-def _load_skus_from_audit_report(path: str, issue_types: set[str]) -> list[str]:
+def _load_skus_from_audit_report(
+    path: str,
+    issue_types: set[str],
+    severity_levels: set[str] | None = None,
+) -> list[str]:
     """Return unique SKUs whose prior audit includes one requested issue type.
 
     This deliberately scopes a repair run to a saved audit snapshot. The
     listing is still read live before any update, so a resolved or changed
-    issue does not result in a blind write.
+    issue does not result in a blind write.  When severities are supplied,
+    the saved issue must also have one of those severities.
     """
     requested = {str(issue_type or "").strip() for issue_type in issue_types}
     requested.discard("")
     if not requested:
         return []
+    requested_severities = {
+        str(severity or "").strip().upper()
+        for severity in (severity_levels or set())
+    }
+    requested_severities.discard("")
 
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -1904,7 +2009,13 @@ def _load_skus_from_audit_report(path: str, issue_types: set[str]) -> list[str]:
         sku = str(entry.get("sku") or "").strip()
         issues = entry.get("issues") or []
         matched = any(
-            isinstance(issue, dict) and str(issue.get("type") or "").strip() in requested
+            isinstance(issue, dict)
+            and str(issue.get("type") or "").strip() in requested
+            and (
+                not requested_severities
+                or str(issue.get("severity") or "").strip().upper()
+                in requested_severities
+            )
             for issue in issues
         )
         if sku and matched and sku not in seen:
@@ -1919,6 +2030,140 @@ def filter_fixes_by_key(fixes: dict, allowed_keys: set[str] | None) -> dict:
         return dict(fixes or {})
     allowed = {str(key) for key in allowed_keys}
     return {key: value for key, value in (fixes or {}).items() if key in allowed}
+
+
+_FIX_KEY_ISSUE_TYPES = {
+    "categoryId": {"category_mismatch"},
+    "categoryName": {"category_mismatch"},
+    "__sync_video__": {"missing_video"},
+    "__remove_video__": {"stale_video"},
+    "__missing_foldable__": {"missing_foldable"},
+    "__incomplete_title__": {"incomplete_title"},
+    "__desc_needs_update__": {
+        "desc_dimension_mismatch",
+        "wrong_dimension",
+        "wrong_weight",
+    },
+    "__source_parameter_rebuild__": {"source_aspect_mismatch"},
+    "Assembly Required": {
+        "assembly_required_mismatch",
+        "assembly_package_conflict",
+    },
+    "__remove__Assembly Status": {"assembly_status_unsupported"},
+    "__assembly_desc_update__": {
+        "assembly_description_contradiction",
+        "assembly_description_missing",
+        "assembly_required_mismatch",
+    },
+    "__motors_compatibility__": {
+        "missing_motors_compatibility",
+        "stale_motors_compatibility",
+        "motors_compatibility_metadata",
+    },
+}
+
+
+def _fix_key_matches_issue(key: str, issue_type: str) -> bool:
+    """Return whether a generated fix is backed by the current issue type."""
+    if key == "__semantic_rebuild_from_source__":
+        return (
+            issue_type.startswith("semantic_")
+            or issue_type.startswith("claim_")
+            or issue_type.startswith("hallucinated_")
+            or issue_type == "description_raw_source_dump"
+        )
+    if key in {"Item Length", "Item Width", "Item Height"}:
+        return issue_type in {"missing_dimension", "wrong_dimension"}
+    if key == "Item Weight":
+        return issue_type in {"missing_weight", "wrong_weight"}
+    if key == "Material":
+        return issue_type in {"source_aspect_mismatch", "semantic_material"}
+    return issue_type in _FIX_KEY_ISSUE_TYPES.get(key, set())
+
+
+def filter_fixes_by_severity(
+    fixes: dict,
+    issues: list[dict],
+    allowed_severities: set[str] | None,
+) -> dict:
+    """Keep fixes backed by a current issue at an explicitly allowed severity.
+
+    Severity scoping is intentionally fail-closed for unknown generated fix
+    keys: a new repair key must be mapped here before a severity-scoped bulk
+    run can write it.
+    """
+    allowed = {
+        str(severity or "").strip().upper()
+        for severity in (allowed_severities or set())
+    }
+    allowed.discard("")
+    if not allowed:
+        return dict(fixes or {})
+
+    current_issues = [issue for issue in (issues or []) if isinstance(issue, dict)]
+    eligible_types = {
+        str(issue.get("type") or "").strip()
+        for issue in current_issues
+        if str(issue.get("severity") or "").strip().upper() in allowed
+    }
+    return {
+        key: value
+        for key, value in (fixes or {}).items()
+        if any(_fix_key_matches_issue(str(key), issue_type) for issue_type in eligible_types)
+    }
+
+
+def fetch_source_details_in_batches(
+    source_client,
+    skus: list[str],
+    *,
+    batch_size: int = 100,
+    pause_seconds: float = 0.3,
+) -> dict[str, dict]:
+    """Fetch source details once per batch for repair operations.
+
+    Semantic rebuilds used to call the source API once per SKU, turning a
+    report-scoped repair into an avoidable N+1 network loop.  The source API
+    already exposes a batch endpoint, so keep a small SKU-keyed cache for the
+    duration of one repair run.
+    """
+    if source_client is None:
+        return {}
+    normalized_skus = []
+    seen = set()
+    for sku in skus or []:
+        value = str(sku or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            normalized_skus.append(value)
+    if not normalized_skus:
+        return {}
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    details_by_sku: dict[str, dict] = {}
+    for start in range(0, len(normalized_skus), batch_size):
+        batch = normalized_skus[start : start + batch_size]
+        details = source_client.get_product_details(batch) or []
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            detail_sku = str(detail.get("sku") or "").strip()
+            if detail_sku:
+                details_by_sku[detail_sku] = detail
+        if pause_seconds and start + batch_size < len(normalized_skus):
+            time.sleep(pause_seconds)
+    return details_by_sku
+
+
+class _CachedSourceDetailClient:
+    """Adapter exposing the single-SKU method expected by build_repair."""
+
+    def __init__(self, details_by_sku: dict[str, dict]):
+        self._details_by_sku = dict(details_by_sku or {})
+
+    def get_product_detail_by_sku(self, sku: str):
+        return self._details_by_sku.get(str(sku or "").strip())
 
 
 def filter_skus_by_local_video_status(
@@ -2272,6 +2517,41 @@ def _offer_quantity_hint(ebay_client, sku) -> int | None:
     return None
 
 
+def _inventory_snapshot_put_payload(live_inventory: dict) -> dict:
+    """Keep only fields accepted by Inventory API for a snapshot restore."""
+    payload = {}
+    for key in (
+        "condition",
+        "product",
+        "availability",
+        "packageWeightAndSize",
+        "locale",
+        "merchantLocationKey",
+    ):
+        value = live_inventory.get(key)
+        if value is not None:
+            payload[key] = value
+    return payload
+
+
+def _put_inventory_snapshot(ebay_client, sku: str, live_inventory: dict):
+    """Restore a protected inventory snapshot after a replacement PUT fails."""
+    token = ebay_client.oauth.get_valid_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Content-Language": "en-US",
+        "Accept": "application/json",
+    }
+    url = f"{ebay_client.base_url}/sell/inventory/v1/inventory_item/{sku}"
+    return ebay_client.session.put(
+        url,
+        headers=headers,
+        json=_inventory_snapshot_put_payload(live_inventory),
+        timeout=120,
+    )
+
+
 def _put_inventory_product_only(ebay_client, sku, title, description, aspects):
     """Update only inventory_item.product fields without touching quantity or price."""
     live_inventory = ebay_client.get_inventory_item(sku) or {}
@@ -2313,6 +2593,17 @@ def _put_inventory_product_only(ebay_client, sku, title, description, aspects):
     product["title"] = safe_title
     product["description"] = description
     product["aspects"] = cleaned_aspects
+    live_video_ids = [
+        str(item).strip()
+        for item in (product.get("videoIds") or [])
+        if str(item).strip()
+    ]
+    if live_video_ids:
+        product["videoIds"] = live_video_ids[:1]
+    else:
+        local_video_id = lookup_stored_video_id(sku)
+        if local_video_id:
+            product["videoIds"] = [local_video_id]
 
     payload = {
         "condition": live_inventory.get("condition") or "NEW",
@@ -2389,7 +2680,17 @@ def _put_inventory_product_only(ebay_client, sku, title, description, aspects):
     url = f"{ebay_client.base_url}/sell/inventory/v1/inventory_item/{sku}"
     response = ebay_client.session.put(url, headers=headers, json=payload, timeout=120)
     if response.status_code not in (200, 204):
-        raise RuntimeError(f"{sku}: product-only inventory update failed {response.status_code}: {response.text[:300]}")
+        rollback_status = "not_attempted"
+        rollback_error = ""
+        try:
+            rollback_response = _put_inventory_snapshot(ebay_client, sku, live_inventory)
+            rollback_status = str(getattr(rollback_response, "status_code", "unknown"))
+        except Exception as exc:
+            rollback_error = f"; rollback_error={exc}"
+        raise RuntimeError(
+            f"{sku}: product-only inventory update failed {response.status_code}: "
+            f"{response.text[:300]} (rollback_status={rollback_status}{rollback_error})"
+        )
 
     return response, description, cleaned_aspects
 
@@ -2671,7 +2972,16 @@ def _remove_live_video_ids_from_inventory(ebay_client, sku: str) -> bool:
     return True
 
 
-def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_opt_raw=None):
+def fix_listing_on_ebay(
+    sku,
+    product_row,
+    fixes,
+    ebay_client,
+    db_conn,
+    *,
+    base_opt_raw=None,
+    source_detail_cache: dict[str, dict] | None = None,
+):
     """Apply fixes to a published eBay listing."""
     results = []
     stored_opt = parse_json(product_row["optimization"])
@@ -2701,6 +3011,7 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
     product_only_update = False
     needs_inventory_update = False
     republished_listing_id = None
+    offer_published = False
     video_changed = False
     synced_video_id = None
     reused_existing_live_video = False
@@ -2873,7 +3184,11 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
             try:
                 from scripts.repair_broken_listings import _dajian, build_repair, verify
 
-                dj = _dajian()
+                dj = (
+                    _CachedSourceDetailClient(source_detail_cache)
+                    if source_detail_cache is not None
+                    else _dajian()
+                )
                 built, reason = build_repair(db_conn, dj, sku)
                 if built is None:
                     results.append(
@@ -2912,6 +3227,7 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
                 build_description_from_snapshot,
                 build_repair,
                 reconcile_semantic_aspects,
+                remove_unsupported_capacity_claims,
                 verify,
             )
             
@@ -2938,6 +3254,28 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
                     results.append(f"ERROR [{sku}]: semantic rebuild skipped ({reason or 'unknown'})")
                     continue
                 new_title, new_desc, new_aspects, snap = built
+
+                # ``build_repair`` starts from the stored optimization snapshot,
+                # which can be sparse for older listings.  Inventory PUT is
+                # replacement-style, so merge the current live aspects before
+                # removing only claims that the FactSheet actually rejects.
+                # This prevents a source rebuild from replacing a rich live
+                # listing with just Brand/Material when the source snapshot is
+                # incomplete.
+                live_product = (live_inv or {}).get("product") or {}
+                live_aspects = live_product.get("aspects")
+                if isinstance(live_aspects, dict):
+                    merged_aspects = dict(live_aspects)
+                    merged_aspects.update(new_aspects or {})
+                    new_aspects = merged_aspects
+                    rebuilt_from_merged = build_description_from_snapshot(
+                        new_title,
+                        snap,
+                        new_aspects,
+                    )
+                    if rebuilt_from_merged:
+                        new_desc = rebuilt_from_merged
+
                 v = verify(new_title, new_desc, new_aspects, snap)
                 
                 # We need to run the FactSheet guard on the built candidate!
@@ -2986,7 +3324,64 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
                                 candidate_description=new_desc,
                                 candidate_aspects=new_aspects,
                             )
-                
+
+                cleaned_capacity_description = remove_unsupported_capacity_claims(
+                    new_desc,
+                    fs_result.get("violations", []),
+                )
+                if cleaned_capacity_description != new_desc:
+                    new_desc = cleaned_capacity_description
+                    v = verify(new_title, new_desc, new_aspects, snap)
+                    fs_result = check_fact_sheet_violations(
+                        conn=fs_conn,
+                        source_title=snap.title,
+                        source_description=full_source_description,
+                        source_attributes=snap.attributes,
+                        source_specs=snap.specs,
+                        candidate_title=new_title,
+                        candidate_description=new_desc,
+                        candidate_aspects=new_aspects,
+                    )
+
+                # Supplier titles occasionally contain an unsupported count
+                # glued to an animal/product noun (for example ``5Cat``).
+                # If that count is explicitly rejected and the current live
+                # title is clean, retain the live title rather than publishing
+                # a new unsupported capacity claim.
+                if any(
+                    vv.get("claim_type") == "semantic_capacity"
+                    and str(vv.get("source_evidence") or "").upper() == "NOT_FOUND"
+                    and re.search(r"\d+\s*cats?\b", str(vv.get("claim_text") or ""), re.IGNORECASE)
+                    and re.search(r"\d+\s*cats?\b", new_title, re.IGNORECASE)
+                    for vv in fs_result.get("violations", [])
+                ):
+                    live_title = str(live_product.get("title") or "").strip()
+                    if live_title:
+                        safe_live_title, _ = normalize_listing_title_for_ebay(
+                            live_title,
+                            source_title=live_title,
+                        )
+                        if safe_live_title and safe_live_title != new_title:
+                            new_title = safe_live_title
+                            rebuilt_from_live_title = build_description_from_snapshot(
+                                new_title,
+                                snap,
+                                new_aspects,
+                            )
+                            if rebuilt_from_live_title:
+                                new_desc = rebuilt_from_live_title
+                            v = verify(new_title, new_desc, new_aspects, snap)
+                            fs_result = check_fact_sheet_violations(
+                                conn=fs_conn,
+                                source_title=snap.title,
+                                source_description=full_source_description,
+                                source_attributes=snap.attributes,
+                                source_specs=snap.specs,
+                                candidate_title=new_title,
+                                candidate_description=new_desc,
+                                candidate_aspects=new_aspects,
+                            )
+
                 blocking_fs_violations = [
                     vv
                     for vv in fs_result.get("violations", [])
@@ -3008,6 +3403,22 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
                         "FactSheet non-blocking MEDIUM findings retained after "
                         "CRITICAL/HIGH gate"
                     )
+
+                from src.utils.listing_quality_gate import apply_source_assembly_requirement
+
+                rebuilt_opt = {
+                    "aspects": dict(new_aspects or {}),
+                    "description": new_desc,
+                }
+                apply_source_assembly_requirement(
+                    rebuilt_opt,
+                    source_title=snap.title,
+                    source_description=full_source_description,
+                    attributes=snap.attributes,
+                    specs=snap.specs,
+                )
+                new_aspects = rebuilt_opt["aspects"]
+                new_desc = rebuilt_opt["description"]
 
                 title = new_title
                 title_changed = True
@@ -3544,6 +3955,7 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
         aspects = _fill_missing_required_aspects(aspects, effective_category, title)
         required_aspects, _ = matcher._get_category_aspects(str(effective_category)) if effective_category else ([], [])
         required_aspect_names = [aspect.get("name") for aspect in required_aspects if aspect.get("name")]
+        aspects = _fill_dynamic_required_aspects(aspects, required_aspect_names, title)
 
         # Step 1: Update inventory item only when product fields changed.
         needs_inventory_update = aspect_changed or description_changed or title_changed or image_restore_requested
@@ -3601,6 +4013,14 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
                     "aspects": aspects,
                     "required_aspect_names": required_aspect_names,
                 }
+                live_video_ids = parse_image_list(
+                    ((live_inventory.get("product") or {}).get("videoIds") or [])
+                )
+                stored_video_id = _stored_video_id_from_optimization(stored_opt)
+                if live_video_ids:
+                    inv_product["video_urls"] = live_video_ids[:1]
+                elif stored_video_id:
+                    inv_product["video_urls"] = [stored_video_id]
                 if pws:
                     inv_product["packageWeightAndSize"] = pws
 
@@ -3633,6 +4053,7 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
                             pub_res = ebay_client.publish_offer(offer_id)
                             if pub_res and pub_res.get("listingId"):
                                 republished_listing_id = pub_res.get("listingId")
+                                offer_published = True
                                 results.append(f"Offer {offer_id} republished to live listing ({pub_res.get('listingId')})")
                             else:
                                 results.append(f"WARNING: Offer {offer_id} publish call did not return listingId")
@@ -3645,7 +4066,13 @@ def fix_listing_on_ebay(sku, product_row, fixes, ebay_client, db_conn, *, base_o
             else:
                 results.append("ERROR: No live offer found for SKU")
 
-        if product_only_update and (title_changed or aspect_changed) and live_offer and live_offer.get("offerId"):
+        if (
+            product_only_update
+            and (title_changed or aspect_changed)
+            and not offer_published
+            and live_offer
+            and live_offer.get("offerId")
+        ):
             offer_id = live_offer["offerId"]
             publish_result = ebay_client.publish_offer(offer_id)
             listing_id = publish_result.get("listingId") if publish_result else None
@@ -3771,6 +4198,7 @@ def main(argv=None):
                 sku_list = _load_skus_from_audit_report(
                     args.source_report,
                     set(args.issue_types or []),
+                    set(args.severity_levels or []),
                 )
             except ValueError as exc:
                 parser.error(str(exc))
@@ -3822,6 +4250,28 @@ def main(argv=None):
         except Exception as e:
             print(f"❌ Failed to initialize eBay client: {e}")
             sys.exit(1)
+
+    semantic_source_detail_cache = None
+    if args.fix and "__semantic_rebuild_from_source__" in set(args.fix_keys or []):
+        try:
+            from scripts.repair_broken_listings import _dajian
+
+            source_client = _dajian()
+            semantic_source_detail_cache = fetch_source_details_in_batches(
+                source_client,
+                [row["sku"] for row in rows],
+            )
+            print(
+                f"✅ Batched source details loaded: "
+                f"{len(semantic_source_detail_cache)}/{len(rows)} SKUs\n"
+            )
+        except Exception as exc:
+            # Keep the repair fail-closed if the batch prefetch is unavailable:
+            # the per-SKU fallback preserves the old behavior and still lets a
+            # scoped run make progress rather than silently rewriting from an
+            # incomplete source cache.
+            semantic_source_detail_cache = None
+            print(f"⚠️ Batched source prefetch failed; using per-SKU fallback: {exc}")
 
     all_issues = []
     all_transport_issues = []
@@ -3928,6 +4378,7 @@ def main(argv=None):
             images_raw=row["images"],
             videos_raw=row["videos"],
             live_inventory=live_inventory if args.live else None,
+            accept_package_conflict_as=args.accept_package_conflict_as,
         )
         issues = preflight_issues + issues
         transport_issues, content_issues = split_transport_issues(issues)
@@ -3967,6 +4418,11 @@ def main(argv=None):
 
         fix_results = []
         selected_fixes = filter_fixes_by_key(fixes, set(args.fix_keys or []))
+        selected_fixes = filter_fixes_by_severity(
+            selected_fixes,
+            issues,
+            set(args.severity_levels or []),
+        )
         if args.fix and selected_fixes and ebay_client:
             print(f"   🔧 Applying {len(selected_fixes)} selected fixes...")
             fix_results = fix_listing_on_ebay(
@@ -3976,6 +4432,7 @@ def main(argv=None):
                 ebay_client,
                 conn,
                 base_opt_raw=audit_opt_raw if args.live else None,
+                source_detail_cache=semantic_source_detail_cache,
             )
             for r in fix_results:
                 if "ERROR" in r:

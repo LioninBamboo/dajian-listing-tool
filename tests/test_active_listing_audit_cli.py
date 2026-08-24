@@ -380,6 +380,46 @@ def test_product_only_update_preserves_combined_source_material_and_color():
     assert captured["payload"]["availability"]["shipToLocationAvailability"]["quantity"] == 1
 
 
+def test_product_only_update_restores_local_video_id_when_live_has_none(monkeypatch):
+    from types import SimpleNamespace
+
+    captured = {}
+
+    class _Session:
+        def put(self, url, headers=None, json=None, timeout=None):
+            captured["payload"] = json
+            return SimpleNamespace(status_code=204, text="")
+
+    class _Client:
+        base_url = "https://api.ebay.example"
+        oauth = SimpleNamespace(get_valid_token=lambda: "token")
+        session = _Session()
+
+        def get_inventory_item(self, sku):
+            return {
+                "condition": "NEW",
+                "availability": {"shipToLocationAvailability": {"quantity": 1}},
+                "product": {
+                    "title": "Storage Cabinet",
+                    "description": "<div>old</div>",
+                    "imageUrls": ["https://example.test/image.jpg"],
+                    "aspects": {"Type": ["Storage Cabinet"]},
+                },
+            }
+
+    monkeypatch.setattr(audit_fix_active_listings, "lookup_stored_video_id", lambda sku: "video-local-1")
+
+    audit_fix_active_listings._put_inventory_product_only(
+        _Client(),
+        "SKU-VIDEO",
+        "Storage Cabinet",
+        "<div>updated</div>",
+        {"Type": ["Storage Cabinet"]},
+    )
+
+    assert captured["payload"]["product"]["videoIds"] == ["video-local-1"]
+
+
 def test_resolve_availability_preserves_live_quantity_including_zero():
     resolved = audit_fix_active_listings.resolve_inventory_availability_for_product_put(
         {"availability": {"shipToLocationAvailability": {"quantity": 0}}},
@@ -502,6 +542,72 @@ def test_product_only_update_skips_when_quantity_unresolvable():
             "<div>updated</div>",
             {"Type": ["Bench"]},
         )
+
+
+def test_product_only_update_rolls_back_after_replacement_put_error():
+    """eBay can partially apply a replacement PUT before returning 400."""
+    from types import SimpleNamespace
+
+    original = {
+        "condition": "NEW",
+        "availability": {"shipToLocationAvailability": {"quantity": 1}},
+        "product": {
+            "title": "Gas Chainsaw",
+            "description": "old",
+            "imageUrls": ["https://example.test/image.jpg"],
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Power Source": ["Battery"],
+                "Type": ["Chainsaw"],
+            },
+        },
+    }
+
+    class _Session:
+        def __init__(self):
+            self.payloads = []
+
+        def put(self, url, headers=None, json=None, timeout=None):
+            self.payloads.append(json)
+            if len(self.payloads) == 1:
+                return SimpleNamespace(status_code=400, text="Power Source is missing")
+            return SimpleNamespace(status_code=204, text="")
+
+    class _Client:
+        base_url = "https://api.ebay.example"
+        oauth = SimpleNamespace(get_valid_token=lambda: "token")
+
+        def __init__(self):
+            self.session = _Session()
+
+        def get_inventory_item(self, sku):
+            return original
+
+    client = _Client()
+    with pytest.raises(RuntimeError, match=r"rollback_status=204"):
+        audit_fix_active_listings._put_inventory_product_only(
+            client,
+            "SKU-ROLLBACK",
+            "Gas Chainsaw",
+            "<div>updated</div>",
+            {"Brand": ["AquaVerve"]},
+        )
+
+    assert len(client.session.payloads) == 2
+    assert client.session.payloads[1]["product"]["aspects"] == original["product"]["aspects"]
+
+
+def test_dynamic_required_aspects_detect_gas_chainsaw_values():
+    aspects = {"Power Source": ["Battery"]}
+
+    filled = audit_fix_active_listings._fill_dynamic_required_aspects(
+        aspects,
+        ["Brand", "Type", "Power Source"],
+        "25cc Gas Chainsaw 12 Inch Bar 2-Cycle",
+    )
+
+    assert filled["Type"] == ["Chainsaw"]
+    assert filled["Power Source"] == ["Gasoline"]
 
 def test_source_parameter_type_rule_only_reclassifies_stale_apothecary_default():
     from src.utils.source_parameter_alignment import find_source_parameter_mismatches
@@ -751,6 +857,126 @@ def test_validate_fix_scope_rejects_ignore_clean_freeze_without_live():
         assert exc.code == 2
     else:
         raise AssertionError("expected parser.error/SystemExit for --ignore-clean-freeze without --live")
+
+
+def test_validate_fix_scope_rejects_package_conflict_accept_without_sku_scope():
+    parser = audit_fix_active_listings.create_parser()
+    args = parser.parse_args(["--live", "--accept-package-conflict-as", "Yes"])
+
+    try:
+        audit_fix_active_listings.validate_fix_scope(args, parser)
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("expected parser.error/SystemExit for unscoped package-conflict accept")
+
+
+def test_validate_fix_scope_allows_package_conflict_accept_with_sku_file():
+    parser = audit_fix_active_listings.create_parser()
+    args = parser.parse_args(
+        [
+            "--live",
+            "--sku-file",
+            "skus.txt",
+            "--accept-package-conflict-as",
+            "Yes",
+        ]
+    )
+
+    audit_fix_active_listings.validate_fix_scope(args, parser)
+    assert args.accept_package_conflict_as == "Yes"
+
+
+def _package_conflict_live_opt(assembly_required=None):
+    aspects = {
+        "Brand": ["AquaVerve"],
+        "Type": ["Coffee Table"],
+        "Material": ["Wood"],
+        "Item Length": ["35.8 in"],
+        "Item Width": ["25.6 in"],
+        "Item Height": ["17.7 in"],
+    }
+    if assembly_required is not None:
+        aspects["Assembly Required"] = [assembly_required]
+    return {
+        "title": "Mid Century Modern Coffee Table Center Table for Living Room",
+        "description": "<div><h3>KEY FEATURES</h3><ul><li>Solid wood</li></ul></div>",
+        "categoryId": "38208",
+        "aspects": aspects,
+    }
+
+
+def test_package_conflict_has_no_fix_without_operator_accept(monkeypatch):
+    class _Matcher:
+        def canonicalize_category(self, title_context, category_id, category_name, description=None):
+            return category_id, category_name
+
+        def is_category_plausible_for_text(self, title, category_id, category_name):
+            return True
+
+    monkeypatch.setattr(audit_fix_active_listings, "get_category_matcher", lambda: _Matcher())
+
+    source_attrs = {
+        "Assembled Length (in.)": "35.80",
+        "Assembled Width (in.)": "25.60",
+        "Assembled Height (in.)": "17.70",
+        "Main Material": "Wood",
+    }
+    source_specs = {
+        "Package Length (in.)": "38.00",
+        "Package Width (in.)": "28.00",
+        "Package Height (in.)": "6.00",
+    }
+
+    issues, fixes = audit_fix_active_listings.audit_single_product(
+        "W1718P452048",
+        "Mid Century Modern Coffee Table Center Table for Living Room",
+        json.dumps(source_attrs),
+        json.dumps(source_specs),
+        json.dumps(_package_conflict_live_opt("No")),
+        "A wooden coffee table. Assembly Required: No",
+    )
+
+    assert any(issue["type"] == "assembly_package_conflict" for issue in issues)
+    assert "Assembly Required" not in fixes
+    assert "__assembly_desc_update__" not in fixes
+
+
+def test_package_conflict_emits_yes_fix_when_operator_accepts(monkeypatch):
+    class _Matcher:
+        def canonicalize_category(self, title_context, category_id, category_name, description=None):
+            return category_id, category_name
+
+        def is_category_plausible_for_text(self, title, category_id, category_name):
+            return True
+
+    monkeypatch.setattr(audit_fix_active_listings, "get_category_matcher", lambda: _Matcher())
+
+    source_attrs = {
+        "Assembled Length (in.)": "35.80",
+        "Assembled Width (in.)": "25.60",
+        "Assembled Height (in.)": "17.70",
+        "Main Material": "Wood",
+    }
+    source_specs = {
+        "Package Length (in.)": "38.00",
+        "Package Width (in.)": "28.00",
+        "Package Height (in.)": "6.00",
+    }
+
+    issues, fixes = audit_fix_active_listings.audit_single_product(
+        "W1718P452048",
+        "Mid Century Modern Coffee Table Center Table for Living Room",
+        json.dumps(source_attrs),
+        json.dumps(source_specs),
+        json.dumps(_package_conflict_live_opt("No")),
+        "A wooden coffee table. Assembly Required: No",
+        accept_package_conflict_as="Yes",
+    )
+
+    assert any(issue["type"] == "assembly_package_conflict" for issue in issues)
+    assert fixes["Assembly Required"] == ["Yes"]
+    assert fixes["__assembly_desc_update__"] == "Yes"
 
 
 def test_fix_mode_audit_email_includes_fix_details_and_report_attachment(tmp_path):
@@ -1534,6 +1760,8 @@ def test_fix_listing_keeps_full_offer_description_when_inventory_copy_is_truncat
     long_description = "<div>" + ("A" * 4300) + "</div>"
 
     class FakeClient:
+        published = 0
+
         def get_inventory_item(self, sku):
             return {"sku": sku, "product": {"title": "Storage bed", "description": "<div>Original</div>"}}
 
@@ -1547,6 +1775,7 @@ def test_fix_listing_keeps_full_offer_description_when_inventory_copy_is_truncat
             return True
 
         def publish_offer(self, offer_id):
+            self.published += 1
             return {"listingId": "456"}
 
     product_row = {
@@ -1569,11 +1798,12 @@ def test_fix_listing_keeps_full_offer_description_when_inventory_copy_is_truncat
         "listing_id": "456",
     }
 
+    client = FakeClient()
     results = audit_fix_active_listings.fix_listing_on_ebay(
         "SKU-DESC",
         product_row,
         {"__assembly_desc_update__": "Yes"},
-        FakeClient(),
+        client,
         conn,
     )
 
@@ -1581,6 +1811,7 @@ def test_fix_listing_keeps_full_offer_description_when_inventory_copy_is_truncat
     assert len(captured["inventory_description"]) <= 4000
     assert "Assembly Required" in captured["offer_description"]
     assert len(captured["offer_description"]) > 4000
+    assert client.published == 1
 
 
 def test_replace_specifications_table_preserves_package_and_footer():
@@ -3054,3 +3285,89 @@ class TestPerfectForNotDuplicateOfFeatures:
         desc = "Modern sofa. Ideal for living room and small apartments."
         out = audit_fix_active_listings._build_perfect_for_copy("Sofa", desc, {"Type": ["Sofa"]})
         assert out == "Ideal for living room and small apartments."
+
+
+def test_report_scope_can_filter_skus_by_issue_severity(tmp_path):
+    report_path = tmp_path / "audit.json"
+    report_path.write_text(
+        json.dumps(
+            {
+                "issues": [
+                    {
+                        "sku": "HIGH-1",
+                        "issues": [
+                            {"type": "semantic_feature", "severity": "HIGH"},
+                            {"type": "semantic_feature", "severity": "MEDIUM"},
+                        ],
+                    },
+                    {
+                        "sku": "MEDIUM-1",
+                        "issues": [
+                            {"type": "semantic_feature", "severity": "MEDIUM"},
+                        ],
+                    },
+                    {
+                        "sku": "CATEGORY-1",
+                        "issues": [
+                            {"type": "category_mismatch", "severity": "CRITICAL"},
+                        ],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert audit_fix_active_listings._load_skus_from_audit_report(
+        str(report_path),
+        {"semantic_feature"},
+        {"HIGH"},
+    ) == ["HIGH-1"]
+    assert audit_fix_active_listings._load_skus_from_audit_report(
+        str(report_path),
+        {"semantic_feature"},
+        {"MEDIUM"},
+    ) == ["HIGH-1", "MEDIUM-1"]
+
+
+def test_severity_scoped_fix_filter_does_not_apply_medium_semantic_rebuild():
+    fixes = {
+        "__semantic_rebuild_from_source__": True,
+        "__sync_video__": "https://example.test/video.mp4",
+    }
+    issues = [
+        {"type": "semantic_feature", "severity": "MEDIUM"},
+        {"type": "missing_video", "severity": "HIGH"},
+    ]
+
+    selected = audit_fix_active_listings.filter_fixes_by_severity(
+        fixes,
+        issues,
+        {"HIGH"},
+    )
+
+    assert selected == {"__sync_video__": "https://example.test/video.mp4"}
+
+
+def test_source_detail_prefetch_uses_batch_endpoint():
+    class FakeSourceClient:
+        def __init__(self):
+            self.calls = []
+
+        def get_product_details(self, skus):
+            self.calls.append(list(skus))
+            return [{"sku": sku, "productName": f"Product {sku}"} for sku in skus]
+
+    client = FakeSourceClient()
+    details = audit_fix_active_listings.fetch_source_details_in_batches(
+        client,
+        ["S1", "S2", "S2", "S3", "S4"],
+        batch_size=2,
+        pause_seconds=0,
+    )
+
+    assert client.calls == [["S1", "S2"], ["S3", "S4"]]
+    assert sorted(details) == ["S1", "S2", "S3", "S4"]
+    cached = audit_fix_active_listings._CachedSourceDetailClient(details)
+    assert cached.get_product_detail_by_sku("S3")["productName"] == "Product S3"
+    assert cached.get_product_detail_by_sku("missing") is None
