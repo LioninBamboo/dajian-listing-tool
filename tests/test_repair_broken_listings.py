@@ -300,3 +300,80 @@ def test_reconcile_semantic_aspects_removes_unsupported_capacity_field(repair_mo
 
     assert "Seating Capacity" not in cleaned
     assert cleaned["Number of Drawers"] == ["2"]
+
+
+def test_reconcile_semantic_aspects_corrects_source_backed_count_and_capacity(repair_mod):
+    class Snap:
+        attributes = {}
+
+    aspects = {
+        "Number of Shelves": ["1"],
+        "Capacity": ["8-12 Person"],
+        "Sleeper Size": ["3 persons"],
+    }
+    violations = [
+        {
+            "claim_type": "semantic_count",
+            "claim_text": "1 shelves (source: 3)",
+            "source_evidence": "3",
+        },
+        {
+            "claim_type": "semantic_capacity",
+            "claim_text": "8-12 person (source: 7-8 person)",
+            "source_evidence": "7-8 person",
+        },
+        {
+            "claim_type": "semantic_capacity",
+            "claim_text": "3 persons",
+            "source_evidence": "NOT_FOUND",
+        },
+    ]
+
+    cleaned = repair_mod.reconcile_semantic_aspects(aspects, Snap(), violations)
+
+    assert cleaned["Number of Shelves"] == ["3"]
+    assert cleaned["Capacity"] == ["7-8 Person"]
+    assert "Sleeper Size" not in cleaned
+
+
+def test_reconcile_semantic_aspects_removes_claims_from_keys_and_incidental_values(repair_mod):
+    class Snap:
+        attributes = {}
+
+    cleaned = repair_mod.reconcile_semantic_aspects(
+        {
+            "Cool-Touch Housing": ["Yes"],
+            "Features": ["Fast Preheating", "Digital Display"],
+            "Included Components": ["18 x Steel Ground Pegs"],
+            "Is Stain Resistant": ["Yes"],
+        },
+        Snap(),
+        [
+            {"claim_type": "semantic_feature", "claim_text": "cool-touch housing"},
+            {"claim_type": "semantic_feature", "claim_text": "fast preheating"},
+            {"claim_type": "semantic_feature", "claim_text": "stain resistant"},
+            {"claim_type": "semantic_material", "claim_text": "steel"},
+        ],
+    )
+
+    assert "Cool-Touch Housing" not in cleaned
+    assert cleaned["Features"] == ["Digital Display"]
+    assert cleaned["Included Components"] == ["18 x Ground Pegs"]
+    assert "Is Stain Resistant" not in cleaned
+
+
+def test_remove_unsupported_capacity_claims_generalizes_source_free_description(repair_mod):
+    description = "<p>Storage for 12–16 pairs of shoes with a slim profile.</p>"
+    cleaned = repair_mod.remove_unsupported_capacity_claims(
+        description,
+        [
+            {
+                "claim_type": "semantic_capacity",
+                "claim_text": "12–16 pair",
+                "source_evidence": "NOT_FOUND",
+            }
+        ],
+    )
+
+    assert "12–16" not in cleaned
+    assert "multiple pairs" in cleaned

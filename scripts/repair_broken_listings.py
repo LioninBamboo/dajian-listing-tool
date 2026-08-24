@@ -78,6 +78,67 @@ def _aspect_values(value: object) -> list[str]:
     return [str(item).strip() for item in values if str(item).strip()]
 
 
+def _claim_matches_key(claim: object, key: object) -> bool:
+    """Return whether a FactSheet claim names an aspect key directly."""
+    return _claim_matches_value(claim, key)
+
+
+def _capacity_target(source_evidence: object) -> str | None:
+    """Extract a source-backed capacity range in eBay-friendly casing."""
+    text = str(source_evidence or "").strip()
+    if not text or text.upper() == "NOT_FOUND":
+        return None
+    match = re.search(
+        r"\b(\d+)\s*[-–]\s*(\d+)\s*(person|people|pair|pairs|seat|seats)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    unit = match.group(3).lower()
+    if unit.startswith("person") or unit.startswith("people"):
+        unit = "Person"
+    elif unit.startswith("pair"):
+        unit = "Pairs"
+    else:
+        unit = "Seats"
+    return f"{match.group(1)}-{match.group(2)} {unit}"
+
+
+def _strip_claim_from_value(value: str, claim: str) -> str:
+    """Remove an unsupported material/feature token without dropping the field."""
+    pattern = re.escape(str(claim or "").strip()).replace(r"\ ", r"\s+")
+    cleaned = re.sub(pattern, "", str(value), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;:/|-–")
+    return cleaned
+
+
+def remove_unsupported_capacity_claims(description: str, violations: list[dict] | None) -> str:
+    """Generalize numeric capacity phrases when the FactSheet has no source."""
+    cleaned = str(description or "")
+    for violation in violations or []:
+        if violation.get("claim_type") != "semantic_capacity":
+            continue
+        if str(violation.get("source_evidence") or "").strip().upper() != "NOT_FOUND":
+            continue
+        claim = str(violation.get("claim_text") or "")
+        match = re.search(
+            r"\b\d+\s*[-–]\s*\d+\s*(person|people|pair|pairs|seat|seats)\b"
+            r"|\b\d+\s*(person|people|pair|pairs|seat|seats)\b",
+            claim,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            continue
+        phrase = match.group(0)
+        unit = (match.group(1) or match.group(2) or "").lower()
+        replacement = "multiple pairs" if unit.startswith("pair") else "multiple people"
+        pattern = re.escape(phrase).replace(r"\ ", r"\s*")
+        cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+([,.;])", r"\1", cleaned)
+    return cleaned
+
+
 def reconcile_semantic_aspects(
     aspects: dict,
     snap,
@@ -103,9 +164,12 @@ def reconcile_semantic_aspects(
         for v in violations
         if v.get("claim_type") == "semantic_feature"
     ]
-    has_capacity_violation = any(
-        v.get("claim_type") == "semantic_capacity" for v in violations
-    )
+    capacity_violations = [
+        v for v in violations if v.get("claim_type") == "semantic_capacity"
+    ]
+    count_violations = [
+        v for v in violations if v.get("claim_type") == "semantic_count"
+    ]
     source_attrs = dict(getattr(snap, "attributes", {}) or {})
     source_upholstery = str(
         source_attrs.get("Upholstery Material")
@@ -126,25 +190,93 @@ def reconcile_semantic_aspects(
         key_lower = key_text.lower()
         values = _aspect_values(out.get(key))
 
-        if has_capacity_violation and (
-            "seating capacity" in key_lower
-            or "number of seats" in key_lower
-            or "accommodates" in key_lower
-        ):
-            out.pop(key, None)
+        for violation in capacity_violations:
+            claim = str(violation.get("claim_text") or "").strip()
+            source_evidence = violation.get("source_evidence")
+            target = _capacity_target(source_evidence)
+            claim_without_source = re.sub(
+                r"\s*\(source:\s*[^)]*\)", "", claim, flags=re.IGNORECASE
+            ).strip()
+            claim_matches_value = any(
+                _claim_matches_value(claim_without_source, value)
+                for value in values
+            )
+            capacity_key = any(
+                token in key_lower
+                for token in ("capacity", "sleeper size", "number of seats", "accommodates")
+            )
+            unknown_source_key = (
+                not str(source_evidence or "").strip()
+                or str(source_evidence or "").strip().upper() == "NOT_FOUND"
+            ) and capacity_key and (
+                any(
+                    unit in " ".join(values).lower()
+                    for unit in ("person", "people", "pair", "pairs", "seat", "seats")
+                )
+                or any(
+                    token in key_lower
+                    for token in ("seating capacity", "number of seats", "accommodates")
+                )
+            )
+            if not (claim_matches_value or unknown_source_key):
+                continue
+            if target:
+                out[key] = [target]
+                values = [target]
+            else:
+                out.pop(key, None)
+                values = []
+            break
+        if key not in out:
+            continue
+
+        for violation in count_violations:
+            claim = str(violation.get("claim_text") or "").strip()
+            source_match = re.search(
+                r"\(source:\s*([^)]+)\)", claim, flags=re.IGNORECASE
+            )
+            source_count = str(source_match.group(1)).strip() if source_match else ""
+            claim_without_source = re.sub(
+                r"\s*\(source:\s*[^)]*\)", "", claim, flags=re.IGNORECASE
+            ).strip()
+            key_matches = any(
+                token in key_lower
+                for token in re.findall(r"[a-z]+", claim_without_source.lower())
+                if token not in {"a", "an", "the"}
+            )
+            value_matches = any(
+                _claim_matches_value(claim_without_source, value)
+                for value in values
+            )
+            if not (key_matches or value_matches):
+                continue
+            if source_count and re.fullmatch(r"\d+(?:\.\d+)?", source_count):
+                out[key] = [source_count]
+                values = [source_count]
+            else:
+                out.pop(key, None)
+                values = []
+            break
+        if key not in out:
             continue
 
         if feature_claims and any(
-            _claim_matches_value(claim, value)
+            _claim_matches_key(claim, key_text)
+            or _claim_matches_value(claim, value)
             for claim in feature_claims
-            for value in values
+            for value in values or [""]
         ):
             kept = [
                 value
                 for value in values
-                if not any(_claim_matches_value(claim, value) for claim in feature_claims)
+                if not any(
+                    _claim_matches_value(claim, value)
+                    for claim in feature_claims
+                )
             ]
-            if kept:
+            if kept and not any(
+                _claim_matches_key(claim, key_text) for claim in feature_claims
+            ):
                 out[key] = kept
             else:
                 out.pop(key, None)
@@ -155,9 +287,12 @@ def reconcile_semantic_aspects(
             for claim in material_claims
             for value in values
         )
+        matched_material_key = any(
+            _claim_matches_key(claim, key_text) for claim in material_claims
+        )
         is_material_field = any(fragment in key_lower for fragment in material_key_fragments)
-        is_wrong_type = key_lower == "type" and matched_material
-        if not matched_material and not is_wrong_type:
+        is_wrong_type = key_lower == "type" and (matched_material or matched_material_key)
+        if not matched_material and not matched_material_key and not is_wrong_type:
             continue
 
         if (
@@ -166,8 +301,20 @@ def reconcile_semantic_aspects(
             and ("fabric" in key_lower or "material" in key_lower)
         ):
             out[key] = [source_upholstery]
-        elif is_material_field or is_wrong_type or matched_material:
+        elif is_material_field or is_wrong_type:
             out.pop(key, None)
+        elif matched_material:
+            kept = [
+                _strip_claim_from_value(value, claim)
+                for value in values
+                for claim in material_claims
+                if _claim_matches_value(claim, value)
+            ]
+            kept = [value for value in kept if value]
+            if kept:
+                out[key] = kept
+            else:
+                out.pop(key, None)
 
     return out
 
