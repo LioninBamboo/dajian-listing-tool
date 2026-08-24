@@ -48,6 +48,12 @@ from src.utils.inventory_audit_contract import (
     AUDIT_SCOPE_FULL_OOS,
     empty_inventory_audit,
 )
+from src.utils.inventory_restock_hold import is_restock_held
+
+
+def should_auto_restock_zero_listing(sku: str) -> bool:
+    """Ghost-OOS recovery may restock qty=0 listings unless a restock hold is active."""
+    return not is_restock_held(sku)
 
 warnings.filterwarnings('ignore')
 
@@ -187,12 +193,13 @@ def plan_auto_reprice(
     min_margin: float = MIN_MARGIN,
     auto_cut_pct: float = AUTO_PRICE_CUT_PCT,
 ):
-    """Decide a health auto-fix price cut, or None to skip.
+    """Decide a health auto-fix price change, or None to skip.
 
     Rules:
     - Unknown / non-positive total_cost → skip (never cut without a floor)
     - new_price = max(strategy_target, cost_floor)
-    - Only cuts (overpriced: ≥3% drop; low_conversion: ≥1% drop); never auto-raise
+    - over/low-conversion modes only cut (never raise)
+    - loss_making mode raises an under-cost listing to the safe floor
     """
     try:
         current = float(current_price or 0)
@@ -235,6 +242,19 @@ def plan_auto_reprice(
             'floor': round(floor, 2),
             'target': round(current * (1 - float(auto_cut_pct) / 100.0), 2),
             'reason': '低转化 → 降价5%',
+        }
+
+    if mode == 'loss_making':
+        # A loss-making live listing is already below the safe floor.  Raising
+        # it is the only safe automatic action; never leave the alert as
+        # report-only because supplier cost changes can happen after pricing.
+        if floor <= current + 0.01:
+            return None
+        return {
+            'new_price': round(floor, 2),
+            'floor': round(floor, 2),
+            'target': round(floor, 2),
+            'reason': '潜在亏损 → 提升至安全底价',
         }
 
     return None
@@ -1110,6 +1130,11 @@ class SalesHealthChecker:
 
                 in_stock, _, _, available_quantity = svc.check_dajian_stock(sku)
                 if in_stock:
+                    if not should_auto_restock_zero_listing(sku):
+                        log.info(
+                            f"  {sku}: restock hold 生效中，保持 eBay 库存为 0，不补为 1"
+                        )
+                        continue
                     log.warning(f"  {sku}: eBay qty=0 但大建有货! (offer={offer_status})")
                     if auto_fix:
                         success = svc.update_ebay_quantity(
@@ -1203,9 +1228,10 @@ class SalesHealthChecker:
         自动修复问题链接
 
         策略:
-        1. 定价偏高: 降价到市场均价 × 0.95 (不低于底价)
-        2. 高展示零转化 + 价格偏高: 同上
-        3. 低转化: 降价 5%
+        1. 潜在亏损: 提升到成本安全底价 (优先处理)
+        2. 定价偏高: 降价到市场均价 × 0.95 (不低于底价)
+        3. 高展示零转化 + 价格偏高: 同上
+        4. 低转化: 降价 5%
         """
         log.info("\n" + "=" * 70)
         log.info("AUTO-FIX — 自动修复")
@@ -1229,12 +1255,39 @@ class SalesHealthChecker:
                         return True
             return False
 
-        # 合并: 定价偏高 + 低转化 (均经 plan_auto_reprice 成本底价护栏)
+        # 合并: 潜在亏损 + 定价偏高 + 低转化。
+        # Loss-making must be handled first because it is an upward correction,
+        # while the other categories are cut-only strategies.
         to_reprice = []
+        queued_skus = set()
         skipped_no_cost = 0
         skipped_floor = 0
 
+        for d in self.results['loss_making']:
+            sku = d['sku']
+            if _repriced_today(d):
+                log.info(f"  {sku}: 今日已执行过重定价，跳过二次改价")
+                continue
+            plan = plan_auto_reprice(
+                current_price=d.get('ebay_price') or 0,
+                total_cost=d.get('total_cost') or 0,
+                mode='loss_making',
+            )
+            if plan is None:
+                continue
+            to_reprice.append({
+                'sku': sku,
+                'listing_id': d.get('listing_id'),
+                'old_price': d.get('ebay_price'),
+                'new_price': plan['new_price'],
+                'reason': plan['reason'],
+                'action': 'price_raise',
+            })
+            queued_skus.add(sku)
+
         for d in self.results['overpriced']:
+            if d['sku'] in queued_skus:
+                continue
             if _repriced_today(d):
                 log.info(f"  {d['sku']}: 今日已执行过重定价，跳过二次改价")
                 continue
@@ -1266,9 +1319,13 @@ class SalesHealthChecker:
                 'old_price': d['current_price'],
                 'new_price': plan['new_price'],
                 'reason': plan['reason'],
+                'action': 'price_cut',
             })
+            queued_skus.add(d['sku'])
 
         for d in self.results['low_conversion']:
+            if d['sku'] in queued_skus:
+                continue
             if _repriced_today(d):
                 log.info(f"  {d['sku']}: 今日已执行过重定价，跳过二次改价")
                 continue
@@ -1297,7 +1354,9 @@ class SalesHealthChecker:
                 'old_price': d['current_price'],
                 'new_price': plan['new_price'],
                 'reason': plan['reason'],
+                'action': 'price_cut',
             })
+            queued_skus.add(d['sku'])
 
         if skipped_no_cost or skipped_floor:
             log.info(
@@ -1339,7 +1398,7 @@ class SalesHealthChecker:
                     success += 1
                     self.actions_taken.append({
                         'sku': sku,
-                        'action': 'price_cut',
+                        'action': item.get('action', 'price_cut'),
                         'old_price': item['old_price'],
                         'new_price': new_price,
                         'reason': item['reason'],
@@ -1362,7 +1421,7 @@ class SalesHealthChecker:
                     failed += 1
                     self.actions_taken.append({
                         'sku': sku,
-                        'action': 'price_cut',
+                        'action': item.get('action', 'price_cut'),
                         'reason': item['reason'],
                         'status': 'failed',
                     })
@@ -1374,7 +1433,7 @@ class SalesHealthChecker:
                 failed += 1
                 self.actions_taken.append({
                     'sku': sku,
-                    'action': 'price_cut',
+                    'action': item.get('action', 'price_cut'),
                     'reason': item['reason'],
                     'status': 'failed',
                 })

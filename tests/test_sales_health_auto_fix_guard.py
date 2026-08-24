@@ -153,6 +153,23 @@ def test_low_conversion_plan_cuts_five_percent_when_safe():
     assert plan["reason"] == "低转化 → 降价5%"
 
 
+# ── loss_making plan ────────────────────────────────────────────────────────
+
+def test_loss_making_plan_raises_listing_to_safe_floor():
+    """A live under-cost listing must be raised, not merely reported."""
+    total_cost = 196.59
+    floor = PricingEngine.safe_floor_price(total_cost, 0.10)
+    plan = shc.plan_auto_reprice(
+        current_price=248.45,
+        total_cost=total_cost,
+        mode="loss_making",
+    )
+    assert plan is not None
+    assert plan["new_price"] == pytest.approx(floor, abs=0.01)
+    assert plan["new_price"] > 248.45
+    assert plan["reason"] == "潜在亏损 → 提升至安全底价"
+
+
 # ── evaluate_live_loss (why daily report never warned) ─────────────────────
 
 def test_evaluate_live_loss_flags_w3118_style_under_cost():

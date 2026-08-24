@@ -199,3 +199,5 @@ INDEX.md
 auth_url*.txt
 full_flow_output*.txt
 config/store_profile.local.yaml
+# Local operator state; may contain temporary per-SKU restock holds.
+/config/inventory_restock_holds.json

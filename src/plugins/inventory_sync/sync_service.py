@@ -24,6 +24,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
 from src.clients.dajian_client import extract_available_inventory_quantity
+from src.utils.inventory_restock_hold import (
+    is_restock_held,
+    should_block_positive_quantity,
+)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -323,7 +327,7 @@ class InventorySyncService:
         cur.execute("""
             SELECT DISTINCT sku FROM inventory_sync_log 
             WHERE date(synced_at) = ?
-              AND action IN ('out_of_stock', 'price_updated', 'no_change', 'restocked', 'skipped')
+              AND action IN ('out_of_stock', 'price_updated', 'no_change', 'restocked', 'skipped', 'restock_held')
         """, (today,))
         
         skus = {row[0] for row in cur.fetchall()}
@@ -470,6 +474,12 @@ class InventorySyncService:
     
     def update_ebay_quantity(self, sku: str, quantity: int) -> bool:
         """更新 eBay 库存数量，并回读验证 live offer 状态。"""
+        if should_block_positive_quantity(sku, quantity):
+            self.logger.warning(
+                f"{sku}: restock hold active, refusing quantity={quantity}"
+            )
+            return False
+
         import requests
         from src.services.ebay_auth import EbayOAuthService
         
@@ -1051,7 +1061,7 @@ class InventorySyncService:
                 results.append(result)
                 
                 # 记录同步结果到数据库
-                if not dry_run and result.action in ('out_of_stock', 'price_updated', 'no_change', 'restocked', 'skipped', 'data_missing'):
+                if not dry_run and result.action in ('out_of_stock', 'price_updated', 'no_change', 'restocked', 'skipped', 'data_missing', 'restock_held'):
                     self.record_sync(result)
                 
                 # 每10个产品记录一次进度
@@ -1094,6 +1104,23 @@ class InventorySyncService:
             
             # 2. 检查大建库存和价格
             in_stock, current_price, shipping_cost, available_quantity = self.check_dajian_stock(sku)
+
+            if is_restock_held(sku):
+                if not _set_ebay_quantity_zero():
+                    return SyncResult(
+                        sku=sku,
+                        action='error',
+                        message='restock hold 生效中，但 eBay 库存保持为 0 失败',
+                        supplier_in_stock=in_stock,
+                    )
+                return SyncResult(
+                    sku=sku,
+                    action='restock_held',
+                    old_value='库存不为0' if in_stock else '库存为0',
+                    new_value='库存保持为0',
+                    message='restock hold 生效中，eBay 库存保持为 0，不补为 1',
+                    supplier_in_stock=in_stock,
+                )
             
             if in_stock is None:
                 # API 请求异常 — 用收藏夹交叉验证产品是否存在
@@ -1163,7 +1190,7 @@ class InventorySyncService:
             
             # 3.5 检查是否从缺货恢复 → 自动重新上架
             last_action = self.get_last_sync_action(sku)
-            if last_action == 'out_of_stock' and in_stock:
+            if last_action in ('out_of_stock', 'restock_held') and in_stock:
                 self.logger.info(f"  {sku}: 从缺货恢复，重新上架")
                 restore_quantity = 1
                 restored = True
