@@ -17,6 +17,7 @@ from src.services.vehicle_compatibility import (
     apply_compatibility_aspects,
     serialize_compatibility_analysis,
 )
+from src.utils.store_profile import get_store_profile
 
 DB_PATH = ROOT / "ebay_collection.db"
 LOG_DIR = ROOT / "logs"
@@ -35,6 +36,7 @@ def parse_json(value, default):
 
 
 def load_rows(conn, sku_filter=None):
+    profile = get_store_profile()
     base_sql = (
         "SELECT sku, status, title, description, optimization, listing_id "
         "FROM collected_products "
@@ -46,7 +48,7 @@ def load_rows(conn, sku_filter=None):
     for row in rows:
         opt = parse_json(row["optimization"], {})
         category_id = str(opt.get("categoryId", "") or "")
-        if category_id not in EBAY_MOTORS_CATEGORIES:
+        if not profile.is_motors and category_id not in EBAY_MOTORS_CATEGORIES:
             continue
         if sku_filter and row["sku"] != sku_filter:
             continue
@@ -63,6 +65,7 @@ def main():
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     rows = load_rows(conn, args.sku)
+    is_motors_store = get_store_profile().is_motors
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = LOG_DIR / f"motors_compatibility_{timestamp}.json"
@@ -81,7 +84,13 @@ def main():
         category_id = str(opt.get("categoryId", "") or "")
         aspects = parse_json(opt.get("aspects", {}), {})
 
-        analysis = analyze_ebay_motors_compatibility(category_id, title, description, aspects)
+        analysis = analyze_ebay_motors_compatibility(
+            category_id,
+            title,
+            description,
+            aspects,
+            is_motors_store=is_motors_store,
+        )
         updated_aspects = apply_compatibility_aspects(category_id, aspects, analysis)
         changed = (
             updated_aspects != aspects or

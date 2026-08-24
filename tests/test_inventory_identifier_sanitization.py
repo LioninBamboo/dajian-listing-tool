@@ -66,3 +66,15 @@ def test_missing_upc_publish_error_adds_official_unavailable_marker():
 
     assert fixed is True
     assert aspects["UPC"] == ["Does not apply"]
+
+
+def test_brand_mpn_publish_error_adds_official_unavailable_marker():
+    aspects = {"Brand": ["AquaVerve"]}
+
+    fixed = batch_publish._try_fix_missing_product_identifier(
+        "Input data for tag <BrandMPN> is invalid or missing. Please check API documentation.",
+        aspects,
+    )
+
+    assert fixed is True
+    assert aspects["MPN"] == ["Does not apply"]

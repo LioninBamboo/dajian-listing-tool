@@ -72,6 +72,9 @@ KNOWN_MODELS = {
     "crosstrek": "Subaru",
     "cx-5": "Mazda",
     "cx-9": "Mazda",
+    "defender 90": "Land Rover",
+    "defender 110": "Land Rover",
+    "defender 130": "Land Rover",
     "durango": "Dodge",
     "edge": "Ford",
     "equinox": "Chevrolet",
@@ -222,10 +225,9 @@ class VehicleCompatibilityParser:
                             entries.append(self._build_entry(year, make, model, note))
                 return _dedupe_entries(entries)
 
-        for make in makes:
-            for year in years:
-                entries.append(self._build_entry(year, make, note=note))
-        return _dedupe_entries(entries)
+        # eBay US Motors rejects a compatibility row without Model.  Keep the
+        # item in manual review when source data exposes only Make + Year.
+        return []
 
     def _from_aspects(
         self,
@@ -259,11 +261,8 @@ class VehicleCompatibilityParser:
                             for model in model_list:
                                 entries.append(self._build_entry(year, make, model, note))
             else:
-                # Last-resort fallback: make + year only. This is still better than
-                # losing fitment entirely if the source data never exposed models.
-                for make in makes:
-                    for year in years:
-                        entries.append(self._build_entry(year, make, note=note))
+                # eBay US Motors requires Year + Make + Model for manual fitment.
+                return []
             return _dedupe_entries(entries)
 
         compatibility_values = aspects.get("Compatibility", [])
@@ -293,6 +292,8 @@ class VehicleCompatibilityParser:
             vehicle_list = match.group(1).strip()
             start_year = int(match.group(2))
             for make, model in self._parse_vehicle_list(vehicle_list):
+                if not model:
+                    continue
                 for year in range(start_year, CURRENT_YEAR + 1):
                     entries.append(self._build_entry(str(year), make, model, note))
 
@@ -313,6 +314,8 @@ class VehicleCompatibilityParser:
                 end_year = int(match.group(2))
                 vehicle_text = self._trim_vehicle_segment(match.group(3))
                 for make, model in self._parse_vehicle_list(vehicle_text):
+                    if not model:
+                        continue
                     for year in range(start_year, end_year + 1):
                         entries.append(self._build_entry(str(year), make, model, note))
 
@@ -326,6 +329,8 @@ class VehicleCompatibilityParser:
             start_year = int(match.group(1))
             vehicle_text = self._trim_vehicle_segment(match.group(2))
             for make, model in self._parse_vehicle_list(vehicle_text):
+                if not model:
+                    continue
                 for year in range(start_year, CURRENT_YEAR + 1):
                     entries.append(self._build_entry(str(year), make, model, note))
 
@@ -827,6 +832,11 @@ def _looks_universal_fit(
 def _has_vehicle_mentions(text: str, aspects: Dict[str, List[str]]) -> bool:
     lowered = text.lower()
     if any(re.search(pattern, lowered) for pattern in GENERIC_VEHICLE_PATTERNS):
+        return True
+
+    if any(re.search(rf"\b{re.escape(make)}\b", lowered) for make in VEHICLE_MAKES):
+        return True
+    if any(re.search(rf"\b{re.escape(model)}\b", lowered) for model in KNOWN_MODELS):
         return True
 
     for key in ("Compatibility", "Compatible Make", "Compatible Model", "Compatible Year"):

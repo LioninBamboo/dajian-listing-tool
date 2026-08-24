@@ -646,6 +646,7 @@ def publish_to_ebay(product: dict) -> dict:
     """Publish product to eBay (basic version)"""
     from src.clients.real_ebay_client import RealEbayClient
     from src.services.ebay_policy_manager import EbayPolicyManager
+    from src.utils.store_profile import get_store_profile
     from src.services.vehicle_compatibility import (
         EBAY_MOTORS_CATEGORIES,
         analyze_ebay_motors_compatibility,
@@ -694,6 +695,7 @@ def publish_to_ebay(product: dict) -> dict:
                 title=title,
                 description=description,
                 aspects=opt_data.get("aspects", _default_brand_aspects()),
+                is_motors_store=get_store_profile().is_motors,
             ),
         )
         compatibility = analyze_ebay_motors_compatibility(
@@ -701,6 +703,7 @@ def publish_to_ebay(product: dict) -> dict:
             title=title,
             description=description,
             aspects=aspects,
+            is_motors_store=get_store_profile().is_motors,
         )
         opt_data["aspects"] = aspects
         opt_data["motorsCompatibility"] = serialize_compatibility_analysis(compatibility)
@@ -771,6 +774,7 @@ def pre_publish_qc(product: dict) -> list:
         analyze_ebay_motors_compatibility,
         apply_compatibility_aspects,
     )
+    from src.utils.store_profile import get_store_profile
     issues = []
     sku = product.get('sku', '?')
     opt = product.get('optimization', {})
@@ -827,13 +831,26 @@ def pre_publish_qc(product: dict) -> list:
         issues.append("⚠️ 缺少产品描述")
 
     # 7. Motors compatibility check
-    if cat_id in {"174020", "174021", "262210", "262216", "262093"}:
+    profile = get_store_profile()
+    if cat_id in {"174020", "174021", "262210", "262216", "262093"} or profile.is_motors:
         aspects = apply_compatibility_aspects(
             cat_id,
             opt.get('aspects', {}),
-            analyze_ebay_motors_compatibility(cat_id, title, desc, opt.get('aspects', {})),
+            analyze_ebay_motors_compatibility(
+                cat_id,
+                title,
+                desc,
+                opt.get('aspects', {}),
+                is_motors_store=profile.is_motors,
+            ),
         )
-        compatibility = analyze_ebay_motors_compatibility(cat_id, title, desc, aspects)
+        compatibility = analyze_ebay_motors_compatibility(
+            cat_id,
+            title,
+            desc,
+            aspects,
+            is_motors_store=profile.is_motors,
+        )
         if compatibility.mode == "generic_vehicle":
             issues.append("⚠️ Motors Compatibility 只有文本级车型信息，无法生成完整结构化 fitment")
         elif compatibility.mode == "needs_review":
@@ -858,6 +875,7 @@ def publish_with_auto_category(product: dict) -> dict:
         apply_compatibility_aspects,
         serialize_compatibility_analysis,
     )
+    from src.utils.store_profile import get_store_profile
     
     oauth = get_oauth_service()
     
@@ -978,6 +996,7 @@ def publish_with_auto_category(product: dict) -> dict:
                 title=title,
                 description=description,
                 aspects=completed_aspects,
+                is_motors_store=get_store_profile().is_motors,
             )
             completed_aspects = apply_compatibility_aspects(category_id, completed_aspects, compatibility)
             sanitize_single_value_aspects(completed_aspects, log=print)

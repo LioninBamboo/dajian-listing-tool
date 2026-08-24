@@ -40,6 +40,7 @@ EPS_TARGET_MAX_IMAGE_BYTES = 9_500_000
 EPS_MIN_IMAGE_SIDE = 500
 UNBRANDED_MARKERS = {"unbranded", "unbrand", "generic"}
 VALID_ASSEMBLY_STATUS_VALUES = {"Part Assembled", "Fully Assembled", "Ready to Assemble"}
+INVALID_MOTORS_COMPATIBILITY_ERROR_CODES = {"21916723", "21916724"}
 IDENTIFIER_PATTERNS = {
     "upc": r"\d{12}",
     "ean": r"(?:\d{8}|\d{13})",
@@ -49,6 +50,53 @@ IDENTIFIER_PATTERNS = {
 # identifier but the product genuinely has none.
 # https://developer.ebay.com/api-docs/sell/static/inventory/product-identifier-text.html
 PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT = "Does not apply"
+
+
+def stored_video_id_from_optimization(opt: Any) -> str:
+    """Return the locally recorded eBay video id from an optimization blob."""
+    if not isinstance(opt, dict):
+        return ""
+    video_id = str(opt.get("video_id") or opt.get("videoId") or "").strip()
+    if video_id:
+        return video_id
+    video_ids = opt.get("videoIds")
+    if isinstance(video_ids, list):
+        for item in video_ids:
+            text = str(item or "").strip()
+            if text:
+                return text
+        return ""
+    if isinstance(video_ids, str):
+        return video_ids.strip()
+    return ""
+
+
+def lookup_stored_video_id(sku: str) -> str:
+    """Best-effort local DB lookup of a previously linked eBay video id."""
+    sku = str(sku or "").strip()
+    if not sku:
+        return ""
+    try:
+        import sqlite3
+        from pathlib import Path
+
+        db_path = Path(__file__).resolve().parents[2] / "ebay_collection.db"
+        if not db_path.exists():
+            return ""
+        con = sqlite3.connect(str(db_path))
+        try:
+            row = con.execute(
+                "SELECT optimization FROM collected_products WHERE sku = ?",
+                (sku,),
+            ).fetchone()
+        finally:
+            con.close()
+        if not row:
+            return ""
+        opt = json.loads(row[0] or "{}") if isinstance(row[0], str) else (row[0] or {})
+        return stored_video_id_from_optimization(opt)
+    except Exception:
+        return ""
 
 
 def _first_text_value(value: Any) -> str:
@@ -637,17 +685,27 @@ class RealEbayClient:
         # Note: Country comes from merchantLocationKey in offer, not inventory item
         
         # Preserve existing live videoIds unless the caller explicitly overrides them.
+        # If live inventory already lost the video, fall back to the locally stored
+        # eBay video_id so later aspect/image PUTs cannot wipe a previously linked video.
         video_urls = product.get("video_urls")
         if video_urls:
-            payload["product"]["videoIds"] = list(video_urls)[:1]  # eBay max 1 video
+            payload["product"]["videoIds"] = [
+                str(item).strip() for item in list(video_urls) if str(item).strip()
+            ][:1]
         elif "video_urls" not in product:
             try:
                 live_inventory = self.get_inventory_item(sku) or {}
             except Exception:
                 live_inventory = {}
-            live_video_ids = ((live_inventory.get("product") or {}).get("videoIds") or [])
-            if live_video_ids:
-                payload["product"]["videoIds"] = list(live_video_ids)[:1]
+            live_video_ids = [
+                str(item).strip()
+                for item in ((live_inventory.get("product") or {}).get("videoIds") or [])
+                if str(item).strip()
+            ]
+            local_video_id = lookup_stored_video_id(sku)
+            preserved = live_video_ids[:1] or ([local_video_id] if local_video_id else [])
+            if preserved:
+                payload["product"]["videoIds"] = preserved
 
         response = self.session.put(url, headers=headers, json=payload)
         
@@ -1007,8 +1065,13 @@ class RealEbayClient:
                                  data=xml.encode("utf-8"), timeout=90)
         body = resp.text
         ack = (re.search(r"<Ack>(.*?)</Ack>", body) or [None, ""])[1] if "<Ack>" in body else ""
+        error_codes = set(re.findall(r"<ErrorCode>(.*?)</ErrorCode>", body, re.S))
         item_id = (re.search(r"<ItemID>(.*?)</ItemID>", body) or [None, None])[1]
-        if item_id and ack in ("Success", "Warning"):
+        if (
+            item_id
+            and ack in ("Success", "Warning")
+            and not error_codes.intersection(INVALID_MOTORS_COMPATIBILITY_ERROR_CODES)
+        ):
             logging.info(f"[MOTORS] Trading publish OK: ItemID {item_id} (Ack={ack})")
             return {"itemId": item_id, "status": "published", "ack": ack}
         errors = [
@@ -1040,18 +1103,96 @@ class RealEbayClient:
         m = re.search(r"<Description>(.*?)</Description>", resp.text, re.S)
         return (m.group(1) if m else "")
 
+    def get_item_compatibility_motors(self, item_id: str) -> list[dict]:
+        """Fetch the manual Trading compatibility rows for a live Motors item.
+
+        ``IncludeItemCompatibilityList`` is required because GetItem omits the
+        row details by default and only returns a count.  The result is kept in
+        the same shape consumed by ``format_compatibility_list``.
+        """
+        import html
+        import re
+        from src.utils.store_profile import get_store_profile
+
+        profile = get_store_profile()
+        xml = (
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+            "<GetItemRequest xmlns=\"urn:ebay:apis:eBLBaseComponents\">"
+            f"<ItemID>{item_id}</ItemID>"
+            "<IncludeItemCompatibilityList>true</IncludeItemCompatibilityList>"
+            "</GetItemRequest>"
+        )
+        headers = {
+            "X-EBAY-API-CALL-NAME": "GetItem",
+            "X-EBAY-API-SITEID": profile.ebay_site_id,
+            "X-EBAY-API-COMPATIBILITY-LEVEL": "1155",
+            "X-EBAY-API-IAF-TOKEN": self.oauth.get_valid_token(),
+            "Content-Type": "text/xml",
+        }
+        resp = self.session.post(
+            "https://api.ebay.com/ws/api.dll",
+            headers=headers,
+            data=xml.encode("utf-8"),
+            timeout=60,
+        )
+        body = resp.text
+        ack_match = re.search(r"<Ack>(.*?)</Ack>", body, re.S)
+        if ack_match and ack_match.group(1).strip() == "Failure":
+            errors = [
+                html.unescape((match.group(1) or "").strip())
+                for match in re.finditer(r"<LongMessage>(.*?)</LongMessage>", body, re.S)
+            ]
+            raise RuntimeError(
+                f"GetItem compatibility failed: {'; '.join(errors)[:400]}"
+            )
+
+        entries = []
+        for block in re.findall(r"<Compatibility>(.*?)</Compatibility>", body, re.S):
+            properties = []
+            for name, value in re.findall(
+                r"<Name>(.*?)</Name>\s*<Value>(.*?)</Value>", block, re.S
+            ):
+                properties.append(
+                    {
+                        "name": html.unescape(name).strip(),
+                        "value": html.unescape(value).strip(),
+                    }
+                )
+            if not properties:
+                continue
+            notes_match = re.search(r"<CompatibilityNotes>(.*?)</CompatibilityNotes>", block, re.S)
+            entry = {"compatibilityProperties": properties}
+            if notes_match:
+                entry["notes"] = html.unescape(notes_match.group(1)).strip()
+            entries.append(entry)
+        return entries
+
     def revise_fixed_price_item_motors(self, item_id: str, *, description: Optional[str] = None,
                                        title: Optional[str] = None) -> Dict:
         """Partial-update a live Motors Trading item's description and/or title.
 
-        Leaves ItemSpecifics, Compatibility and Price untouched (they are simply
-        not sent). Returns {"itemId", "ack"} or raises with eBay's error messages.
+        On a Motors store, snapshot the live compatibility rows first and send
+        them back with ``ReplaceAll=true``.  This fail-closed preservation gate
+        prevents a description/title revision path from silently dropping a
+        previously repaired fitment table.  Returns {"itemId", "ack"} or raises
+        with eBay's error messages.
         """
         import re
         from src.services.motors_trading import build_revise_fixed_price_item_xml
         from src.utils.store_profile import get_store_profile
         profile = get_store_profile()
-        xml = build_revise_fixed_price_item_xml(item_id=item_id, description=description, title=title)
+        compatibility = None
+        replace_all_compatibility = False
+        if profile.is_motors:
+            compatibility = self.get_item_compatibility_motors(item_id)
+            replace_all_compatibility = bool(compatibility)
+        xml = build_revise_fixed_price_item_xml(
+            item_id=item_id,
+            description=description,
+            title=title,
+            compatibility=compatibility,
+            replace_all_compatibility=replace_all_compatibility,
+        )
         headers = {
             "X-EBAY-API-CALL-NAME": "ReviseFixedPriceItem",
             "X-EBAY-API-SITEID": profile.ebay_site_id,
@@ -1063,7 +1204,11 @@ class RealEbayClient:
                                  data=xml.encode("utf-8"), timeout=90)
         body = resp.text
         ack = (re.search(r"<Ack>(.*?)</Ack>", body) or [None, ""])[1] if "<Ack>" in body else ""
-        if ack in ("Success", "Warning"):
+        error_codes = set(re.findall(r"<ErrorCode>(.*?)</ErrorCode>", body, re.S))
+        if (
+            ack in ("Success", "Warning")
+            and not error_codes.intersection(INVALID_MOTORS_COMPATIBILITY_ERROR_CODES)
+        ):
             logging.info(f"[MOTORS] Revise OK: ItemID {item_id} (Ack={ack})")
             return {"itemId": item_id, "ack": ack}
         errors = [(m.group(1) or "").strip()

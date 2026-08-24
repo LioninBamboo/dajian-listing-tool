@@ -62,6 +62,21 @@ class TestTreeAwareGate:
         assert r.mode != "specific"
         assert r.compatible_products == []
 
+    def test_motors_store_requires_year_before_building_fitment(self):
+        # eBay Trading rejects a manual compatibility row without Year/Make/Model
+        # (error 21916723).  A title-only make/model mention must therefore stay
+        # in manual review instead of producing an invalid fitment payload.
+        r = analyze_ebay_motors_compatibility(
+            "33654",
+            "OMU Genesis Series Carbon Fiber Trim Fit For New Land Rover Defender 90/110/130",
+            "Direct replacement trim for Defender wing mirrors.",
+            {"Fitment Type": ["Vehicle Specific Fit"]},
+            is_motors_store=True,
+        )
+        assert r.mode == "generic_vehicle"
+        assert r.compatible_products == []
+        assert r.issues
+
 
 class TestEndToEndDryRun:
     """Rehearse batch_publish's Trading branch offline: analyze -> XML."""

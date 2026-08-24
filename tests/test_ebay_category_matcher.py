@@ -83,6 +83,28 @@ def test_real_sofa_still_remapped_to_sofas():
     assert category_name == "Sofas, Armchairs & Couches"
 
 
+def test_legacy_rocking_chair_category_uses_current_leaf():
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    title = "Outdoor Rocking Chair with Thick Comfy Cushion for Patio Living Room Reading"
+
+    assert matcher._fallback_category(title)[0] == "66690"
+    assert matcher.canonicalize_category(title, "20877", "Rocking Chairs") == (
+        "66690",
+        "Rockers, Gliders",
+    )
+
+
+def test_legacy_laundry_hamper_category_uses_current_leaf():
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    title = "Water Hyacinth Woven Laundry Hamper with Lid Natural Light Brown 18x18x23"
+
+    assert matcher._fallback_category(title)[0] == "43517"
+    assert matcher.canonicalize_category(title, "43527", "Laundry Hampers") == (
+        "43517",
+        "Laundry Carts & Hampers",
+    )
+
+
 def test_bell_tent_with_cooler_weather_copy_stays_in_tents():
     """2026-07-27: the rebuilt description said "cozy even in cooler weather".
     A bare \bcooler\b match set has_cooler and wanted to move 4 bell tents from

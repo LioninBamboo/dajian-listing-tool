@@ -110,6 +110,64 @@ def test_create_inventory_item_preserves_existing_video_ids_when_new_payload_omi
     assert client.session.last_json["product"]["videoIds"] == ["video-live-1"]
 
 
+def test_create_inventory_item_falls_back_to_local_video_id_when_live_inventory_has_none(monkeypatch):
+    from src.clients import real_ebay_client
+
+    client = object.__new__(RealEbayClient)
+    client.base_url = "https://api.ebay.example"
+    client.oauth = _DummyOauth()
+    client.session = _Session()
+    client._prepare_inventory_image_urls = lambda sku, image_urls, max_images=24: image_urls
+    client._verify_inventory_image_urls = lambda sku, expected_count: None
+    client.get_inventory_item = lambda sku: {"product": {"videoIds": []}}
+    monkeypatch.setattr(real_ebay_client, "lookup_stored_video_id", lambda sku: "video-local-1")
+
+    result = client.create_or_replace_inventory_item(
+        "SKU123",
+        {
+            "title": "Storage Ottoman",
+            "description": "<div>ok</div>",
+            "image_urls": ["https://example.com/a.jpg"],
+            "quantity": 1,
+            "condition": "NEW",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+            },
+        },
+    )
+
+    assert result["status"] == "success"
+    assert client.session.last_json["product"]["videoIds"] == ["video-local-1"]
+
+
+def test_create_inventory_item_explicit_empty_video_urls_still_clears_video():
+    client = object.__new__(RealEbayClient)
+    client.base_url = "https://api.ebay.example"
+    client.oauth = _DummyOauth()
+    client.session = _Session()
+    client._prepare_inventory_image_urls = lambda sku, image_urls, max_images=24: image_urls
+    client._verify_inventory_image_urls = lambda sku, expected_count: None
+    client.get_inventory_item = lambda sku: {"product": {"videoIds": ["video-live-1"]}}
+
+    result = client.create_or_replace_inventory_item(
+        "SKU123",
+        {
+            "title": "Storage Ottoman",
+            "description": "<div>ok</div>",
+            "image_urls": ["https://example.com/a.jpg"],
+            "video_urls": [],
+            "quantity": 1,
+            "condition": "NEW",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+            },
+        },
+    )
+
+    assert result["status"] == "success"
+    assert "videoIds" not in client.session.last_json["product"]
+
+
 def test_create_inventory_item_removes_invalid_assembly_status_yes_no_values():
     client = object.__new__(RealEbayClient)
     client.base_url = "https://api.ebay.example"

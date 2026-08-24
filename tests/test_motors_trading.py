@@ -28,6 +28,24 @@ class TestReviseBuilder:
         with pytest.raises(ValueError):
             build_revise_fixed_price_item_xml(item_id="", description="d")
 
+    def test_can_replace_a_preserved_fitment_snapshot(self):
+        xml = build_revise_fixed_price_item_xml(
+            item_id="188777280873",
+            description="<div>Updated</div>",
+            compatibility=[{
+                "compatibilityProperties": [
+                    {"name": "Year", "value": "2020"},
+                    {"name": "Make", "value": "Land Rover"},
+                    {"name": "Model", "value": "Defender"},
+                ],
+            }],
+            replace_all_compatibility=True,
+        )
+        assert "<ItemCompatibilityList>" in xml
+        assert "<ReplaceAll>true</ReplaceAll>" in xml
+        assert "<Name>Make</Name><Value>Land Rover</Value>" in xml
+        assert "<Name>Model</Name><Value>Defender</Value>" in xml
+
 _POLICIES = {
     "fulfillmentPolicyId": "262397301013",
     "returnPolicyId": "262619354013",
@@ -61,11 +79,13 @@ class TestCompatibility:
         assert format_compatibility_list(None) == ""
 
     def test_skips_incomplete_props(self):
-        xml = format_compatibility_list([{"compatibilityProperties": [{"name": "Year", "value": ""}]}])
-        assert xml == ""
+        with pytest.raises(ValueError, match="Year, Make, and Model"):
+            format_compatibility_list([{"compatibilityProperties": [{"name": "Year", "value": ""}]}])
 
     def test_escapes_values(self):
         xml = format_compatibility_list([{"compatibilityProperties": [
+            {"name": "Year", "value": "2020"},
+            {"name": "Make", "value": "Land Rover"},
             {"name": "Model", "value": "A&B <special>"}]}])
         assert "&amp;" in xml and "&lt;" in xml
 
@@ -155,6 +175,16 @@ class _CaptureSession:
         return _Resp(self._text)
 
 
+class _SequenceSession:
+    def __init__(self, *texts):
+        self._responses = [_Resp(text) for text in texts]
+        self.calls = []
+
+    def post(self, url, headers=None, data=None, timeout=None):
+        self.calls.append({"url": url, "headers": headers, "data": data})
+        return self._responses.pop(0)
+
+
 class _Oauth:
     def get_valid_token(self):
         return "iaf-token"
@@ -164,6 +194,7 @@ def _auto_profile():
     return dataclasses.replace(
         StoreProfile(),
         store_kind="auto",
+        category_tree_id="100",
         listing_channel="trading",
         ebay_site_id="100",
         warehouse_location="Los Angeles, CA",
@@ -221,6 +252,22 @@ class TestClientWrapper:
             {"title": "T", "description": "d"}, category_id="33653", price=9.99
         )["itemId"] == "999"
 
+    def test_warning_with_invalid_fitment_does_not_count_as_publish_success(self, monkeypatch):
+        warn = (
+            "<r><Ack>Warning</Ack><ItemID>999</ItemID>"
+            "<Errors><ErrorCode>21916723</ErrorCode>"
+            "<LongMessage>Specify Year Make Model</LongMessage></Errors></r>"
+        )
+        c = self._client(monkeypatch, warn)
+        with pytest.raises(Exception) as exc:
+            c.add_fixed_price_item_motors(
+                {"title": "T", "description": "d"},
+                category_id="33653",
+                price=9.99,
+                quantity=1,
+            )
+        assert "Year Make Model" in str(exc.value)
+
     def test_failure_raises_with_message(self, monkeypatch):
         fail = ("<r><Ack>Failure</Ack><Errors><LongMessage>"
                 "non-compliant domestic return policy</LongMessage></Errors></r>")
@@ -230,3 +277,37 @@ class TestClientWrapper:
                 {"title": "T", "description": "d"}, category_id="33653", price=9.99
             )
         assert "return policy" in str(exc.value)
+
+    def test_revise_preserves_existing_live_fitment(self, monkeypatch):
+        get_item = """
+        <GetItemResponse><Ack>Success</Ack><Item>
+          <ItemCompatibilityList>
+            <Compatibility><NameValueList>
+              <Name>Year</Name><Value>2020</Value>
+            </NameValueList><NameValueList>
+              <Name>Make</Name><Value>Land Rover</Value>
+            </NameValueList><NameValueList>
+              <Name>Model</Name><Value>Defender</Value>
+            </NameValueList></Compatibility>
+          </ItemCompatibilityList>
+        </Item></GetItemResponse>
+        """
+        revised = "<ReviseFixedPriceItemResponse><Ack>Warning</Ack></ReviseFixedPriceItemResponse>"
+        monkeypatch.setattr(
+            "src.utils.store_profile.get_store_profile", lambda: _auto_profile()
+        )
+        c = object.__new__(RealEbayClient)
+        c.oauth = _Oauth()
+        c.session = _SequenceSession(get_item, revised)
+
+        out = c.revise_fixed_price_item_motors(
+            "188777280873", description="<div>Updated</div>"
+        )
+
+        assert out["ack"] == "Warning"
+        assert c.session.calls[0]["headers"]["X-EBAY-API-CALL-NAME"] == "GetItem"
+        assert c.session.calls[1]["headers"]["X-EBAY-API-CALL-NAME"] == "ReviseFixedPriceItem"
+        revise_xml = c.session.calls[1]["data"].decode("utf-8")
+        assert "<ReplaceAll>true</ReplaceAll>" in revise_xml
+        assert "<Name>Make</Name><Value>Land Rover</Value>" in revise_xml
+        assert "<Name>Model</Name><Value>Defender</Value>" in revise_xml

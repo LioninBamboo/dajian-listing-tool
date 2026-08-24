@@ -1432,6 +1432,14 @@ def _try_fix_missing_aspect(error_msg: str, aspects: dict, category_id: str) -> 
 
 def _try_fix_missing_product_identifier(error_msg: str, aspects: dict) -> bool:
     """Add eBay US's official unavailable text after an explicit missing-ID error."""
+    if re.search(r"<BrandMPN>\s+is\s+(?:invalid|missing)", error_msg or "", re.IGNORECASE):
+        aspects["MPN"] = [PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT]
+        logger.info(
+            f"  [FIX] BrandMPN is required but unavailable; "
+            f"using eBay US identifier text '{PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT}'"
+        )
+        return True
+
     for aspect_name in ("UPC", "EAN", "ISBN"):
         if re.search(rf"\b{aspect_name}\s+field\s+is\s+missing\b", error_msg or "", re.IGNORECASE):
             aspects[aspect_name] = [PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT]

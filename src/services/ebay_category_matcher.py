@@ -429,6 +429,10 @@ class EbayCategoryMatcher:
             "45331": ("20689", "Wine Racks & Bottle Holders"),
             "66756": ("66743", "Play Table & Chair Sets"),
             "175761": ("20490", "Ottomans, Footstools & Poufs"),
+            # eBay tree 0 retired these historical IDs. Keep old drafts
+            # publishable by canonicalizing them to the current leaves.
+            "20877": ("66690", "Rockers, Gliders"),
+            "43527": ("43517", "Laundry Carts & Hampers"),
         }
         if cid in direct_replacements:
             return direct_replacements[cid]
@@ -1535,7 +1539,7 @@ class EbayCategoryMatcher:
             (["gaming chair"], "22513", "Gaming Chairs"),
             (["round chair", "cushioned backrest", "compressible chair"], "54235", "Chairs"),
             (["accent chair", "arm chair", "lounge chair", "club chair"], "54235", "Chairs"),
-            (["rocking chair", "glider"], "20877", "Rocking Chairs"),
+            (["rocking chair", "glider"], "66690", "Rockers, Gliders"),
             (["ottoman", "footstool", "pouf"], "20490", "Ottomans, Footstools & Poufs"),
             
             # Tables
@@ -1585,7 +1589,7 @@ class EbayCategoryMatcher:
             (["bathroom mirror"], "133696", "Bathroom Mirrors"),
             (["towel rack", "towel bar"], "42427", "Towel Racks"),
             (["shower bench", "bath stool"], "42429", "Shower Benches"),
-            (["laundry hamper", "laundry basket"], "43527", "Laundry Hampers"),
+            (["laundry hamper", "laundry basket"], "43517", "Laundry Carts & Hampers"),
             
             # ==================== OUTDOOR ====================
             (["patio furniture set", "patio set", "patio conversation", "outdoor conversation set", "outdoor furniture set", "outdoor sectional"], "139849", "Patio & Garden Furniture Sets"),

@@ -19,7 +19,11 @@ from xml.sax.saxutils import escape
 CONDITION_NEW = "1000"
 
 
-def format_compatibility_list(entries: Optional[Sequence[Mapping[str, Any]]]) -> str:
+def format_compatibility_list(
+    entries: Optional[Sequence[Mapping[str, Any]]],
+    *,
+    replace_all: bool = False,
+) -> str:
     """Render collected fitment into <ItemCompatibilityList>.
 
     ``entries`` is ``motorsCompatibility.compatibleProducts``: each item has
@@ -29,6 +33,12 @@ def format_compatibility_list(entries: Optional[Sequence[Mapping[str, Any]]]) ->
     blocks: List[str] = []
     for e in entries or []:
         props = (e or {}).get("compatibilityProperties") or []
+        prop_map = {
+            str(p.get("name") or "").strip().lower(): str(p.get("value") or "").strip()
+            for p in props
+        }
+        if props and any(not prop_map.get(required) for required in ("year", "make", "model")):
+            raise ValueError("Motors compatibility rows require Year, Make, and Model")
         nv = "".join(
             f"<NameValueList><Name>{escape(str(p['name']))}</Name>"
             f"<Value>{escape(str(p['value']))}</Value></NameValueList>"
@@ -42,7 +52,8 @@ def format_compatibility_list(entries: Optional[Sequence[Mapping[str, Any]]]) ->
             blocks.append(f"<Compatibility>{nv}</Compatibility>")
     if not blocks:
         return ""
-    return f"<ItemCompatibilityList>{''.join(blocks)}</ItemCompatibilityList>"
+    replace_all_xml = "<ReplaceAll>true</ReplaceAll>" if replace_all else ""
+    return f"<ItemCompatibilityList>{replace_all_xml}{''.join(blocks)}</ItemCompatibilityList>"
 
 
 def _aspects_xml(aspects: Optional[Mapping[str, Any]]) -> str:
@@ -72,11 +83,16 @@ def build_revise_fixed_price_item_xml(
     item_id: str,
     description: Optional[str] = None,
     title: Optional[str] = None,
+    compatibility: Optional[Sequence[Mapping[str, Any]]] = None,
+    replace_all_compatibility: bool = False,
 ) -> str:
     """Build a minimal ReviseFixedPriceItem request for a live Motors item.
 
     Only the fields passed are sent — ReviseFixedPriceItem is a partial update, so
     omitting ItemSpecifics/Compatibility/Price leaves the live values untouched.
+    When a caller supplies a live compatibility snapshot, ``ReplaceAll=true``
+    makes that snapshot authoritative instead of relying on an implicit API
+    merge during a listing revision.
     Used to push a corrected description (or a strengthened title) onto an item
     that was published before a template/QC fix, without disturbing its fitment.
     """
@@ -87,6 +103,12 @@ def build_revise_fixed_price_item_xml(
         parts.append(f"<Title>{escape(str(title)[:80])}</Title>")
     if description is not None:
         parts.append(f"<Description><![CDATA[{description}]]></Description>")
+    compatibility_xml = format_compatibility_list(
+        compatibility,
+        replace_all=replace_all_compatibility,
+    )
+    if compatibility_xml:
+        parts.append(compatibility_xml)
     return (
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
         "<ReviseFixedPriceItemRequest xmlns=\"urn:ebay:apis:eBLBaseComponents\">"

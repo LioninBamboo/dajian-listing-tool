@@ -29,6 +29,7 @@ from src.services.vehicle_compatibility import (
     analyze_ebay_motors_compatibility,
     apply_compatibility_aspects,
 )
+from src.utils.store_profile import get_store_profile
 from src.utils.ebay_quantity import resolve_publish_quantity
 from src.utils.publish_autofix import sanitize_placeholder_aspects, sanitize_single_value_aspects
 from src.utils.publish_aspect_completion import (
@@ -668,8 +669,8 @@ class EbayPublisher:
                 "Color": "Black"
             }
         },
-        # Rocking Chairs (20877) — Gliders, Nursery Gliders
-        "20877": {
+        # Rockers, Gliders (66690) — current eBay tree-0 leaf
+        "66690": {
             "required": ["Brand", "Type", "Material", "Color"],
             "defaults": {
                 "Brand": "Unbranded",
@@ -1042,7 +1043,7 @@ class EbayPublisher:
         "38208": ["sofa", "couch", "loveseat", "sectional", "futon", "recliner"],
         "181270": ["massage chair"],
         "22513": ["gaming chair"],
-        "20877": ["rocking chair", "glider"],
+        "66690": ["rocking chair", "glider"],
         "48319": ["bean bag"],
         "175761": ["ottoman", "footstool", "pouf"],
         
@@ -1077,7 +1078,7 @@ class EbayPublisher:
         "133696": ["bathroom mirror"],
         "42427": ["towel rack", "towel bar"],
         "42429": ["shower bench", "bath stool"],
-        "43527": ["laundry hamper", "laundry basket"],
+        "43517": ["laundry hamper", "laundry basket"],
         
         # Outdoor
         "139849": ["patio furniture", "patio set", "outdoor sofa", "outdoor sectional"],
@@ -1778,7 +1779,7 @@ class EbayPublisher:
             "accent chair", "arm chair", "lounge chair", "club chair", "barrel chair",
             "papasan", "chaise lounge", "wingback chair",
         ], ["outdoor", "patio", "desk chair", "office chair", "dining chair"]),
-        ("20877", "Rocking Chairs", ["rocking chair", "glider"], []),
+        ("66690", "Rockers, Gliders", ["rocking chair", "glider"], []),
         
         # ---- Misc Furniture ----
         ("38221", "Shoe Storage", ["shoe rack", "shoe cabinet", "shoe bench", "shoe storage"], []),
@@ -2100,7 +2101,13 @@ class EbayPublisher:
         description: str,
         aspects: Dict,
     ) -> CompatibilityAnalysis:
-        compatibility = analyze_ebay_motors_compatibility(category_id, title, description, aspects)
+        compatibility = analyze_ebay_motors_compatibility(
+            category_id,
+            title,
+            description,
+            aspects,
+            is_motors_store=get_store_profile().is_motors,
+        )
         if compatibility.mode != "not_applicable":
             self.logger.info(f"[COMPAT] {compatibility.summary}")
             for issue in compatibility.issues:
