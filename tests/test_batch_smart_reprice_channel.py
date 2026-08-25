@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from requests.exceptions import ConnectionError, Timeout
+
 from src.services.motors_trading import (
     build_revise_fixed_price_item_xml,
     parse_trading_item_price,
@@ -45,8 +47,27 @@ def test_parse_trading_item_price_prefers_current_price():
 
 
 def test_parse_trading_item_price_falls_back_to_start_price():
-    payload = "<GetItemResponse><StartPrice>88.50</StartPrice></GetItemResponse>"
+    payload = (
+        "<GetItemResponse><Ack>Success</Ack>"
+        "<StartPrice>88.50</StartPrice>"
+        "</GetItemResponse>"
+    )
     assert parse_trading_item_price(payload) == 88.50
+
+
+def test_parse_trading_item_price_rejects_failure_ack():
+    payload = (
+        "<GetItemResponse><Ack>Failure</Ack>"
+        "<Errors><LongMessage>Item not found</LongMessage></Errors>"
+        "<CurrentPrice>45.00</CurrentPrice>"
+        "</GetItemResponse>"
+    )
+    assert parse_trading_item_price(payload) is None
+
+
+def test_parse_trading_item_price_rejects_missing_ack():
+    payload = "<GetItemResponse><CurrentPrice>45.00</CurrentPrice></GetItemResponse>"
+    assert parse_trading_item_price(payload) is None
 
 
 def test_price_only_revise_xml_does_not_replace_item_specifics():
@@ -210,3 +231,73 @@ def test_fetch_live_offer_price_uses_getitem_on_trading_channel():
     post.assert_called_once()
     assert post.call_args.kwargs["headers"]["X-EBAY-API-CALL-NAME"] == "GetItem"
     get.assert_not_called()
+
+
+def test_fetch_trading_item_price_returns_none_on_http_error():
+    from scripts import batch_smart_reprice as reprice
+
+    oauth = MagicMock()
+    oauth.get_valid_token.return_value = "tok"
+    profile = StoreProfile(listing_channel="trading", ebay_site_id="100")
+    fail = _XmlResp(
+        "<GetItemResponse><Ack>Success</Ack>"
+        "<CurrentPrice>56.63</CurrentPrice>"
+        "</GetItemResponse>",
+        status_code=500,
+    )
+
+    with patch(
+        "src.utils.store_profile.get_store_profile", return_value=profile
+    ), patch.object(reprice.requests, "post", return_value=fail):
+        assert reprice.fetch_trading_item_price(oauth, "188760790738") is None
+
+
+def test_fetch_trading_item_price_returns_none_on_network_error():
+    from scripts import batch_smart_reprice as reprice
+
+    oauth = MagicMock()
+    oauth.get_valid_token.return_value = "tok"
+    profile = StoreProfile(listing_channel="trading", ebay_site_id="100")
+
+    with patch(
+        "src.utils.store_profile.get_store_profile", return_value=profile
+    ), patch.object(reprice.requests, "post", side_effect=Timeout("timed out")):
+        assert reprice.fetch_trading_item_price(oauth, "188760790738") is None
+
+
+def test_read_current_listing_price_swallows_trading_network_errors():
+    from scripts import batch_smart_reprice as reprice
+
+    oauth = MagicMock()
+    oauth.get_valid_token.return_value = "tok"
+    profile = StoreProfile(listing_channel="trading", ebay_site_id="100")
+
+    with patch(
+        "src.utils.store_profile.get_store_profile", return_value=profile
+    ), patch.object(
+        reprice.requests, "post", side_effect=ConnectionError("reset")
+    ):
+        assert reprice.read_current_listing_price(
+            oauth, "W465P475235", "188760790738"
+        ) is None
+
+
+def test_update_ebay_price_returns_false_on_trading_network_error():
+    from scripts import batch_smart_reprice as reprice
+
+    oauth = MagicMock()
+    oauth.get_valid_token.return_value = "tok"
+    profile = StoreProfile(listing_channel="trading", ebay_site_id="100")
+
+    with patch(
+        "src.services.repricing_guard.precheck_price", return_value=(True, "ok")
+    ), patch(
+        "src.utils.store_profile.get_store_profile", return_value=profile
+    ), patch.object(
+        reprice.requests, "post", side_effect=ConnectionError("reset")
+    ):
+        ok = reprice.update_ebay_price(
+            oauth, "W465P475235", 56.63, expected_listing_id="188760790738"
+        )
+
+    assert ok is False

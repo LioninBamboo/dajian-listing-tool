@@ -668,14 +668,24 @@ def fetch_trading_item_price(oauth, listing_id: str):
         f"<ItemID>{xml_escape(listing_id)}</ItemID>"
         "</GetItemRequest>"
     )
-    response = requests.post(
-        "https://api.ebay.com/ws/api.dll",
-        headers=_trading_headers(oauth.get_valid_token(), "GetItem", _trading_site_id()),
-        data=xml.encode("utf-8"),
-        timeout=30,
-        verify=False,
-    )
-    return parse_trading_item_price(response.content.decode("utf-8", "replace"))
+    try:
+        response = requests.post(
+            "https://api.ebay.com/ws/api.dll",
+            headers=_trading_headers(oauth.get_valid_token(), "GetItem", _trading_site_id()),
+            data=xml.encode("utf-8"),
+            timeout=30,
+            verify=False,
+        )
+        if response.status_code != 200:
+            log.warning(f"  GetItem {listing_id}: HTTP {response.status_code}")
+            return None
+        return parse_trading_item_price(response.content.decode("utf-8", "replace"))
+    except (SSLError, Timeout, ConnectionError, RequestException) as e:
+        log.warning(f"  GetItem {listing_id}: {e}")
+        return None
+    except Exception as e:
+        log.warning(f"  GetItem {listing_id}: {e}")
+        return None
 
 
 def update_trading_price(oauth, sku: str, new_price: float, listing_id: str) -> bool:
@@ -694,26 +704,36 @@ def update_trading_price(oauth, sku: str, new_price: float, listing_id: str) -> 
         item_id=listing_id,
         start_price=new_price,
     )
-    response = requests.post(
-        "https://api.ebay.com/ws/api.dll",
-        headers=_trading_headers(
-            oauth.get_valid_token(), "ReviseFixedPriceItem", _trading_site_id()
-        ),
-        data=xml.encode("utf-8"),
-        timeout=40,
-        verify=False,
-    )
-    body = response.content.decode("utf-8", "replace")
-    ack_match = re.search(r"<Ack>(\w+)</Ack>", body)
-    ack = ack_match.group(1) if ack_match else ""
-    if ack in {"Success", "Warning"}:
-        return True
-    message = re.search(r"<LongMessage>(.*?)</LongMessage>", body)
-    log.error(
-        f"  {sku}: Trading revise failed: "
-        f"{(message.group(1) if message else body)[:160]}"
-    )
-    return False
+    try:
+        response = requests.post(
+            "https://api.ebay.com/ws/api.dll",
+            headers=_trading_headers(
+                oauth.get_valid_token(), "ReviseFixedPriceItem", _trading_site_id()
+            ),
+            data=xml.encode("utf-8"),
+            timeout=40,
+            verify=False,
+        )
+        body = response.content.decode("utf-8", "replace")
+        if response.status_code != 200:
+            log.error(f"  {sku}: Trading revise failed HTTP {response.status_code}")
+            return False
+        ack_match = re.search(r"<Ack>(\w+)</Ack>", body)
+        ack = ack_match.group(1) if ack_match else ""
+        if ack in {"Success", "Warning"}:
+            return True
+        message = re.search(r"<LongMessage>(.*?)</LongMessage>", body)
+        log.error(
+            f"  {sku}: Trading revise failed: "
+            f"{(message.group(1) if message else body)[:160]}"
+        )
+        return False
+    except (SSLError, Timeout, ConnectionError, RequestException) as e:
+        log.error(f"  {sku}: Trading revise exception {e}")
+        return False
+    except Exception as e:
+        log.error(f"  {sku}: exception {e}")
+        return False
 
 
 def read_current_listing_price(oauth, sku: str, listing_id: str = None, client=None):
@@ -721,7 +741,10 @@ def read_current_listing_price(oauth, sku: str, listing_id: str = None, client=N
     from src.services.repricing_guard import reprice_write_channel
 
     if reprice_write_channel(listing_id) == "trading":
-        return fetch_trading_item_price(oauth, listing_id)
+        try:
+            return fetch_trading_item_price(oauth, listing_id)
+        except Exception:
+            return None
     if client is None:
         return None
     try:
@@ -763,7 +786,11 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
         from src.services.repricing_guard import reprice_write_channel
 
     if reprice_write_channel(expected_listing_id) == "trading":
-        return update_trading_price(oauth, sku, new_price, expected_listing_id)
+        try:
+            return update_trading_price(oauth, sku, new_price, expected_listing_id)
+        except Exception as e:
+            log.error(f"  {sku}: exception {e}")
+            return False
 
     token = oauth.get_valid_token()
     headers = {

@@ -80,8 +80,16 @@ def _pictures_xml(image_urls: Optional[Sequence[str]]) -> str:
 
 
 def parse_trading_item_price(payload: str) -> Optional[float]:
-    """Read CurrentPrice, falling back to StartPrice, from a GetItem body."""
+    """Read CurrentPrice, falling back to StartPrice, from a GetItem body.
+
+    Only Success/Warning GetItem payloads are trusted; Failure (or missing Ack)
+    bodies can still contain a price-shaped tag that must not be treated as live.
+    """
     text = str(payload or "")
+    ack_match = re.search(r"<Ack>(\w+)</Ack>", text)
+    ack = ack_match.group(1) if ack_match else ""
+    if ack not in {"Success", "Warning"}:
+        return None
     match = re.search(r"<CurrentPrice[^>]*>([0-9.]+)</CurrentPrice>", text) or re.search(
         r"<StartPrice[^>]*>([0-9.]+)</StartPrice>", text
     )
