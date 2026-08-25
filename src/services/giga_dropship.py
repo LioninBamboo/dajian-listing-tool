@@ -17,6 +17,45 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = PROJECT_ROOT / "ebay_collection.db"
 
+# Statuses that are safe to re-plan / re-reserve. Excludes push_unknown
+# (acceptance is ambiguous after timeout) and pushed/in-progress states.
+RETRYABLE_FULFILLMENT_STATUSES = (
+    "dry_run_ready",
+    "validation_failed",
+    "stock_blocked",
+    "stock_check_failed",
+    "push_failed",
+)
+
+
+def is_ambiguous_dropship_push_error(exc: BaseException) -> bool:
+    """True when GIGA may have accepted the order despite the exception.
+
+    Timeouts, connection/proxy failures, and HTTP 5xx after POST must stay
+    ``push_unknown`` (duplicate-order risk). HTTP 4xx, GIGA business errors,
+    and local validation failures are definite rejections.
+    """
+    import requests
+
+    if isinstance(exc, (TimeoutError, requests.exceptions.Timeout)):
+        return True
+    if isinstance(
+        exc,
+        (requests.exceptions.ConnectionError, requests.exceptions.ProxyError),
+    ):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        try:
+            return int(status) >= 500
+        except (TypeError, ValueError):
+            return True
+    msg = str(exc or "").lower()
+    return any(
+        marker in msg
+        for marker in ("timeout", "timed out", "connection error", "proxy error")
+    )
+
 # eBay order id may contain hyphens; GIGA orderNo only allows letters/digits/._-
 _ORDER_NO_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -310,7 +349,7 @@ def reserve_fulfillment_push(
           AND giga_order_no = ?
           AND status IN (
               'dry_run_ready', 'validation_failed', 'stock_blocked',
-              'stock_check_failed'
+              'stock_check_failed', 'push_failed'
           )
         """,
         (payload_json, now, ebay_order_id, giga_order_no),
@@ -428,12 +467,8 @@ def plan_dropship_batch(
         if conn is not None:
             prior = get_fulfillment_row(conn, ebay_id)
             # still_processing: already on GIGA, waiting for tracking — do not re-push
-            if skip_already_pushed and prior and prior.get("status") not in (
-                "dry_run_ready",
-                "validation_failed",
-                "stock_blocked",
-                "stock_check_failed",
-            ):
+            # push_unknown: write may have been accepted (timeout) — do not re-push
+            if skip_already_pushed and prior and prior.get("status") not in RETRYABLE_FULFILLMENT_STATUSES:
                 continue
 
         payload = build_dropship_payload_from_ebay_order(order)

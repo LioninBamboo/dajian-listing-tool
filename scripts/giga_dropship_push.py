@@ -66,6 +66,7 @@ def main():
     from src.services.giga_dropship import (
         fetch_ebay_orders,
         find_inventory_shortages,
+        is_ambiguous_dropship_push_error,
         plan_dropship_batch,
         record_fulfillment_attempt,
         reserve_fulfillment_push,
@@ -230,16 +231,21 @@ def main():
             row["status"] = "pushed"
             row["giga_response"] = resp
         except Exception as e:
-            print(f"  [UNKNOWN] {ebay_id}: {e}")
+            status = (
+                "push_unknown"
+                if is_ambiguous_dropship_push_error(e)
+                else "push_failed"
+            )
+            print(f"  [{status.upper()}] {ebay_id}: {e}")
             record_fulfillment_attempt(
                 conn,
                 ebay_order_id=ebay_id,
                 giga_order_no=giga_no,
-                status="push_unknown",
+                status=status,
                 payload=payload,
                 error=str(e),
             )
-            row["status"] = "push_unknown"
+            row["status"] = status
             row["error"] = str(e)
         results.append(row)
 

@@ -84,8 +84,9 @@ def test_upsert_finance_order_with_recomputed_cost(tmp_path):
     assert summary["lines"][0]["ebay_item_number"] == "366518074803"
     assert summary["lines"][0]["ebay_transaction_id"] == "10085330527613"
 
-    # net = gross - cogs - fees
-    assert abs(summary["net_est"] - (summary["gross_sales"] - summary["total_cogs"] - summary["total_fees_est"])) < 0.02
+    # net = after-store-discount proceeds - cogs - fees
+    proceeds = round(summary["gross_sales"] * 0.95, 2)
+    assert abs(summary["net_est"] - (proceeds - summary["total_cogs"] - summary["total_fees_est"])) < 0.02
 
     s = query_finance_summary(conn)
     assert s["order_count"] == 1
@@ -108,6 +109,38 @@ def test_build_lines_missing_sku_cost(tmp_path):
     lines = build_lines_from_ebay_order(conn, SAMPLE)
     assert lines[0].unit_giga_cost == 0.0
     assert lines[0].cost_source == "sku_not_in_db"
+    proceeds = round(lines[0].line_gross * 0.95, 2)
+    assert abs(lines[0].net_est - (proceeds - lines[0].line_cogs - lines[0].fee_est)) < 0.02
+    conn.close()
+
+
+def test_paid_order_cogs_stay_locked_after_catalog_reprice(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "f.db"))
+    cost = _seed_product(conn)
+    first = upsert_finance_order(conn, SAMPLE, ad_rate=0.05)
+    locked = first["lines"][0]["unit_giga_cost"]
+    assert locked == cost["total_dajian_cost"]
+
+    conn.execute(
+        "UPDATE collected_products SET price = 400, shipping = 80, cost_breakdown = ?",
+        (json.dumps(PricingEngine.calculate_dajian_cost(400.0, 80.0)),),
+    )
+    conn.commit()
+
+    second = upsert_finance_order(conn, SAMPLE, ad_rate=0.05)
+    assert second["lines"][0]["unit_giga_cost"] == locked
+    assert second["total_cogs"] == first["total_cogs"]
+    conn.close()
+
+
+def test_net_est_uses_after_store_discount_proceeds(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "f.db"))
+    _seed_product(conn)
+    summary = upsert_finance_order(conn, SAMPLE, ad_rate=0.05)
+    line = summary["lines"][0]
+    proceeds = round(line["line_gross"] * 0.95, 2)
+    assert line["net_est"] < round(line["line_gross"] - line["unit_giga_cost"] - line["fee_est"], 2)
+    assert abs(line["net_est"] - (proceeds - line["unit_giga_cost"] - line["fee_est"])) < 0.02
     conn.close()
 
 

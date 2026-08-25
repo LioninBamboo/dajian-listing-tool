@@ -55,3 +55,31 @@ def test_all_elif_branches_appear_in_pages_or_plugins():
     if orphans:
         # 仅当超过 5 个孤儿分支时认为异常
         assert len(orphans) < 10, f"过多孤儿 elif 分支 (>=10): {sorted(orphans)}"
+
+
+def test_publish_paths_do_not_hard_truncate_titles():
+    """ADR-002: Streamlit publish/AI fallback must not raw-cut titles with [:80]."""
+    text = APP_PY.read_text(encoding="utf-8")
+    assert "product.get('title', '')[:80]" not in text
+    assert 'opt_data.get("title", product.get(\'title\', \'\'))[:80]' not in text
+    assert "_safe_listing_title" in text
+
+
+def test_batch_publish_requires_listing_id_before_marking_published():
+    text = APP_PY.read_text(encoding="utf-8")
+    start = text.find('if st.button("🚀 批量发布所有"')
+    assert start != -1
+    loop = text[start:start + 2500]
+    assert "PUBLISHED' if listing_id else 'READY_TO_PUBLISH'" in loop
+    assert "result.get('listing_id') or result.get('offer_id')" not in loop
+
+
+def test_publish_retry_binds_aspects_and_category_before_try():
+    text = APP_PY.read_text(encoding="utf-8")
+    marker = "for attempt in range(max_retries):"
+    start = text.find(marker)
+    assert start != -1
+    block = text[start:start + 400]
+    assert "completed_aspects = {}" in block
+    assert 'category_id = ""' in block
+    assert block.find("completed_aspects = {}") < block.find("try:")
