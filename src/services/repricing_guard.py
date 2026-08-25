@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 from typing import Optional, Tuple
 
@@ -48,6 +49,29 @@ def _fetch_cost_and_listing(db_path: str, sku: str) -> Tuple[Optional[float], Op
             pass
     listing_id = str(row[1]) if row[1] else None
     return cost, listing_id
+
+
+def reprice_write_channel(listing_id: Optional[str] = None, profile=None) -> str:
+    """Return ``trading`` or ``inventory`` for one live listing's price write.
+
+    Gated on ``store_profile.listing_channel``. Furniture/main defaults stay
+    on Inventory offer PUT. Motors/Trading stores write through
+    ``ReviseFixedPriceItem``. ``listing_id`` is part of the per-listing
+    contract (sub-stores may override locally) but shared defaults are
+    store-level only.
+    """
+    if profile is None:
+        from src.utils.store_profile import get_store_profile
+
+        profile = get_store_profile()
+    channel = str(getattr(profile, "listing_channel", "") or "").strip().lower()
+    if channel != "trading":
+        return "inventory"
+    extra = str(os.environ.get("REPRICE_INVENTORY_LISTING_IDS", "") or "")
+    inventory_ids = {item.strip() for item in extra.split(",") if item.strip()}
+    if str(listing_id or "").strip() in inventory_ids:
+        return "inventory"
+    return "trading"
 
 
 # ─── 主入口 ───

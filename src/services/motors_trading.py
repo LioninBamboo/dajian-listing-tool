@@ -12,6 +12,7 @@ docs/HANDOFF_MULTI_STORE_20260723.md §6.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 from xml.sax.saxutils import escape
 
@@ -78,18 +79,28 @@ def _pictures_xml(image_urls: Optional[Sequence[str]]) -> str:
     return f"<PictureDetails>{inner}</PictureDetails>"
 
 
+def parse_trading_item_price(payload: str) -> Optional[float]:
+    """Read CurrentPrice, falling back to StartPrice, from a GetItem body."""
+    text = str(payload or "")
+    match = re.search(r"<CurrentPrice[^>]*>([0-9.]+)</CurrentPrice>", text) or re.search(
+        r"<StartPrice[^>]*>([0-9.]+)</StartPrice>", text
+    )
+    return float(match.group(1)) if match else None
+
+
 def build_revise_fixed_price_item_xml(
     *,
     item_id: str,
     description: Optional[str] = None,
     title: Optional[str] = None,
+    start_price: Optional[float] = None,
     compatibility: Optional[Sequence[Mapping[str, Any]]] = None,
     replace_all_compatibility: bool = False,
 ) -> str:
     """Build a minimal ReviseFixedPriceItem request for a live Motors item.
 
     Only the fields passed are sent — ReviseFixedPriceItem is a partial update, so
-    omitting ItemSpecifics/Compatibility/Price leaves the live values untouched.
+    omitting ItemSpecifics/Compatibility/StartPrice leaves the live values untouched.
     When a caller supplies a live compatibility snapshot, ``ReplaceAll=true``
     makes that snapshot authoritative instead of relying on an implicit API
     merge during a listing revision.
@@ -101,6 +112,8 @@ def build_revise_fixed_price_item_xml(
     parts = [f"<ItemID>{escape(str(item_id))}</ItemID>"]
     if title is not None:
         parts.append(f"<Title>{escape(str(title)[:80])}</Title>")
+    if start_price is not None:
+        parts.append(f"<StartPrice>{float(start_price):.2f}</StartPrice>")
     if description is not None:
         parts.append(f"<Description><![CDATA[{description}]]></Description>")
     compatibility_xml = format_compatibility_list(

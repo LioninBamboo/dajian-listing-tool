@@ -20,6 +20,13 @@ class TestReviseBuilder:
         assert "<ItemSpecifics>" not in xml              # fitment/aspects preserved
         assert xml.startswith("<?xml")
 
+    def test_price_only_revise_sends_start_price_without_wiping_specifics(self):
+        xml = build_revise_fixed_price_item_xml(item_id="188760790738", start_price=56.63)
+        assert "<StartPrice>56.63</StartPrice>" in xml
+        assert "<ItemSpecifics>" not in xml
+        assert "<Description>" not in xml
+        assert "<ItemCompatibilityList>" not in xml
+
     def test_title_clipped_to_80(self):
         xml = build_revise_fixed_price_item_xml(item_id="1", title="x" * 120)
         assert "<Title>" + "x" * 80 + "</Title>" in xml

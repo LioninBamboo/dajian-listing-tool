@@ -27,6 +27,7 @@ import argparse
 import sqlite3
 import csv
 import warnings
+import re
 import requests
 from requests.exceptions import RequestException, SSLError, Timeout, ConnectionError
 from pathlib import Path
@@ -635,8 +636,111 @@ def _select_best_offer(offers, expected_listing_id: str = None):
     return sorted(offers, key=_rank)[0]
 
 
+def _trading_site_id() -> str:
+    from src.utils.store_profile import get_store_profile
+
+    profile = get_store_profile()
+    return str(getattr(profile, "ebay_site_id", "0") or "0")
+
+
+def _trading_headers(token: str, call: str, site_id: str) -> dict:
+    return {
+        "X-EBAY-API-CALL-NAME": call,
+        "X-EBAY-API-SITEID": site_id,
+        "X-EBAY-API-COMPATIBILITY-LEVEL": "1155",
+        "X-EBAY-API-IAF-TOKEN": token,
+        "Content-Type": "text/xml",
+    }
+
+
+def fetch_trading_item_price(oauth, listing_id: str):
+    """Read live Trading price via GetItem."""
+    from xml.sax.saxutils import escape as xml_escape
+
+    from src.services.motors_trading import parse_trading_item_price
+
+    listing_id = str(listing_id or "").strip()
+    if not listing_id:
+        return None
+    xml = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+        f"<ItemID>{xml_escape(listing_id)}</ItemID>"
+        "</GetItemRequest>"
+    )
+    response = requests.post(
+        "https://api.ebay.com/ws/api.dll",
+        headers=_trading_headers(oauth.get_valid_token(), "GetItem", _trading_site_id()),
+        data=xml.encode("utf-8"),
+        timeout=30,
+        verify=False,
+    )
+    return parse_trading_item_price(response.content.decode("utf-8", "replace"))
+
+
+def update_trading_price(oauth, sku: str, new_price: float, listing_id: str) -> bool:
+    """Write a Trading/Motors listing price via ReviseFixedPriceItem.
+
+    Price-only revise: do not send ItemSpecifics, or the live fitment/aspects
+    would be replaced. Furniture/Inventory listings never enter this path.
+    """
+    from src.services.motors_trading import build_revise_fixed_price_item_xml
+
+    listing_id = str(listing_id or "").strip()
+    if not listing_id:
+        log.error(f"  {sku}: Trading revise needs listing_id")
+        return False
+    xml = build_revise_fixed_price_item_xml(
+        item_id=listing_id,
+        start_price=new_price,
+    )
+    response = requests.post(
+        "https://api.ebay.com/ws/api.dll",
+        headers=_trading_headers(
+            oauth.get_valid_token(), "ReviseFixedPriceItem", _trading_site_id()
+        ),
+        data=xml.encode("utf-8"),
+        timeout=40,
+        verify=False,
+    )
+    body = response.content.decode("utf-8", "replace")
+    ack_match = re.search(r"<Ack>(\w+)</Ack>", body)
+    ack = ack_match.group(1) if ack_match else ""
+    if ack in {"Success", "Warning"}:
+        return True
+    message = re.search(r"<LongMessage>(.*?)</LongMessage>", body)
+    log.error(
+        f"  {sku}: Trading revise failed: "
+        f"{(message.group(1) if message else body)[:160]}"
+    )
+    return False
+
+
+def read_current_listing_price(oauth, sku: str, listing_id: str = None, client=None):
+    """Read the live listing price from the listing's write channel."""
+    from src.services.repricing_guard import reprice_write_channel
+
+    if reprice_write_channel(listing_id) == "trading":
+        return fetch_trading_item_price(oauth, listing_id)
+    if client is None:
+        return None
+    try:
+        offers = client.get_offers_by_sku(sku)
+        if not offers:
+            return None
+        offer = _select_best_offer(offers, expected_listing_id=listing_id)
+        if not offer:
+            return None
+        return float(offer.get("pricingSummary", {}).get("price", {}).get("value", 0) or 0)
+    except Exception:
+        return None
+
+
 def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: str = None) -> bool:
-    """通过 Inventory API 更新 eBay 售价 (支持自动处理促销阻止 + 触底自动关广告).
+    """Update live eBay price through the listing's write channel.
+
+    Trading-channel Motors listings use ReviseFixedPriceItem. Furniture and
+    other Inventory stores keep the existing offer PUT path unchanged.
 
     🛡️ 安全护栏 (2026-05): 写出前调用 repricing_guard.precheck_price 校验.
     - 价格 < 带广告死线 但 >= 关广告死线 → 自动关广告后放行
@@ -644,7 +748,7 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
     """
     # ── 守门员: 死线 + 广告自适应 (与 InventorySyncService 共用) ──
     try:
-        from src.services.repricing_guard import precheck_price
+        from src.services.repricing_guard import precheck_price, reprice_write_channel
         ok, reason = precheck_price(
             sku=sku, new_price=new_price,
             db_path='ebay_collection.db',
@@ -656,6 +760,10 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
             return False
     except Exception as guard_exc:
         log.warning(f"  {sku}: ⚠️ PRICE GUARD 异常, 放行: {guard_exc}")
+        from src.services.repricing_guard import reprice_write_channel
+
+    if reprice_write_channel(expected_listing_id) == "trading":
+        return update_trading_price(oauth, sku, new_price, expected_listing_id)
 
     token = oauth.get_valid_token()
     headers = {
@@ -769,8 +877,12 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
 
 
 def fetch_live_offer_price(oauth, sku: str, expected_listing_id: str = None):
-    """Fetch the current live offer price for a SKU."""
+    """Fetch the current live price for a SKU (Inventory offer or Trading GetItem)."""
     try:
+        from src.services.repricing_guard import reprice_write_channel
+
+        if reprice_write_channel(expected_listing_id) == "trading":
+            return fetch_trading_item_price(oauth, expected_listing_id)
         token = oauth.get_valid_token()
         headers = {
             'Authorization': f'Bearer {token}',
@@ -1006,16 +1118,9 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
         if market_avg <= 0:
             no_market += 1
 
-        # Get current eBay price (from offer)
-        current_price = None
-        try:
-            offers = client.get_offers_by_sku(sku)
-            if offers:
-                offer = _select_best_offer(offers, expected_listing_id=p.get('listing_id'))
-                if offer:
-                    current_price = float(offer.get('pricingSummary', {}).get('price', {}).get('value', 0))
-        except Exception:
-            pass
+        current_price = read_current_listing_price(
+            oauth, sku, p.get("listing_id"), client=client
+        )
 
         # Calculate price change
         price_diff = new_price - (current_price or 0) if current_price else 0
