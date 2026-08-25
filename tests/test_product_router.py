@@ -21,6 +21,8 @@ class TestAuto:
             "Running Board Nerf Bar Side Step for Silverado",
             "3Ton 12V Electric Car Scissor Jack Kit",
             "Front Brake Pad and Rotor Kit",
+            "Portable 5 Gallon Aluminum Air Tank with Pressure Gauge",
+            "Lightweight Durable Air Compressor Tank with Safety Valve",
         ],
     )
     def test_auto_titles_route_to_auto(self, title):

@@ -75,6 +75,19 @@ _SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
     # PU leather). Source often writes "PU" while the generated copy expands it to
     # "polyurethane" — same material, not a hallucinated upgrade.
     frozenset({"pu", "polyurethane", "pu (polyurethane)", "polyurethane (pu)"}),
+    # PP casters / polypropylene parts. Source specs often say "PP" while the
+    # listing expands it; this is the same polymer, not a material upgrade.
+    frozenset({"pp", "polypropylene", "pp (polypropylene)", "polypropylene (pp)"}),
+    # eBay upholstery aspect canonicalizes microsuede → Microfiber.
+    frozenset({
+        "microfiber",
+        "microfibre",
+        "microsuede",
+        "micro suede",
+        "micro-suede",
+        "microfiber fabric",
+        "microsuede fabric",
+    }),
 )
 
 # Generalization is safe, specialization is the hallucination direction:
@@ -739,11 +752,15 @@ def compare_fact_sheets(
         # a load rating always looks "unsourced" here even though it sits in the
         # source title/description. Don't flag it when its number is in the source
         # text (grounded) — the car-jack "3Ton" and garden-cart "880lb" false positives.
+        # Volume claims ("5 gallon") belong in the same bucket: if the source title
+        # already states the number+unit, the live sheet did not invent occupancy.
         _is_weight = bool(re.search(r"(lb|lbs|pound|ton|tonne|kg|oz)\b", live["capacity"], re.I))
         _num = re.search(r"\d+(?:\.\d+)?", live["capacity"])
         _num_in_source = bool(_num and source_text and _num.group(0) in source_text)
         live_range = _capacity_numbers(live["capacity"])
-        if _is_weight and (_num_in_source or source_text is None):
+        if source_text is not None and _claim_in_text(live["capacity"], source_text):
+            pass  # grounded in source copy (title/description)
+        elif _is_weight and (_num_in_source or source_text is None):
             pass  # grounded load rating (or source text unavailable) — not fabricated
         elif live_range is None or live_range[1] >= 3:
             violations.append(

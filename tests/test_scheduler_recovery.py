@@ -494,7 +494,7 @@ def test_task_auto_publish_scopes_to_latest_mi_ready_skus(monkeypatch):
     calls = []
 
     monkeypatch.setattr(scheduler_daemon, '_task_succeeded_today', lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(scheduler_daemon, '_latest_mi_ready_skus', lambda limit: ['MI-1', 'MI-2'])
+    monkeypatch.setattr(scheduler_daemon, '_latest_mi_ready_skus', lambda limit, **_kwargs: ['MI-1', 'MI-2'])
     monkeypatch.setenv('ENABLE_MI_AUTO_PUBLISH', '1')
     monkeypatch.setenv('MI_AUTO_PUBLISH_LIMIT', '10')
     monkeypatch.setattr(scheduler_daemon, 'run_task', lambda *args, **kwargs: calls.append((args, kwargs)))
@@ -581,10 +581,10 @@ def test_latest_mi_ready_skus_reads_top_level_list_snapshot(tmp_path, monkeypatc
     (tmp_path / 'mi_opportunities_20260511_100000.json').write_text(
         json.dumps(
             [
-                {'sku': 'MI-1', 'status': 'READY'},
-                {'sku': 'OLD', 'status': 'PUBLISHED'},
-                {'sku': 'MI-2', 'status': 'READY_TO_PUBLISH'},
-                {'sku': 'MI-1', 'status': 'READY'},
+                {'sku': 'MI-1', 'status': 'READY', 'opportunity_score': 70, 'title': 'Patio Chair'},
+                {'sku': 'OLD', 'status': 'PUBLISHED', 'opportunity_score': 90, 'title': 'Patio Chair'},
+                {'sku': 'MI-2', 'status': 'READY_TO_PUBLISH', 'opportunity_score': 70, 'title': 'Patio Chair'},
+                {'sku': 'MI-1', 'status': 'READY', 'opportunity_score': 70, 'title': 'Patio Chair'},
             ],
             ensure_ascii=False,
         ),

@@ -36,6 +36,7 @@ class TestProfileDefaultsContract:
         assert p.is_motors is False
         # listing generation: furniture template, house brand stamped
         assert p.template_style == "furniture_classic"
+        assert p.qc_profile == "furniture"
         assert p.force_house_brand is True
         assert p.default_brand == "AquaVerve"
         assert p.banned_terms == ()          # guard is a no-op for main

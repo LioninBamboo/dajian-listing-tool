@@ -63,6 +63,10 @@ from src.utils.inventory_audit_contract import (
     summarize_incremental_sync_results,
 )
 from src.utils.store_profile import get_store_profile
+from src.utils.smart_reprice_schedule import (
+    SMART_REPRICE_RUN_DAY_LABELS,
+    should_run_smart_reprice,
+)
 
 UTC = getattr(datetime, "UTC", timezone.utc)
 from src.utils.mi_opportunity_flow import auto_prepare_mi_opportunity_drafts, empty_auto_prepare_result
@@ -132,10 +136,6 @@ def _open_listing_qc_connection():
     import sqlite3
 
     return sqlite3.connect(str(PROJECT_ROOT / "ebay_collection.db"), timeout=30)
-
-
-SMART_REPRICE_RUN_DAYS = {0, 3}  # Monday / Thursday
-SMART_REPRICE_RUN_DAY_LABELS = "周一、周四"
 
 
 def analyze_collected_products(
@@ -550,12 +550,6 @@ def run_smart_reprice(market_mode: str | None = None) -> dict:
             'changed_rows': [],
             'summary': {},
         }
-
-
-def should_run_smart_reprice(run_time: datetime | None = None) -> bool:
-    """Within the daily framework, only execute smart repricing twice a week."""
-    run_time = run_time or datetime.now()
-    return run_time.weekday() in SMART_REPRICE_RUN_DAYS
 
 
 def generate_terapeak_report() -> dict:
@@ -1568,6 +1562,63 @@ def run_mi_snapshot(min_margin: float = 0.20, max_results: int = 30) -> dict:
         )
 
         intel = IntelligenceService()
+        from src.utils.mi_opportunity_flow import lookup_supplier_stock
+        try:
+            from src.utils.mi_unpublished_pool import recycle_ended_for_mi
+
+            try:
+                recycle_limit = max(0, int(os.getenv("MI_ENDED_RECYCLE_LIMIT", "20")))
+            except ValueError:
+                recycle_limit = 20
+            result["ended_recycled"] = recycle_ended_for_mi(
+                str(PROJECT_ROOT / "ebay_collection.db"),
+                limit=recycle_limit,
+                store_kind=getattr(get_store_profile(), "store_kind", "furniture"),
+                blacklist=intel._load_mi_blacklist(),
+                stock_lookup=lookup_supplier_stock,
+            )
+            recycled = result["ended_recycled"].get("reactivated") or []
+            if recycled:
+                logger.info(
+                    f"[MI] 已把 {len(recycled)} 条 ENDED 库存回收为 PENDING 供发掘"
+                )
+        except Exception as recycle_error:
+            logger.warning(f"[MI] ENDED 回收失败: {recycle_error}")
+            result["ended_recycled"] = {
+                "reactivated": [],
+                "skipped": {"error": 1},
+                "requested": 0,
+            }
+
+        try:
+            from src.plugins.terapeak_research.external_discovery import (
+                ingest_uncollected_for_mi,
+            )
+
+            try:
+                giga_limit = max(0, int(os.getenv("MI_GIGA_INGEST_LIMIT", "10")))
+            except ValueError:
+                giga_limit = 10
+            result["giga_ingested"] = ingest_uncollected_for_mi(
+                intel,
+                limit=giga_limit,
+                store_kind=getattr(get_store_profile(), "store_kind", "furniture"),
+                stock_lookup=lookup_supplier_stock,
+                db_path=str(PROJECT_ROOT / "ebay_collection.db"),
+            )
+            ingested = result["giga_ingested"].get("inserted") or []
+            if ingested:
+                logger.info(
+                    f"[MI] 已从 GigaCloud 入库 {len(ingested)} 条未采集新品为 PENDING"
+                )
+        except Exception as ingest_error:
+            logger.warning(f"[MI] GigaCloud 新品入库失败: {ingest_error}")
+            result["giga_ingested"] = {
+                "inserted": [],
+                "skipped": {"error": 1},
+                "requested": 0,
+            }
+
         opportunities = intel.auto_discover_opportunities(
             min_margin=min_margin, max_results=max_results
         )

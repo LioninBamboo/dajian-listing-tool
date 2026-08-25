@@ -93,8 +93,23 @@ class TestOverrides:
         }
         assert profile.quality_banner_marker == "motornest"
         assert profile.quality_footer_marker == "texas"
+        assert profile.qc_profile == "furniture"
         assert profile.server_port == 8001
         assert profile.server_base_url == "http://localhost:8001"
+
+    def test_qc_profile_override(self, tmp_path):
+        yaml_file = tmp_path / "motors.yaml"
+        yaml_file.write_text(
+            textwrap.dedent(
+                """
+                quality_gate:
+                  qc_profile: motors
+                """
+            ),
+            encoding="utf-8",
+        )
+        profile = load_store_profile(yaml_file)
+        assert profile.qc_profile == "motors"
 
     def test_v2_listing_and_pricing_sections(self, tmp_path):
         yaml_file = tmp_path / "blindbox.yaml"

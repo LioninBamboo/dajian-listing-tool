@@ -3,6 +3,9 @@ streamlit>=1.30.0
 python-dotenv>=1.0.0
 requests>=2.31.0
 pysocks>=1.7.1
+# httpx talks to DashScope/OpenAI during MI draft; local SOCKS proxy needs this extra.
+# Without it, daily_tasks --mi-only raises: socksio package is not installed.
+httpx[socks]>=0.28.0
 sqlalchemy>=2.0.25
 schedule>=1.2.0
 pyyaml>=6.0  # store_profile loader + config/*.yaml; must fail loud if absent

@@ -184,6 +184,7 @@ Generated artifact note:
 ## Repricing And Email Truthfulness
 
 - Smart repricing is implemented in `scripts/batch_smart_reprice.py` and also participates in the scheduled daily workload.
+- The blanket catalog reprice is shared across all store instances and runs Monday and Thursday only. SKUs with a sale in the last 14 days are held (`REPRICE_SALES_COOLDOWN_DAYS`, default `hold`). Conversion-driven CRO queue consume stays a separate daily path.
 - Repricing results are included in the daily summary email.
 - Standalone smart repricing email can also be sent through the shared SMTP sender.
 - `SMART_REPRICE_EMAIL_ENABLED=0` disables the extra standalone repricing email in the daily flow.

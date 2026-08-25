@@ -336,6 +336,35 @@ def test_hydraulic_adjustment_supports_adjustable_height():
     assert compare_fact_sheets(source, live) == []
 
 
+def test_pu_supports_polyurethane_material():
+    source = dict(SOURCE_SHEET, materials=["pu", "steel"])
+    live = dict(SOURCE_SHEET, materials=["polyurethane", "steel"])
+    assert compare_fact_sheets(source, live) == []
+
+
+def test_pp_supports_polypropylene_material():
+    source = dict(SOURCE_SHEET, materials=["plywood", "pp"])
+    live = dict(SOURCE_SHEET, materials=["polypropylene", "plywood"])
+    assert compare_fact_sheets(source, live) == []
+
+
+def test_microsuede_supports_microfiber_material():
+    source = dict(SOURCE_SHEET, materials=["artificial rabbit velvet fabric", "microsuede", "velvet"])
+    live = dict(SOURCE_SHEET, materials=["microfiber"])
+    assert compare_fact_sheets(source, live) == []
+
+
+def test_gallon_capacity_grounded_in_source_title():
+    live = dict(SOURCE_SHEET, capacity="5 gallon")
+    violations = compare_fact_sheets(
+        SOURCE_SHEET,
+        live,
+        live_text="5 Gallon Portable Air Tank",
+        source_text="Portable 5 Gallon Air Tank with Pressure Gauge",
+    )
+    assert not any(v["claim_type"] == "semantic_capacity" for v in violations)
+
+
 def test_capacity_person_vs_seat_equivalent():
     source = dict(SOURCE_SHEET, capacity="3 seat")
     live = dict(SOURCE_SHEET, capacity="3 person")

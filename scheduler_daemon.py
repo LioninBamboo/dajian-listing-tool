@@ -967,8 +967,8 @@ def task_listing_status_sync():
     )
 
 
-def _latest_mi_ready_skus(limit: int, reports_dir: Path | None = None) -> list[str]:
-    """Return READY SKUs from today's latest MI opportunity snapshot."""
+def _latest_mi_ready_skus(limit: int, reports_dir: Path | None = None, stock_lookup=None) -> list[str]:
+    """Return eligible READY SKUs from today's latest MI opportunity snapshot."""
     reports = Path(reports_dir) if reports_dir else PROJECT_ROOT / 'reports'
     if not reports.is_dir():
         return []
@@ -991,20 +991,16 @@ def _latest_mi_ready_skus(limit: int, reports_dir: Path | None = None) -> list[s
     else:
         opportunities = []
 
-    skus: list[str] = []
-    seen: set[str] = set()
-    for opportunity in opportunities:
-        if not isinstance(opportunity, dict):
-            continue
-        status = str(opportunity.get('status') or '').strip().upper()
-        sku = str(opportunity.get('sku') or '').strip()
-        if status not in {'READY', 'READY_TO_PUBLISH'} or not sku or sku in seen:
-            continue
-        seen.add(sku)
-        skus.append(sku)
-        if len(skus) >= limit:
-            break
-    return skus
+    from src.utils.mi_opportunity_flow import select_mi_auto_publish_skus
+    from src.utils.store_profile import get_store_profile
+
+    store_kind = getattr(get_store_profile(), 'store_kind', 'furniture')
+    return select_mi_auto_publish_skus(
+        opportunities,
+        limit=limit,
+        store_kind=store_kind,
+        stock_lookup=stock_lookup,
+    )
 
 
 def task_auto_publish():
@@ -1024,9 +1020,11 @@ def task_auto_publish():
     except ValueError:
         limit = 10
 
-    mi_skus = _latest_mi_ready_skus(limit)
+    from src.utils.mi_opportunity_flow import lookup_supplier_stock
+
+    mi_skus = _latest_mi_ready_skus(limit, stock_lookup=lookup_supplier_stock)
     if not mi_skus:
-        msg = 'Skipped (no READY MI opportunities in latest snapshot)'
+        msg = 'Skipped (no eligible READY MI opportunities in latest snapshot)'
         update_health('auto_publish', 'success', msg)
         logger.info(f"[AUTO-PUBLISH] {msg}")
         return True, msg

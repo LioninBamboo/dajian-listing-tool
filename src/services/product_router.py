@@ -48,6 +48,7 @@ _AUTO_TERMS = (
     "air intake", "exhaust manifold", "muffler", "catback",
     "car cover", "seat cover", "floor mat", "cargo liner", "trunk organizer",
     "jump starter", "obd2", "obd-ii", "tire inflator", "car jack", "scissor jack",
+    "air tank", "air compressor", "compressor tank",
     "winch", "leveling kit", "lift kit", "skid plate",
 )
 

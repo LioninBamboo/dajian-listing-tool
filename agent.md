@@ -8,6 +8,7 @@ This file is for future coding agents working in this repository. It is intentio
 - Current daily workload entrypoint is `daily_tasks.py`.
 - `daily_tasks.py` also runs `run_cro_diagnose()`; CRO execution is then consumed later by scheduler jobs rather than inline in the same step.
 - Generated listing correctness is centralized in `src/utils/listing_quality_gate.py`; do not fork product-family, item-specific, image, or measurement blockers in one-off scripts.
+- `StoreProfile.qc_profile` defaults to `furniture`. AquaRides sets `motors`, which skips furniture FactSheet / quality-gate rules and blocks incomplete Motors fitment instead.
 - Do not publish READY drafts before running `scripts/audit_fix_ready_drafts.py` and checking `logs/ready_draft_audit_*.json`.
 - Treat any `quality_gate` unresolved entry in `logs/ready_draft_audit_*.json` as a publish blocker.
 - The scheduled `11:30` live listing audit is detect-only: `scripts/audit_fix_active_listings.py --live --email` reports and emails, but does not auto-fix the full live corpus.
@@ -44,6 +45,9 @@ This file is for future coding agents working in this repository. It is intentio
 
 - MI is a first-class subsystem and currently runs inside the default `python daily_tasks.py` flow through `run_mi_snapshot()`.
 - `run_mi_snapshot()` and the Streamlit MI manual discover action now auto-prepare discovered `PENDING` / `COLLECTED` opportunities into local `READY` drafts, but do not auto-publish them.
+- Auto-publish (scheduler `10:10` and store marketing digest) only takes READY MI SKUs that clear the shared gates in `select_mi_auto_publish_skus()`: score ≥ 50, store-kind routing, and non-zero supplier stock when the lookup returns a value.
+- Daily MI snapshot first recycles eligible local `ENDED` rows back to `PENDING` (`recycle_ended_for_mi`, cap `MI_ENDED_RECYCLE_LIMIT` default 20). `DELISTED` is not recycled.
+- The same snapshot then ingests bounded GigaCloud-uncollected SKUs as `PENDING` (`ingest_uncollected_for_mi`, cap `MI_GIGA_INGEST_LIMIT` default 10). Live, ENDED, DELISTED, low-score, auto-family, and zero-stock SKUs are skipped.
 - There is no standalone `--mi-only` CLI switch today. Do not document or rely on one unless you add it in code and tests.
 - `scheduler_daemon.py` runs `task_mi_self_check()` at `09:35`; it must treat missing snapshot, missing digest, missing or empty trend history, unreadable trend history, and stale trend state as failures.
 - MI diagnostic entrypoint is `python scripts/mi_diagnose.py` or `python scripts/mi_diagnose.py --json`.
@@ -97,6 +101,10 @@ Image handling rule:
 Three flows can change live eBay prices:
 
 - `scripts/batch_smart_reprice.py`
+- `src/utils/smart_reprice_schedule.py`
+- `src/utils/reprice_sales_cooldown.py`
+- `src/utils/mi_opportunity_flow.py`
+- `src/utils/mi_unpublished_pool.py`
 - `src/plugins/inventory_sync/sync_service.py`
 - `scripts/sales_health_check.py`
 

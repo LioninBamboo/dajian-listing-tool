@@ -337,3 +337,87 @@ def test_external_discovery_no_candidates(fake_db):
     assert diag["scanned"] == 0
     assert diag["candidates"] == 0
 
+
+def test_ingest_uncollected_for_mi_inserts_new_skips_live_ended_and_low_score(fake_db):
+    from src.plugins.terapeak_research.external_discovery import (
+        ingest_uncollected_for_mi,
+    )
+
+    intel = _make_intel(fake_db)
+    opps = [
+        {
+            "sku": "FRESH-HIGH",
+            "title": "Outdoor Patio Sofa",
+            "status": "UNCOLLECTED",
+            "existing_status": "",
+            "opportunity_score": 78,
+            "images": ["https://a.jpg", "https://b.jpg"],
+            "cost_breakdown": {"total_dajian_cost": 120.0},
+            "suggested_price": 249.0,
+        },
+        {
+            "sku": "FRESH-LOW",
+            "title": "Outdoor Patio Bench",
+            "status": "UNCOLLECTED",
+            "existing_status": "",
+            "opportunity_score": 32,
+            "images": ["https://a.jpg", "https://b.jpg"],
+            "cost_breakdown": {"total_dajian_cost": 80.0},
+        },
+        {
+            "sku": "ENDED-SKU",
+            "title": "Once Listed Chair",
+            "status": "ENDED",
+            "existing_status": "ENDED",
+            "opportunity_score": 80,
+            "images": ["https://a.jpg", "https://b.jpg"],
+        },
+        {
+            "sku": "LIVE-SKU",
+            "title": "Already Listed Sofa",
+            "status": "PUBLISHED",
+            "existing_status": "PUBLISHED",
+            "opportunity_score": 90,
+            "images": ["https://a.jpg", "https://b.jpg"],
+        },
+        {
+            "sku": "HITCH-NEW",
+            "title": "Class 3 Tow Trailer Hitch 2 Inch Receiver",
+            "status": "UNCOLLECTED",
+            "existing_status": "",
+            "opportunity_score": 88,
+            "images": ["https://a.jpg", "https://b.jpg"],
+        },
+        {
+            "sku": "OOS-NEW",
+            "title": "Garden Side Table",
+            "status": "UNCOLLECTED",
+            "existing_status": "",
+            "opportunity_score": 70,
+            "images": ["https://a.jpg", "https://b.jpg"],
+        },
+    ]
+
+    report = ingest_uncollected_for_mi(
+        intel,
+        opportunities=opps,
+        limit=10,
+        store_kind="furniture",
+        db_path=fake_db,
+        stock_lookup=lambda sku: 0 if sku == "OOS-NEW" else 4,
+    )
+    assert report["inserted"] == ["FRESH-HIGH"]
+    assert report["skipped"]["low_score"] == 1
+    assert report["skipped"]["already_local"] == 2
+    assert report["skipped"]["auto_family"] == 1
+    assert report["skipped"]["zero_stock"] == 1
+
+    conn = sqlite3.connect(fake_db)
+    status = dict(conn.execute("SELECT sku, status FROM collected_products").fetchall())
+    conn.close()
+    assert status["FRESH-HIGH"] == "PENDING"
+    assert status["LIVE-SKU"] == "PUBLISHED"
+    assert status["ENDED-SKU"] == "ENDED"
+    assert "HITCH-NEW" not in status
+    assert "OOS-NEW" not in status
+

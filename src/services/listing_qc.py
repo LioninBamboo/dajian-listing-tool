@@ -14,6 +14,7 @@ from typing import Any
 from src.utils import listing_fact_sheet as _fact_sheet
 from src.utils import listing_quality_gate as _quality_gate
 from src.services import qc_experience_registry as _experience_registry
+from src.services.vehicle_compatibility import analyze_ebay_motors_compatibility
 
 
 # Thin module-level adapters keep the service easy to monkeypatch in tests,
@@ -53,6 +54,34 @@ LISTING_QC_RULESET_VERSION = "listing-qc-v2"
 # MEDIUM = marketing / soft phrasing noise. Still reported as warnings for
 # operators, but must NOT block conversion-focused KEY FEATURES copy.
 FACT_SHEET_BLOCKING_SEVERITIES = frozenset({"CRITICAL", "HIGH"})
+MOTORS_FITMENT_BLOCK_MODES = frozenset({"generic_vehicle", "needs_review"})
+
+
+def resolve_qc_profile(explicit: str | None = None) -> str:
+    raw = str(explicit or "").strip().lower()
+    if raw:
+        return raw
+    try:
+        from src.utils.store_profile import get_store_profile
+        return str(getattr(get_store_profile(), "qc_profile", "furniture") or "furniture").strip().lower()
+    except Exception:
+        return "furniture"
+
+
+def motors_fitment_blockers(candidate: Mapping[str, Any]) -> list[str]:
+    analysis = analyze_ebay_motors_compatibility(
+        category_id=str(candidate.get("categoryId") or ""),
+        title=str(candidate.get("title") or ""),
+        description=str(candidate.get("description") or ""),
+        aspects=candidate.get("aspects") or {},
+        is_motors_store=True,
+    )
+    if analysis.mode not in MOTORS_FITMENT_BLOCK_MODES:
+        return []
+    issues = [str(issue) for issue in (analysis.issues or []) if str(issue).strip()]
+    if not issues:
+        issues = [str(analysis.summary or "Motors fitment is incomplete")]
+    return [f"[Fitment] {issue}" for issue in issues]
 
 
 def _dedupe(messages: list[str]) -> list[str]:
@@ -124,6 +153,7 @@ def run_listing_qc(
     videos: list[str] | None = None,
     category_matcher: Any = None,
     fact_sheet_conn: Any = None,
+    qc_profile: str | None = None,
 ) -> dict[str, Any]:
     """Run deterministic listing QC and the semantic FactSheet guard.
 
@@ -139,6 +169,14 @@ def run_listing_qc(
     source_specs = source_specs or {}
     images = images or []
     videos = videos or []
+    profile = resolve_qc_profile(qc_profile)
+
+    if profile == "motors":
+        result["fact_sheet_status"] = "skipped"
+        result["blockers"] = motors_fitment_blockers(candidate)
+        result["blockers"] = _dedupe(result["blockers"])
+        result["status"] = "blocked" if result["blockers"] else "pass"
+        return result
 
     try:
         quality_issues_raw = validate_listing_quality(

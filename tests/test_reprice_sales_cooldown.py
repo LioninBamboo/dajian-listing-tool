@@ -9,9 +9,15 @@ from __future__ import annotations
 import pytest
 
 from scripts import batch_smart_reprice as reprice
+from src.utils import reprice_sales_cooldown as shared_cooldown
 
 
 # ── cooldown_decision (pure) ──────────────────────────────────────────────
+def test_shared_module_is_the_script_source():
+    assert reprice.cooldown_decision is shared_cooldown.cooldown_decision
+    assert reprice.fetch_recently_sold_skus is shared_cooldown.fetch_recently_sold_skus
+
+
 def test_not_in_cooldown_always_allows():
     assert reprice.cooldown_decision(False, -5.0, "hold") == (True, "")
     assert reprice.cooldown_decision(False, +5.0, "no_downside") == (True, "")

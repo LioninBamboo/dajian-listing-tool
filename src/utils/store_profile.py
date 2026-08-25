@@ -68,6 +68,9 @@ class StoreProfile:
     # rejected 100% of candidates (zero pushes 7/17–7/22). Match on the stable
     # part of the footer instead of a city name.
     quality_footer_marker: str = "ships from"
+    # furniture (default, main store) uses listing_quality_gate + FactSheet.
+    # motors skips those furniture semantic rules and requires fitment instead.
+    qc_profile: str = "furniture"  # furniture | motors | arttoy
 
     # Listing generation (v2). Defaults keep furniture/auto instances unchanged.
     template_style: str = "furniture_classic"   # furniture_classic | arttoy_hype
@@ -196,6 +199,7 @@ _SECTION_FIELD_MAP = {
     "quality_gate": {
         "quality_banner_marker",
         "quality_footer_marker",
+        "qc_profile",
     },
     "listing": {
         "template_style",

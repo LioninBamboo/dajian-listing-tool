@@ -38,7 +38,7 @@ import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -466,3 +466,88 @@ def ingest_external_opportunity_as_pending(
         return "inserted"
     finally:
         conn.close()
+
+
+def ingest_uncollected_for_mi(
+    intel,
+    *,
+    opportunities: Optional[List[Dict]] = None,
+    limit: int = 10,
+    store_kind: str = "furniture",
+    min_score: float = 50,
+    stock_lookup: Optional[Callable] = None,
+    db_path: Optional[str] = None,
+    dajian_client=None,
+) -> Dict[str, Any]:
+    """Insert bounded GigaCloud-uncollected SKUs as PENDING for daily MI.
+
+    Local ENDED/DELISTED rows are left to ``recycle_ended_for_mi``. Live rows
+    stay untouched. Low-score, auto-family, and zero-stock SKUs are skipped.
+    """
+    from collections import Counter
+
+    from src.utils.mi_opportunity_flow import MI_AUTO_PUBLISH_MIN_SCORE, _store_kind_allows
+
+    cap = max(0, int(limit or 0))
+    threshold = float(min_score if min_score is not None else MI_AUTO_PUBLISH_MIN_SCORE)
+    skipped: Counter[str] = Counter()
+    inserted: List[str] = []
+    if cap <= 0:
+        return {"inserted": [], "skipped": {}, "requested": 0}
+
+    db_path = db_path or getattr(intel, "db_path", str(PROJECT_ROOT / "ebay_collection.db"))
+    opps = opportunities
+    if opps is None:
+        discovered = discover_external_opportunities(
+            intel,
+            dajian_client=dajian_client,
+            max_results=max(cap * 3, cap),
+            db_path=db_path,
+        )
+        opps = discovered or []
+
+    for opp in opps:
+        if len(inserted) >= cap:
+            break
+        if not isinstance(opp, dict):
+            continue
+        sku = str(opp.get("sku") or "").strip()
+        if not sku:
+            skipped["invalid"] += 1
+            continue
+        existing = str(opp.get("existing_status") or opp.get("status") or "").strip().upper()
+        if existing in {"PUBLISHED", "READY", "READY_TO_PUBLISH", "ENDED", "DELISTED", "PENDING", "COLLECTED", "ERROR"}:
+            skipped["already_local"] += 1
+            continue
+        try:
+            score = float(opp.get("opportunity_score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        if score < threshold:
+            skipped["low_score"] += 1
+            continue
+        title = str(opp.get("title") or "")
+        if not _store_kind_allows(title, store_kind):
+            skipped["auto_family"] += 1
+            continue
+        images = opp.get("images") or []
+        if not isinstance(images, list) or len([u for u in images if str(u or "").strip()]) < 2:
+            skipped["too_few_images"] += 1
+            continue
+        if stock_lookup is not None:
+            try:
+                quantity = stock_lookup(sku)
+            except Exception:
+                quantity = None
+            if quantity is not None and int(quantity) <= 0:
+                skipped["zero_stock"] += 1
+                continue
+        outcome = ingest_external_opportunity_as_pending(opp, db_path=db_path)
+        if outcome == "inserted":
+            inserted.append(sku)
+        elif outcome == "skipped_live":
+            skipped["already_local"] += 1
+        else:
+            skipped[outcome] += 1
+
+    return {"inserted": inserted, "skipped": dict(skipped), "requested": cap}
