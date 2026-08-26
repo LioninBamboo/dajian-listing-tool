@@ -10,8 +10,16 @@ sqlalchemy>=2.0.25
 schedule>=1.2.0
 pyyaml>=6.0  # store_profile loader + config/*.yaml; must fail loud if absent
 
+# FastAPI collect server (extension posts to /api/collect). Missing this is why
+# AutoParts' fresh venv could run Streamlit but not server.py.
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
 # AI/ML
 openai>=1.0.0
 
 # Optional: for development
 pytest>=7.4.3
+
+# Shared listing QC helpers (whitelist / residual / store labels / assembly policy)
+-e ./packages/listing_qc

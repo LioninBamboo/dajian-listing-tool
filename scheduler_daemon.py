@@ -659,40 +659,15 @@ def task_listing_audit():
 
 
 # 12:10 自动修白名单。新增类型/key 必须单独决定;categoryId 永远不在其中。
-# 与 scripts.audit_fix_active_listings.SCHEDULED_SOURCE_ASPECT_AUTOFIX_* 保持同步。
-SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES = (
-    "source_aspect_mismatch",
-    "desc_dimension_mismatch",
-    "desc_weight_mismatch",
-    "wrong_dimension",
-    "description_structure_missing_key_features",
-    "wrong_weight",
-    "missing_weight",
-    "missing_dimension",
-    "description_raw_source_dump",
-    "assembly_description_missing",
-    "assembly_status_unsupported",
-    "assembly_required_mismatch",
-    "non_applicable_aspect",
-    "incomplete_title",
+# 单一来源：packages/listing_qc.autofix_whitelist
+from listing_qc import (
+    MISSING_VIDEO_DAILY_LIMIT_DEFAULT as MISSING_VIDEO_DAILY_LIMIT,
+    SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS,
+    SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES,
 )
-SOURCE_ASPECT_AUTOFIX_FIX_KEYS = (
-    "Color",
-    "Material",
-    "__source_parameter_rebuild__",
-    "Item Length",
-    "Item Width",
-    "Item Height",
-    "Item Weight",
-    "__desc_needs_update__",
-    "__restore_live_description_from_local__",
-    "__rebuild_description_from_source__",
-    "__assembly_desc_update__",
-    "__remove__Assembly Status",
-    "Assembly Required",
-    "__title__",
-)
-MISSING_VIDEO_DAILY_LIMIT = 30
+
+SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES = tuple(SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES)
+SOURCE_ASPECT_AUTOFIX_FIX_KEYS = tuple(SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS)
 
 
 def build_source_aspect_autofix_cmd(report_path) -> list[str]:

@@ -66,43 +66,21 @@ QUALITY_GATE_META_KEY = "_quality_gate"
 QUALITY_GATE_META_VERSION = 1
 QUALITY_GATE_RULESET_VERSION = 2
 
-# Keep in sync with scheduler_daemon.SOURCE_ASPECT_AUTOFIX_* — email + ops
-# split "今日可自动修" vs "需人工/另队列" using these sets.
-SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES = frozenset({
-    "source_aspect_mismatch",
-    "desc_dimension_mismatch",
-    "desc_weight_mismatch",
-    "wrong_dimension",
-    "description_structure_missing_key_features",
-    "wrong_weight",
-    "missing_weight",
-    "missing_dimension",
-    "description_raw_source_dump",
-    "assembly_description_missing",
-    "assembly_status_unsupported",
-    "assembly_required_mismatch",
-    "non_applicable_aspect",
-    "incomplete_title",
-})
-SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS = frozenset({
-    "Color",
-    "Material",
-    "__source_parameter_rebuild__",
-    "Item Length",
-    "Item Width",
-    "Item Height",
-    "Item Weight",
-    "__desc_needs_update__",
-    "__restore_live_description_from_local__",
-    "__rebuild_description_from_source__",
-    "__assembly_desc_update__",
-    "__remove__Assembly Status",
-    "Assembly Required",
-    "__title__",
-})
-MISSING_VIDEO_AUTOFIX_ISSUE_TYPES = frozenset({"missing_video"})
-MISSING_VIDEO_AUTOFIX_FIX_KEYS = frozenset({"__sync_video__"})
-MISSING_VIDEO_DAILY_LIMIT_DEFAULT = 30
+# Shared QC package (packages/listing_qc) — single source for whitelist / residual / labels.
+from listing_qc import (
+    ACTIONABLE_SEVERITIES as _ACTIONABLE_SEVERITIES,
+    FIX_KEY_ISSUE_TYPES as _FIX_KEY_ISSUE_TYPES,
+    MISSING_VIDEO_AUTOFIX_FIX_KEYS,
+    MISSING_VIDEO_AUTOFIX_ISSUE_TYPES,
+    MISSING_VIDEO_DAILY_LIMIT_DEFAULT,
+    SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS,
+    SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES,
+    fix_attempt_succeeded as _fix_attempt_succeeded,
+    fix_key_matches_issue as _fix_key_matches_issue,
+    residual_issues_for_item as _residual_issues_for_item,
+    split_autofix_scope_counts as _split_autofix_scope_counts,
+    store_email_label as _shared_store_email_label,
+)
 
 TRANSPORT_ISSUE_TYPES = {
     "live_fetch_failed",
@@ -2079,61 +2057,6 @@ def filter_fixes_by_key(fixes: dict, allowed_keys: set[str] | None) -> dict:
     return {key: value for key, value in (fixes or {}).items() if key in allowed}
 
 
-_FIX_KEY_ISSUE_TYPES = {
-    "categoryId": {"category_mismatch"},
-    "categoryName": {"category_mismatch"},
-    "__sync_video__": {"missing_video"},
-    "__remove_video__": {"stale_video"},
-    "__missing_foldable__": {"missing_foldable"},
-    "__incomplete_title__": {"incomplete_title"},
-    "__desc_needs_update__": {
-        "desc_dimension_mismatch",
-        "wrong_dimension",
-        "wrong_weight",
-    },
-    "__source_parameter_rebuild__": {"source_aspect_mismatch"},
-    "Assembly Required": {
-        "assembly_required_mismatch",
-        "assembly_package_conflict",
-    },
-    "__remove__Assembly Status": {"assembly_status_unsupported"},
-    "__assembly_desc_update__": {
-        "assembly_description_contradiction",
-        "assembly_description_missing",
-        "assembly_required_mismatch",
-    },
-    "__motors_compatibility__": {
-        "missing_motors_compatibility",
-        "stale_motors_compatibility",
-        "motors_compatibility_metadata",
-    },
-}
-
-
-def _fix_key_matches_issue(key: str, issue_type: str) -> bool:
-    """Return whether a generated fix is backed by the current issue type."""
-    if key == "__semantic_rebuild_from_source__":
-        return (
-            issue_type.startswith("semantic_")
-            or issue_type.startswith("claim_")
-            or issue_type.startswith("hallucinated_")
-            or issue_type == "description_raw_source_dump"
-        )
-    if key == "__title__":
-        return issue_type == "title_cleanup"
-    if key == "__rebuild_description_from_source__":
-        return issue_type == "description_raw_source_dump"
-    if key == "__restore_live_description_from_local__":
-        return issue_type == "description_structure_missing_key_features"
-    if key in {"Item Length", "Item Width", "Item Height"}:
-        return issue_type in {"missing_dimension", "wrong_dimension"}
-    if key == "Item Weight":
-        return issue_type in {"missing_weight", "wrong_weight"}
-    if key == "Material":
-        return issue_type in {"source_aspect_mismatch", "semantic_material"}
-    return issue_type in _FIX_KEY_ISSUE_TYPES.get(key, set())
-
-
 def filter_fixes_by_severity(
     fixes: dict,
     issues: list[dict],
@@ -2276,9 +2199,6 @@ def _render_audit_fix_items(fixes, *, limit=10):
     return "\n".join(rendered) or "<li>无自动修复</li>"
 
 
-_ACTIONABLE_SEVERITIES = {"CRITICAL", "HIGH"}
-
-
 def _filter_actionable(items):
     """Keep only rows that carry a CRITICAL/HIGH issue, and within each row drop
     the MEDIUM/LOW noise. The inspection email exists to surface what will be
@@ -2370,66 +2290,6 @@ def _find_prior_full_corpus_audit(current_path: Path | None = None):
     return pick_latest_full_corpus_audit(candidates)
 
 
-def _fix_attempt_succeeded(fixes_applied) -> bool:
-    texts = [str(item) for item in (fixes_applied or [])]
-    if not texts:
-        return False
-    return not any(text.startswith("ERROR") for text in texts)
-
-
-def _residual_issues_for_item(item: dict) -> list[dict]:
-    """CRITICAL/HIGH still needing attention after a fix attempt.
-
-    Prefer post_fix_issues (live re-audit). Else drop issue types covered by
-    selected_fix_keys / successful apply so the email does not restate
-    pre-fix noise as if nothing changed.
-    """
-    post = item.get("post_fix_issues")
-    if isinstance(post, list):
-        return [
-            issue
-            for issue in post
-            if isinstance(issue, dict)
-            and str(issue.get("severity", "")).upper() in _ACTIONABLE_SEVERITIES
-        ]
-
-    issues = [
-        issue
-        for issue in (item.get("issues") or [])
-        if isinstance(issue, dict)
-        and str(issue.get("severity", "")).upper() in _ACTIONABLE_SEVERITIES
-    ]
-    if not _fix_attempt_succeeded(item.get("fixes_applied")):
-        return issues
-
-    selected = {str(key) for key in (item.get("selected_fix_keys") or []) if str(key).strip()}
-    if not selected:
-        return issues
-
-    residual = []
-    for issue in issues:
-        typ = str(issue.get("type") or "").strip()
-        if any(_fix_key_matches_issue(key, typ) for key in selected):
-            continue
-        residual.append(issue)
-    return residual
-
-
-def _split_autofix_scope_counts(type_counts: dict[str, int]) -> tuple[int, int, list[tuple[str, int]], list[tuple[str, int]]]:
-    auto_parts = []
-    manual_parts = []
-    auto_total = 0
-    manual_total = 0
-    for typ, count in sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0])):
-        if typ in SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES:
-            auto_parts.append((typ, count))
-            auto_total += count
-        else:
-            manual_parts.append((typ, count))
-            manual_total += count
-    return auto_total, manual_total, auto_parts[:8], manual_parts[:8]
-
-
 def _format_type_delta_lines(current_counts: dict[str, int], prior_counts: dict[str, int]) -> list[str]:
     keys = sorted(set(current_counts) | set(prior_counts))
     deltas = []
@@ -2485,9 +2345,20 @@ def export_category_mismatch_manifest(report, out_dir: Path | None = None) -> Pa
     return path
 
 
+def _store_email_label() -> str:
+    """Brand label for email subject/heading so multi-store inboxes are distinguishable."""
+    def _brand_getter() -> str:
+        from src.utils.store_profile import get_store_profile
+
+        return str(getattr(get_store_profile(), "brand_name", "") or "").strip()
+
+    return _shared_store_email_label(brand_getter=_brand_getter)
+
+
 def _send_audit_email(report, report_path):
     from src.utils.email_sender import send_email
 
+    store_label = _store_email_label()
     total_published = int(report.get("total_published", 0))
     total_transport_failures = int(report.get("total_transport_failures", 0))
     fixed_count = int(report.get("fixed_count", 0))
@@ -2560,9 +2431,9 @@ def _send_audit_email(report, report_path):
         summary = f"{summary}，另有 {total_transport_failures} 条抓取/availability 异常"
     if mode == "fix":
         summary = f"{summary}，已修复 {fixed_count} 条"
-        subject = f"eBay/GIGA 刊登修复报告 - {summary}"
+        subject = f"[{store_label}] 刊登修复报告 - {summary}"
     else:
-        subject = f"eBay/GIGA 刊登内容审计 - {summary}"
+        subject = f"[{store_label}] 刊登内容审计 - {summary}"
 
     # Fix table: show applied fixes; omit pre-fix issue dump (use residual section).
     display_fixed = []
@@ -2702,7 +2573,11 @@ def _send_audit_email(report, report_path):
             rows=transport_rows,
         )
 
-    heading = "eBay/GIGA 刊登修复报告" if mode == "fix" else "eBay/GIGA 刊登内容审计"
+    heading = (
+        f"[{store_label}] 刊登修复报告"
+        if mode == "fix"
+        else f"[{store_label}] 刊登内容审计"
+    )
     _banner_bg = "#c0392b" if (n_critical or n_high) else "#27ae60"
     _banner_txt = (f"需处理 {n_action_rows} 条：CRITICAL {n_critical} · HIGH {n_high}"
                    if (n_critical or n_high) else "本次无需人工处理的 CRITICAL/HIGH 问题 ✅")
