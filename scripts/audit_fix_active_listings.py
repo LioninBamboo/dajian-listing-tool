@@ -2119,6 +2119,17 @@ def _fix_key_matches_issue(key: str, issue_type: str) -> bool:
             or issue_type.startswith("hallucinated_")
             or issue_type == "description_raw_source_dump"
         )
+    if key == "__title__":
+        return issue_type == "incomplete_title"
+    if key == "__rebuild_description_from_source__":
+        return issue_type == "description_raw_source_dump"
+    if key == "__restore_live_description_from_local__":
+        return (
+            issue_type.startswith("semantic_")
+            or issue_type.startswith("claim_")
+            or issue_type.startswith("hallucinated_")
+            or issue_type == "description_raw_source_dump"
+        )
     if key in {"Item Length", "Item Width", "Item Height"}:
         return issue_type in {"missing_dimension", "wrong_dimension"}
     if key == "Item Weight":
@@ -2288,6 +2299,16 @@ def _filter_actionable(items):
         trimmed["issues"] = keep
         out.append(trimmed)
     return out
+
+
+def _count_actionable_severities(items) -> dict[str, int]:
+    counts = {"CRITICAL": 0, "HIGH": 0}
+    for item in items or []:
+        for issue in item.get("issues") or []:
+            sev = str(issue.get("severity", "")).upper()
+            if sev in counts:
+                counts[sev] += 1
+    return counts
 
 
 def _render_audit_table_rows(items, *, include_fixes=False, max_rows=200):
@@ -2505,9 +2526,18 @@ def _send_audit_email(report, report_path):
 
     # Audit-mode: all actionable rows (detect-only).
     actionable_all = _filter_actionable(issues)
-    n_critical = int(severity_counts.get("CRITICAL", 0))
-    n_high = int(severity_counts.get("HIGH", 0))
-    n_action_rows = len(actionable_all) if mode != "fix" else len(residual_items)
+    display_items = residual_items if mode == "fix" else actionable_all
+    display_severity_counts = (
+        _count_actionable_severities(display_items)
+        if mode == "fix"
+        else {
+            "CRITICAL": int(severity_counts.get("CRITICAL", 0)),
+            "HIGH": int(severity_counts.get("HIGH", 0)),
+        }
+    )
+    n_critical = int(display_severity_counts.get("CRITICAL", 0))
+    n_high = int(display_severity_counts.get("HIGH", 0))
+    n_action_rows = len(display_items)
 
     type_counts = _issue_type_counts(report)
     auto_total, manual_total, auto_parts, manual_parts = _split_autofix_scope_counts(type_counts)
@@ -2716,8 +2746,8 @@ def _send_audit_email(report, report_path):
         banner_txt=html.escape(_banner_txt),
         summary=html.escape(summary),
         mode=html.escape(mode),
-        critical=int(severity_counts.get("CRITICAL", 0)),
-        high=int(severity_counts.get("HIGH", 0)),
+        critical=n_critical,
+        high=n_high,
         medium=int(severity_counts.get("MEDIUM", 0)),
         low=int(severity_counts.get("LOW", 0)),
         transport_failures=total_transport_failures,

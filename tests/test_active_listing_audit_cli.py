@@ -1109,6 +1109,67 @@ def test_audit_email_includes_category_manifest_hint(tmp_path):
     assert "apply_approved_fixes.py" in html_body
 
 
+def test_fix_mode_email_uses_residual_counts_not_prefix_severity_totals(tmp_path):
+    report = {
+        "mode": "fix",
+        "total_published": 3,
+        "total_with_issues": 1,
+        "total_transport_failures": 0,
+        "skipped_clean_frozen": 0,
+        "clean_state_recorded": 0,
+        "severity_counts": {"CRITICAL": 4, "HIGH": 7, "MEDIUM": 0, "LOW": 0},
+        "fixed_count": 1,
+        "issues": [
+            {
+                "sku": "SKU-FIXED",
+                "listing_id": "123",
+                "title": "Fixed row",
+                "selected_fix_keys": ["__title__"],
+                "issues": [
+                    {
+                        "severity": "HIGH",
+                        "type": "incomplete_title",
+                        "detail": "title was truncated before fix",
+                    }
+                ],
+                "fixes_applied": ["Inventory product fields updated on eBay"],
+            }
+        ],
+        "transport_issues": [],
+    }
+    report_path = tmp_path / "listing_audit_fix.json"
+    report_path.write_text("{}", encoding="utf-8")
+
+    with patch("src.utils.email_sender.send_email", return_value=True) as mock_send:
+        ok = audit_fix_active_listings._send_audit_email(report, report_path)
+
+    assert ok is True
+    subject, html_body = mock_send.call_args.args
+    assert "0 条需处理（CRITICAL 0 / HIGH 0）" in subject
+    assert "本次无需人工处理的 CRITICAL/HIGH 问题" in html_body
+    assert "需处理 0 条：CRITICAL 0 · HIGH 0" not in html_body
+    assert "需处理 0 条，" not in subject
+
+
+def test_residual_filter_drops_successfully_applied_scheduled_whitelist_keys_without_post_verify():
+    item = {
+        "selected_fix_keys": [
+            "__title__",
+            "__rebuild_description_from_source__",
+            "__restore_live_description_from_local__",
+        ],
+        "fixes_applied": ["Inventory product fields updated on eBay"],
+        "issues": [
+            {"severity": "HIGH", "type": "incomplete_title", "detail": "dangling token"},
+            {"severity": "CRITICAL", "type": "description_raw_source_dump", "detail": "raw source dump"},
+            {"severity": "HIGH", "type": "semantic_feature", "detail": "unsupported live claim"},
+        ],
+    }
+
+    residual = audit_fix_active_listings._residual_issues_for_item(item)
+    assert residual == []
+
+
 def test_export_category_mismatch_manifest_writes_csv(tmp_path):
     report = {
         "issues": [

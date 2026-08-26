@@ -668,14 +668,32 @@ def fetch_trading_item_price(oauth, listing_id: str):
         f"<ItemID>{xml_escape(listing_id)}</ItemID>"
         "</GetItemRequest>"
     )
-    response = requests.post(
-        "https://api.ebay.com/ws/api.dll",
-        headers=_trading_headers(oauth.get_valid_token(), "GetItem", _trading_site_id()),
-        data=xml.encode("utf-8"),
-        timeout=30,
-        verify=False,
-    )
-    return parse_trading_item_price(response.content.decode("utf-8", "replace"))
+    try:
+        response = requests.post(
+            "https://api.ebay.com/ws/api.dll",
+            headers=_trading_headers(oauth.get_valid_token(), "GetItem", _trading_site_id()),
+            data=xml.encode("utf-8"),
+            timeout=30,
+            verify=False,
+        )
+    except (SSLError, Timeout, ConnectionError, RequestException) as e:
+        log.warning(f"  {listing_id}: Trading GetItem transport failed: {e}")
+        return None
+
+    if response.status_code != 200:
+        log.warning(f"  {listing_id}: Trading GetItem HTTP {response.status_code}")
+        return None
+
+    body = response.content.decode("utf-8", "replace")
+    ack_match = re.search(r"<Ack>(\w+)</Ack>", body)
+    ack = ack_match.group(1) if ack_match else ""
+    if ack not in {"Success", "Warning"}:
+        message = re.search(r"<LongMessage>(.*?)</LongMessage>", body)
+        detail = message.group(1) if message else body
+        log.warning(f"  {listing_id}: Trading GetItem failed (Ack={ack or 'missing'}): {detail[:160]}")
+        return None
+
+    return parse_trading_item_price(body)
 
 
 def update_trading_price(oauth, sku: str, new_price: float, listing_id: str) -> bool:
@@ -694,15 +712,24 @@ def update_trading_price(oauth, sku: str, new_price: float, listing_id: str) -> 
         item_id=listing_id,
         start_price=new_price,
     )
-    response = requests.post(
-        "https://api.ebay.com/ws/api.dll",
-        headers=_trading_headers(
-            oauth.get_valid_token(), "ReviseFixedPriceItem", _trading_site_id()
-        ),
-        data=xml.encode("utf-8"),
-        timeout=40,
-        verify=False,
-    )
+    try:
+        response = requests.post(
+            "https://api.ebay.com/ws/api.dll",
+            headers=_trading_headers(
+                oauth.get_valid_token(), "ReviseFixedPriceItem", _trading_site_id()
+            ),
+            data=xml.encode("utf-8"),
+            timeout=40,
+            verify=False,
+        )
+    except (SSLError, Timeout, ConnectionError, RequestException) as e:
+        log.error(f"  {sku}: Trading revise transport failed: {e}")
+        return False
+
+    if response.status_code != 200:
+        log.error(f"  {sku}: Trading revise HTTP {response.status_code}")
+        return False
+
     body = response.content.decode("utf-8", "replace")
     ack_match = re.search(r"<Ack>(\w+)</Ack>", body)
     ack = ack_match.group(1) if ack_match else ""
@@ -721,7 +748,10 @@ def read_current_listing_price(oauth, sku: str, listing_id: str = None, client=N
     from src.services.repricing_guard import reprice_write_channel
 
     if reprice_write_channel(listing_id) == "trading":
-        return fetch_trading_item_price(oauth, listing_id)
+        try:
+            return fetch_trading_item_price(oauth, listing_id)
+        except Exception:
+            return None
     if client is None:
         return None
     try:
