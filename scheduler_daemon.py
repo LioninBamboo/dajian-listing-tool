@@ -85,6 +85,7 @@ TASK_TIMEOUT = {
     'title_optimize': 7200,    # 2小时
     'listing_audit': 10800,    # 3小时 (全量 live eBay/GIGA 内容审计)
     'source_aspect_autofix': 7200,   # 2小时 (定向写回,逐 SKU live 调用)
+    'missing_video_autofix': 7200,   # 2小时 (限量视频上传/挂接)
     'daily_tasks': 10800,      # 3小时 (含库存同步 + 智能调价)
     'auto_analyze': 3600,      # 1小时
     'smart_reprice': 7200,     # 2小时
@@ -658,6 +659,7 @@ def task_listing_audit():
 
 
 # 12:10 自动修白名单。新增类型/key 必须单独决定;categoryId 永远不在其中。
+# 与 scripts.audit_fix_active_listings.SCHEDULED_SOURCE_ASPECT_AUTOFIX_* 保持同步。
 SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES = (
     "source_aspect_mismatch",
     "desc_dimension_mismatch",
@@ -690,6 +692,7 @@ SOURCE_ASPECT_AUTOFIX_FIX_KEYS = (
     "Assembly Required",
     "__title__",
 )
+MISSING_VIDEO_DAILY_LIMIT = 30
 
 
 def build_source_aspect_autofix_cmd(report_path) -> list[str]:
@@ -706,8 +709,29 @@ def build_source_aspect_autofix_cmd(report_path) -> list[str]:
         cmd.extend(["--issue-type", issue_type])
     for fix_key in SOURCE_ASPECT_AUTOFIX_FIX_KEYS:
         cmd.extend(["--fix-key", fix_key])
+    cmd.append("--email")
     cmd.append("--fix")
     return cmd
+
+
+def build_missing_video_autofix_cmd(report_path, *, limit: int = MISSING_VIDEO_DAILY_LIMIT) -> list[str]:
+    """Build the capped 13:00 missing-video sync command."""
+    return [
+        str(PROJECT_ROOT / "scripts" / "audit_fix_active_listings.py"),
+        "--live",
+        "--ignore-clean-freeze",
+        "--exit-zero-on-issues",
+        "--source-report",
+        str(report_path),
+        "--issue-type",
+        "missing_video",
+        "--fix-key",
+        "__sync_video__",
+        "--limit",
+        str(int(limit)),
+        "--email",
+        "--fix",
+    ]
 
 
 def task_source_aspect_autofix():
@@ -746,6 +770,31 @@ def task_source_aspect_autofix():
         'source_aspect_autofix',
         build_source_aspect_autofix_cmd(report_path),
         timeout_sec=TASK_TIMEOUT['source_aspect_autofix'],
+    )
+
+
+def task_missing_video_autofix():
+    """限量同步 missing_video — 独立于 12:10 白名单,避免拖垮源参数修复。"""
+    if _task_succeeded_today('missing_video_autofix'):
+        logger.info("↪ 跳过缺视频同步: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from scripts.semantic_rewrite import pick_latest_full_corpus_audit
+        picked = pick_latest_full_corpus_audit(list((PROJECT_ROOT / 'logs').glob('listing_audit_fix_*.json')))
+    except Exception as exc:
+        logger.warning("↪ 跳过缺视频同步: 无法定位审计报告 (%s)", exc)
+        return True, f'Skipped (no audit report: {exc})'
+    if not picked:
+        logger.info("↪ 跳过缺视频同步: 尚无全量审计报告")
+        return True, 'Skipped (no full-corpus audit report)'
+
+    report_path, _scores = picked
+    run_task(
+        'missing_video_autofix',
+        build_missing_video_autofix_cmd(report_path),
+        timeout_sec=TASK_TIMEOUT.get('missing_video_autofix', 7200),
     )
 
 
@@ -1700,6 +1749,7 @@ def setup_schedule():
 
     # 12:30 — 语义改写闭环 (读当日 audit 增量队列, 限 40; 需 SEMANTIC_REWRITE_APPLY_ENABLED=1)
     schedule.every().day.at("12:10").do(task_source_aspect_autofix).tag('daily', 'source_aspect_autofix')
+    schedule.every().day.at("13:00").do(task_missing_video_autofix).tag('daily', 'missing_video_autofix')
     schedule.every().day.at("12:30").do(task_semantic_rewrite).tag('daily', 'semantic_rewrite')
 
     # 每 6 小时 — 出单源复核 (新订单 SKU 源重抓 + live 声明比对, 发货前拦退款)
@@ -1742,7 +1792,8 @@ def setup_schedule():
     logger.info("  10:45  CRO 标题热词优化 dry-run (显式 env 才 live apply)")
     logger.info("  10:55  源内容刷新 (source_content_refresh --email — 卖家漂移检测)")
     logger.info("  11:30  eBay/GIGA live listing 内容审计 (audit_fix_active_listings --live --email)")
-    logger.info("  12:10  源参数写回 live (audit --source-report --issue-type source_aspect_mismatch --fix,限定 Color/Material/描述重建)")
+    logger.info("  12:10  源参数写回 live (audit --source-report --fix --email,限定 Color/Material/描述重建)")
+    logger.info("  13:00  缺视频限量同步 (audit --issue-type missing_video --fix-key __sync_video__ --limit 30 --email)")
     logger.info("  12:30  语义改写闭环 (semantic_rewrite --from-daily-audit --limit 40 --apply --email)")
     logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 48 --email)")
     logger.info("  每 4h  履约闭环 (giga push + sync + finance_sync)")
@@ -2030,12 +2081,30 @@ def recover_missed_tasks(log_when_clean=True):
                 'priority': 140,
             },
             {
+                'name': 'source_aspect_autofix',
+                'scheduled_time': '12:10',
+                'recovery_grace_minutes': 20,
+                'func': task_source_aspect_autofix,
+                'label': '源参数自动修复',
+                'priority': 142,
+                'depends_on_success': 'listing_audit',
+            },
+            {
                 'name': 'semantic_rewrite',
                 'scheduled_time': '12:30',
                 'recovery_grace_minutes': 20,
                 'func': task_semantic_rewrite,
                 'label': '语义改写闭环',
                 'priority': 145,  # listing_audit(140) 之后
+            },
+            {
+                'name': 'missing_video_autofix',
+                'scheduled_time': '13:00',
+                'recovery_grace_minutes': 25,
+                'func': task_missing_video_autofix,
+                'label': '缺视频限量同步',
+                'priority': 146,
+                'depends_on_success': 'listing_audit',
             },
             {
                 'name': 'health_check',
@@ -2219,7 +2288,7 @@ def main():
     parser.add_argument('--once', action='store_true',
                        help='立即执行全部任务一次后退出')
     parser.add_argument('--task', type=str,
-                       choices=['title', 'listing_audit', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_snapshot', 'mi_self_check', 'listing_status_sync', 'auto_publish', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_title_rewrite', 'cro_lifecycle_evaluate', 'cro_send_offer', 'source_refresh', 'order_recheck', 'semantic_rewrite', 'finance_sync', 'giga_dropship_push', 'giga_dropship_sync'],
+                       choices=['title', 'listing_audit', 'source_aspect_autofix', 'missing_video_autofix', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_snapshot', 'mi_self_check', 'listing_status_sync', 'auto_publish', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_title_rewrite', 'cro_lifecycle_evaluate', 'cro_send_offer', 'source_refresh', 'order_recheck', 'semantic_rewrite', 'finance_sync', 'giga_dropship_push', 'giga_dropship_sync'],
                        help='立即执行指定单个任务后退出')
     parser.add_argument('--status', action='store_true',
                        help='显示守护进程状态')
@@ -2259,6 +2328,7 @@ def main():
             'title': task_title_optimize,
             'listing_audit': task_listing_audit,
             'source_aspect_autofix': task_source_aspect_autofix,
+            'missing_video_autofix': task_missing_video_autofix,
             'daily': task_daily_full,
             'analyze': task_auto_analyze,
             'reprice': task_smart_reprice,

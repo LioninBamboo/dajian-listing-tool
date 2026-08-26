@@ -985,6 +985,8 @@ def test_fix_mode_audit_email_includes_fix_details_and_report_attachment(tmp_pat
         "total_published": 10,
         "total_with_issues": 2,
         "total_transport_failures": 1,
+        "skipped_clean_frozen": 0,
+        "clean_state_recorded": 0,
         "severity_counts": {"CRITICAL": 1, "HIGH": 1, "MEDIUM": 0, "LOW": 0},
         "fixed_count": 1,
         "issues": [
@@ -992,16 +994,29 @@ def test_fix_mode_audit_email_includes_fix_details_and_report_attachment(tmp_pat
                 "sku": "SKU-1",
                 "listing_id": "123",
                 "title": "Live title",
+                "selected_fix_keys": ["__assembly_desc_update__"],
                 "issues": [
                     {
+                        "severity": "HIGH",
+                        "type": "assembly_description_missing",
+                        "detail": "Description should explicitly say assembly is required",
+                    },
+                    {
                         "severity": "CRITICAL",
-                        "type": "hallucinated_foldable",
-                        "detail": "Listing says foldable but source does not support it",
-                    }
+                        "type": "category_mismatch",
+                        "detail": "Wrong category still needs human approval",
+                    },
                 ],
                 "fixes_applied": [
                     "Inventory product fields updated on eBay",
                     "Local DB updated",
+                ],
+                "post_fix_issues": [
+                    {
+                        "severity": "CRITICAL",
+                        "type": "category_mismatch",
+                        "detail": "Wrong category still needs human approval",
+                    }
                 ],
             },
             {
@@ -1043,15 +1058,152 @@ def test_fix_mode_audit_email_includes_fix_details_and_report_attachment(tmp_pat
     assert ok is True
     args, kwargs = mock_send.call_args
     subject, html_body = args
+    assert "刊登修复报告" in subject
     assert "已修复 1 条" in subject
     assert "抓取/availability 异常" in subject
     assert "已自动修复明细" in html_body
     assert "Inventory product fields updated on eBay" in html_body
     assert "SKU-2" in html_body
     assert "SKU-3" in html_body
-    assert "待人工复核" in html_body
+    assert "仍残留" in html_body
+    assert "category_mismatch" in html_body
+    assert "审计上下文" in html_body
+    assert "Clean frozen" in html_body
     assert "抓取 / Availability 异常" in html_body
     assert kwargs["attachments"] == [str(report_path)]
+
+
+def test_audit_email_includes_category_manifest_hint(tmp_path):
+    report = {
+        "mode": "live_audit",
+        "total_published": 3,
+        "total_with_issues": 1,
+        "total_transport_failures": 0,
+        "skipped_clean_frozen": 12,
+        "clean_state_recorded": 2,
+        "severity_counts": {"CRITICAL": 1, "HIGH": 0, "MEDIUM": 0, "LOW": 0},
+        "fixed_count": 0,
+        "category_mismatch_manifest": str(tmp_path / "category_mismatch_manifest_demo.csv"),
+        "issues": [
+            {
+                "sku": "SKU-CAT",
+                "listing_id": "1",
+                "title": "Wrong category",
+                "issues": [
+                    {
+                        "severity": "CRITICAL",
+                        "type": "category_mismatch",
+                        "detail": "expected 38199",
+                    }
+                ],
+            }
+        ],
+        "transport_issues": [],
+    }
+    report_path = tmp_path / "audit.json"
+    report_path.write_text("{}", encoding="utf-8")
+    with patch("src.utils.email_sender.send_email", return_value=True) as mock_send:
+        assert audit_fix_active_listings._send_audit_email(report, report_path) is True
+    html_body = mock_send.call_args.args[1]
+    assert "category_mismatch 待审批清单" in html_body
+    assert "apply_approved_fixes.py" in html_body
+
+
+def test_export_category_mismatch_manifest_writes_csv(tmp_path):
+    report = {
+        "issues": [
+            {
+                "sku": "SKU-A",
+                "issues": [
+                    {
+                        "type": "category_mismatch",
+                        "severity": "CRITICAL",
+                        "expected": "38199",
+                        "detail": "nightstand mismatch",
+                    }
+                ],
+            },
+            {
+                "sku": "SKU-B",
+                "issues": [{"type": "missing_video", "severity": "HIGH", "detail": "no video"}],
+            },
+        ]
+    }
+    path = audit_fix_active_listings.export_category_mismatch_manifest(report, out_dir=tmp_path)
+    assert path is not None
+    text = path.read_text(encoding="utf-8")
+    assert "sku,fix_keys,note" in text
+    assert "SKU-A,categoryId," in text
+    assert "SKU-B" not in text
+
+
+def test_load_skus_from_audit_report_respects_caller_limit_via_slice(tmp_path):
+    report = {
+        "issues": [
+            {"sku": f"SKU-{i}", "issues": [{"type": "missing_video", "severity": "HIGH"}]}
+            for i in range(5)
+        ]
+    }
+    path = tmp_path / "prior.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    skus = audit_fix_active_listings._load_skus_from_audit_report(
+        str(path),
+        {"missing_video"},
+    )
+    assert skus[:3] == ["SKU-0", "SKU-1", "SKU-2"]
+
+
+def test_product_only_update_preserves_merchant_location_key(monkeypatch):
+    put_payloads = []
+
+    class _Resp:
+        status_code = 204
+        text = ""
+
+    class _Session:
+        def put(self, url, headers=None, json=None, timeout=None):
+            put_payloads.append(json)
+            return _Resp()
+
+    class _OAuth:
+        def get_valid_token(self):
+            return "token"
+
+    class _Client:
+        base_url = "https://api.ebay.example"
+        oauth = _OAuth()
+        session = _Session()
+
+        def get_inventory_item(self, sku):
+            return {
+                "condition": "NEW",
+                "merchantLocationKey": "DAJIAN_LA_WAREHOUSE",
+                "locale": "en_US",
+                "availability": {
+                    "shipToLocationAvailability": {"quantity": 2}
+                },
+                "product": {"title": "T", "description": "D", "aspects": {}},
+            }
+
+        def get_offers_by_sku(self, sku):
+            return []
+
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "lookup_stored_video_id",
+        lambda sku: None,
+    )
+    audit_fix_active_listings._put_inventory_product_only(
+        _Client(),
+        "SKU-LOC",
+        "Title",
+        "<p>desc</p>",
+        {"Brand": ["AquaVerve"]},
+    )
+    assert put_payloads
+    assert put_payloads[0]["merchantLocationKey"] == "DAJIAN_LA_WAREHOUSE"
+    assert put_payloads[0]["locale"] == "en_US"
+    assert "availability" in put_payloads[0]
 
 
 def test_persist_listing_audit_state_does_not_touch_updated_at_by_default():

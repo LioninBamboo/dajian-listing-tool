@@ -1108,7 +1108,15 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             if not eps_images:
                 return {"status": "error", "message": "No images after EPS upload"}
 
-            video_id = _try_upload_video(product, oauth, sku, title)
+            video_id, video_status = _try_upload_video(product, oauth, sku, title)
+            if video_status == "upload_failed":
+                msg = "publishable source video failed to upload/link; refusing to publish without video"
+                record_error(sku, msg)
+                return {"status": "error", "message": msg}
+            if video_status == "unsupported_source":
+                _persist_video_status(sku, "UNSUPPORTED_SOURCE")
+            elif video_id:
+                _persist_video_status(sku, "UPLOADED", video_id=video_id)
 
             # Create inventory item
             logger.info(f"  Creating inventory item (attempt {attempt+1})...")
@@ -1401,21 +1409,77 @@ def _published_listing_for_offer(ebay_client, offer_id: str) -> tuple[str | None
     return listing_id, listing.get("listingStatus")
 
 
-def _try_upload_video(product, oauth, sku, title) -> str:
-    """Best-effort video upload. Returns video_id or None."""
-    videos = product.get('videos', [])
+def _try_upload_video(product, oauth, sku, title):
+    """Upload source video when publishable.
+
+    Returns ``(video_id | None, status)`` where status is one of:
+    - ``ok``: uploaded (or no source video)
+    - ``unsupported_source``: source present but not eBay-publishable; caller
+      should persist ``video_status=UNSUPPORTED_SOURCE`` and continue without video
+    - ``upload_failed``: source was publishable but upload/link failed — block publish
+    """
+    videos = product.get('videos', []) or []
     if not videos:
-        return None
+        return None, "ok"
     try:
+        from src.utils.listing_quality_gate import evaluate_source_video_urls
         from src.services.ebay_video_uploader import EbayVideoUploader
+
+        video_info = evaluate_source_video_urls(videos)
+        if video_info.get("present") and video_info.get("preflight_status") == "blocked":
+            detail = ", ".join(video_info.get("issue_codes") or []) or "blocked"
+            logger.warning(f"  Video unsupported for eBay publish ({detail}); marking UNSUPPORTED_SOURCE")
+            return None, "unsupported_source"
+
         uploader = EbayVideoUploader(oauth)
         vid = uploader.upload_video_sync(videos[0], sku, title[:50])
         if vid:
             logger.info(f"  Video: {vid}")
-        return vid
+            return vid, "ok"
+        err = str(getattr(uploader, "last_upload_error", "") or "")
+        if err.startswith("unsupported_source") or "not a direct downloadable" in err:
+            logger.warning(f"  Video source dead/unsupported: {err}")
+            return None, "unsupported_source"
+        logger.error(f"  Publishable source video failed to upload: {err or 'unknown'}")
+        return None, "upload_failed"
     except Exception as e:
-        logger.warning(f"  Video failed (non-blocking): {e}")
-        return None
+        logger.error(f"  Video upload exception (blocking publish): {e}")
+        return None, "upload_failed"
+
+
+def _persist_video_status(sku: str, status: str, video_id: str | None = None) -> None:
+    """Best-effort local optimization update for publish-time video outcome."""
+    try:
+        conn = sqlite3.connect(str(PROJECT_ROOT / "ebay_collection.db"), timeout=30)
+        row = conn.execute(
+            "SELECT optimization FROM collected_products WHERE sku = ?",
+            (sku,),
+        ).fetchone()
+        if not row:
+            conn.close()
+            return
+        opt = {}
+        raw = row[0]
+        if raw:
+            try:
+                opt = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                opt = {}
+        if not isinstance(opt, dict):
+            opt = {}
+        opt["video_status"] = status
+        if video_id:
+            opt["video_id"] = video_id
+        elif status == "UNSUPPORTED_SOURCE":
+            opt.pop("video_id", None)
+        conn.execute(
+            "UPDATE collected_products SET optimization = ? WHERE sku = ?",
+            (json.dumps(opt, ensure_ascii=False), sku),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        logger.warning(f"  Failed to persist video_status={status} for {sku}: {exc}")
 
 
 def _try_fix_missing_aspect(error_msg: str, aspects: dict, category_id: str) -> bool:

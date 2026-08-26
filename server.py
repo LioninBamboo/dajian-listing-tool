@@ -1710,21 +1710,53 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             flag_modified(product, 'logs')
             db.commit()
             
-            # Video upload (best-effort, after publishing)
+            # Video upload (align with live-audit): blocked sources → UNSUPPORTED_SOURCE;
+            # publishable sources must upload/link or leave a failure trail for the
+            # daily missing_video autofix (do not silently skip).
             video_id = None
             if product.videos and len(product.videos) > 0:
                 video_url = product.videos[0]
                 video_title = listing_title[:50]
                 print(f" Uploading video for {sku}...")
                 try:
+                    from src.utils.listing_quality_gate import evaluate_source_video_urls
                     from src.services.ebay_video_uploader import EbayVideoUploader
-                    video_uploader = EbayVideoUploader(ebay_client.oauth)
-                    video_id = video_uploader.upload_video_sync(video_url, sku, video_title)
-                    if video_id:
-                        print(f" Video uploaded: {video_id}")
-                        product.logs.append(f"Video uploaded: {video_id}")
+
+                    video_info = evaluate_source_video_urls(list(product.videos or []))
+                    opt = dict(product.optimization or {})
+                    if video_info.get("present") and video_info.get("preflight_status") == "blocked":
+                        opt["video_status"] = "UNSUPPORTED_SOURCE"
+                        opt.pop("video_id", None)
+                        product.optimization = opt
+                        flag_modified(product, "optimization")
+                        product.logs.append(
+                            "Video marked UNSUPPORTED_SOURCE (not directly publishable to eBay)"
+                        )
                     else:
-                        product.logs.append("Video upload failed")
+                        video_uploader = EbayVideoUploader(ebay_client.oauth)
+                        video_id = video_uploader.upload_video_sync(video_url, sku, video_title)
+                        if video_id:
+                            print(f" Video uploaded: {video_id}")
+                            opt["video_id"] = video_id
+                            opt["video_status"] = "UPLOADED"
+                            product.optimization = opt
+                            flag_modified(product, "optimization")
+                            product.logs.append(f"Video uploaded: {video_id}")
+                        else:
+                            err = str(getattr(video_uploader, "last_upload_error", "") or "")
+                            if err.startswith("unsupported_source") or "not a direct downloadable" in err:
+                                opt["video_status"] = "UNSUPPORTED_SOURCE"
+                                opt.pop("video_id", None)
+                                product.optimization = opt
+                                flag_modified(product, "optimization")
+                                product.logs.append(f"Video UNSUPPORTED_SOURCE: {err[:120]}")
+                            else:
+                                opt["video_status"] = "FAILED"
+                                product.optimization = opt
+                                flag_modified(product, "optimization")
+                                product.logs.append(
+                                    f"Video upload failed (publishable source): {err[:120] or 'unknown'}"
+                                )
                 except Exception as video_error:
                     print(f" Video upload error: {video_error}")
                     product.logs.append(f"Video upload error: {str(video_error)[:100]}")
@@ -2389,6 +2421,28 @@ async def ebay_auth_status():
     return {
         "authorized": is_authorized,
         "environment": environment
+    }
+
+
+@app.get("/api/store-info")
+async def store_info():
+    """Dashboard branding for this instance (main / outdoor / auto)."""
+    profile = get_store_profile()
+    brand = str(getattr(profile, "brand_name", "") or "Store").strip()
+    kind = str(getattr(profile, "store_kind", "") or "").strip().lower()
+    if brand.lower() == "grovepop" or "garden" in str(getattr(profile, "template_style", "")).lower():
+        short = "户外店"
+    elif kind == "auto" or brand.lower() == "aquarides":
+        short = "汽配店"
+    else:
+        short = "家具主店"
+    return {
+        "brand_name": brand,
+        "short_name": short,
+        "display_name": f"{short} {brand}",
+        "store_kind": kind,
+        "port": int(getattr(profile, "server_port", 0) or 0),
+        "tagline": str(getattr(profile, "brand_tagline", "") or ""),
     }
 
 @app.get("/api/ebay/policies")

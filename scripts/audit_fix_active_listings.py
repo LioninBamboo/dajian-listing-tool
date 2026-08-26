@@ -35,16 +35,24 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Force UTF-8 output on Windows without invalidating the underlying stream.
+# Under uvicorn BackgroundTasks the stdio handle often rejects reconfigure
+# (OSError errno 22). Swallow that so importing this module for
+# build_description_from_source never fails garden/auto optimization.
 for _stream_name in ("stdout", "stderr"):
     _stream = getattr(sys, _stream_name)
-    if hasattr(_stream, "reconfigure"):
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    elif getattr(_stream, "buffer", None) is not None:
-        setattr(
-            sys,
-            _stream_name,
-            io.TextIOWrapper(_stream.buffer, encoding="utf-8", errors="replace", line_buffering=True),
-        )
+    try:
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        elif getattr(_stream, "buffer", None) is not None:
+            setattr(
+                sys,
+                _stream_name,
+                io.TextIOWrapper(
+                    _stream.buffer, encoding="utf-8", errors="replace", line_buffering=True
+                ),
+            )
+    except (OSError, ValueError, AttributeError):
+        pass
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -57,6 +65,45 @@ LOG_DIR.mkdir(exist_ok=True)
 QUALITY_GATE_META_KEY = "_quality_gate"
 QUALITY_GATE_META_VERSION = 1
 QUALITY_GATE_RULESET_VERSION = 2
+
+# Keep in sync with scheduler_daemon.SOURCE_ASPECT_AUTOFIX_* — email + ops
+# split "今日可自动修" vs "需人工/另队列" using these sets.
+SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES = frozenset({
+    "source_aspect_mismatch",
+    "desc_dimension_mismatch",
+    "desc_weight_mismatch",
+    "wrong_dimension",
+    "description_structure_missing_key_features",
+    "wrong_weight",
+    "missing_weight",
+    "missing_dimension",
+    "description_raw_source_dump",
+    "assembly_description_missing",
+    "assembly_status_unsupported",
+    "assembly_required_mismatch",
+    "non_applicable_aspect",
+    "incomplete_title",
+})
+SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS = frozenset({
+    "Color",
+    "Material",
+    "__source_parameter_rebuild__",
+    "Item Length",
+    "Item Width",
+    "Item Height",
+    "Item Weight",
+    "__desc_needs_update__",
+    "__restore_live_description_from_local__",
+    "__rebuild_description_from_source__",
+    "__assembly_desc_update__",
+    "__remove__Assembly Status",
+    "Assembly Required",
+    "__title__",
+})
+MISSING_VIDEO_AUTOFIX_ISSUE_TYPES = frozenset({"missing_video"})
+MISSING_VIDEO_AUTOFIX_FIX_KEYS = frozenset({"__sync_video__"})
+MISSING_VIDEO_DAILY_LIMIT_DEFAULT = 30
+
 TRANSPORT_ISSUE_TYPES = {
     "live_fetch_failed",
     "live_inventory_missing",
@@ -2270,25 +2317,218 @@ def _render_audit_table_rows(items, *, include_fixes=False, max_rows=200):
     return "\n".join(rows), truncated
 
 
+def _issue_type_counts(report) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in report.get("issues") or []:
+        for issue in item.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            typ = str(issue.get("type") or "").strip()
+            if not typ:
+                continue
+            counts[typ] = counts.get(typ, 0) + 1
+    return counts
+
+
+def _find_prior_full_corpus_audit(current_path: Path | None = None):
+    """Latest full-corpus live_audit report strictly older than current_path."""
+    try:
+        from scripts.semantic_rewrite import pick_latest_full_corpus_audit
+    except Exception:
+        return None
+    candidates = []
+    current_resolved = None
+    if current_path is not None:
+        try:
+            current_resolved = Path(current_path).resolve()
+        except OSError:
+            current_resolved = None
+    for path in LOG_DIR.glob("listing_audit_fix_*.json"):
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if current_resolved is not None and resolved == current_resolved:
+            continue
+        candidates.append(path)
+    return pick_latest_full_corpus_audit(candidates)
+
+
+def _fix_attempt_succeeded(fixes_applied) -> bool:
+    texts = [str(item) for item in (fixes_applied or [])]
+    if not texts:
+        return False
+    return not any(text.startswith("ERROR") for text in texts)
+
+
+def _residual_issues_for_item(item: dict) -> list[dict]:
+    """CRITICAL/HIGH still needing attention after a fix attempt.
+
+    Prefer post_fix_issues (live re-audit). Else drop issue types covered by
+    selected_fix_keys / successful apply so the email does not restate
+    pre-fix noise as if nothing changed.
+    """
+    post = item.get("post_fix_issues")
+    if isinstance(post, list):
+        return [
+            issue
+            for issue in post
+            if isinstance(issue, dict)
+            and str(issue.get("severity", "")).upper() in _ACTIONABLE_SEVERITIES
+        ]
+
+    issues = [
+        issue
+        for issue in (item.get("issues") or [])
+        if isinstance(issue, dict)
+        and str(issue.get("severity", "")).upper() in _ACTIONABLE_SEVERITIES
+    ]
+    if not _fix_attempt_succeeded(item.get("fixes_applied")):
+        return issues
+
+    selected = {str(key) for key in (item.get("selected_fix_keys") or []) if str(key).strip()}
+    if not selected:
+        return issues
+
+    residual = []
+    for issue in issues:
+        typ = str(issue.get("type") or "").strip()
+        if any(_fix_key_matches_issue(key, typ) for key in selected):
+            continue
+        residual.append(issue)
+    return residual
+
+
+def _split_autofix_scope_counts(type_counts: dict[str, int]) -> tuple[int, int, list[tuple[str, int]], list[tuple[str, int]]]:
+    auto_parts = []
+    manual_parts = []
+    auto_total = 0
+    manual_total = 0
+    for typ, count in sorted(type_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        if typ in SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES:
+            auto_parts.append((typ, count))
+            auto_total += count
+        else:
+            manual_parts.append((typ, count))
+            manual_total += count
+    return auto_total, manual_total, auto_parts[:8], manual_parts[:8]
+
+
+def _format_type_delta_lines(current_counts: dict[str, int], prior_counts: dict[str, int]) -> list[str]:
+    keys = sorted(set(current_counts) | set(prior_counts))
+    deltas = []
+    for key in keys:
+        cur = int(current_counts.get(key, 0))
+        prev = int(prior_counts.get(key, 0))
+        delta = cur - prev
+        if delta == 0:
+            continue
+        deltas.append((abs(delta), key, prev, cur, delta))
+    deltas.sort(reverse=True)
+    lines = []
+    for _abs, key, prev, cur, delta in deltas[:12]:
+        sign = f"+{delta}" if delta > 0 else str(delta)
+        lines.append(f"{key}: {prev} → {cur} ({sign})")
+    return lines
+
+
+def export_category_mismatch_manifest(report, out_dir: Path | None = None) -> Path | None:
+    """Write apply_approved_fixes CSV for CRITICAL/HIGH category_mismatch rows."""
+    rows = []
+    for item in report.get("issues") or []:
+        if not isinstance(item, dict):
+            continue
+        sku = str(item.get("sku") or "").strip()
+        if not sku:
+            continue
+        matched = [
+            issue
+            for issue in (item.get("issues") or [])
+            if isinstance(issue, dict) and str(issue.get("type") or "").strip() == "category_mismatch"
+        ]
+        if not matched:
+            continue
+        detail = str(matched[0].get("detail") or matched[0].get("expected") or "category_mismatch")[:200]
+        expected = matched[0].get("expected")
+        note = f"expected={expected}; {detail}" if expected is not None else detail
+        rows.append({"sku": sku, "fix_keys": "categoryId", "note": note.replace("\n", " ")})
+
+    if not rows:
+        return None
+
+    target_dir = Path(out_dir) if out_dir is not None else LOG_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = target_dir / f"category_mismatch_manifest_{stamp}.csv"
+    import csv
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["sku", "fix_keys", "note"])
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
 def _send_audit_email(report, report_path):
     from src.utils.email_sender import send_email
 
     total_published = int(report.get("total_published", 0))
-    total_with_issues = int(report.get("total_with_issues", 0))
     total_transport_failures = int(report.get("total_transport_failures", 0))
     fixed_count = int(report.get("fixed_count", 0))
+    skipped_clean_frozen = int(report.get("skipped_clean_frozen", 0) or 0)
+    clean_state_recorded = int(report.get("clean_state_recorded", 0) or 0)
     mode = str(report.get("mode", ""))
     severity_counts = report.get("severity_counts", {})
     issues = report.get("issues", [])
     transport_issues = report.get("transport_issues", [])
-    fixed_items = [item for item in issues if item.get("fixes_applied")]
-    # Only surface rows that still need a human — CRITICAL/HIGH. MEDIUM/LOW are
-    # deliberately not fixed, so they're excluded from the body to keep the focus.
-    manual_items = _filter_actionable([item for item in issues if not item.get("fixes_applied")])
+    category_manifest_path = report.get("category_mismatch_manifest")
+
+    fixed_items = [
+        item for item in issues
+        if item.get("fixes_applied") and _fix_attempt_succeeded(item.get("fixes_applied"))
+    ]
+    failed_fix_items = [
+        item for item in issues
+        if item.get("fixes_applied") and not _fix_attempt_succeeded(item.get("fixes_applied"))
+    ]
+
+    # Fix-mode residual: actionable issues not covered by successful applies.
+    residual_items = []
+    for item in issues:
+        residual = _residual_issues_for_item(item)
+        if not residual:
+            continue
+        trimmed = dict(item)
+        trimmed["issues"] = residual
+        residual_items.append(trimmed)
+    residual_items = _filter_actionable(residual_items)
+
+    # Audit-mode: all actionable rows (detect-only).
     actionable_all = _filter_actionable(issues)
     n_critical = int(severity_counts.get("CRITICAL", 0))
     n_high = int(severity_counts.get("HIGH", 0))
-    n_action_rows = len(actionable_all)
+    n_action_rows = len(actionable_all) if mode != "fix" else len(residual_items)
+
+    type_counts = _issue_type_counts(report)
+    auto_total, manual_total, auto_parts, manual_parts = _split_autofix_scope_counts(type_counts)
+
+    prior_counts = {}
+    prior_meta = ""
+    prior_pick = _find_prior_full_corpus_audit(Path(report_path) if report_path else None)
+    if prior_pick:
+        prior_path, _scores = prior_pick
+        try:
+            prior_report = json.loads(Path(prior_path).read_text(encoding="utf-8"))
+            prior_counts = _issue_type_counts(prior_report)
+            prior_meta = (
+                f"{Path(prior_path).name} "
+                f"(issues={prior_report.get('total_with_issues')}, "
+                f"frozen={prior_report.get('skipped_clean_frozen', 0)})"
+            )
+        except (OSError, json.JSONDecodeError, TypeError):
+            prior_counts = {}
+            prior_meta = ""
+    delta_lines = _format_type_delta_lines(type_counts, prior_counts) if prior_counts else []
 
     summary = f"检查 {total_published} 条，{n_action_rows} 条需处理（CRITICAL {n_critical} / HIGH {n_high}）"
     if total_transport_failures:
@@ -2299,20 +2539,59 @@ def _send_audit_email(report, report_path):
     else:
         subject = f"eBay/GIGA 刊登内容审计 - {summary}"
 
-    fixed_rows, fixed_rows_truncated = _render_audit_table_rows(fixed_items, include_fixes=True)
-    manual_rows, manual_rows_truncated = _render_audit_table_rows(manual_items, include_fixes=False)
+    # Fix table: show applied fixes; omit pre-fix issue dump (use residual section).
+    display_fixed = []
+    for item in fixed_items:
+        clone = dict(item)
+        clone["issues"] = [
+            {
+                "severity": "INFO",
+                "type": "applied",
+                "detail": "见右侧 Fixes Applied（修复前 issue 不在此重复列出）",
+            }
+        ]
+        display_fixed.append(clone)
+    fixed_rows, fixed_rows_truncated = _render_audit_table_rows(display_fixed, include_fixes=True)
+    residual_rows, residual_rows_truncated = _render_audit_table_rows(residual_items, include_fixes=False)
     issue_rows, issue_rows_truncated = _render_audit_table_rows(actionable_all, include_fixes=False)
+    failed_rows, failed_rows_truncated = _render_audit_table_rows(failed_fix_items, include_fixes=True)
+
+    context_bits = [
+        f"Clean frozen 跳过: {skipped_clean_frozen}",
+        f"本次新记 clean: {clean_state_recorded}",
+        f"白名单可自动修 issue 实例: {auto_total}",
+        f"白名单外（人工/另队列）issue 实例: {manual_total}",
+    ]
+    if prior_meta:
+        context_bits.append(f"对比基准: {prior_meta}")
+    if auto_parts:
+        context_bits.append(
+            "可自动修 Top: " + ", ".join(f"{typ}×{count}" for typ, count in auto_parts)
+        )
+    if manual_parts:
+        context_bits.append(
+            "需人工/另队列 Top: " + ", ".join(f"{typ}×{count}" for typ, count in manual_parts)
+        )
+    if delta_lines:
+        context_bits.append("相对昨日类型变化: " + "; ".join(delta_lines))
+    if category_manifest_path:
+        context_bits.append(
+            f"category_mismatch 待审批清单: {category_manifest_path} "
+            f"（python scripts/apply_approved_fixes.py … --allow-category）"
+        )
+    context_html = "".join(f"<li>{html.escape(bit)}</li>" for bit in context_bits)
 
     fixed_section = ""
     if mode == "fix":
         fixed_note = (
-            "<p style='color:#666;'>邮件正文最多展示前 200 条自动修复记录，其余请看附件报告。</p>"
+            "<p style='color:#666;'>邮件正文最多展示前 200 条自动修复记录，其余请看附件报告。"
+            "左侧 Issues 不再回显修复前快照，避免误判为未修好。</p>"
             if fixed_rows_truncated
-            else ""
+            else "<p style='color:#666;'>左侧 Issues 不再回显修复前快照；未覆盖的 CRITICAL/HIGH 见下方「仍残留」。</p>"
         )
         fixed_section = """
         <h3>已自动修复明细</h3>
-        <p>共 {fixed_count} 条。</p>
+        <p>共 {fixed_count} 条成功。</p>
         {fixed_note}
         <table style="border-collapse:collapse;width:100%;">
           <thead>
@@ -2327,18 +2606,45 @@ def _send_audit_email(report, report_path):
           <tbody>{rows}</tbody>
         </table>
         """.format(
-            fixed_count=fixed_count,
+            fixed_count=len(fixed_items),
             fixed_note=fixed_note,
             rows=fixed_rows or '<tr><td colspan="5" style="padding:8px;">本次没有自动修复记录</td></tr>',
         )
+        if failed_fix_items:
+            failed_note = (
+                "<p style='color:#666;'>邮件正文最多展示前 200 条失败记录。</p>"
+                if failed_rows_truncated
+                else ""
+            )
+            fixed_section += """
+            <h3>自动修复失败</h3>
+            <p>共 {failed_count} 条（含 25604/上传失败等）。</p>
+            {failed_note}
+            <table style="border-collapse:collapse;width:100%;">
+              <thead>
+                <tr>
+                  <th align="left" style="padding:8px;border-bottom:2px solid #999;">SKU</th>
+                  <th align="left" style="padding:8px;border-bottom:2px solid #999;">Listing ID</th>
+                  <th align="left" style="padding:8px;border-bottom:2px solid #999;">Title</th>
+                  <th align="left" style="padding:8px;border-bottom:2px solid #999;">Issues</th>
+                  <th align="left" style="padding:8px;border-bottom:2px solid #999;">Fixes Applied</th>
+                </tr>
+              </thead>
+              <tbody>{rows}</tbody>
+            </table>
+            """.format(
+                failed_count=len(failed_fix_items),
+                failed_note=failed_note,
+                rows=failed_rows,
+            )
 
-    manual_title = "待人工复核" if mode == "fix" else "优先检查 SKU"
+    manual_title = "仍残留（需人工 / 白名单外）" if mode == "fix" else "优先检查 SKU"
     manual_note = (
         "<p style='color:#666;'>邮件正文最多展示前 200 条待复核记录，其余请看附件报告。</p>"
-        if ((manual_rows_truncated and mode == "fix") or (issue_rows_truncated and mode != "fix"))
+        if ((residual_rows_truncated and mode == "fix") or (issue_rows_truncated and mode != "fix"))
         else ""
     )
-    manual_rows_html = manual_rows if mode == "fix" else issue_rows
+    manual_rows_html = residual_rows if mode == "fix" else issue_rows
     transport_rows, transport_rows_truncated = _render_audit_table_rows(
         transport_issues,
         include_fixes=False,
@@ -2371,11 +2677,12 @@ def _send_audit_email(report, report_path):
             rows=transport_rows,
         )
 
+    heading = "eBay/GIGA 刊登修复报告" if mode == "fix" else "eBay/GIGA 刊登内容审计"
     _banner_bg = "#c0392b" if (n_critical or n_high) else "#27ae60"
     _banner_txt = (f"需处理 {n_action_rows} 条：CRITICAL {n_critical} · HIGH {n_high}"
                    if (n_critical or n_high) else "本次无需人工处理的 CRITICAL/HIGH 问题 ✅")
     html_body = """
-    <h2>eBay/GIGA 刊登内容审计</h2>
+    <h2>{heading}</h2>
     <div style="background:{banner_bg};color:#fff;padding:14px 18px;border-radius:6px;font-size:18px;font-weight:700;margin:8px 0 14px;">{banner_txt}</div>
     <p>{summary}</p>
     <ul>
@@ -2386,6 +2693,8 @@ def _send_audit_email(report, report_path):
       <li>抓取 / Availability 异常: {transport_failures}</li>
       <li>报告文件: <code>{report_path}</code></li>
     </ul>
+    <h3>审计上下文</h3>
+    <ul>{context_html}</ul>
     {fixed_section}
     <h3>{manual_title}</h3>
     {manual_note}
@@ -2402,6 +2711,7 @@ def _send_audit_email(report, report_path):
     </table>
     {transport_section}
     """.format(
+        heading=html.escape(heading),
         banner_bg=_banner_bg,
         banner_txt=html.escape(_banner_txt),
         summary=html.escape(summary),
@@ -2412,6 +2722,7 @@ def _send_audit_email(report, report_path):
         low=int(severity_counts.get("LOW", 0)),
         transport_failures=total_transport_failures,
         report_path=html.escape(str(report_path)),
+        context_html=context_html,
         fixed_section=fixed_section,
         manual_title=manual_title,
         manual_note=manual_note,
@@ -2609,6 +2920,13 @@ def _put_inventory_product_only(ebay_client, sku, title, description, aspects):
         "condition": live_inventory.get("condition") or "NEW",
         "product": product,
     }
+    # Inventory items with a merchant location require the key on every
+    # replacement PUT; omitting it is a common 25604 "Availability not found"
+    # trigger even when shipToLocationAvailability.quantity is present.
+    for meta_key in ("merchantLocationKey", "locale"):
+        meta_val = live_inventory.get(meta_key)
+        if meta_val:
+            payload[meta_key] = meta_val
     if live_inventory.get("packageWeightAndSize"):
         pkg = dict(live_inventory.get("packageWeightAndSize") or {})
         weight = pkg.get("weight") or {}
@@ -2679,6 +2997,40 @@ def _put_inventory_product_only(ebay_client, sku, title, description, aspects):
     }
     url = f"{ebay_client.base_url}/sell/inventory/v1/inventory_item/{sku}"
     response = ebay_client.session.put(url, headers=headers, json=payload, timeout=120)
+
+    def _is_availability_not_found(resp) -> bool:
+        text = str(getattr(resp, "text", "") or "")
+        return "25604" in text or "Availability not found" in text
+
+    # One refresh+retry on 25604: live qty / offer qty / merchantLocationKey may
+    # have been stale on the first read.
+    if response.status_code not in (200, 204) and _is_availability_not_found(response):
+        logging.warning(f"[AVAIL] {sku}: 25604 on product-only PUT — refresh and retry once")
+        refreshed = ebay_client.get_inventory_item(sku) or {}
+        if refreshed:
+            live_inventory = refreshed
+            for meta_key in ("merchantLocationKey", "locale"):
+                meta_val = live_inventory.get(meta_key)
+                if meta_val:
+                    payload[meta_key] = meta_val
+                else:
+                    payload.pop(meta_key, None)
+            if live_inventory.get("condition"):
+                payload["condition"] = live_inventory.get("condition")
+        offer_qty = _offer_quantity_hint(ebay_client, sku)
+        availability = resolve_inventory_availability_for_product_put(
+            live_inventory,
+            offer_quantity=offer_qty,
+        )
+        if not availability:
+            raise RuntimeError(
+                f"{sku}: skip product-only inventory update after 25604 — cannot resolve "
+                f"availability from refreshed live inventory or offer"
+            )
+        availability.pop("_quantity_source", None)
+        payload["availability"] = availability
+        response = ebay_client.session.put(url, headers=headers, json=payload, timeout=120)
+
     if response.status_code not in (200, 204):
         rollback_status = "not_attempted"
         rollback_error = ""
@@ -4213,6 +4565,9 @@ def main(argv=None):
             print(f"⚠️ Selected SKU scope is empty: {scope_label}")
             conn.close()
             return 0
+        if args.limit is not None and int(args.limit) >= 0:
+            sku_list = sku_list[: int(args.limit)]
+            print(f"🔢 Scoped SKU cap (--limit={args.limit}): {len(sku_list)} SKUs")
         placeholders = ",".join("?" for _ in sku_list)
         rows = conn.execute(
             f"SELECT sku, title, attributes, specs, optimization, description, images, videos, price, suggested_price, status, listing_id "
@@ -4423,6 +4778,9 @@ def main(argv=None):
             issues,
             set(args.severity_levels or []),
         )
+        fix_succeeded = False
+        post_fix_issues = None
+        post_fix_verify_error = None
         if args.fix and selected_fixes and ebay_client:
             print(f"   🔧 Applying {len(selected_fixes)} selected fixes...")
             fix_results = fix_listing_on_ebay(
@@ -4440,14 +4798,55 @@ def main(argv=None):
                     error_count += 1
                 else:
                     print(f"   ✅ {r}")
-            if fix_results and all("ERROR" not in r for r in fix_results):
+            fix_succeeded = bool(fix_results) and all("ERROR" not in r for r in fix_results)
+            if fix_succeeded:
                 fixed_count += 1
+                # Light post-fix live re-audit so residual report is not the
+                # pre-fix issue snapshot.
+                try:
+                    time.sleep(0.4)
+                    verify_inventory = ebay_client.get_inventory_item(sku) or {}
+                    verify_offers = ebay_client.get_offers_by_sku(sku) or []
+                    verify_offer = _select_best_offer(
+                        verify_offers,
+                        expected_listing_id=current_listing_id or row["listing_id"],
+                    )
+                    verify_opt = build_live_listing_opt_snapshot(
+                        source_opt,
+                        inventory_item=verify_inventory,
+                        offer=verify_offer,
+                    )
+                    verify_issues, _ = audit_single_product(
+                        sku,
+                        title,
+                        row["attributes"],
+                        row["specs"],
+                        json.dumps(verify_opt, ensure_ascii=False),
+                        row["description"],
+                        ebay_client=ebay_client,
+                        images_raw=row["images"],
+                        videos_raw=row["videos"],
+                        live_inventory=verify_inventory,
+                        accept_package_conflict_as=args.accept_package_conflict_as,
+                    )
+                    _transport, post_fix_issues = split_transport_issues(verify_issues)
+                    residual_n = sum(
+                        1
+                        for issue in post_fix_issues
+                        if str(issue.get("severity", "")).upper() in _ACTIONABLE_SEVERITIES
+                    )
+                    if residual_n:
+                        print(f"   🔎 Post-fix residual CRITICAL/HIGH: {residual_n}")
+                    else:
+                        print("   🔎 Post-fix verify: no CRITICAL/HIGH residual")
+                except Exception as verify_exc:
+                    post_fix_verify_error = str(verify_exc)
+                    print(f"   ⚠️ Post-fix verify failed: {verify_exc}")
             # Rate limit
             time.sleep(1)
 
         if args.live:
             if args.fix:
-                fix_succeeded = bool(fix_results) and all("ERROR" not in r for r in fix_results)
                 persist_listing_audit_state(
                     conn,
                     sku,
@@ -4474,13 +4873,18 @@ def main(argv=None):
             "listing_id": current_listing_id,
         }
         if content_issues:
-            all_issues.append({
+            issue_row = {
                 **base_item,
                 "issues": content_issues,
                 "fix_keys": sorted(fixes.keys()),
                 "selected_fix_keys": sorted(selected_fixes.keys()) if args.fix else [],
                 "fixes_applied": fix_results if args.fix else [],
-            })
+            }
+            if post_fix_issues is not None:
+                issue_row["post_fix_issues"] = post_fix_issues
+            if post_fix_verify_error:
+                issue_row["post_fix_verify_error"] = post_fix_verify_error
+            all_issues.append(issue_row)
         if transport_issues:
             transport_issue_count += 1
             all_transport_issues.append({
@@ -4528,6 +4932,19 @@ def main(argv=None):
         "issues": all_issues,
         "transport_issues": all_transport_issues if args.live else [],
     }
+    if not args.fix:
+        manifest_path = export_category_mismatch_manifest(report)
+        if manifest_path:
+            report["category_mismatch_manifest"] = str(manifest_path)
+            report["category_mismatch_count"] = sum(
+                1
+                for item in all_issues
+                if any(
+                    str(issue.get("type") or "") == "category_mismatch"
+                    for issue in (item.get("issues") or [])
+                )
+            )
+            print(f"📋 Category mismatch manifest: {manifest_path}")
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n📄 Full report: {report_path}")
 

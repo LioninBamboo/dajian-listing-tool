@@ -635,3 +635,18 @@ def test_source_aspect_autofix_cmd_includes_first_batch_safe_types():
     assert "missing_foldable" not in text
     assert "assembly_package_conflict" not in text
     assert "--fix" in text
+    assert "--email" in text
+
+
+def test_missing_video_autofix_cmd_is_capped_and_scoped():
+    cmd = scheduler_daemon.build_missing_video_autofix_cmd(Path("logs/listing_audit_fix_demo.json"))
+    assert "--issue-type" in cmd
+    assert "missing_video" in cmd
+    assert "--fix-key" in cmd
+    assert "__sync_video__" in cmd
+    assert "--limit" in cmd
+    assert "30" in cmd
+    assert "--email" in cmd
+    assert "--fix" in cmd
+    assert "categoryId" not in cmd
+    assert "Assembly Required" not in cmd
