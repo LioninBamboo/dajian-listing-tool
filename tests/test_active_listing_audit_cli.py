@@ -1128,8 +1128,8 @@ def test_fix_mode_email_uses_residual_counts_not_prefix_severity_totals(tmp_path
                 "issues": [
                     {
                         "severity": "HIGH",
-                        "type": "incomplete_title",
-                        "detail": "title was truncated before fix",
+                        "type": "title_cleanup",
+                        "detail": "video marker stripped from title",
                     }
                 ],
                 "fixes_applied": ["Inventory product fields updated on eBay"],
@@ -1155,19 +1155,42 @@ def test_residual_filter_drops_successfully_applied_scheduled_whitelist_keys_wit
     item = {
         "selected_fix_keys": [
             "__title__",
+            "__incomplete_title__",
             "__rebuild_description_from_source__",
             "__restore_live_description_from_local__",
         ],
         "fixes_applied": ["Inventory product fields updated on eBay"],
         "issues": [
+            {"severity": "HIGH", "type": "title_cleanup", "detail": "video marker"},
             {"severity": "HIGH", "type": "incomplete_title", "detail": "dangling token"},
             {"severity": "CRITICAL", "type": "description_raw_source_dump", "detail": "raw source dump"},
-            {"severity": "HIGH", "type": "semantic_feature", "detail": "unsupported live claim"},
+            {
+                "severity": "HIGH",
+                "type": "description_structure_missing_key_features",
+                "detail": "missing KEY FEATURES",
+            },
         ],
     }
 
     residual = audit_fix_active_listings._residual_issues_for_item(item)
     assert residual == []
+
+
+def test_fix_key_matches_issue_uses_audit_generated_issue_types():
+    assert audit_fix_active_listings._fix_key_matches_issue(
+        "__restore_live_description_from_local__",
+        "description_structure_missing_key_features",
+    )
+    assert not audit_fix_active_listings._fix_key_matches_issue(
+        "__restore_live_description_from_local__",
+        "semantic_feature",
+    )
+    assert audit_fix_active_listings._fix_key_matches_issue("__title__", "title_cleanup")
+    assert not audit_fix_active_listings._fix_key_matches_issue("__title__", "incomplete_title")
+    assert audit_fix_active_listings._fix_key_matches_issue(
+        "__incomplete_title__",
+        "incomplete_title",
+    )
 
 
 def test_export_category_mismatch_manifest_writes_csv(tmp_path):

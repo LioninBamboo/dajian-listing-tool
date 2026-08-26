@@ -2120,16 +2120,11 @@ def _fix_key_matches_issue(key: str, issue_type: str) -> bool:
             or issue_type == "description_raw_source_dump"
         )
     if key == "__title__":
-        return issue_type == "incomplete_title"
+        return issue_type == "title_cleanup"
     if key == "__rebuild_description_from_source__":
         return issue_type == "description_raw_source_dump"
     if key == "__restore_live_description_from_local__":
-        return (
-            issue_type.startswith("semantic_")
-            or issue_type.startswith("claim_")
-            or issue_type.startswith("hallucinated_")
-            or issue_type == "description_raw_source_dump"
-        )
+        return issue_type == "description_structure_missing_key_features"
     if key in {"Item Length", "Item Width", "Item Height"}:
         return issue_type in {"missing_dimension", "wrong_dimension"}
     if key == "Item Weight":
