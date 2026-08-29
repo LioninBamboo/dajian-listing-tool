@@ -50,6 +50,8 @@ import os  # noqa: E402
 
 from src.services.source_refresh import refresh_skus  # noqa: E402
 from src.utils.claim_diff_engine import build_source_constraints, detect_claim_violations  # noqa: E402
+from src.services.listing_qc import resolve_qc_profile  # noqa: E402
+from src.utils.store_profile import get_store_profile  # noqa: E402
 
 _EBAY_NS = "{urn:ebay:apis:eBLBaseComponents}"
 
@@ -206,15 +208,108 @@ def _fetch_live_content(ebay_client, sku: str, listing_id: str) -> dict | None:
         return None
 
 
+def _compat_vehicle_key(entry: dict) -> tuple[str, str, str]:
+    props = {
+        str(p.get("name") or "").strip().lower(): str(p.get("value") or "").strip()
+        for p in (entry or {}).get("compatibilityProperties") or []
+        if p.get("name")
+    }
+    return (
+        props.get("year", ""),
+        props.get("make", ""),
+        props.get("model", ""),
+    )
+
+
+def _load_source_compatible_products(optimization_json: str | None) -> list[dict]:
+    try:
+        optimization = json.loads(optimization_json or "{}")
+    except json.JSONDecodeError:
+        optimization = {}
+    if not isinstance(optimization, dict):
+        return []
+    motors = optimization.get("motorsCompatibility") or {}
+    if not isinstance(motors, dict):
+        return []
+    products = motors.get("compatibleProducts") or []
+    return products if isinstance(products, list) else []
+
+
+def _fetch_live_compatible_products(ebay_client, sku: str, listing_id: str) -> list[dict]:
+    live_entries: list[dict] = []
+    try:
+        payload = ebay_client.get_product_compatibility(sku) or {}
+        live_entries = payload.get("compatibleProducts") or []
+    except Exception:
+        live_entries = []
+    if live_entries:
+        return live_entries
+    if listing_id:
+        try:
+            return ebay_client.get_item_compatibility_motors(listing_id) or []
+        except Exception:
+            return []
+    return []
+
+
+def _check_fitment_drift(
+    ebay_client,
+    sku: str,
+    listing_id: str,
+    optimization_json: str | None,
+) -> list[dict]:
+    """Motors-only: live structured fitment must cover the source snapshot."""
+    source_entries = _load_source_compatible_products(optimization_json)
+    if not source_entries:
+        return []
+
+    live_entries = _fetch_live_compatible_products(ebay_client, sku, listing_id)
+    if not live_entries:
+        return [
+            {
+                "type": "fitment_missing_live",
+                "severity": "CRITICAL",
+                "detail": (
+                    f"source has {len(source_entries)} fitment rows but live listing has none"
+                ),
+            }
+        ]
+
+    source_keys = {_compat_vehicle_key(entry) for entry in source_entries}
+    live_keys = {_compat_vehicle_key(entry) for entry in live_entries}
+    source_keys.discard(("", "", ""))
+    live_keys.discard(("", "", ""))
+    missing = source_keys - live_keys
+    if missing and len(missing) >= max(1, len(source_keys) // 10):
+        sample = ", ".join(f"{y} {mk} {md}" for y, mk, md in list(missing)[:3])
+        return [
+            {
+                "type": "fitment_drift",
+                "severity": "CRITICAL",
+                "detail": (
+                    f"live fitment missing {len(missing)}/{len(source_keys)} source vehicles "
+                    f"(e.g. {sample})"
+                ),
+            }
+        ]
+    return []
+
+
+def _branded_email_subject(prefix: str) -> str:
+    brand = get_store_profile().brand_name
+    return f"[{brand}] {prefix}"
+
+
 def check_sku_against_fresh_source(conn, ebay_client, sku: str) -> list[dict]:
     """Diff the live listing against the (already refreshed) source snapshot."""
     row = conn.execute(
-        "SELECT title, description, attributes, specs, listing_id FROM collected_products WHERE sku = ?",
+        "SELECT title, description, attributes, specs, listing_id, optimization "
+        "FROM collected_products WHERE sku = ?",
         (sku,),
     ).fetchone()
     if row is None:
         return [{"type": "sku_not_in_db", "severity": "HIGH", "detail": f"{sku} not in collected_products"}]
-    source_title, source_description, attributes_json, specs_json, listing_id = row
+    source_title, source_description, attributes_json, specs_json, listing_id, optimization_json = row
     attributes = json.loads(attributes_json or "{}")
     specs = json.loads(specs_json or "{}")
 
@@ -245,17 +340,23 @@ def check_sku_against_fresh_source(conn, ebay_client, sku: str) -> list[dict]:
                 }
             )
 
-    for aspect_key, attr_key, tolerance in _MEASUREMENT_CHECKS:
-        live_value = _first_float(_aspect_first(live["aspects"], aspect_key))
-        source_value = _first_float(attributes.get(attr_key))
-        if live_value is not None and source_value is not None and abs(live_value - source_value) > tolerance:
-            issues.append(
-                {
-                    "type": "measurement_drift",
-                    "severity": "CRITICAL",
-                    "detail": f"{aspect_key}: live={live_value} vs source={source_value} (>{tolerance} tolerance)",
-                }
-            )
+    qc_profile = resolve_qc_profile()
+    if qc_profile == "furniture":
+        for aspect_key, attr_key, tolerance in _MEASUREMENT_CHECKS:
+            live_value = _first_float(_aspect_first(live["aspects"], aspect_key))
+            source_value = _first_float(attributes.get(attr_key))
+            if live_value is not None and source_value is not None and abs(live_value - source_value) > tolerance:
+                issues.append(
+                    {
+                        "type": "measurement_drift",
+                        "severity": "CRITICAL",
+                        "detail": f"{aspect_key}: live={live_value} vs source={source_value} (>{tolerance} tolerance)",
+                    }
+                )
+    elif qc_profile == "motors":
+        issues.extend(
+            _check_fitment_drift(ebay_client, sku, listing_id, optimization_json)
+        )
 
     return issues
 
@@ -378,12 +479,14 @@ def main() -> int:
 
         if alerts:
             send_email(
-                f"⚠ 出单源复核: {len(alerts)} 个订单的 listing 与源不符",
+                _branded_email_subject(f"⚠ 出单源复核: {len(alerts)} 个订单的 listing 与源不符"),
                 build_alert_html(alerts),
             )
         else:
             send_email(
-                f"✅ 出单源复核: {len(targets)} 个新订单已复核，未发现与源不符",
+                _branded_email_subject(
+                    f"✅ 出单源复核: {len(targets)} 个新订单已复核，未发现与源不符"
+                ),
                 build_clean_html(targets),
             )
     elif alerts:

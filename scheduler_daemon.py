@@ -68,6 +68,7 @@ from src.utils.process_identity import (
     get_process_creation_marker,
     is_process_identity_alive,
 )
+from src.utils.store_profile import get_store_profile
 
 # ─── 配置 ───────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).parent
@@ -87,6 +88,7 @@ TASK_TIMEOUT = {
     'source_aspect_autofix': 7200,   # 2小时 (定向写回,逐 SKU live 调用)
     'missing_video_autofix': 7200,   # 2小时 (限量视频上传/挂接)
     'daily_tasks': 10800,      # 3小时 (含库存同步 + 智能调价)
+    'ops_daily': 1800,         # 30分钟 (子店: 库存同步 + 幽灵缺货恢复)
     'auto_analyze': 3600,      # 1小时
     'smart_reprice': 7200,     # 2小时
     'ad_restore': 3600,        # 1小时
@@ -192,7 +194,7 @@ def acquire_lock():
     kernel32 = ctypes.windll.kernel32
 
     # 使用 Windows Named Mutex — 内核级互斥，彻底防止竞争
-    MUTEX_NAME = "Global\\DajianSchedulerDaemonMutex"
+    MUTEX_NAME = get_store_profile().resolved_scheduler_mutex_name()
     ERROR_ALREADY_EXISTS = 183
 
     _mutex_handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
@@ -211,7 +213,18 @@ def acquire_lock():
     # 同时写入 PID 文件 (用于监控/日志)
     ensure_pid_file()
     atexit.register(release_lock)
-    logger.info(f"PID 锁已获取: {os.getpid()} (mutex)")
+    logger.info(
+        f"PID 锁已获取: {os.getpid()} "
+        f"(mutex={get_store_profile().resolved_scheduler_mutex_name()})"
+    )
+
+
+def _scheduler_profile_name() -> str:
+    return str(getattr(get_store_profile(), 'scheduler_profile', 'full') or 'full').strip().lower()
+
+
+def _is_ops_scheduler() -> bool:
+    return _scheduler_profile_name() == 'ops'
 
 
 def release_lock():
@@ -899,6 +912,19 @@ def task_daily_full():
         'daily_tasks',
         [str(PROJECT_ROOT / 'daily_tasks.py')],
         timeout_sec=TASK_TIMEOUT['daily_tasks'],
+    )
+
+
+def task_ops_daily():
+    """子店运营包: 增量库存同步 + 幽灵缺货恢复 + 精简邮件."""
+    if _task_succeeded_today('ops_daily'):
+        logger.info("↪ 跳过子店运营任务: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+
+    run_task(
+        'ops_daily',
+        [str(PROJECT_ROOT / 'daily_tasks.py'), '--ops-only'],
+        timeout_sec=TASK_TIMEOUT['ops_daily'],
     )
 
 
@@ -1640,7 +1666,28 @@ def task_mi_self_check():
 # ─── 调度配置 ─────────────────────────────────────────────
 
 def setup_schedule():
-    """配置任务调度时间表"""
+    """配置任务调度时间表（按 store_profile.scheduler_profile 分流）."""
+    schedule.clear()
+    if _is_ops_scheduler():
+        _setup_schedule_ops()
+    else:
+        _setup_schedule_full()
+
+
+def _setup_schedule_ops():
+    """子店 lean 档: 库存运营 + 出单源复核 only."""
+    schedule.every().day.at("09:30").do(task_ops_daily).tag('daily', 'ops')
+    schedule.every(6).hours.do(task_order_recheck).tag('recurring', 'order_recheck')
+
+    profile = get_store_profile()
+    logger.info("调度表已配置 (scheduler_profile=ops):")
+    logger.info(f"  店铺: {profile.brand_name} | mutex={profile.resolved_scheduler_mutex_name()}")
+    logger.info("  09:30  库存运营包 (daily_tasks.py --ops-only)")
+    logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 48 --email)")
+
+
+def _setup_schedule_full():
+    """主店 full 档 — 保持现有全部定时任务."""
     # 09:15 — 财务订单同步 (eBay → finance_orders), 赶在 09:30 日报前刷新数字
     schedule.every().day.at("09:15").do(task_finance_sync).tag('daily', 'finance_sync')
 
@@ -1834,7 +1881,91 @@ def recover_missed_tasks(log_when_clean=True):
         
         # 定义需要在 daemon 重启后补跑的关键定时任务。
         # 判断标准是: 已经过了今日的恢复窗口，且自今日计划时间之后还没有成功过。
-        critical_tasks = [
+        critical_tasks = _get_critical_recovery_tasks()
+
+        ordered_tasks = sorted(
+            critical_tasks,
+            key=lambda item: (item.get('priority', 99), item['scheduled_time'])
+        )
+
+        for config in ordered_tasks:
+            task_name = str(config['name'])
+            weekday = config.get('weekday')
+            if weekday is not None and now.weekday() != int(weekday):
+                continue
+
+            scheduled_time = str(config.get('scheduled_time', '00:00'))
+            try:
+                scheduled_hour, scheduled_minute = [int(x) for x in scheduled_time.split(':', 1)]
+            except Exception:
+                logger.warning(f"  ⚠️ 任务 {task_name} scheduled_time 配置非法: {scheduled_time}")
+                continue
+
+            scheduled_dt = now.replace(
+                hour=scheduled_hour, minute=scheduled_minute, second=0, microsecond=0
+            )
+            grace_minutes = int(config.get('recovery_grace_minutes', 10))
+            recovery_window_start = scheduled_dt + timedelta(minutes=grace_minutes)
+
+            # 今天已经成功执行过，不再补跑
+            if _task_succeeded_today(task_name, now=now):
+                continue
+            
+            # 未到补跑窗口（给定时任务留出执行时间）
+            if now < recovery_window_start:
+                continue
+
+            depends_on = config.get('depends_on_success')
+            if depends_on and not _task_succeeded_today(str(depends_on), now=now):
+                continue
+
+            if _task_in_progress_or_recovered_today(task_name, scheduled_dt, now=now):
+                continue
+
+            last_run = _get_task_health(task_name).get('at', '')
+            if last_run:
+                try:
+                    last_dt = datetime.fromisoformat(last_run)
+                except (ValueError, TypeError):
+                    continue
+                if last_dt >= scheduled_dt:
+                    continue
+                logger.info(
+                    f"  ⚠️ 发现遗漏任务: {config['label']} "
+                    f"(上次运行: {last_run}, 今日计划: {scheduled_time})"
+                )
+            else:
+                logger.info(
+                    f"  ⚠️ 发现遗漏任务: {config['label']} "
+                    f"(无历史记录, 今日计划: {scheduled_time})"
+                )
+
+            recovered.append(task_name)
+            config['func']()
+        
+        if recovered:
+            logger.info(f"  已恢复 {len(recovered)} 个遗漏任务: {recovered}")
+        elif log_when_clean:
+            logger.info("  ✅ 没有遗漏的任务")
+    except Exception as e:
+        logger.error(f"  遗漏任务检查异常: {e}")
+
+
+def _get_critical_recovery_tasks():
+    """Return missed-task recovery entries for the active scheduler profile."""
+    if _is_ops_scheduler():
+        return [
+            {
+                'name': 'ops_daily',
+                'scheduled_time': '09:30',
+                'recovery_grace_minutes': 20,
+                'func': task_ops_daily,
+                'label': '子店库存运营包',
+                'priority': 20,
+            },
+        ]
+
+    tasks = [
             {
                 'name': 'finance_sync',
                 'scheduled_time': '09:15',
@@ -2117,73 +2248,7 @@ def recover_missed_tasks(log_when_clean=True):
                 'weekday': 6,
             },
         ]
-
-        ordered_tasks = sorted(
-            critical_tasks,
-            key=lambda item: (item.get('priority', 99), item['scheduled_time'])
-        )
-
-        for config in ordered_tasks:
-            task_name = str(config['name'])
-            weekday = config.get('weekday')
-            if weekday is not None and now.weekday() != int(weekday):
-                continue
-
-            scheduled_time = str(config.get('scheduled_time', '00:00'))
-            try:
-                scheduled_hour, scheduled_minute = [int(x) for x in scheduled_time.split(':', 1)]
-            except Exception:
-                logger.warning(f"  ⚠️ 任务 {task_name} scheduled_time 配置非法: {scheduled_time}")
-                continue
-
-            scheduled_dt = now.replace(
-                hour=scheduled_hour, minute=scheduled_minute, second=0, microsecond=0
-            )
-            grace_minutes = int(config.get('recovery_grace_minutes', 10))
-            recovery_window_start = scheduled_dt + timedelta(minutes=grace_minutes)
-
-            # 今天已经成功执行过，不再补跑
-            if _task_succeeded_today(task_name, now=now):
-                continue
-            
-            # 未到补跑窗口（给定时任务留出执行时间）
-            if now < recovery_window_start:
-                continue
-
-            depends_on = config.get('depends_on_success')
-            if depends_on and not _task_succeeded_today(str(depends_on), now=now):
-                continue
-
-            if _task_in_progress_or_recovered_today(task_name, scheduled_dt, now=now):
-                continue
-
-            last_run = _get_task_health(task_name).get('at', '')
-            if last_run:
-                try:
-                    last_dt = datetime.fromisoformat(last_run)
-                except (ValueError, TypeError):
-                    continue
-                if last_dt >= scheduled_dt:
-                    continue
-                logger.info(
-                    f"  ⚠️ 发现遗漏任务: {config['label']} "
-                    f"(上次运行: {last_run}, 今日计划: {scheduled_time})"
-                )
-            else:
-                logger.info(
-                    f"  ⚠️ 发现遗漏任务: {config['label']} "
-                    f"(无历史记录, 今日计划: {scheduled_time})"
-                )
-
-            recovered.append(task_name)
-            config['func']()
-        
-        if recovered:
-            logger.info(f"  已恢复 {len(recovered)} 个遗漏任务: {recovered}")
-        elif log_when_clean:
-            logger.info("  ✅ 没有遗漏的任务")
-    except Exception as e:
-        logger.error(f"  遗漏任务检查异常: {e}")
+    return tasks
 
 
 def run_daemon():
@@ -2195,7 +2260,13 @@ def run_daemon():
         atexit.register(request_system_awake, False)
 
     logger.info("=" * 60)
+    profile = get_store_profile()
     logger.info(f"Dajian Listing Tool 调度守护进程启动")
+    logger.info(
+        f"scheduler_profile={_scheduler_profile_name()} "
+        f"brand={profile.brand_name} "
+        f"mutex={profile.resolved_scheduler_mutex_name()}"
+    )
     logger.info(f"PID: {os.getpid()}")
     logger.info(f"Python: {sys.executable}")
     logger.info(f"Project: {PROJECT_ROOT}")
@@ -2263,7 +2334,7 @@ def main():
     parser.add_argument('--once', action='store_true',
                        help='立即执行全部任务一次后退出')
     parser.add_argument('--task', type=str,
-                       choices=['title', 'listing_audit', 'source_aspect_autofix', 'missing_video_autofix', 'daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_snapshot', 'mi_self_check', 'listing_status_sync', 'auto_publish', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_title_rewrite', 'cro_lifecycle_evaluate', 'cro_send_offer', 'source_refresh', 'order_recheck', 'semantic_rewrite', 'finance_sync', 'giga_dropship_push', 'giga_dropship_sync'],
+                       choices=['title', 'listing_audit', 'source_aspect_autofix', 'missing_video_autofix', 'daily', 'ops_daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_snapshot', 'mi_self_check', 'listing_status_sync', 'auto_publish', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_title_rewrite', 'cro_lifecycle_evaluate', 'cro_send_offer', 'source_refresh', 'order_recheck', 'semantic_rewrite', 'finance_sync', 'giga_dropship_push', 'giga_dropship_sync'],
                        help='立即执行指定单个任务后退出')
     parser.add_argument('--status', action='store_true',
                        help='显示守护进程状态')
@@ -2305,6 +2376,7 @@ def main():
             'source_aspect_autofix': task_source_aspect_autofix,
             'missing_video_autofix': task_missing_video_autofix,
             'daily': task_daily_full,
+            'ops_daily': task_ops_daily,
             'analyze': task_auto_analyze,
             'reprice': task_smart_reprice,
             'health': task_health_check,

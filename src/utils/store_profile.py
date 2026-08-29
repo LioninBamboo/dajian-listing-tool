@@ -127,6 +127,12 @@ class StoreProfile:
     # Local server
     server_port: int = 8000
 
+    # Scheduler profile. "full" = main-store cadence (MI/CRO/listing audit/…).
+    # "ops" = sub-store lean cadence (inventory sync + ghost recovery + order recheck only).
+    scheduler_profile: str = "full"  # full | ops
+    # Windows Named Mutex for scheduler_daemon. Empty => main-store default.
+    scheduler_mutex_name: str = ""
+
     @property
     def brand_name_lower(self) -> str:
         return self.brand_name.lower()
@@ -172,6 +178,22 @@ class StoreProfile:
         per-item IP and fall back to "Unbranded" rather than the store name.
         """
         return self.brand_name if self.force_house_brand else "Unbranded"
+
+    @property
+    def is_ops_scheduler(self) -> bool:
+        return str(self.scheduler_profile or "full").strip().lower() == "ops"
+
+    def resolved_scheduler_mutex_name(self) -> str:
+        """Kernel mutex name for scheduler_daemon (one per store instance)."""
+        explicit = str(self.scheduler_mutex_name or "").strip()
+        if explicit:
+            return explicit
+        # Main store keeps the historical mutex; sub-stores must set explicitly
+        # or derive from brand to avoid cross-instance exclusion.
+        if self.brand_name == "AquaVerve":
+            return "Global\\DajianSchedulerDaemonMutex"
+        safe = "".join(ch if ch.isalnum() else "" for ch in self.brand_name) or "SubStore"
+        return f"Global\\{safe}SchedulerDaemonMutex"
 
 
 _SECTION_FIELD_MAP = {
@@ -223,6 +245,8 @@ _SECTION_FIELD_MAP = {
     },
     "server": {
         "server_port",
+        "scheduler_profile",
+        "scheduler_mutex_name",
     },
 }
 

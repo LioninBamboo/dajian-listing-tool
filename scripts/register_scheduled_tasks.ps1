@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$ProjectRoot = 'C:\Users\poonx\Dajian_Listing_Tool',
+    [string]$TaskNamePrefix = 'Dajian',
     [ValidateSet('Interactive', 'S4U', 'Password')]
     [string]$LogonType = 'S4U',
     [ValidateSet('Highest', 'Limited')]
@@ -139,6 +140,10 @@ foreach ($name in @(
 Write-Host 'OK'
 Write-Host ''
 
+$daemonTaskName = "$TaskNamePrefix Scheduler Daemon"
+$watchdogTaskName = "$TaskNamePrefix Scheduler Watchdog"
+
+Write-Host ("ProjectRoot={0} TaskPrefix={1}" -f $ProjectRoot, $TaskNamePrefix)
 Write-Host ("Using LogonType={0}, RunLevel={1}, User={2}" -f $LogonType, $RunLevel, $userId)
 Write-Host ''
 
@@ -162,7 +167,7 @@ $daemonTriggers = @(
     (New-ScheduledTaskTrigger -Daily -At 8:50AM)
 )
 Register-DajianTask `
-    -TaskName 'Dajian Scheduler Daemon' `
+    -TaskName $daemonTaskName `
     -Action $daemonAction `
     -Trigger $daemonTriggers `
     -Settings $daemonSettings `
@@ -191,7 +196,7 @@ $watchdogTrigger = New-ScheduledTaskTrigger `
     -RepetitionInterval (New-TimeSpan -Minutes 5) `
     -RepetitionDuration (New-TimeSpan -Days 3650)
 Register-DajianTask `
-    -TaskName 'Dajian Scheduler Watchdog' `
+    -TaskName $watchdogTaskName `
     -Action $watchdogAction `
     -Trigger $watchdogTrigger `
     -Settings $watchdogSettings `
@@ -203,9 +208,9 @@ Write-Host 'OK'
 Write-Host ''
 
 Write-Step '[4/4] Verifying tasks...'
-Get-TaskSummary -TaskName 'Dajian Scheduler Daemon' | Format-List
+Get-TaskSummary -TaskName $daemonTaskName | Format-List
 Write-Host ''
-Get-TaskSummary -TaskName 'Dajian Scheduler Watchdog' | Format-List
+Get-TaskSummary -TaskName $watchdogTaskName | Format-List
 Write-Host ''
 
 Write-Host 'Scheduled task registration completed.' -ForegroundColor Green

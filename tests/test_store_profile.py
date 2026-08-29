@@ -111,6 +111,25 @@ class TestOverrides:
         profile = load_store_profile(yaml_file)
         assert profile.qc_profile == "motors"
 
+    def test_scheduler_profile_ops_override(self, tmp_path):
+        yaml_file = tmp_path / "ops.yaml"
+        yaml_file.write_text(
+            textwrap.dedent(
+                """
+                server:
+                  scheduler_profile: ops
+                  scheduler_mutex_name: Global\\GrovePopSchedulerDaemonMutex
+                store:
+                  brand_name: GrovePop
+                """
+            ),
+            encoding="utf-8",
+        )
+        profile = load_store_profile(yaml_file)
+        assert profile.scheduler_profile == "ops"
+        assert profile.is_ops_scheduler is True
+        assert profile.resolved_scheduler_mutex_name() == "Global\\GrovePopSchedulerDaemonMutex"
+
     def test_v2_listing_and_pricing_sections(self, tmp_path):
         yaml_file = tmp_path / "blindbox.yaml"
         yaml_file.write_text(

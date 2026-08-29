@@ -142,13 +142,14 @@ def db_conn(tmp_path):
             listing_id TEXT,
             logs TEXT,
             status TEXT,
-            updated_at TEXT
+            updated_at TEXT,
+            optimization TEXT
         )
         """
     )
     conn.execute(
-        "INSERT INTO collected_products (sku, title, description, attributes, specs, videos, listing_id, logs, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO collected_products (sku, title, description, attributes, specs, videos, listing_id, logs, status, optimization) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             "W3636P456662",
             "600D Oxford Bell Tent with Stove Jack",
@@ -167,6 +168,7 @@ def db_conn(tmp_path):
             "366352780987",
             "[]",
             "PUBLISHED",
+            "{}",
         ),
     )
     conn.commit()
@@ -175,16 +177,23 @@ def db_conn(tmp_path):
 
 
 class FakeEbayClient:
-    def __init__(self, product=None, raise_on_inventory=False):
+    def __init__(self, product=None, raise_on_inventory=False, compatible_products=None):
         self._product = product
-        self._raise = raise_on_inventory
+        self._raise_on_inventory = raise_on_inventory
+        self._compatible_products = compatible_products
 
     def get_inventory_item(self, sku):
-        if self._raise:
+        if self._raise_on_inventory:
             raise RuntimeError("500 for Trading-created listing")
         if self._product is None:
             return {}
         return {"product": self._product}
+
+    def get_product_compatibility(self, sku):
+        return {"compatibleProducts": self._compatible_products or []}
+
+    def get_item_compatibility_motors(self, item_id):
+        return self._compatible_products or []
 
 
 def test_recheck_clean_listing_yields_no_issues(recheck, db_conn):
@@ -286,3 +295,63 @@ class TestCleanRunIsVisiblyClean:
     def test_clean_html_handles_missing_fields(self, recheck):
         html = recheck.build_clean_html([{}])
         assert "<table" in html
+
+
+def test_motors_fitment_missing_on_live_is_critical(recheck, db_conn, monkeypatch):
+    monkeypatch.setattr(recheck, "resolve_qc_profile", lambda explicit=None: "motors")
+    db_conn.execute(
+        "INSERT INTO collected_products (sku, title, description, attributes, specs, listing_id, optimization) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            "MOTOR-SKU-1",
+            "Trailer Hitch",
+            "<div>Hitch</div>",
+            "{}",
+            "{}",
+            "188732319492",
+            json.dumps(
+                {
+                    "motorsCompatibility": {
+                        "compatibleProducts": [
+                            {
+                                "compatibilityProperties": [
+                                    {"name": "Year", "value": "2020"},
+                                    {"name": "Make", "value": "Ford"},
+                                    {"name": "Model", "value": "Ranger"},
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ),
+        ),
+    )
+    db_conn.commit()
+
+    ebay = FakeEbayClient(
+        product={"title": "Trailer Hitch", "description": "<div>Hitch</div>", "aspects": {}},
+        compatible_products=[],
+    )
+    issues = recheck.check_sku_against_fresh_source(db_conn, ebay, "MOTOR-SKU-1")
+    assert any(i["type"] == "fitment_missing_live" and i["severity"] == "CRITICAL" for i in issues)
+
+
+def test_arttoy_skips_furniture_measurement_checks(recheck, db_conn, monkeypatch):
+    monkeypatch.setattr(recheck, "resolve_qc_profile", lambda explicit=None: "arttoy")
+    ebay = FakeEbayClient(
+        product={
+            "title": "600D Oxford Bell Tent with Stove Jack",
+            "description": "<div>Tent</div>",
+            "aspects": {"Item Length": ["157.2 in"]},
+        }
+    )
+    issues = recheck.check_sku_against_fresh_source(db_conn, ebay, "W3636P456662")
+    assert not any(i["type"] == "measurement_drift" for i in issues)
+
+
+def test_branded_email_subject_includes_store_name(recheck, monkeypatch):
+    from src.utils import store_profile as sp
+    from src.utils.store_profile import StoreProfile
+
+    monkeypatch.setattr(recheck, "get_store_profile", lambda: StoreProfile(brand_name="GrovePop"))
+    assert recheck._branded_email_subject("出单源复核") == "[GrovePop] 出单源复核"

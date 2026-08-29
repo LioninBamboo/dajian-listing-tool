@@ -45,6 +45,11 @@ class TestProfileDefaultsContract:
         assert p.price_ends_99 is False
         # server
         assert p.server_port == 8000
+        # scheduler: main store stays on the full cadence + historical mutex
+        assert p.scheduler_profile == "full"
+        assert p.is_ops_scheduler is False
+        assert p.scheduler_mutex_name == ""
+        assert p.resolved_scheduler_mutex_name() == "Global\\DajianSchedulerDaemonMutex"
 
     def test_main_store_return_policy_is_buyer_paid_everywhere(self):
         # The Motors seller-paid return is auto-parts-only. With no Motors return

@@ -105,6 +105,9 @@ PUBLISHED
 | `09:40` | `ad_restore` | 广告恢复审计与修复 |
 | `10:05` | `mi_check` | MI 自检，检查快照 / digest / 长周期 trend / 状态文件 |
 | `11:30` | `listing_audit` | `scripts/audit_fix_active_listings.py --live --email`，detect-only；对 live eBay listing 与 GIGA 原文做内容核对并发邮件 |
+| `12:10` | `source_aspect_autofix` | 白名单 `--fix-key` + `--email --fix`（禁止裸 `--fix`）；见 `docs/QC_PIPELINE_RED_LINES.md` |
+| `12:30` | `semantic_rewrite` | 语义改写闭环 `--from-daily-audit --limit 40 --apply --email` |
+| `13:00` | `missing_video_autofix` | 缺视频限量同步 `--fix-key __sync_video__ --limit 30 --email --fix` |
 | `09:45` | `bl_cleanup` | 广告黑名单自动清理 |
 | `09:50` | `guard_alert` | 守门员异常率告警 |
 | `09:55` | `cro_monthly_report` | CRO 效果验证 / 阈值反馈门控 |
@@ -227,7 +230,40 @@ python scripts/repair_published_taxonomy.py --apply
 python daily_tasks.py
 python daily_tasks.py --analyze-only
 python daily_tasks.py --sync-only
+python daily_tasks.py --ops-only
 python daily_tasks.py --audit-only
+```
+
+### 子店 ops 调度（GrovePop / AquaRides）
+
+子店实例在 `config/store_profile.local.yaml` 设置 `scheduler_profile: ops` 后，只跑库存运营与出单源复核，不触发主店的 MI/CRO/语义改写任务。
+
+| 时间 | 任务 | 入口 |
+|------|------|------|
+| 每天 09:30 | 库存运营包 | `daily_tasks.py --ops-only`（增量同步 + 幽灵缺货恢复 + 精简邮件） |
+| 每 6 小时 | 出单源复核 | `scripts/order_source_recheck.py --hours-back 48 --email` |
+
+金丝雀验收（子店目录内）：
+
+```bash
+python daily_tasks.py --ops-only
+python scripts/order_source_recheck.py --sku <PUBLISHED_SKU> --dry-run
+python scheduler_daemon.py --status
+```
+
+注册 Windows 计划任务（需管理员 PowerShell）：
+
+```powershell
+.\scripts\register_substore_ops_scheduler.ps1 -StorePrefix GrovePop
+.\scripts\register_substore_ops_scheduler.ps1 -StorePrefix AquaRides
+```
+
+`store_profile.local.yaml` 示例：
+
+```yaml
+scheduler_profile: ops
+scheduler_mutex_name: Global\GrovePopSchedulerDaemonMutex
+qc_profile: arttoy   # AquaRides 用 motors
 ```
 
 ### 库存日报口径

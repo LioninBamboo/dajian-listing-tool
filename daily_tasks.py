@@ -12,6 +12,7 @@
   python daily_tasks.py                    # 执行所有任务
   python daily_tasks.py --analyze-only     # 仅分析采集产品
   python daily_tasks.py --sync-only        # 仅同步库存
+  python daily_tasks.py --ops-only         # 子店运营包（同步+幽灵恢复+精简邮件）
 """
 import json
 import os
@@ -507,6 +508,52 @@ def run_ghost_oos_recovery(auto_fix: bool = True) -> dict:
             'error': str(e),
             'qty_zero_restocked': [],
         }
+
+
+def run_ops_daily() -> dict:
+    """Sub-store ops bundle: incremental sync + ghost OOS recovery (no MI/CRO)."""
+    results: dict = {}
+
+    try:
+        results['inventory'] = sync_inventory()
+    except Exception as e:
+        logger.error(f"库存同步异常: {e}")
+        results['inventory'] = {
+            **empty_inventory_audit(
+                AUDIT_SCOPE_INCREMENTAL,
+                error_count=1,
+                error=str(e),
+            ),
+            'error': str(e),
+            'checked': 0,
+            'errors': 1,
+            'out_of_stock': [],
+            'price_changed': [],
+            'data_missing': [],
+            'no_change': 0,
+        }
+
+    try:
+        ghost_recovery = run_ghost_oos_recovery(auto_fix=True)
+        results.setdefault('inventory', {})
+        results['inventory']['full_oos_audit'] = ghost_recovery
+        results['inventory']['ghost_restocked'] = ghost_recovery.get('qty_zero_restocked', [])
+        if ghost_recovery.get('error'):
+            results['inventory']['ghost_restock_error'] = ghost_recovery.get('error')
+    except Exception as e:
+        logger.error(f"幽灵缺货恢复异常: {e}")
+        results.setdefault('inventory', {})
+        results['inventory']['full_oos_audit'] = {
+            **empty_inventory_audit(
+                AUDIT_SCOPE_FULL_OOS,
+                error_count=1,
+                error=str(e),
+            ),
+            'status': 'error',
+        }
+        results['inventory']['ghost_restock_error'] = str(e)
+
+    return results
 
 
 def run_smart_reprice(market_mode: str | None = None) -> dict:
@@ -1109,6 +1156,141 @@ def _format_smart_reprice_reason(row: dict) -> str:
         parts.append(f"回退: {fallback_reason}")
 
     return ' · '.join(parts)
+
+
+def _build_inventory_email_sections(inv: dict) -> tuple[str, dict]:
+    """Return (inventory_html, full_oos_audit) for daily / ops summary emails."""
+    oos_skus = inv.get('out_of_stock', [])
+    price_items = inv.get('price_changed', [])
+    data_missing_skus = inv.get('data_missing', [])
+    ghost_restocked = inv.get('ghost_restocked', [])
+    ghost_restock_error = inv.get('ghost_restock_error', '')
+    full_oos_audit = inv.get('full_oos_audit') or empty_inventory_audit(AUDIT_SCOPE_FULL_OOS)
+
+    if oos_skus:
+        oos_thumbs = _load_product_thumbnails(oos_skus)
+        oos_rows = ''
+        for s in oos_skus:
+            thumb_url = oos_thumbs.get(s, '')
+            thumb_html = build_thumbnail_img_html(thumb_url, width=40, height=40)
+            oos_rows += f'<tr><td style="padding:4px 6px;border:1px solid #ddd;text-align:center;">{thumb_html}</td><td style="padding:4px 6px;border:1px solid #ddd;color:red;">{s}</td></tr>'
+        oos_html = f'<table style="border-collapse:collapse;font-size:13px;margin-top:4px;"><tr style="background:#ffebee;"><th style="padding:4px 6px;border:1px solid #ddd;">图片</th><th style="padding:4px 6px;border:1px solid #ddd;">SKU</th></tr>{oos_rows}</table>'
+    else:
+        oos_html = '<p style="color:#999;">无</p>'
+    data_missing_html = ''.join(f'<li style="color:#cc6600;">{s}</li>' for s in data_missing_skus) if data_missing_skus else ''
+    ghost_restock_html = ''.join(
+        f"<li style=\"color:#067647;\">{html_escape(item.get('sku', ''))} - {html_escape(item.get('status', ''))}</li>"
+        for item in ghost_restocked
+    ) if ghost_restocked else ''
+
+    if price_items:
+        sku_thumbs = _load_product_thumbnails(
+            [p.get('sku', '') if isinstance(p, dict) else str(p) for p in price_items]
+        )
+        price_rows = ''
+        for p in price_items:
+            sku = p.get('sku', '') if isinstance(p, dict) else str(p)
+            old_val = p.get('old_value', '') if isinstance(p, dict) else ''
+            new_val = p.get('new_value', '') if isinstance(p, dict) else ''
+            msg = p.get('message', '') if isinstance(p, dict) else ''
+            thumb_url = sku_thumbs.get(sku, '')
+            thumb_html = build_thumbnail_img_html(thumb_url, width=50, height=50)
+            success = bool(new_val) and 'error' not in msg.lower()
+            status_icon = '✅' if success else '⚠️'
+            price_rows += f'''<tr>
+                <td style="padding:6px 8px;border:1px solid #ddd;text-align:center;">{thumb_html}</td>
+                <td style="padding:6px 8px;border:1px solid #ddd;">{sku}</td>
+                <td style="padding:6px 8px;border:1px solid #ddd;">{old_val}</td>
+                <td style="padding:6px 8px;border:1px solid #ddd;font-weight:bold;">{new_val}</td>
+                <td style="padding:6px 8px;border:1px solid #ddd;text-align:center;">{status_icon}</td>
+            </tr>'''
+        price_html = f'''<table style="border-collapse:collapse;width:100%;margin-top:8px;font-size:13px;">
+            <tr style="background:#fff3e0;">
+                <th style="padding:6px 8px;border:1px solid #ddd;text-align:center;">图片</th>
+                <th style="padding:6px 8px;border:1px solid #ddd;text-align:left;">SKU</th>
+                <th style="padding:6px 8px;border:1px solid #ddd;text-align:left;">调整前</th>
+                <th style="padding:6px 8px;border:1px solid #ddd;text-align:left;">调整后</th>
+                <th style="padding:6px 8px;border:1px solid #ddd;text-align:center;">状态</th>
+            </tr>{price_rows}</table>'''
+    else:
+        price_html = '<p style="color:#999;">无价格变动</p>'
+
+    def _audit_table(title, audit, *, show_supplier_skus=False):
+        details = ''
+        if show_supplier_skus and audit.get('supplier_oos_skus'):
+            details += (
+                '<details><summary>供应商无货 SKU</summary><ul>'
+                + ''.join(f'<li>{html_escape(str(sku))}</li>' for sku in audit['supplier_oos_skus'])
+                + '</ul></details>'
+            )
+        if audit.get('qty_zero_skus'):
+            details += (
+                '<details><summary>eBay 库存为 0 SKU</summary><ul>'
+                + ''.join(f'<li>{html_escape(str(sku))}</li>' for sku in audit['qty_zero_skus'])
+                + '</ul></details>'
+            )
+        if audit.get('error_count'):
+            details += f'<p style="color:#b42318;">错误数: {audit.get("error_count", 0)}</p>'
+        if audit.get('error'):
+            details += f'<p style="color:#b42318;">审核异常: {html_escape(str(audit["error"]))}</p>'
+        return f'''
+        <h4>{title}</h4>
+        <table style="border-collapse:collapse;width:100%;font-size:13px;margin-bottom:8px;">
+          <tr style="background:#f5f5f5;"><td style="padding:7px;border:1px solid #ddd;">检查范围</td><td style="padding:7px;border:1px solid #ddd;">{html_escape(audit_scope_label(audit.get('audit_scope')))}</td></tr>
+          <tr><td style="padding:7px;border:1px solid #ddd;">范围总数</td><td style="padding:7px;border:1px solid #ddd;">{audit.get('scope_count', audit.get('checked_count', 0))}</td></tr>
+          <tr><td style="padding:7px;border:1px solid #ddd;">本次跳过</td><td style="padding:7px;border:1px solid #ddd;">{audit.get('skipped_count', 0)}</td></tr>
+          <tr><td style="padding:7px;border:1px solid #ddd;">检查数</td><td style="padding:7px;border:1px solid #ddd;font-weight:bold;">{audit.get('checked_count', 0)}</td></tr>
+          <tr style="background:#ffebee;"><td style="padding:7px;border:1px solid #ddd;">eBay 库存为 0</td><td style="padding:7px;border:1px solid #ddd;color:#b42318;font-weight:bold;">{audit.get('qty_zero_count', 0)}</td></tr>
+          <tr style="background:#fff8e1;"><td style="padding:7px;border:1px solid #ddd;">供应商无货</td><td style="padding:7px;border:1px solid #ddd;color:#b54708;font-weight:bold;">{audit.get('supplier_oos_count', 0)}</td></tr>
+          <tr style="background:#ecfdf3;"><td style="padding:7px;border:1px solid #ddd;">恢复数</td><td style="padding:7px;border:1px solid #ddd;color:#067647;font-weight:bold;">{audit.get('restocked_count', 0)}</td></tr>
+          <tr><td style="padding:7px;border:1px solid #ddd;">错误数</td><td style="padding:7px;border:1px solid #ddd;">{audit.get('error_count', 0)}</td></tr>
+        </table>{details}'''
+
+    inventory_html = (
+        _audit_table('增量库存同步', inv, show_supplier_skus=True)
+        + _audit_table('全量缺货审核', full_oos_audit)
+        + (f'<details><summary>🔴 增量同步缺货 SKU 列表</summary>{oos_html}</details>' if oos_skus else '')
+        + (
+            f'<details><summary>⚠️ 数据异常 SKU (有库存但无价格，需人工检查)</summary><ul>{data_missing_html}</ul></details>'
+            if data_missing_skus
+            else ''
+        )
+        + (f'<details><summary>🟢 幽灵下架恢复明细</summary><ul>{ghost_restock_html}</ul></details>' if ghost_restocked else '')
+        + (f'<p style="color:#b42318;">幽灵下架恢复检查失败: {html_escape(ghost_restock_error)}</p>' if ghost_restock_error else '')
+        + (f'<details open><summary>💰 价格变动明细</summary>{price_html}</details>' if price_items else '')
+    )
+    return inventory_html, full_oos_audit
+
+
+def send_ops_summary_email(results: dict):
+    """Sub-store ops email: inventory sync + ghost recovery only."""
+    from src.utils.email_sender import send_email
+
+    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    inv = results.get('inventory', {})
+    inventory_html, full_oos_audit = _build_inventory_email_sections(inv)
+    brand = get_store_profile().brand_name
+
+    html = f"""
+    <html><body style="font-family:Arial,sans-serif;padding:20px;max-width:700px;">
+    <h2 style="color:#1a73e8;">📦 {html_escape(brand)} 库存运营报告 - {date_str}</h2>
+    <p style="color:#666;">执行时间: {now}</p>
+    <hr style="border:1px solid #e0e0e0;">
+    <h3>库存与缺货审核</h3>
+    {inventory_html}
+    <hr style="border:1px solid #e0e0e0;">
+    <p style="color:#999;font-size:12px;">此邮件由 Dajian Listing Tool 子店 ops 调度自动发送</p>
+    </body></html>
+    """
+
+    subject = (
+        f"📦 [{brand}] 库存运营 - {date_str} | "
+        f"增量同步{inv.get('checked_count', inv.get('checked', 0))}个 "
+        f"全量审核{full_oos_audit.get('checked_count', 0)}个 "
+        f"恢复{full_oos_audit.get('restocked_count', 0)}个"
+    )
+    return send_email(subject, html)
 
 
 def send_daily_summary_email(results: dict):
@@ -2184,6 +2366,8 @@ def main():
     parser = argparse.ArgumentParser(description='每日自动任务')
     parser.add_argument('--analyze-only', action='store_true', help='仅分析采集产品')
     parser.add_argument('--sync-only', action='store_true', help='仅同步库存')
+    parser.add_argument('--ops-only', action='store_true',
+                        help='子店运营包：增量库存同步 + 幽灵缺货恢复 + 精简邮件')
     parser.add_argument('--audit-only', action='store_true', help='仅运行刊登质量审计')
     parser.add_argument('--mi-only', action='store_true',
                         help='仅运行 MI 自动机会发现 + 快照 (供 scheduler 独立定时任务解耦调用)')
@@ -2210,6 +2394,8 @@ def main():
     
     if args.sync_only:
         results['inventory'] = sync_inventory()
+    elif args.ops_only:
+        results = run_ops_daily()
     elif args.analyze_only:
         results['analyze'] = analyze_collected_products()
     elif args.mi_only:
@@ -2358,8 +2544,13 @@ def main():
     
     logger.info(f"日志已保存到: {log_file}")
     
-    # 发送汇总邮件（全量任务模式下）— --mi-only 有自带 digest, 不发每日汇总
-    if not (args.analyze_only or args.sync_only or args.mi_only):
+    # 发送汇总邮件（全量任务模式下）— --mi-only / --ops-only 各自发专用邮件
+    if args.ops_only:
+        try:
+            send_ops_summary_email(results)
+        except Exception as e:
+            logger.error(f"ops 汇总邮件发送失败: {e}")
+    elif not (args.analyze_only or args.sync_only or args.mi_only):
         try:
             send_daily_summary_email(results)
         except Exception as e:
