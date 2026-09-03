@@ -87,7 +87,7 @@ TASK_TIMEOUT = {
     'listing_audit': 10800,    # 3小时 (全量 live eBay/GIGA 内容审计)
     'source_aspect_autofix': 7200,   # 2小时 (定向写回,逐 SKU live 调用)
     'missing_video_autofix': 7200,   # 2小时 (限量视频上传/挂接)
-    'daily_tasks': 10800,      # 3小时 (含库存同步 + 智能调价)
+    'daily_tasks': 14400,      # 4小时 (周一/周四全库调价常超过 3h)
     'ops_daily': 1800,         # 30分钟 (子店: 库存同步 + 幽灵缺货恢复)
     'auto_analyze': 3600,      # 1小时
     'smart_reprice': 7200,     # 2小时
@@ -309,6 +309,18 @@ def _get_task_health(task_name):
         return {}
 
 
+_TASK_STARTED_TODAY_STATUSES = {
+    'running',
+    'recovering',
+    'success',
+    'ok',
+    'partial_success',
+    'completed_with_errors',
+    'timeout',
+    'failed',
+}
+
+
 def _task_succeeded_today(task_name, now=None):
     """判断任务今天是否已经成功执行过（用于防止重复触发）。"""
     now = now or datetime.now()
@@ -326,6 +338,27 @@ def _task_succeeded_today(task_name, now=None):
     except (TypeError, ValueError):
         return False
 
+    return last_dt.date() == now.date()
+
+
+def _task_already_started_today(task_name, now=None):
+    """True when today's health already recorded a start, including timeout/failed.
+
+    daily_tasks may only open one round per calendar day. Timeout is not success
+    (CRO still waits), but it must not trigger another apply.
+    """
+    now = now or datetime.now()
+    info = _get_task_health(task_name)
+    if not info:
+        return False
+    status = str(info.get('status', '')).lower()
+    at = info.get('at')
+    if status not in _TASK_STARTED_TODAY_STATUSES or not at:
+        return False
+    try:
+        last_dt = datetime.fromisoformat(at)
+    except (TypeError, ValueError):
+        return False
     return last_dt.date() == now.date()
 
 
@@ -904,9 +937,15 @@ def task_giga_dropship_sync():
 
 def task_daily_full():
     """每日全量任务 (分析 + 库存同步 + 报告；智能调价仅周一/周四执行)"""
-    if _task_succeeded_today('daily_tasks'):
-        logger.info("↪ 跳过每日全量任务: 今日已成功执行，避免重复发送每日汇总")
-        return True, 'Skipped (already succeeded today)'
+    if _is_ops_scheduler():
+        logger.info("↪ ops 档 --task daily 转去库存运营包，避免子店跑主店全量")
+        return task_ops_daily()
+
+    if _task_already_started_today('daily_tasks'):
+        info = _get_task_health('daily_tasks')
+        status = str(info.get('status', '')).lower() or 'unknown'
+        logger.info("↪ 跳过每日全量任务: 今日已启动过 (status=%s)，禁止二次 apply", status)
+        return True, f'Skipped (already started today: {status})'
 
     run_task(
         'daily_tasks',
@@ -1041,15 +1080,17 @@ def _latest_mi_ready_skus(limit: int, reports_dir: Path | None = None, stock_loo
     else:
         opportunities = []
 
-    from src.utils.mi_opportunity_flow import select_mi_auto_publish_skus
+    from src.utils.mi_opportunity_flow import load_today_factsheet_failed_skus, select_mi_auto_publish_skus
     from src.utils.store_profile import get_store_profile
 
     store_kind = getattr(get_store_profile(), 'store_kind', 'furniture')
+    exclude = load_today_factsheet_failed_skus(PROJECT_ROOT / 'logs')
     return select_mi_auto_publish_skus(
         opportunities,
         limit=limit,
         store_kind=store_kind,
         stock_lookup=stock_lookup,
+        exclude_skus=exclude,
     )
 
 
@@ -1070,9 +1111,36 @@ def task_auto_publish():
     except ValueError:
         limit = 10
 
-    from src.utils.mi_opportunity_flow import lookup_supplier_stock
+    from src.utils.mi_opportunity_flow import lookup_supplier_stock, summarize_mi_auto_publish_gates
 
     mi_skus = _latest_mi_ready_skus(limit, stock_lookup=lookup_supplier_stock)
+    try:
+        reports = PROJECT_ROOT / 'reports'
+        today = datetime.now().strftime('%Y%m%d')
+        snapshots = sorted(
+            reports.glob(f'mi_opportunities_{today}_*.json'),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        ) if reports.is_dir() else []
+        snapshot_opps = []
+        if snapshots:
+            data = json.loads(snapshots[0].read_text(encoding='utf-8'))
+            if isinstance(data, list):
+                snapshot_opps = data
+            elif isinstance(data, dict):
+                snapshot_opps = data.get('opportunities') or []
+        gates = summarize_mi_auto_publish_gates(snapshot_opps)
+        logger.info(
+            "[AUTO-PUBLISH] snapshot gates: READY=%s score<%s=%s not_recommended=%s eligible=%s",
+            gates['ready'],
+            gates['min_score'],
+            gates['below_min_score'],
+            gates['not_recommended'],
+            len(mi_skus),
+        )
+    except Exception as exc:
+        logger.info("[AUTO-PUBLISH] snapshot gates unavailable: %s", exc)
+
     if not mi_skus:
         msg = 'Skipped (no eligible READY MI opportunities in latest snapshot)'
         update_health('auto_publish', 'success', msg)
@@ -1909,6 +1977,10 @@ def recover_missed_tasks(log_when_clean=True):
 
             # 今天已经成功执行过，不再补跑
             if _task_succeeded_today(task_name, now=now):
+                continue
+
+            # daily_tasks: 当日已启动过（含 timeout/failed）禁止再开一轮
+            if task_name == 'daily_tasks' and _task_already_started_today(task_name, now=now):
                 continue
             
             # 未到补跑窗口（给定时任务留出执行时间）
