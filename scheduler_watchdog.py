@@ -27,7 +27,7 @@ STALE_HEARTBEAT_MINUTES = 15
 # 关键任务巡检表。过了 daemon 的恢复窗口仍未 success → 主动补跑一次。
 # 统一改走 scheduler_daemon.py --task，复用同一套防重和健康状态写入。
 CRITICAL_DAILY_TASKS = [
-        {'health_name': 'daily_tasks', 'deadline': '09:50', 'daemon_task': 'daily'},
+        {'health_name': 'daily_tasks', 'deadline': '09:50', 'daemon_task': 'daily', 'skip_if_started_today': True},
         {'health_name': 'mi_self_check', 'deadline': '10:15', 'daemon_task': 'mi_self_check'},
         {'health_name': 'ad_restore', 'deadline': '09:50', 'daemon_task': 'ad_restore'},
         {'health_name': 'blacklist_cleanup', 'deadline': '09:55', 'daemon_task': 'blacklist_cleanup'},
@@ -44,6 +44,26 @@ CRITICAL_DAILY_TASKS = [
         {'health_name': 'listing_audit', 'deadline': '11:45', 'daemon_task': 'listing_audit'},
         {'health_name': 'health_check', 'deadline': '20:10', 'daemon_task': 'health'},
 ]
+
+CRITICAL_OPS_DAILY_TASKS = [
+        {'health_name': 'ops_daily', 'deadline': '09:50', 'daemon_task': 'ops_daily'},
+]
+
+
+def _is_ops_scheduler():
+    """Match daemon scheduler_profile=ops so substores never recover the full catalog."""
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from src.utils.store_profile import get_store_profile
+        return bool(get_store_profile().is_ops_scheduler)
+    except Exception:
+        return False
+
+
+def _watchdog_critical_tasks():
+    if _is_ops_scheduler():
+        return CRITICAL_OPS_DAILY_TASKS
+    return CRITICAL_DAILY_TASKS
 
 
 def _daemon_task_command(task_alias):
@@ -262,6 +282,29 @@ def _task_in_progress_today(health, task_name, today):
         return False
 
 
+def _task_already_started_today(health, task_name, today):
+    """daily_tasks: 当日已启动过（含 timeout/failed）则不再补跑."""
+    info = _get_task_info(health, task_name)
+    if str(info.get('status', '')).lower() not in {
+        'running',
+        'recovering',
+        'success',
+        'ok',
+        'partial_success',
+        'completed_with_errors',
+        'timeout',
+        'failed',
+    }:
+        return False
+    at = info.get('at')
+    if not at:
+        return False
+    try:
+        return datetime.fromisoformat(at).date() == today
+    except Exception:
+        return False
+
+
 def _get_task_info(health, task_name):
     if task_name == 'mi_self_check':
         info = dict((health.get('mi_self_check') or {}))
@@ -301,7 +344,7 @@ def check_overdue_critical_tasks():
     health = read_health()
     today = datetime.now().date()
     now = datetime.now()
-    for task in CRITICAL_DAILY_TASKS:
+    for task in _watchdog_critical_tasks():
         name = str(task['health_name'])
         task_alias = str(task['daemon_task'])
         weekday = task.get('weekday')
@@ -322,6 +365,8 @@ def check_overdue_critical_tasks():
         if _task_succeeded_today(health, name, today):
             continue
         if _task_in_progress_today(health, name, today):
+            continue
+        if task.get('skip_if_started_today') and _task_already_started_today(health, name, today):
             continue
         # 防短时间反复触发: 看 last_recovery_at
         recovery = (health.get('watchdog_recovery') or {}).get(name) or {}

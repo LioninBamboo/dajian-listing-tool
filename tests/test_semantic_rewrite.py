@@ -952,7 +952,11 @@ def test_w3636_style_plan_has_template_and_passes_layers(monkeypatch):
     result = plan_rewrite(conn, FakeDajian(snap), ebay, "W3636SIM")
     assert isinstance(result, RewritePlan), getattr(result, "reason", result)
     after_desc = (result.after.get("description") or "").lower()
-    assert "aquaverve" in after_desc
+    from src.utils.store_profile import get_store_profile
+
+    brand = str(get_store_profile().brand_name or "").strip().lower()
+    assert brand
+    assert brand in after_desc
     assert "key features" in after_desc
     assert "us warehouse" in after_desc
     assert "trusted seller" in after_desc
@@ -1033,8 +1037,8 @@ def test_cli_derive_queue(tmp_path, monkeypatch):
         from scripts.semantic_rewrite import _score_audit_for_queue
 
         scores = _score_audit_for_queue(audit)
-        assert scores["A1"] == 2
-        assert scores["A2"] == 1
+        assert scores["A1"] == 20
+        assert scores["A2"] == 10
         ordered = sorted(scores.keys(), key=lambda s: scores[s], reverse=True)
         assert ordered[0] == "A1"
     finally:
@@ -1752,13 +1756,13 @@ class TestQueueCoversEveryActionableDetector:
             "assembly_description_contradiction",
             "assembly_required_mismatch",
         ):
-            assert _score_audit_for_queue(self._audit(t)) == {"W1": 1}, t
+            assert _score_audit_for_queue(self._audit(t)) == {"W1": 10}, t
 
     def test_original_prefix_families_still_reach_the_queue(self):
         from scripts.semantic_rewrite import _score_audit_for_queue
 
         for t in ("semantic_material", "claim_diff", "hallucinated_leather"):
-            assert _score_audit_for_queue(self._audit(t)) == {"W1": 1}, t
+            assert _score_audit_for_queue(self._audit(t)) == {"W1": 10}, t
 
     def test_non_actionable_type_is_still_excluded(self):
         """category_mismatch 必须留在队列外——类目改动是本仓库后果最重的一类,
@@ -1776,6 +1780,64 @@ class TestQueueCoversEveryActionableDetector:
             ]
         }
         assert _score_audit_for_queue(audit) == {}
+
+    def test_high_semantic_feature_reaches_the_queue(self):
+        from scripts.semantic_rewrite import _score_audit_for_queue
+
+        audit = {
+            "issues": [
+                {"sku": "H1", "issues": [{"type": "semantic_feature", "severity": "HIGH"}]},
+            ]
+        }
+        assert _score_audit_for_queue(audit) == {"H1": 1}
+
+    def test_critical_ranks_above_high_actionable(self):
+        from scripts.semantic_rewrite import _score_audit_for_queue
+
+        audit = {
+            "issues": [
+                {"sku": "HIGH1", "issues": [{"type": "semantic_feature", "severity": "HIGH"}]},
+                {"sku": "CRIT1", "issues": [{"type": "semantic_material", "severity": "CRITICAL"}]},
+            ]
+        }
+        scores = _score_audit_for_queue(audit)
+        ordered = sorted(scores, key=lambda sku: scores[sku], reverse=True)
+        assert ordered == ["CRIT1", "HIGH1"]
+        assert scores["CRIT1"] == 10
+        assert scores["HIGH1"] == 1
+
+    def test_morning_audit_high_semantic_feature_skus_enter_derived_scores(self, tmp_path):
+        """Fixture shaped like listing_audit_fix_20260903_114609.json: HIGH semantic_feature must queue."""
+        from scripts.semantic_rewrite import pick_latest_full_corpus_audit
+
+        path = tmp_path / "listing_audit_fix_20260903_114609.json"
+        path.write_text(
+            json.dumps({
+                "total_published": 1200,
+                "issues": [
+                    {
+                        "sku": "W206P305082",
+                        "issues": [{"type": "semantic_feature", "severity": "HIGH"}],
+                    },
+                    {
+                        "sku": "CRIT-SKU",
+                        "issues": [{"type": "semantic_material", "severity": "CRITICAL"}],
+                    },
+                    {
+                        "sku": "MED-SKU",
+                        "issues": [{"type": "semantic_feature", "severity": "MEDIUM"}],
+                    },
+                ],
+            }),
+            encoding="utf-8",
+        )
+        picked = pick_latest_full_corpus_audit([path])
+        assert picked is not None
+        _chosen, scores = picked
+        assert "W206P305082" in scores
+        assert scores["W206P305082"] == 1
+        assert scores["CRIT-SKU"] == 10
+        assert "MED-SKU" not in scores
 
     def test_actionable_predicate_is_explicit_about_membership(self):
         from scripts.semantic_rewrite import queue_type_is_actionable

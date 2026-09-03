@@ -106,15 +106,19 @@ def _score_audit_for_queue(data: dict) -> dict[str, int]:
         sku = row.get("sku")
         if not sku:
             continue
-        crit = 0
+        points = 0
         for iss in row.get("issues") or []:
             if not isinstance(iss, dict):
                 continue
-            sev = str(iss.get("severity") or "")
-            if sev.upper() == "CRITICAL" and queue_type_is_actionable(iss.get("type")):
-                crit += 1
-        if crit:
-            scores[sku] = scores.get(sku, 0) + crit
+            if not queue_type_is_actionable(iss.get("type")):
+                continue
+            sev = str(iss.get("severity") or "").upper()
+            if sev == "CRITICAL":
+                points += 10
+            elif sev == "HIGH":
+                points += 1
+        if points:
+            scores[sku] = scores.get(sku, 0) + points
     return scores
 
 
@@ -158,9 +162,11 @@ def pick_latest_full_corpus_audit(
 
 
 def derive_queue_from_latest_audit(limit: int | None = None) -> list[str]:
-    """Project §8.2: latest *non-empty* listing_audit_fix_*.json → semantic CRITICAL queue.
+    """Project §8.2: latest *non-empty* listing_audit_fix_*.json → rewrite queue.
 
-    Single-SKU dry-run artifacts (0 issue rows) are skipped so the queue is not
+    CRITICAL actionable issues score 10; HIGH actionable issues score 1 so they
+    still enter the queue behind CRITICAL. MEDIUM/LOW stay out. Single-SKU
+    dry-run artifacts (0 scored rows) are skipped so the queue is not
     accidentally wiped by a later tiny report. Full-corpus reports
     (total_published > 500) always beat single-SKU dry-runs; among full-corpus
     reports the newest mtime wins.

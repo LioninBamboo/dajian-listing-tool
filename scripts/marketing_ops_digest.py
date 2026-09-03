@@ -45,7 +45,7 @@ def _build_mi_auto_publish_argv():
     import os
     from datetime import datetime
 
-    from src.utils.mi_opportunity_flow import lookup_supplier_stock, select_mi_auto_publish_skus
+    from src.utils.mi_opportunity_flow import lookup_supplier_stock, select_mi_auto_publish_skus, load_today_factsheet_failed_skus
     from src.utils.store_profile import get_store_profile
 
     enable = os.getenv("ENABLE_MI_AUTO_PUBLISH", "").strip().lower() in ("1", "true", "yes", "on")
@@ -68,13 +68,17 @@ def _build_mi_auto_publish_argv():
         return None, "MI 快照无法读取"
     opportunities = payload if isinstance(payload, list) else (payload.get("opportunities") or [])
     store_kind = getattr(get_store_profile(), "store_kind", "furniture")
+    exclude = load_today_factsheet_failed_skus(ROOT / "logs")
     skus = select_mi_auto_publish_skus(
         opportunities,
         limit=limit,
         store_kind=store_kind,
         stock_lookup=lookup_supplier_stock,
+        exclude_skus=exclude,
     )
     if not skus:
+        if exclude:
+            return None, "今日已有 FactSheet 失败的 SKU 已跳过，没有新的过门槛 READY"
         return None, "没有过门槛的 READY MI SKU（推荐分/店定位/库存）"
     argv = [
         str(ROOT / "batch_publish.py"),

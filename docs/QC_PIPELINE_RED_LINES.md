@@ -4,6 +4,7 @@
 
 - **禁止裸 `--fix`**：对 `audit_fix_active_listings.py` / 等价写回脚本，不传 `--fix-key`（或 Motors 侧等价白名单）等于允许全部 key，含 `categoryId`。历史事故：室内软包被改判 Outdoor Daybeds 并 republish。
 - **禁止**把「内容审计」计划任务配成全量写 live。
+- **ops watchdog 任务表必须与 `scheduler_profile` 一致**：`ops` 店只允许补跑 `ops_daily`（可选 `order_recheck`），禁止补跑主店 `daily` / CRO / `listing_audit` / `ad_restore`。`--task daily` 在 ops 下必须转去 `daily_tasks.py --ops-only`。
 - **禁止**三店共用同一个 Windows 任务名 / 同一个 Global Mutex（主店 `Dajian*`，GrovePop 必须用 `GrovePop*`）。
 
 ## 正确闭环

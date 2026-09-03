@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+import json
+from collections.abc import Callable, Collection, Iterable
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from src.services.product_router import ARTTOY, AUTO, FURNITURE, classify_product
@@ -103,22 +106,26 @@ def select_mi_auto_publish_skus(
     limit: int = 10,
     store_kind: str = "furniture",
     stock_lookup: Callable[[str], int | None] | None = None,
+    exclude_skus: Collection[str] | None = None,
 ) -> list[str]:
     """READY MI SKUs that are allowed to enter auto-publish.
 
     Shared by scheduler_daemon and marketing_ops_digest. Stock lookup is
     optional: ``0`` skips the SKU, ``None`` (unknown / lookup failed) does not.
+    ``exclude_skus`` drops SKUs already FactSheet-failed today so digest
+    does not retry the same draft every morning.
     """
     cap = max(1, int(limit or 10))
     selected: list[str] = []
     seen: set[str] = set()
+    blocked = {str(sku).strip() for sku in (exclude_skus or []) if str(sku).strip()}
 
     for opportunity in opportunities or []:
         if not isinstance(opportunity, dict):
             continue
         sku = str(opportunity.get("sku") or "").strip()
         status = str(opportunity.get("status") or "").strip().upper()
-        if not sku or sku in seen or status not in _READY_STATUSES:
+        if not sku or sku in seen or sku in blocked or status not in _READY_STATUSES:
             continue
         if not _is_recommended(opportunity):
             continue
@@ -137,3 +144,60 @@ def select_mi_auto_publish_skus(
         if len(selected) >= cap:
             break
     return selected
+
+
+def summarize_mi_auto_publish_gates(
+    opportunities: Iterable[dict[str, Any]] | None,
+) -> dict[str, int]:
+    """Counts for skip observability. Does not change the publish threshold."""
+    ready = 0
+    below_min_score = 0
+    not_recommended = 0
+    for opportunity in opportunities or []:
+        if not isinstance(opportunity, dict):
+            continue
+        status = str(opportunity.get("status") or "").strip().upper()
+        if status not in _READY_STATUSES:
+            continue
+        ready += 1
+        if str(opportunity.get("recommendation") or "").startswith("❌"):
+            not_recommended += 1
+        if _opportunity_score(opportunity) < MI_AUTO_PUBLISH_MIN_SCORE:
+            below_min_score += 1
+    return {
+        "ready": ready,
+        "below_min_score": below_min_score,
+        "not_recommended": not_recommended,
+        "min_score": MI_AUTO_PUBLISH_MIN_SCORE,
+    }
+
+
+def load_today_factsheet_failed_skus(
+    logs_dir: str | Path,
+    *,
+    today: str | None = None,
+) -> set[str]:
+    """SKUs whose today's publish_results already recorded a FactSheet error."""
+    day = today or datetime.now().strftime("%Y%m%d")
+    root = Path(logs_dir)
+    failed: set[str] = set()
+    if not root.is_dir():
+        return failed
+    for path in root.glob(f"publish_results_{day}_*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        rows = payload if isinstance(payload, list) else []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("status") or "").lower() != "error":
+                continue
+            message = str(row.get("message") or "")
+            if "factsheet" not in message.lower():
+                continue
+            sku = str(row.get("sku") or "").strip()
+            if sku:
+                failed.add(sku)
+    return failed
