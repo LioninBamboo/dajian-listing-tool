@@ -416,11 +416,12 @@ class InventorySyncService:
                         return True, None, None, None
                 except Exception:
                     pass
-                # 全部 API 失败
+                # 全部 API 失败 / 空数据 → 库存未知（勿当无货清零）。
+                # Region restriction / 权限异常时也会走到这里；误判无货会把整店刷成 0。
                 if price_api_error:
                     raise price_api_error
-                self.logger.warning(f"  {sku}: 所有 API 均返回空数据，视为无库存")
-                return False, None, None, 0
+                self.logger.warning(f"  {sku}: 所有 API 均返回空数据，视为库存未知（保持 eBay 库存不变）")
+                return None, None, None, None
             
             if not inventory:
                 # 库存 API 失败但价格 API 成功 → 仅基于 skuAvailable 判断
@@ -433,7 +434,11 @@ class InventorySyncService:
                     current_price = float(raw_price) if raw_price else None
                     shipping_cost = float(price_info.get('shippingFee') or 0)
                     return True, current_price, shipping_cost, None
-                return False, None, None, 0
+                # 价格有返回但不可售 / 无库存信号不明 → 未知，勿清零
+                if price_info and price_info.get('skuAvailable') is False:
+                    return False, None, None, 0
+                self.logger.warning(f"  {sku}: 库存 API 空且无明确 skuAvailable，视为库存未知")
+                return None, None, None, None
 
             buyer_inv = inventory.get('buyerInventoryInfo') or {}
             seller_inv = inventory.get('sellerInventoryInfo') or {}
@@ -1143,30 +1148,17 @@ class InventorySyncService:
                         supplier_in_stock=None,
                     )
                 
-                # 产品在收藏夹中但API异常 → 短暂故障，用连续失败计数
+                # 产品在收藏夹中但API异常 → 短暂故障 / Region restriction。
+                # 连续失败也不清零：区域限制会让全店 API 连续失败，清零会误伤整店。
                 consecutive_skips = self._get_consecutive_skip_count(sku)
-                if consecutive_skips >= 2:
-                    self.logger.warning(
-                        f"  {sku}: 连续 {consecutive_skips+1} 次无法获取库存信息，视为无库存并下架")
-                    if not _set_ebay_quantity_zero():
-                        return SyncResult(
-                            sku=sku,
-                            action='error',
-                            message='连续获取大建库存失败，且 eBay 库存归零失败',
-                            supplier_in_stock=None,
-                        )
-                    return SyncResult(
-                        sku=sku,
-                        action='out_of_stock',
-                        old_value='有库存',
-                        new_value='库存设为0',
-                        message=f'连续 {consecutive_skips+1} 次无法获取大建库存，已将 eBay 库存设为 0',
-                        supplier_in_stock=None,
-                    )
                 return SyncResult(
                     sku=sku,
                     action='skipped',
-                    message=f'无法获取大建库存信息 (连续第 {consecutive_skips+1} 次)'
+                    message=(
+                        f'无法获取大建库存信息 (连续第 {consecutive_skips+1} 次，'
+                        f'保持 eBay 库存不变)'
+                    ),
+                    supplier_in_stock=None,
                 )
             
             # 3. 处理无库存情况

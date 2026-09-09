@@ -1,0 +1,171 @@
+{
+  "total": 16,
+  "api_readable": 16,
+  "blocked": 0,
+  "blocked_skus": [],
+  "readable_skus": [
+    "W714S02067",
+    "W714S02068",
+    "W714S02069",
+    "W714S02070",
+    "W714S02058",
+    "W714S02059",
+    "W714S02060",
+    "W714S02061",
+    "W714S02049",
+    "W714S02050",
+    "W714S02051",
+    "W714S02052",
+    "W714S02040",
+    "W714S02041",
+    "W714S02042",
+    "W714S02043"
+  ],
+  "rows": [
+    {
+      "sku": "W714S02067",
+      "api_readable": true,
+      "quantity": 30,
+      "error": null,
+      "in_stock": true,
+      "price": 286.0,
+      "shipping_fee": 79.48
+    },
+    {
+      "sku": "W714S02068",
+      "api_readable": true,
+      "quantity": 30,
+      "error": null,
+      "in_stock": true,
+      "price": 371.0,
+      "shipping_fee": 100.39
+    },
+    {
+      "sku": "W714S02069",
+      "api_readable": true,
+      "quantity": 17,
+      "error": null,
+      "in_stock": true,
+      "price": 456.0,
+      "shipping_fee": 121.3
+    },
+    {
+      "sku": "W714S02070",
+      "api_readable": true,
+      "quantity": 25,
+      "error": null,
+      "in_stock": true,
+      "price": 401.0,
+      "shipping_fee": 117.07
+    },
+    {
+      "sku": "W714S02058",
+      "api_readable": true,
+      "quantity": 31,
+      "error": null,
+      "in_stock": true,
+      "price": 286.0,
+      "shipping_fee": 79.48
+    },
+    {
+      "sku": "W714S02059",
+      "api_readable": true,
+      "quantity": 31,
+      "error": null,
+      "in_stock": true,
+      "price": 371.0,
+      "shipping_fee": 100.39
+    },
+    {
+      "sku": "W714S02060",
+      "api_readable": true,
+      "quantity": 18,
+      "error": null,
+      "in_stock": true,
+      "price": 456.0,
+      "shipping_fee": 121.3
+    },
+    {
+      "sku": "W714S02061",
+      "api_readable": true,
+      "quantity": 25,
+      "error": null,
+      "in_stock": true,
+      "price": 401.0,
+      "shipping_fee": 117.07
+    },
+    {
+      "sku": "W714S02049",
+      "api_readable": true,
+      "quantity": 31,
+      "error": null,
+      "in_stock": true,
+      "price": 286.0,
+      "shipping_fee": 79.48
+    },
+    {
+      "sku": "W714S02050",
+      "api_readable": true,
+      "quantity": 31,
+      "error": null,
+      "in_stock": true,
+      "price": 371.0,
+      "shipping_fee": 100.39
+    },
+    {
+      "sku": "W714S02051",
+      "api_readable": true,
+      "quantity": 18,
+      "error": null,
+      "in_stock": true,
+      "price": 456.0,
+      "shipping_fee": 121.3
+    },
+    {
+      "sku": "W714S02052",
+      "api_readable": true,
+      "quantity": 25,
+      "error": null,
+      "in_stock": true,
+      "price": 401.0,
+      "shipping_fee": 117.07
+    },
+    {
+      "sku": "W714S02040",
+      "api_readable": true,
+      "quantity": 28,
+      "error": null,
+      "in_stock": true,
+      "price": 286.0,
+      "shipping_fee": 79.48
+    },
+    {
+      "sku": "W714S02041",
+      "api_readable": true,
+      "quantity": 28,
+      "error": null,
+      "in_stock": true,
+      "price": 371.0,
+      "shipping_fee": 100.39
+    },
+    {
+      "sku": "W714S02042",
+      "api_readable": true,
+      "quantity": 16,
+      "error": null,
+      "in_stock": true,
+      "price": 456.0,
+      "shipping_fee": 121.3
+    },
+    {
+      "sku": "W714S02043",
+      "api_readable": true,
+      "quantity": 22,
+      "error": null,
+      "in_stock": true,
+      "price": 401.0,
+      "shipping_fee": 117.07
+    }
+  ],
+  "hint": "Blocked SKUs are not in DaJian buyer favorites (or API denied). Open each on GIGA with the browser extension and click the heart, then re-run this gate before collect/publish."
+}

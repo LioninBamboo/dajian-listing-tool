@@ -2225,6 +2225,50 @@ def description_uses_store_template(text: str | None, profile: Any = None) -> bo
     return description_has_store_banner(text, profile) and description_has_store_footer(text, profile)
 
 
+def _store_footer_html(profile: Any = None) -> str:
+    profile = profile if profile is not None else _store_profile_or_none()
+    footer_html = str(getattr(profile, "footer_html", "") or "").strip()
+    if footer_html:
+        return footer_html
+    l1 = html_lib.escape(str(getattr(profile, "description_footer_line1", "") or ""))
+    l2 = html_lib.escape(str(getattr(profile, "description_footer_line2", "") or ""))
+    return (
+        '<div style="text-align:center;padding:20px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
+        f'<p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">{l1}</p>'
+        f'<p style="margin:8px 0 0;font-size:11px;color:#808080">{l2}</p>'
+        "</div>"
+    )
+
+
+def dedupe_store_description_headers(description: str | None, profile: Any = None) -> str:
+    """Remove nested duplicate brand banner+title blocks (keep one shell).
+
+    Happens when a description that already includes the AquaVerve header is
+    passed through ``build_store_description_shell`` again as the body.
+    """
+    profile = profile if profile is not None else _store_profile_or_none()
+    html = description or ""
+    brand = str(getattr(profile, "brand_name", "AquaVerve") or "AquaVerve").upper()
+    if html.upper().count(brand) <= 1:
+        return html
+
+    # Strip one leading banner + title-bar pair at a time while duplicates remain.
+    header_re = re.compile(
+        r"(?is)"
+        r'<div style="text-align:center;padding:30px[^"]*"[^>]*>.*?</div>\s*'
+        r'<div style="background:#f8f9fa;padding:25px[^"]*"[^>]*>\s*'
+        r"<h2[^>]*>.*?</h2>\s*</div>"
+    )
+    guard = 0
+    while html.upper().count(brand) > 1 and guard < 5:
+        guard += 1
+        new_html, n = header_re.subn("", html, count=1)
+        if n == 0 or new_html == html:
+            break
+        html = new_html
+    return html
+
+
 def build_store_description_shell(
     *,
     title: str,
@@ -2235,18 +2279,14 @@ def build_store_description_shell(
     profile = profile if profile is not None else _store_profile_or_none()
     brand = html_lib.escape(str(getattr(profile, "brand_name", "AquaVerve") or "AquaVerve").upper())
     tagline = html_lib.escape(str(getattr(profile, "brand_tagline", "") or ""))
-    footer_html = str(getattr(profile, "footer_html", "") or "").strip()
-    if not footer_html:
-        l1 = html_lib.escape(str(getattr(profile, "description_footer_line1", "") or ""))
-        l2 = html_lib.escape(str(getattr(profile, "description_footer_line2", "") or ""))
-        footer_html = (
-            '<div style="text-align:center;padding:20px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
-            f'<p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">{l1}</p>'
-            f'<p style="margin:8px 0 0;font-size:11px;color:#808080">{l2}</p>'
-            "</div>"
-        )
+    footer_html = _store_footer_html(profile)
     safe_title = html_lib.escape(_clean_text(title) or brand)
-    body = body_html or ""
+    # Never nest a second banner/title when the body already carries one.
+    body = dedupe_store_description_headers(body_html or "", profile)
+    if description_has_store_banner(body, profile):
+        if not description_has_store_footer(body, profile):
+            body = f"{body}{footer_html}"
+        return body
     return (
         '<div style="max-width:900px;margin:0 auto;font-family:Arial,sans-serif;color:#1a1a1a;line-height:1.7">'
         '<div style="text-align:center;padding:30px 15px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
@@ -2279,7 +2319,7 @@ def ensure_store_description_template(
     - Already good store template → unchanged
     """
     profile = profile if profile is not None else _store_profile_or_none()
-    desc = description or ""
+    desc = dedupe_store_description_headers(description or "", profile)
 
     # Specialized templates (arttoy_hype, auto_technical) emit their OWN complete
     # banner + footer. The furniture shell here must not re-wrap them — doing so
@@ -2340,7 +2380,14 @@ def ensure_store_description_template(
             and not description_contains_cjk(rebuilt)
             and description_uses_store_template(rebuilt, profile)
         ):
-            return rebuilt
+            return dedupe_store_description_headers(rebuilt, profile)
+
+    # Already has the brand banner: never wrap again (that creates double headers).
+    # Only append a missing footer when needed.
+    if description_has_store_banner(desc, profile) and not has_cjk:
+        if not description_has_store_footer(desc, profile):
+            desc = f"{desc}{_store_footer_html(profile)}"
+        return dedupe_store_description_headers(desc, profile)
 
     # English body without shell (or rebuild failed): wrap existing copy so
     # assembly notes / specs rows from normalize are not discarded.

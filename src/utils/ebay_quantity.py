@@ -197,6 +197,24 @@ def fetch_live_supplier_quantity(
     return max(0, quantity)
 
 
+def _db_collected_stock(sku: str) -> Optional[int]:
+    """Best-effort local stock from CollectedProduct when live supplier API is blocked."""
+    try:
+        from src.db.collection_db import SessionLocal
+        from src.db.collection_models import CollectedProduct
+
+        db = SessionLocal()
+        try:
+            row = db.query(CollectedProduct).filter_by(sku=sku).first()
+            if row is None or row.stock is None:
+                return None
+            return max(0, int(row.stock))
+        finally:
+            db.close()
+    except Exception:
+        return None
+
+
 def resolve_publish_quantity(
     sku: str,
     *,
@@ -214,6 +232,18 @@ def resolve_publish_quantity(
             logger.warning(f"  [{sku}] Failed to fetch live supplier quantity: {exc}")
 
     if quantity is None:
+        db_stock = _db_collected_stock(sku)
+        if db_stock is not None and db_stock > 0:
+            if logger is not None:
+                logger.warning(
+                    f"  [{sku}] Supplier quantity lookup unavailable; "
+                    f"using CollectedProduct.stock={db_stock}"
+                )
+            return normalize_ebay_listing_quantity(
+                db_stock,
+                fallback=fallback,
+                max_quantity=max_quantity,
+            )
         fallback_quantity = (
             _publish_failure_fallback_quantity()
             if lookup_failure_fallback is None

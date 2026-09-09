@@ -106,8 +106,8 @@ PUBLISHED
 | `10:05` | `mi_check` | MI 自检，检查快照 / digest / 长周期 trend / 状态文件 |
 | `11:30` | `listing_audit` | `scripts/audit_fix_active_listings.py --live --email`，detect-only；对 live eBay listing 与 GIGA 原文做内容核对并发邮件 |
 | `12:10` | `source_aspect_autofix` | 白名单 `--fix-key` + `--email --fix`（禁止裸 `--fix`）；见 `docs/QC_PIPELINE_RED_LINES.md` |
-| `12:30` | `semantic_rewrite` | 语义改写闭环 `--from-daily-audit --limit 40 --apply --email` |
-| `13:00` | `missing_video_autofix` | 缺视频限量同步 `--fix-key __sync_video__ --limit 30 --email --fix` |
+| `12:30` | `semantic_rewrite` | 语义改写闭环 `--from-daily-audit --limit 80 --apply --email` |
+| `13:00` | `missing_video_autofix` | 缺视频限量同步 `--fix-key __sync_video__ --limit 80 --email --fix` |
 | `09:45` | `bl_cleanup` | 广告黑名单自动清理 |
 | `09:50` | `guard_alert` | 守门员异常率告警 |
 | `09:55` | `cro_monthly_report` | CRO 效果验证 / 阈值反馈门控 |
@@ -272,6 +272,14 @@ qc_profile: arttoy   # AquaRides 用 motors
 
 - `增量库存同步`：只统计本次实际进入 `InventorySyncService.sync_all()` 的 SKU；`检查数`是本次实际处理数，另显示本次范围总数和跳过数。
 - `全量缺货审核`：独立复核全部 `PUBLISHED` 链接的 eBay 实时数量，再交叉检查供应商库存；`检查数`是全量审核实际完成数。
+
+单供应商批量刊登前，先跑收藏/API 可读性闸门（未收藏的 SKU 无法查库存/价格）：
+
+```bash
+python scripts/supplier_favorite_api_gate.py --sku-list tools/w714_listing/B4_skus.txt --require-all
+```
+
+流程说明见 `tools/w714_listing/SUPPLIER_BATCH_PLAYBOOK.md`。
 
 两栏统一返回 `audit_scope`、`checked_count`、`qty_zero_count`、`supplier_oos_count`、`restocked_count`、`error_count`。每日主流程只执行一次全量缺货审核，销售健康诊断复用结果但不再重复调用数量审核。
 

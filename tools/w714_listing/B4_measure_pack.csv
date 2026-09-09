@@ -1,0 +1,37 @@
+﻿sku,is_combo,combo_box_count,net_weight_lbs,gross_weight_lbs,child_combo,assembled_length_in,assembled_width_in,assembled_height_in,package_length_in,package_width_in,package_height_in,page_price,page_shipping,giga_url,status,notes
+W714S01942,True,2,99.0,116.6,W714P499767x1 | W714P499770x1,70.8,35.4,34.6,,,,220.16,76.82,https://www.gigab2b.com/product/W714S01942,collected,"assembled_from_vl,missing_package_lwh"
+W714S01943,True,3,123.2,145.2,W714P499767x1 | W714P499770x1 | W714P499779x1,70.8,34.6,34.2,32.0,23.0,8.0,293.26,96.14,https://www.gigab2b.com/product/W714S01943,collected,"assembled_from_vl,package_from_children"
+W714S01944,True,4,147.4,173.8,W714P499767x1 | W714P499770x1 | W714P499779x2,70.8,35.4,34.6,32.0,23.0,8.0,366.36,115.46,https://www.gigab2b.com/product/W714S01944,collected,"assembled_from_vl,package_from_children"
+W714S01945,True,3,137.5,161.7,W714P499767x1 | W714P499770x1 | W714P499776x1,101.1,34.6,34.2,,,,310.46,113.2,https://www.gigab2b.com/product/W714S01945,collected,"assembled_from_vl,missing_package_lwh"
+W714S01946,True,4,161.7,190.3,W714P499767x1 | W714P499770x1 | W714P499776x1 | W714P499779x1,101.1,58.2,34.6,32.0,23.0,8.0,383.56,132.52,https://www.gigab2b.com/product/W714S01946,collected,"assembled_from_vl,package_from_children"
+W714P499767,False,1,49.5,58.3,,,,,,,,,,https://www.gigab2b.com/product/W714P499767,pending,
+W714P499770,False,1,49.5,58.3,,,,,,,,,,https://www.gigab2b.com/product/W714P499770,pending,
+W714P499776,False,1,38.5,45.1,,,,,,,,,,https://www.gigab2b.com/product/W714P499776,pending,
+W714P499779,False,1,24.2,28.6,,30.30,24.00,18.90,32.00,23.00,8.00,73.1,19.32,https://www.gigab2b.com/product/W714P499779,collected,
+W714S01960,True,2,99.0,116.6,W714P499778x1 | W714P499780x1,70.8,35.4,34.6,32.0,31.0,11.0,220.16,76.82,https://www.gigab2b.com/product/W714S01960,collected,"assembled_from_vl,package_from_children"
+W714S01961,True,3,123.2,145.2,W714P499778x1 | W714P499780x1 | W714P499782x1,70.8,34.6,34.2,32.0,31.0,11.0,293.26,96.14,https://www.gigab2b.com/product/W714S01961,collected,"assembled_from_vl,package_from_children"
+W714S01962,True,4,147.4,173.8,W714P499778x1 | W714P499780x1 | W714P499782x2,70.8,35.4,34.6,32.0,31.0,11.0,366.36,115.46,https://www.gigab2b.com/product/W714S01962,collected,"assembled_from_vl,package_from_children"
+W714S01963,True,3,137.5,161.7,W714P499778x1 | W714P499780x1 | W714P499781x1,101.1,34.6,34.2,32.0,31.0,11.0,310.46,113.2,https://www.gigab2b.com/product/W714S01963,collected,"assembled_from_vl,package_from_children"
+W714S01964,True,4,161.7,190.3,W714P499778x1 | W714P499780x1 | W714P499781x1 | W714P499782x1,101.1,58.2,34.6,32.0,31.0,11.0,383.56,132.52,https://www.gigab2b.com/product/W714S01964,collected,"assembled_from_vl,package_from_children"
+W714P499778,False,1,49.5,58.3,,35.40,34.30,34.60,32.00,31.00,11.00,110.08,38.41,https://www.gigab2b.com/product/W714P499778,collected,
+W714P499780,False,1,49.5,58.3,,35.40,34.30,34.60,32.00,31.00,11.00,110.08,38.41,https://www.gigab2b.com/product/W714P499780,collected,
+W714P499781,False,1,38.5,45.1,,30.30,34.30,34.60,32.00,31.00,10.00,90.3,36.38,https://www.gigab2b.com/product/W714P499781,collected,
+W714P499782,False,1,24.2,28.6,,30.30,24.00,18.90,32.00,23.00,8.00,73.1,19.32,https://www.gigab2b.com/product/W714P499782,collected,
+W714S01923,True,2,99.0,116.6,W714P499651x1 | W714P499653x1,70.8,35.4,34.6,,,,220.16,76.82,https://www.gigab2b.com/product/W714S01923,collected,"assembled_from_vl,missing_package_lwh"
+W714S01934,True,3,123.2,145.2,W714P499651x1 | W714P499653x1 | W714P499662x1,70.8,34.6,34.2,32.0,23.0,8.0,293.26,96.14,https://www.gigab2b.com/product/W714S01934,collected,"assembled_from_vl,package_from_children"
+W714S01935,True,4,147.4,173.8,W714P499651x1 | W714P499653x1 | W714P499662x2,70.8,58.2,34.6,32.0,23.0,8.0,366.36,115.46,https://www.gigab2b.com/product/W714S01935,collected,"assembled_from_vl,package_from_children"
+W714S01936,True,3,137.5,161.7,W714P499651x1 | W714P499653x1 | W714P499660x1,101.1,34.6,34.2,,,,310.46,113.2,https://www.gigab2b.com/product/W714S01936,collected,"assembled_from_vl,missing_package_lwh"
+W714S01937,True,4,161.7,190.3,W714P499651x1 | W714P499653x1 | W714P499660x1 | W714P499662x1,101.1,58.2,34.6,32.0,23.0,8.0,383.56,132.52,https://www.gigab2b.com/product/W714S01937,collected,"assembled_from_vl,package_from_children"
+W714P499651,False,1,49.5,58.3,,,,,,,,,,https://www.gigab2b.com/product/W714P499651,pending,
+W714P499653,False,1,49.5,58.3,,,,,,,,,,https://www.gigab2b.com/product/W714P499653,pending,
+W714P499660,False,1,38.5,45.1,,,,,,,,,,https://www.gigab2b.com/product/W714P499660,pending,
+W714P499662,False,1,24.2,28.6,,30.30,24.00,18.90,32.00,23.00,8.00,73.1,19.32,https://www.gigab2b.com/product/W714P499662,collected,
+W714S01951,True,2,99.0,116.6,W714P499664x1 | W714P499750x1,70.8,35.4,34.6,,,,220.16,76.82,https://www.gigab2b.com/product/W714S01951,collected,"assembled_from_vl,missing_package_lwh"
+W714S01952,True,3,123.2,145.2,W714P499664x1 | W714P499750x1 | W714P499756x1,70.8,35.4,34.6,32.0,23.0,8.0,293.26,96.14,https://www.gigab2b.com/product/W714S01952,collected,"assembled_from_vl,package_from_children"
+W714S01953,True,4,147.4,173.8,W714P499664x1 | W714P499750x1 | W714P499756x2,70.8,34.6,39.1,32.0,23.0,8.0,366.36,115.46,https://www.gigab2b.com/product/W714S01953,collected,"assembled_from_vl,package_from_children"
+W714S01954,True,3,137.5,161.7,W714P499664x1 | W714P499752x1 | W714P499750x1,101.1,34.6,34.2,32.0,31.0,10.0,310.46,113.2,https://www.gigab2b.com/product/W714S01954,collected,"assembled_from_vl,package_from_children"
+W714S01955,True,4,161.7,190.3,W714P499664x1 | W714P499752x1 | W714P499750x1 | W714P499756x1,101.1,58.2,34.6,32.0,31.0,10.0,383.56,132.52,https://www.gigab2b.com/product/W714S01955,collected,"assembled_from_vl,package_from_children"
+W714P499664,False,1,49.5,58.3,,,,,,,,,,https://www.gigab2b.com/product/W714P499664,pending,
+W714P499750,False,1,49.5,58.3,,,,,,,,,,https://www.gigab2b.com/product/W714P499750,pending,
+W714P499752,False,1,38.5,45.1,,30.30,34.30,34.60,32.00,31.00,10.00,90.3,36.38,https://www.gigab2b.com/product/W714P499752,collected,
+W714P499756,False,1,24.2,28.6,,30.30,24.00,18.90,32.00,23.00,8.00,73.1,19.32,https://www.gigab2b.com/product/W714P499756,collected,

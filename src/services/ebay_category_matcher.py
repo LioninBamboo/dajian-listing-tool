@@ -1090,7 +1090,11 @@ class EbayCategoryMatcher:
                 return False
 
         has_ottoman_title = any(marker in title_lower for marker in ottoman_markers + ("ottoman", "footstool", "pouf")) and not any(
-            marker in title_lower for marker in sofa_markers + ("armchair", "accent chair", "reading chair", "club chair", "chaise lounge", "recliner", "manual reclining", "reclining footrest")
+            marker in title_lower for marker in sofa_markers + (
+                "sofa", "couch", "armchair", "accent chair", "reading chair",
+                "club chair", "chaise lounge", "recliner", "manual reclining",
+                "reclining footrest",
+            )
         )
         if has_ottoman_title:
             return cid in ottoman_categories

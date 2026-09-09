@@ -2,6 +2,8 @@ from types import SimpleNamespace
 
 import src.utils.listing_quality_gate as listing_quality_gate
 from src.utils.listing_quality_gate import (
+    build_store_description_shell,
+    dedupe_store_description_headers,
     description_contains_cjk,
     description_uses_store_template,
     ensure_store_description_template,
@@ -15,6 +17,30 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_store_shell_does_not_double_wrap_existing_banner():
+    body = (
+        '<div style="padding:25px"><h3>KEY FEATURES</h3>'
+        "<ul><li>Soft chenille cushions</li></ul></div>"
+    )
+    once = build_store_description_shell(title="Cloud Couch Test Sofa", body_html=body)
+    assert once.upper().count("AQUAVERVE") == 1
+    twice = build_store_description_shell(title="Cloud Couch Test Sofa", body_html=once)
+    assert twice.upper().count("AQUAVERVE") == 1
+    nested = (
+        '<div style="max-width:900px;margin:0 auto;font-family:Arial,sans-serif;color:#1a1a1a;line-height:1.7">'
+        '<div style="text-align:center;padding:30px 15px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
+        '<h1 style="margin:0;font-size:28px;font-weight:300;letter-spacing:6px;color:#d4af37">AQUAVERVE</h1>'
+        '<p style="margin:8px 0 0;font-size:12px;color:#a0a0a0;letter-spacing:2px">PREMIUM HOME FURNISHINGS</p>'
+        "</div>"
+        '<div style="background:#f8f9fa;padding:25px;text-align:center;border-bottom:2px solid #d4af37">'
+        '<h2 style="margin:0;font-size:20px;color:#2d3436;font-weight:500">Cloud Couch Test Sofa</h2>'
+        f"</div>{once}</div>"
+    )
+    assert nested.upper().count("AQUAVERVE") == 2
+    assert dedupe_store_description_headers(nested).upper().count("AQUAVERVE") == 1
+    assert ensure_store_description_template(nested, title="Cloud Couch Test Sofa").upper().count("AQUAVERVE") == 1
 
 
 def test_description_cjk_and_store_template_helpers():
