@@ -210,3 +210,87 @@ def test_fetch_live_offer_price_uses_getitem_on_trading_channel():
     post.assert_called_once()
     assert post.call_args.kwargs["headers"]["X-EBAY-API-CALL-NAME"] == "GetItem"
     get.assert_not_called()
+
+
+def test_fetch_trading_item_price_ignores_failure_ack_even_with_price_tag():
+    from scripts import batch_smart_reprice as reprice
+
+    oauth = MagicMock()
+    oauth.get_valid_token.return_value = "tok"
+    bad = _XmlResp(
+        "<GetItemResponse><Ack>Failure</Ack>"
+        "<Errors><LongMessage>Item not found</LongMessage></Errors>"
+        "<CurrentPrice currencyID='USD'>12.34</CurrentPrice>"
+        "</GetItemResponse>"
+    )
+
+    with patch.object(reprice.requests, "post", return_value=bad):
+        assert reprice.fetch_trading_item_price(oauth, "188760790738") is None
+
+
+def test_fetch_trading_item_price_rejects_non_200():
+    from scripts import batch_smart_reprice as reprice
+
+    oauth = MagicMock()
+    oauth.get_valid_token.return_value = "tok"
+    bad = _XmlResp(
+        "<GetItemResponse><Ack>Success</Ack>"
+        "<CurrentPrice>56.63</CurrentPrice></GetItemResponse>",
+        status_code=503,
+    )
+
+    with patch.object(reprice.requests, "post", return_value=bad):
+        assert reprice.fetch_trading_item_price(oauth, "188760790738") is None
+
+
+def test_fetch_trading_item_price_swallows_transport_errors():
+    from scripts import batch_smart_reprice as reprice
+
+    oauth = MagicMock()
+    oauth.get_valid_token.return_value = "tok"
+
+    with patch.object(
+        reprice.requests, "post", side_effect=reprice.Timeout("boom")
+    ):
+        assert reprice.fetch_trading_item_price(oauth, "188760790738") is None
+
+
+def test_update_trading_price_swallows_transport_errors():
+    from scripts import batch_smart_reprice as reprice
+
+    oauth = MagicMock()
+    oauth.get_valid_token.return_value = "tok"
+    profile = StoreProfile(listing_channel="trading", ebay_site_id="100")
+
+    with patch(
+        "src.services.repricing_guard.precheck_price", return_value=(True, "ok")
+    ), patch(
+        "src.utils.store_profile.get_store_profile", return_value=profile
+    ), patch.object(
+        reprice.requests, "post", side_effect=reprice.ConnectionError("down")
+    ):
+        ok = reprice.update_ebay_price(
+            oauth, "W465P475235", 56.63, expected_listing_id="188760790738"
+        )
+
+    assert ok is False
+
+
+def test_read_current_listing_price_trading_does_not_raise():
+    from scripts import batch_smart_reprice as reprice
+
+    oauth = MagicMock()
+    oauth.get_valid_token.return_value = "tok"
+    profile = StoreProfile(listing_channel="trading", ebay_site_id="100")
+
+    with patch(
+        "src.utils.store_profile.get_store_profile", return_value=profile
+    ), patch.object(
+        reprice.requests, "post", side_effect=RuntimeError("unexpected")
+    ):
+        assert (
+            reprice.read_current_listing_price(
+                oauth, "W465P475235", "188760790738"
+            )
+            is None
+        )
