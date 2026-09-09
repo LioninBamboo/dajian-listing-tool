@@ -22,9 +22,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     chrome.storage.local.get([DAJIAN_STORE_KEY], (result) => {
-        const id = result[DAJIAN_STORE_KEY] || DAJIAN_DEFAULT_STORE;
-        storeSelect.value = id;
-        paintStore(id);
+        const raw = result[DAJIAN_STORE_KEY] || DAJIAN_DEFAULT_STORE;
+        const store = dajianStoreById(raw);
+        // Migrate legacy ids (e.g. blindbox → outdoor) so the <select> matches.
+        if (raw !== store.id) {
+            chrome.storage.local.set({ [DAJIAN_STORE_KEY]: store.id });
+        }
+        storeSelect.value = store.id;
+        paintStore(store.id);
     });
 
     storeSelect.addEventListener('change', () => {
