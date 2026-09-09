@@ -176,6 +176,191 @@ def test_watchdog_skips_task_already_running_today(tmp_path, monkeypatch):
     assert 'cro_sentinel' not in aliases
 
 
+def test_watchdog_skips_short_tasks_while_daily_tasks_running(tmp_path, monkeypatch):
+    """Main-loop daily_tasks occupies the daemon; do not Popen ad_restore etc."""
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'running',
+                    'at': '2026-05-11T09:35:00',
+                    'message': 'sync still running',
+                },
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    launched = []
+    logs = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', logs.append)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert aliases == []
+    assert 'ad_restore' not in aliases
+    assert 'blacklist_cleanup' not in aliases
+    assert 'guard_anomaly' not in aliases
+    assert any('daily_tasks in progress; skip overdue recovery' in msg for msg in logs)
+
+
+def test_watchdog_recovers_short_tasks_after_daily_partial_success(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'partial_success',
+                    'at': '2026-05-11T10:20:00',
+                },
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    launched = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert 'ad_restore' in aliases
+    assert 'blacklist_cleanup' in aliases
+    assert 'guard_anomaly' in aliases
+
+
+def test_watchdog_skips_mi_self_check_while_mi_snapshot_running(tmp_path, monkeypatch):
+    """mi_snapshot still occupies the main loop; do not Popen mi_self_check."""
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'success',
+                    'at': '2026-05-11T10:15:00',
+                },
+                'mi_snapshot': {
+                    'status': 'running',
+                    'at': '2026-05-11T10:16:00',
+                    'message': 'opportunity discovery in progress',
+                },
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    launched = []
+    logs = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', logs.append)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert 'mi_self_check' not in aliases
+    assert 'ad_restore' in aliases
+    assert any(
+        'mi_snapshot in progress; skip mi_self_check recovery' in msg for msg in logs
+    )
+
+
+def test_watchdog_recovers_mi_self_check_after_mi_snapshot_success(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'success',
+                    'at': '2026-05-11T10:15:00',
+                },
+                'mi_snapshot': {
+                    'status': 'success',
+                    'at': '2026-05-11T10:25:00',
+                },
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    launched = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert 'mi_self_check' in aliases
+
+
+def test_watchdog_recovers_mi_self_check_when_mi_snapshot_failed(tmp_path, monkeypatch):
+    """True missing snapshot should still allow overdue mi_self_check recovery."""
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'success',
+                    'at': '2026-05-11T10:15:00',
+                },
+                'mi_snapshot': {
+                    'status': 'failed',
+                    'at': '2026-05-11T10:20:00',
+                    'message': 'timeout',
+                },
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    launched = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert 'mi_self_check' in aliases
+
+
 def test_watchdog_records_recovery_as_in_progress(tmp_path, monkeypatch):
     health_path = tmp_path / '_scheduler_health.json'
     health_path.write_text(json.dumps({}, ensure_ascii=False), encoding='utf-8')

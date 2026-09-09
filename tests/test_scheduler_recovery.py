@@ -741,8 +741,36 @@ def test_missing_video_autofix_cmd_is_capped_and_scoped():
     assert "--fix-key" in cmd
     assert "__sync_video__" in cmd
     assert "--limit" in cmd
-    assert "30" in cmd
+    assert "80" in cmd
     assert "--email" in cmd
     assert "--fix" in cmd
     assert "categoryId" not in cmd
     assert "Assembly Required" not in cmd
+
+
+def test_semantic_rewrite_task_uses_daily_limit_and_apply_flags(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        scheduler_daemon,
+        '_task_succeeded_today',
+        lambda name: False,
+    )
+    monkeypatch.setattr(
+        scheduler_daemon,
+        'run_task',
+        lambda *args, **kwargs: calls.append((args, kwargs)) or (True, 'ok'),
+    )
+
+    scheduler_daemon.task_semantic_rewrite()
+
+    assert calls, 'run_task should be invoked'
+    args, kwargs = calls[0]
+    assert args[0] == 'semantic_rewrite'
+    cmd = list(args[1])
+    assert '--from-daily-audit' in cmd
+    assert '--limit' in cmd
+    assert cmd[cmd.index('--limit') + 1] == '80'
+    assert '--apply' in cmd
+    assert '--email' in cmd
+    assert kwargs.get('timeout_sec') == 7200

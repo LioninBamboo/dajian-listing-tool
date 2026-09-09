@@ -111,7 +111,7 @@ TASK_TIMEOUT = {
     'auto_publish': 3600,      # 1小时 (READY 草稿刊登; 默认 dry-run)
     'source_refresh': 1800,    # 30分钟 (全量 PUBLISHED 源快照刷新, 批量 detailInfo)
     'order_recheck': 900,      # 15分钟 (出单源复核: GetOrders + 单 SKU 源重抓比对)
-    'semantic_rewrite': 3600,  # 1小时 (语义改写管线: 日审增量队列, 默认限 40)
+    'semantic_rewrite': 7200,  # 2小时 (语义改写管线: 日审增量队列, 默认限 80)
     'finance_sync': 900,       # 15分钟 (eBay 订单 → 财务 PnL 本地表)
     'giga_dropship_push': 1800,  # 30分钟 (PAID 未履约 → GIGA 推单)
     'giga_dropship_sync': 1800,  # 30分钟 (GIGA 运单 → eBay 标发)
@@ -203,8 +203,10 @@ def acquire_lock():
     if last_err == ERROR_ALREADY_EXISTS:
         kernel32.CloseHandle(_mutex_handle)
         _mutex_handle = None
+        # Another instance already holds the mutex — treat as success for Task
+        # Scheduler / duplicate 08:50 starts (already running = healthy).
         logger.error("调度器已在运行 (另一个实例持有 mutex), 退出")
-        sys.exit(1)
+        sys.exit(0)
 
     if not _mutex_handle:
         logger.error(f"无法创建 mutex (error={last_err}), 退出")
@@ -710,6 +712,7 @@ from listing_qc import (
     MISSING_VIDEO_DAILY_LIMIT_DEFAULT as MISSING_VIDEO_DAILY_LIMIT,
     SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS,
     SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES,
+    SEMANTIC_REWRITE_DAILY_LIMIT_DEFAULT as SEMANTIC_REWRITE_DAILY_LIMIT,
 )
 
 SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES = tuple(SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES)
@@ -854,7 +857,7 @@ def task_semantic_rewrite():
         [
             str(PROJECT_ROOT / 'scripts' / 'semantic_rewrite.py'),
             '--from-daily-audit',
-            '--limit', '40',
+            '--limit', str(SEMANTIC_REWRITE_DAILY_LIMIT),
             '--apply',
             '--email',
         ],
@@ -1080,11 +1083,11 @@ def _latest_mi_ready_skus(limit: int, reports_dir: Path | None = None, stock_loo
     else:
         opportunities = []
 
-    from src.utils.mi_opportunity_flow import load_today_factsheet_failed_skus, select_mi_auto_publish_skus
+    from src.utils.mi_opportunity_flow import load_factsheet_blocked_skus, select_mi_auto_publish_skus
     from src.utils.store_profile import get_store_profile
 
     store_kind = getattr(get_store_profile(), 'store_kind', 'furniture')
-    exclude = load_today_factsheet_failed_skus(PROJECT_ROOT / 'logs')
+    exclude = load_factsheet_blocked_skus(PROJECT_ROOT / 'logs')
     return select_mi_auto_publish_skus(
         opportunities,
         limit=limit,
@@ -1837,7 +1840,7 @@ def _setup_schedule_full():
     # 11:30 — 只读审计 live eBay 刊登内容 vs GIGA 原文，发现 AI 幻觉/事实偏差后发邮件
     schedule.every().day.at("11:30").do(task_listing_audit).tag('daily', 'listing_audit')
 
-    # 12:30 — 语义改写闭环 (读当日 audit 增量队列, 限 40; 需 SEMANTIC_REWRITE_APPLY_ENABLED=1)
+    # 12:30 — 语义改写闭环 (读当日 audit 增量队列, 限 80; 需 SEMANTIC_REWRITE_APPLY_ENABLED=1)
     schedule.every().day.at("12:10").do(task_source_aspect_autofix).tag('daily', 'source_aspect_autofix')
     schedule.every().day.at("13:00").do(task_missing_video_autofix).tag('daily', 'missing_video_autofix')
     schedule.every().day.at("12:30").do(task_semantic_rewrite).tag('daily', 'semantic_rewrite')
@@ -1883,8 +1886,8 @@ def _setup_schedule_full():
     logger.info("  10:55  源内容刷新 (source_content_refresh --email — 卖家漂移检测)")
     logger.info("  11:30  eBay/GIGA live listing 内容审计 (audit_fix_active_listings --live --email)")
     logger.info("  12:10  源参数写回 live (audit --source-report --fix --email,限定 Color/Material/描述重建)")
-    logger.info("  13:00  缺视频限量同步 (audit --issue-type missing_video --fix-key __sync_video__ --limit 30 --email)")
-    logger.info("  12:30  语义改写闭环 (semantic_rewrite --from-daily-audit --limit 40 --apply --email)")
+    logger.info("  13:00  缺视频限量同步 (audit --issue-type missing_video --fix-key __sync_video__ --limit 80 --email)")
+    logger.info("  12:30  语义改写闭环 (semantic_rewrite --from-daily-audit --limit 80 --apply --email)")
     logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 48 --email)")
     logger.info("  每 4h  履约闭环 (giga push + sync + finance_sync)")
     logger.info("  20:00  销售健康诊断 (health_check --auto-fix --email)")

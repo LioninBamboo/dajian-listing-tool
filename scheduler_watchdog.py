@@ -344,6 +344,16 @@ def check_overdue_critical_tasks():
     health = read_health()
     today = datetime.now().date()
     now = datetime.now()
+    # Full-profile daily_tasks occupies the synchronous daemon main loop.
+    # While it is running/recovering today, short overdue recoveries would pile
+    # on top of a blocked scheduler — skip the whole overdue pass (ops profile
+    # has no daily_tasks entry and uses CRITICAL_OPS_DAILY_TASKS instead).
+    if (
+        not _is_ops_scheduler()
+        and _task_in_progress_today(health, 'daily_tasks', today)
+    ):
+        log('daily_tasks in progress; skip overdue recovery')
+        return
     for task in _watchdog_critical_tasks():
         name = str(task['health_name'])
         task_alias = str(task['daemon_task'])
@@ -365,6 +375,15 @@ def check_overdue_critical_tasks():
         if _task_succeeded_today(health, name, today):
             continue
         if _task_in_progress_today(health, name, today):
+            continue
+        # mi_snapshot occupies the main loop after daily_tasks; recovering
+        # mi_self_check mid-snapshot yields a false "no snapshot" alert.
+        # Failed snapshot still allows recovery (true missing digest).
+        if (
+            name == 'mi_self_check'
+            and _task_in_progress_today(health, 'mi_snapshot', today)
+        ):
+            log('mi_snapshot in progress; skip mi_self_check recovery')
             continue
         if task.get('skip_if_started_today') and _task_already_started_today(health, name, today):
             continue

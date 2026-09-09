@@ -6,6 +6,7 @@ from .autofix_whitelist import (
     MISSING_VIDEO_DAILY_LIMIT_DEFAULT,
     SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS,
     SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES,
+    SEMANTIC_REWRITE_DAILY_LIMIT_DEFAULT,
 )
 from .assembly_category_policy import (
     ASSEMBLY_AUTO_YES_CATEGORY_IDS,
@@ -32,6 +33,7 @@ __all__ = [
     "MISSING_VIDEO_DAILY_LIMIT_DEFAULT",
     "SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS",
     "SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES",
+    "SEMANTIC_REWRITE_DAILY_LIMIT_DEFAULT",
     "category_allows_assembly_auto_yes",
     "fix_attempt_succeeded",
     "fix_key_matches_issue",
