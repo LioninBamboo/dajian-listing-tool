@@ -405,8 +405,9 @@ def upsert_db(payload: dict, meta: dict) -> None:
             row.shipping = payload["shipping"]
             row.stock = payload["stock"]
             row.url = payload["url"]
-            row.status = "COLLECTED"
-            row.optimization = None
+            if row.status not in {"PUBLISHED", "READY"}:
+                row.status = "COLLECTED"
+                row.optimization = None
             row.logs = (row.logs or []) + logs
             for f in ("attributes", "specs", "images", "videos", "logs"):
                 flag_modified(row, f)

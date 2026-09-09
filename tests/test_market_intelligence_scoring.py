@@ -1372,6 +1372,41 @@ class TestF24DailyDigest:
         assert ok is True
         assert sent["n"] == 0
 
+    def test_digest_sends_after_empty_archive_same_day(self, monkeypatch, tmp_path):
+        import daily_tasks
+        from datetime import datetime
+
+        reports = tmp_path / "reports"
+        reports.mkdir()
+        today = datetime.now().strftime("%Y%m%d")
+        (reports / f"mi_digest_{today}.html").write_text(
+            "<html><p>共发现 <b>0</b> 条机会</p></html>", encoding="utf-8"
+        )
+
+        monkeypatch.setattr(daily_tasks, "PROJECT_ROOT", tmp_path)
+        sent = {"n": 0}
+
+        def fake_send_email(subject, html):
+            sent["n"] += 1
+            return True
+
+        monkeypatch.setattr(daily_tasks, "send_email", fake_send_email)
+        opps = [
+            {
+                "sku": "A1",
+                "title": "Modern Sofa",
+                "opportunity_score": 80,
+                "suggested_price": 400,
+                "margin_rate": 30.0,
+                "potential_profit": 120,
+                "seller_str_pct": 2.5,
+                "image_url": "https://img.example.com/a1.jpg",
+            }
+        ]
+        ok = daily_tasks._send_mi_daily_digest(opps, {"current_count": 1}, "snap.json")
+        assert ok is True
+        assert sent["n"] == 1
+
 
 class TestF25DigestArchive:
     """F25 — MI 日报 HTML 归档 + 3 天保留"""

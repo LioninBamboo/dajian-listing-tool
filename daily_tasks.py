@@ -2326,7 +2326,14 @@ def _send_mi_daily_digest(opportunities: list, kpi: dict, snap_name: str,
         """
         subject = format_mi_digest_subject(brand, len(opportunities))
         digest_path = (PROJECT_ROOT / "reports" / f"mi_digest_{datetime.now():%Y%m%d}.html")
-        already_archived_today = digest_path.is_file()
+        # 空日报只归档不发信，不能把文件存在当成 SMTP 已发出。
+        already_emailed_today = False
+        if digest_path.is_file():
+            try:
+                prev_html = digest_path.read_text(encoding="utf-8")
+            except OSError:
+                prev_html = ""
+            already_emailed_today = "共发现 <b>0</b> 条机会" not in prev_html
         # F25 — 归档 HTML 到 reports/，保留 3 天
         try:
             _archive_mi_digest_html(html, keep_days=3)
@@ -2335,9 +2342,9 @@ def _send_mi_daily_digest(opportunities: list, kpi: dict, snap_name: str,
         if not opportunities:
             logger.info("[MI DIGEST] 无机会，已归档日报，不发送空日报邮件")
             return False
-        if already_archived_today:
+        if already_emailed_today:
             logger.info(
-                "[MI DIGEST] 今日已有归档 %s，跳过重复 SMTP（一日一封）",
+                "[MI DIGEST] 今日已有非空归档 %s，跳过重复 SMTP（一日一封）",
                 digest_path.name,
             )
             return True
