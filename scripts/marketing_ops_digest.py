@@ -45,7 +45,7 @@ def _build_mi_auto_publish_argv():
     import os
     from datetime import datetime
 
-    from src.utils.mi_opportunity_flow import lookup_supplier_stock, select_mi_auto_publish_skus, load_today_factsheet_failed_skus
+    from src.utils.mi_opportunity_flow import lookup_supplier_stock, select_mi_auto_publish_skus, load_factsheet_blocked_skus
     from src.utils.store_profile import get_store_profile
 
     enable = os.getenv("ENABLE_MI_AUTO_PUBLISH", "").strip().lower() in ("1", "true", "yes", "on")
@@ -68,7 +68,7 @@ def _build_mi_auto_publish_argv():
         return None, "MI 快照无法读取"
     opportunities = payload if isinstance(payload, list) else (payload.get("opportunities") or [])
     store_kind = getattr(get_store_profile(), "store_kind", "furniture")
-    exclude = load_today_factsheet_failed_skus(ROOT / "logs")
+    exclude = load_factsheet_blocked_skus(ROOT / "logs")
     skus = select_mi_auto_publish_skus(
         opportunities,
         limit=limit,
@@ -78,7 +78,7 @@ def _build_mi_auto_publish_argv():
     )
     if not skus:
         if exclude:
-            return None, "今日已有 FactSheet 失败的 SKU 已跳过，没有新的过门槛 READY"
+            return None, "FactSheet/人工队列已跳过阻塞 SKU，没有新的过门槛 READY"
         return None, "没有过门槛的 READY MI SKU（推荐分/店定位/库存）"
     argv = [
         str(ROOT / "batch_publish.py"),
@@ -90,7 +90,6 @@ def _build_mi_auto_publish_argv():
     if not enable:
         argv.append("--dry-run")
     return argv, ""
-
 
 def _run(argv, timeout):
     t0 = time.monotonic()
@@ -137,8 +136,17 @@ def main():
         results.append(("MI 自动刊登", "DRY", " ".join(pub_argv or []), 0.0))
     else:
         ok, tail, dur = _run(pub_argv or [], args.timeout)
-        results.append(("MI 自动刊登", "OK" if ok else "FAIL", tail, dur))
+        status = "OK" if ok else "FAIL"
+        if ok:
+            from src.utils.mi_opportunity_flow import latest_today_publish_has_factsheet_error
 
+            if latest_today_publish_has_factsheet_error(ROOT / "logs"):
+                status = "FAIL"
+                if tail:
+                    tail = f"{tail}\nFactSheet error in latest publish_results"
+                else:
+                    tail = "FactSheet error in latest publish_results"
+        results.append(("MI 自动刊登", status, tail, dur))
     icon = {"OK": "✅", "FAIL": "❌", "PAUSED": "⏸️", "SKIPPED": "⏭️", "DRY": "🔎"}
     n_ok = sum(1 for r in results if r[1] == "OK")
     n_fail = sum(1 for r in results if r[1] == "FAIL")

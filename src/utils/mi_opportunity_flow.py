@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Collection, Iterable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -179,7 +179,10 @@ def load_today_factsheet_failed_skus(
 ) -> set[str]:
     """SKUs whose today's publish_results already recorded a FactSheet error."""
     day = today or datetime.now().strftime("%Y%m%d")
-    root = Path(logs_dir)
+    return _factsheet_failed_skus_for_day(Path(logs_dir), day)
+
+
+def _factsheet_failed_skus_for_day(root: Path, day: str) -> set[str]:
     failed: set[str] = set()
     if not root.is_dir():
         return failed
@@ -201,3 +204,76 @@ def load_today_factsheet_failed_skus(
             if sku:
                 failed.add(sku)
     return failed
+
+
+def load_semantic_human_queue_skus(logs_dir: str | Path) -> set[str]:
+    """First field of each line in semantic_rewrite_human_queue.txt."""
+    path = Path(logs_dir) / "semantic_rewrite_human_queue.txt"
+    skus: set[str] = set()
+    if not path.is_file():
+        return skus
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return skus
+    for line in text.splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        sku = raw.replace("\t", " ").split(" ", 1)[0].strip()
+        if sku:
+            skus.add(sku)
+    return skus
+
+
+def load_factsheet_blocked_skus(
+    logs_dir: str | Path,
+    *,
+    today: str | None = None,
+    lookback_days: int = 3,
+) -> set[str]:
+    """FactSheet publish errors over recent days + semantic human-queue SKUs."""
+    root = Path(logs_dir)
+    blocked: set[str] = set()
+    day = datetime.strptime(
+        today or datetime.now().strftime("%Y%m%d"),
+        "%Y%m%d",
+    ).date()
+    days = max(1, int(lookback_days or 1))
+    for offset in range(days):
+        d = (day - timedelta(days=offset)).strftime("%Y%m%d")
+        blocked |= _factsheet_failed_skus_for_day(root, d)
+    blocked |= load_semantic_human_queue_skus(root)
+    return blocked
+
+
+def latest_today_publish_has_factsheet_error(
+    logs_dir: str | Path,
+    *,
+    today: str | None = None,
+) -> bool:
+    """True if the newest publish_results for *today* contains a FactSheet error."""
+    day = today or datetime.now().strftime("%Y%m%d")
+    root = Path(logs_dir)
+    if not root.is_dir():
+        return False
+    paths = sorted(
+        root.glob(f"publish_results_{day}_*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not paths:
+        return False
+    try:
+        payload = json.loads(paths[0].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    rows = payload if isinstance(payload, list) else []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("status") or "").lower() != "error":
+            continue
+        if "factsheet" in str(row.get("message") or "").lower():
+            return True
+    return False

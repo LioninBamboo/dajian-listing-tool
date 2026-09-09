@@ -129,6 +129,73 @@ def test_load_today_factsheet_failed_skus(tmp_path):
     assert failed == {"W206P305082"}
 
 
+def test_load_factsheet_blocked_skus_lookback_and_human_queue(tmp_path):
+    from src.utils.mi_opportunity_flow import load_factsheet_blocked_skus
+
+    (tmp_path / "publish_results_20260903_113205.json").write_text(
+        json.dumps([
+            {
+                "status": "error",
+                "sku": "TODAY-FS",
+                "message": "[FactSheet] semantic_feature (HIGH): adjustable speed",
+            }
+        ]),
+        encoding="utf-8",
+    )
+    (tmp_path / "publish_results_20260901_103234.json").write_text(
+        json.dumps([
+            {
+                "status": "error",
+                "sku": "TWO-DAYS-AGO",
+                "message": "[FactSheet] unsupported claim",
+            }
+        ]),
+        encoding="utf-8",
+    )
+    (tmp_path / "publish_results_20260830_103234.json").write_text(
+        json.dumps([
+            {
+                "status": "error",
+                "sku": "TOO-OLD",
+                "message": "[FactSheet] leftover",
+            }
+        ]),
+        encoding="utf-8",
+    )
+    (tmp_path / "semantic_rewrite_human_queue.txt").write_text(
+        "W206P305082\tneeds_human\tsome reason\n"
+        "HUMAN2  other note\n",
+        encoding="utf-8",
+    )
+    blocked = load_factsheet_blocked_skus(tmp_path, today="20260903", lookback_days=3)
+    assert blocked == {"TODAY-FS", "TWO-DAYS-AGO", "W206P305082", "HUMAN2"}
+    assert "TOO-OLD" not in blocked
+
+
+def test_latest_today_publish_has_factsheet_error(tmp_path):
+    from src.utils.mi_opportunity_flow import latest_today_publish_has_factsheet_error
+    import time
+
+    older = tmp_path / "publish_results_20260903_100000.json"
+    newer = tmp_path / "publish_results_20260903_120000.json"
+    older.write_text(
+        json.dumps([{"status": "success", "sku": "OK", "message": "ok"}]),
+        encoding="utf-8",
+    )
+    time.sleep(0.02)
+    newer.write_text(
+        json.dumps([
+            {
+                "status": "error",
+                "sku": "W206",
+                "message": "[FactSheet] semantic_feature (HIGH): x",
+            }
+        ]),
+        encoding="utf-8",
+    )
+    assert latest_today_publish_has_factsheet_error(tmp_path, today="20260903") is True
+
+
 def test_summarize_mi_auto_publish_gates_counts_ready_score_and_x():
     gates = summarize_mi_auto_publish_gates(
         [
