@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = PROJECT_ROOT / "ebay_collection.db"
 
 _Q2 = Decimal("0.01")
+DEFAULT_STORE_DISCOUNT = 0.05
 
 
 def _d(value: Any) -> Decimal:
@@ -31,6 +32,15 @@ def _d(value: Any) -> Decimal:
 
 def _q2(value: Decimal) -> float:
     return float(value.quantize(_Q2, rounding=ROUND_HALF_UP))
+
+
+def merchandise_after_store_discount(
+    gross: float,
+    *,
+    store_discount: float = DEFAULT_STORE_DISCOUNT,
+) -> float:
+    """Seller merchandise take-home after the modeled store discount."""
+    return _q2(_d(gross) * (Decimal("1") - _d(store_discount)))
 
 
 # ─── Schema ────────────────────────────────────────────────────────────────
@@ -118,7 +128,7 @@ def estimate_line_fees(
     line_gross: float,
     *,
     ad_rate: float = 0.05,
-    store_discount: float = 0.05,
+    store_discount: float = DEFAULT_STORE_DISCOUNT,
     fvf: float = 0.1325,
     fixed_fee: float = 0.30,
     order_line_count: int = 1,
@@ -133,6 +143,57 @@ def estimate_line_fees(
     n = max(int(order_line_count or 1), 1)
     fixed_share = _d(fixed_fee) / Decimal(n)
     return _q2(variable + fixed_share)
+
+
+def _line_cost_key(line_item_id: str, sku: str) -> str:
+    lid = str(line_item_id or "").strip()
+    if lid:
+        return f"line:{lid}"
+    return f"sku:{str(sku or '').strip()}"
+
+
+def load_existing_line_cost_snapshots(
+    conn: sqlite3.Connection,
+    platform_order_id: str,
+) -> dict[str, tuple[float, float, str]]:
+    """Return prior paid-time COGS snapshots keyed by line_item_id / sku.
+
+    Only positive unit costs are kept so a first upsert that missed the SKU
+    can still populate COGS on a later sync.
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT line_item_id, sku, unit_giga_cost, line_cogs, cost_source
+            FROM finance_order_lines
+            WHERE platform_order_id = ?
+            """,
+            (platform_order_id,),
+        ).fetchall()
+    except sqlite3.Error:
+        return {}
+
+    out: dict[str, tuple[float, float, str]] = {}
+    for line_item_id, sku, unit_cost, line_cogs, cost_source in rows:
+        try:
+            unit_f = float(unit_cost or 0)
+        except (TypeError, ValueError):
+            unit_f = 0.0
+        if unit_f <= 0:
+            continue
+        try:
+            line_cogs_f = float(line_cogs or 0)
+        except (TypeError, ValueError):
+            line_cogs_f = 0.0
+        src = str(cost_source or "paid_time_snapshot").strip() or "paid_time_snapshot"
+        if not src.startswith("paid_time_snapshot"):
+            src = f"paid_time_snapshot:{src}"
+        out[_line_cost_key(str(line_item_id or ""), str(sku or ""))] = (
+            unit_f,
+            line_cogs_f,
+            src,
+        )
+    return out
 
 
 def lookup_giga_unit_cost(conn: sqlite3.Connection, sku: str) -> tuple[float, str]:
@@ -180,9 +241,12 @@ def build_lines_from_ebay_order(
     order: dict,
     *,
     ad_rate: float = 0.05,
+    store_discount: float = DEFAULT_STORE_DISCOUNT,
+    cost_snapshots: Optional[dict[str, tuple[float, float, str]]] = None,
 ) -> list[LinePnl]:
     raw_lines = [li for li in (order.get("lineItems") or []) if li.get("sku")]
     n = max(len(raw_lines), 1)
+    snapshots = cost_snapshots or {}
     out: list[LinePnl] = []
 
     for li in raw_lines:
@@ -192,15 +256,36 @@ def build_lines_from_ebay_order(
         if line_gross <= 0:
             line_gross = float((li.get("total") or {}).get("value") or 0)
         unit_sell = round(line_gross / qty, 2) if qty else line_gross
-        unit_cost, cost_source = lookup_giga_unit_cost(conn, sku)
-        line_cogs = round(unit_cost * qty, 2)
-        fee = estimate_line_fees(line_gross, ad_rate=ad_rate, order_line_count=n)
-        net = round(line_gross - line_cogs - fee, 2)
+        line_item_id = str(li.get("lineItemId") or "")
+        snap = snapshots.get(_line_cost_key(line_item_id, sku))
+        if snap:
+            unit_cost, prior_line_cogs, cost_source = snap
+            # Qty may change on a corrected sync; keep unit cost, recompute line.
+            line_cogs = (
+                round(unit_cost * qty, 2)
+                if qty
+                else round(float(prior_line_cogs or 0), 2)
+            )
+        else:
+            unit_cost, cost_source = lookup_giga_unit_cost(conn, sku)
+            line_cogs = round(unit_cost * qty, 2)
+        fee = estimate_line_fees(
+            line_gross,
+            ad_rate=ad_rate,
+            store_discount=store_discount,
+            order_line_count=n,
+        )
+        # Fees already use post-discount base; net must too or profit is
+        # inflated by roughly the store discount on every order.
+        revenue = merchandise_after_store_discount(
+            line_gross, store_discount=store_discount
+        )
+        net = round(revenue - line_cogs - fee, 2)
         out.append(
             LinePnl(
                 sku=sku,
                 title=str(li.get("title") or "")[:200],
-                line_item_id=str(li.get("lineItemId") or ""),
+                line_item_id=line_item_id,
                 ebay_item_number=str(li.get("legacyItemId") or ""),
                 ebay_transaction_id=str(li.get("lineItemId") or ""),
                 qty=qty,
@@ -221,6 +306,7 @@ def upsert_finance_order(
     order: dict,
     *,
     ad_rate: float = 0.05,
+    store_discount: float = DEFAULT_STORE_DISCOUNT,
     giga_order_no: Optional[str] = None,
 ) -> dict:
     """Insert/update one eBay order into finance tables. Returns summary dict."""
@@ -244,7 +330,16 @@ def upsert_finance_order(
         for t in li.get("ebayCollectAndRemitTaxes") or []:
             tax += float((t.get("amount") or {}).get("value") or 0)
 
-    lines = build_lines_from_ebay_order(conn, order, ad_rate=ad_rate)
+    # Preserve first captured positive COGS so later supplier/cost refreshes
+    # cannot rewrite paid-time economics on every sync.
+    cost_snapshots = load_existing_line_cost_snapshots(conn, platform_order_id)
+    lines = build_lines_from_ebay_order(
+        conn,
+        order,
+        ad_rate=ad_rate,
+        store_discount=store_discount,
+        cost_snapshots=cost_snapshots,
+    )
     if gross <= 0:
         gross = sum(l.line_gross for l in lines)
     if total <= 0:
@@ -252,9 +347,10 @@ def upsert_finance_order(
 
     total_cogs = round(sum(l.line_cogs for l in lines), 2)
     total_fees = round(sum(l.fee_est for l in lines), 2)
-    # Net on merchandise: gross sales - cogs - fees (tax not seller revenue)
-    net_est = round(gross - total_cogs - total_fees, 2)
-    margin = round(net_est / gross, 4) if gross > 0 else 0.0
+    # Net on merchandise after store discount: revenue - cogs - fees
+    revenue = merchandise_after_store_discount(gross, store_discount=store_discount)
+    net_est = round(revenue - total_cogs - total_fees, 2)
+    margin = round(net_est / revenue, 4) if revenue > 0 else 0.0
 
     # Link GIGA fulfillment if present
     if not giga_order_no:

@@ -71,6 +71,43 @@ def test_estimate_line_fees_positive():
     assert fee < 30
 
 
+def test_line_net_uses_post_discount_revenue():
+    """Fees are on post-discount base; net must not keep pre-discount gross."""
+    from src.services.finance_orders import merchandise_after_store_discount
+
+    fee = estimate_line_fees(100.0, ad_rate=0.05, order_line_count=1)
+    revenue = merchandise_after_store_discount(100.0)
+    # Inflated (buggy) net would be ~100 - fee; correct is ~95 - fee.
+    inflated = round(100.0 - fee, 2)
+    correct = round(revenue - fee, 2)
+    assert abs(inflated - correct - 5.0) < 0.02
+    assert correct < inflated
+
+
+def test_upsert_preserves_paid_time_cogs_snapshot(tmp_path):
+    db = tmp_path / "f.db"
+    conn = sqlite3.connect(str(db))
+    cost = _seed_product(conn)
+
+    first = upsert_finance_order(conn, SAMPLE, ad_rate=0.05)
+    assert first["total_cogs"] == cost["total_dajian_cost"]
+    snapshot_cogs = first["total_cogs"]
+
+    # Supplier cost refresh after the order was paid must not rewrite COGS.
+    expensive = PricingEngine.calculate_dajian_cost(200.0, 50.0)
+    conn.execute(
+        "UPDATE collected_products SET price = 200, shipping = 50, cost_breakdown = ?",
+        (json.dumps(expensive),),
+    )
+    conn.commit()
+
+    second = upsert_finance_order(conn, SAMPLE, ad_rate=0.05)
+    assert second["total_cogs"] == snapshot_cogs
+    assert second["total_cogs"] != expensive["total_dajian_cost"]
+    assert second["lines"][0]["unit_giga_cost"] == first["lines"][0]["unit_giga_cost"]
+    conn.close()
+
+
 def test_upsert_finance_order_with_recomputed_cost(tmp_path):
     db = tmp_path / "f.db"
     conn = sqlite3.connect(str(db))
@@ -84,8 +121,11 @@ def test_upsert_finance_order_with_recomputed_cost(tmp_path):
     assert summary["lines"][0]["ebay_item_number"] == "366518074803"
     assert summary["lines"][0]["ebay_transaction_id"] == "10085330527613"
 
-    # net = gross - cogs - fees
-    assert abs(summary["net_est"] - (summary["gross_sales"] - summary["total_cogs"] - summary["total_fees_est"])) < 0.02
+    # net = post-discount revenue - cogs - fees
+    from src.services.finance_orders import merchandise_after_store_discount
+
+    revenue = merchandise_after_store_discount(summary["gross_sales"])
+    assert abs(summary["net_est"] - (revenue - summary["total_cogs"] - summary["total_fees_est"])) < 0.02
 
     s = query_finance_summary(conn)
     assert s["order_count"] == 1
