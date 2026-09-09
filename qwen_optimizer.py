@@ -35,6 +35,16 @@ from src.utils.dimension_helpers import (
 )
 from src.utils.claim_diff_engine import build_source_constraints, FEATURE_CLAIM_PATTERNS
 from src.utils.store_profile import get_store_profile
+from src.utils.title_sanitizer import normalize_listing_title_for_ebay
+
+
+def _ebay_title(title: str, *, source_title: str = "") -> str:
+    """Word-safe eBay title trim (ADR-002: no raw [:80])."""
+    cleaned, _ = normalize_listing_title_for_ebay(
+        title or "",
+        source_title=source_title or title or "",
+    )
+    return cleaned
 
 
 def _safe_print(*args, **kwargs):
@@ -687,7 +697,7 @@ class QwenOptimizer:
         # Fall back rather than publish something unvalidated.
         print("   [FALLBACK] art-toy generation could not produce a clean listing")
         return {
-            "title": str(original_title or "")[:80],
+            "title": _ebay_title(original_title, source_title=original_title),
             "titleCN": "",
             "description": str(original_description or ""),
             "descriptionCN": "",
@@ -753,7 +763,10 @@ class QwenOptimizer:
             # the description. Mirrors the GrovePop garden migration.
             from src.services.auto_technical_prompt import _normalize_aspects
             from src.services.semantic_rewrite import build_description_from_source
-            title = str(data.get("title") or original_title or "").strip()[:80]
+            title = _ebay_title(
+                str(data.get("title") or original_title or "").strip(),
+                source_title=original_title,
+            )
             aspects = _normalize_aspects(data.get("aspects"))
             if getattr(profile, "force_house_brand", False):
                 aspects["Brand"] = [getattr(profile, "brand_name", "") or "Unbranded"]
@@ -809,7 +822,7 @@ class QwenOptimizer:
             traceback.print_exc()
             # Fall back rather than publish something unvalidated.
             return {
-                "title": str(original_title or "")[:80],
+                "title": _ebay_title(original_title, source_title=original_title),
                 "description": str(original_description or ""),
                 "aspects": {},
                 "features": [],
@@ -885,7 +898,10 @@ class QwenOptimizer:
 
             from src.services.auto_technical_prompt import _normalize_aspects
             from src.services.semantic_rewrite import build_description_from_source
-            title = str(data.get("title") or original_title or "").strip()[:80]
+            title = _ebay_title(
+                str(data.get("title") or original_title or "").strip(),
+                source_title=original_title,
+            )
             aspects = _normalize_aspects(data.get("aspects"))
             if getattr(profile, "force_house_brand", False):
                 aspects["Brand"] = [getattr(profile, "brand_name", "") or "Unbranded"]
@@ -933,9 +949,12 @@ class QwenOptimizer:
 
         except Exception as e:
             print(f"❌ Garden-lifestyle optimization failed: {e}")
-            traceback.print_exc()
+            try:
+                traceback.print_exc()
+            except OSError:
+                pass
             return {
-                "title": str(original_title or "")[:80],
+                "title": _ebay_title(original_title, source_title=original_title),
                 "description": str(original_description or ""),
                 "aspects": {},
                 "features": [],
@@ -1634,7 +1653,7 @@ class QwenOptimizer:
             aspects["Item Weight"] = [dimensions["weight"]]
         
         return {
-            "title": original_title[:80],
+            "title": _ebay_title(original_title, source_title=original_title),
             "description": original_description[:3500] if original_description else "",
             "aspects": aspects,
             "error": "Fallback result used"

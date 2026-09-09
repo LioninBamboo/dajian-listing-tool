@@ -45,7 +45,7 @@ from src.utils.publish_autofix import (
     try_fix_publish_error,
 )
 from src.utils.publish_aspect_completion import complete_publish_aspects
-from src.utils.title_sanitizer import strip_supplier_brand_prefix
+from src.utils.title_sanitizer import normalize_listing_title_for_ebay, strip_supplier_brand_prefix
 
 _QUALITY_GATE_CATEGORY_MATCHER = None
 
@@ -1573,8 +1573,12 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                     product.specs if hasattr(product, 'specs') and product.specs else {},
                 )
                 
+                listing_title, _ = normalize_listing_title_for_ebay(
+                    listing_title,
+                    source_title=getattr(product, "title", "") or listing_title,
+                )
                 inv_product = {
-                    "title": listing_title[:80],
+                    "title": listing_title,
                     "description": description,
                     "image_urls": eps_images,
                     "price": final_price,

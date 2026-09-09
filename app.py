@@ -607,14 +607,26 @@ def calculate_pricing(product: dict) -> dict:
 # AI Optimizer (Qwen)
 # ============================================================================
 
+def _ebay_title(title: str, *, source_title: str = "") -> str:
+    """Word-safe eBay title trim (ADR-002: no raw [:80])."""
+    from src.utils.title_sanitizer import normalize_listing_title_for_ebay
+
+    cleaned, _ = normalize_listing_title_for_ebay(
+        title or "",
+        source_title=source_title or title or "",
+    )
+    return cleaned
+
+
 def run_ai_optimization(product: dict) -> dict:
     """Run Qwen AI optimization"""
     from qwen_optimizer import QwenOptimizer
     
     qwen_key = os.getenv("QWEN_API_KEY")
+    source_title = product.get('title', '')
     if not qwen_key:
         return {
-            "title": product.get('title', '')[:80],
+            "title": _ebay_title(source_title, source_title=source_title),
             "description": product.get('description', ''),
             "aspects": _default_brand_aspects(),
             "error": "QWEN_API_KEY not set"
@@ -632,7 +644,7 @@ def run_ai_optimization(product: dict) -> dict:
         return result
     except Exception as e:
         return {
-            "title": product.get('title', '')[:80],
+            "title": _ebay_title(source_title, source_title=source_title),
             "description": product.get('description', ''),
             "aspects": _default_brand_aspects(),
             "error": str(e)
@@ -673,7 +685,10 @@ def publish_to_ebay(product: dict) -> dict:
             return {"status": "error", "message": "价格未计算"}
         
         sku = product['sku']
-        title = opt_data.get("title", product.get('title', ''))[:80]
+        title = _ebay_title(
+            opt_data.get("title", product.get('title', '')),
+            source_title=product.get('title', ''),
+        )
         description = opt_data.get("description", product.get('description', ''))
         category_id = remap_legacy_category_id(opt_data.get("categoryId", ""))
         if not is_sellable_leaf_category(oauth, category_id):
@@ -988,7 +1003,10 @@ def publish_with_auto_category(product: dict) -> dict:
             # 1. Create Inventory Item
             # 使用智能HTML截断器，保持描述结构完整
             from src.utils.html_truncator import smart_truncate_html
-            title = opt_data.get("title", product.get('title', ''))[:80]
+            title = _ebay_title(
+                opt_data.get("title", product.get('title', '')),
+                source_title=product.get('title', ''),
+            )
             description = opt_data.get("description", product.get('description', ''))
             description = smart_truncate_html(description, max_length=50000, min_length=45000)
             compatibility = analyze_ebay_motors_compatibility(
