@@ -94,6 +94,40 @@ def test_eps_image_normalization_upscales_small_side():
     assert size[1] >= 500
 
 
+def test_eps_image_normalization_downscales_oversized_side():
+    from io import BytesIO
+    from PIL import Image
+
+    image = Image.new("RGB", (20000, 800), "red")
+    buf = BytesIO()
+    image.save(buf, format="JPEG", quality=95)
+
+    data, content_type, size = normalize_eps_image_data(buf.getvalue(), "image/jpeg")
+
+    assert content_type == "image/jpeg"
+    assert data
+    assert max(size) <= 14000
+    assert sum(size) <= 14900
+
+
+def test_eps_image_normalization_downscales_oversized_combined_dimension():
+    from io import BytesIO
+    from PIL import Image
+
+    # Square Giga assets can be under 15000 per side but still fail EPS
+    # when width + height exceeds 15000 (error 21916604).
+    image = Image.new("RGB", (8335, 8335), "red")
+    buf = BytesIO()
+    image.save(buf, format="JPEG", quality=90)
+
+    data, content_type, size = normalize_eps_image_data(buf.getvalue(), "image/jpeg")
+
+    assert content_type == "image/jpeg"
+    assert data
+    assert max(size) <= 14000
+    assert sum(size) <= 14900
+
+
 def test_inventory_item_converts_supplier_urls_to_eps(monkeypatch):
     client = _make_client()
     raw_urls = [

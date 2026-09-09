@@ -38,6 +38,12 @@ EBAY_HOSTED_IMAGE_DOMAINS = ("i.ebayimg.com",)
 EPS_MAX_IMAGE_BYTES = 10 * 1024 * 1024
 EPS_TARGET_MAX_IMAGE_BYTES = 9_500_000
 EPS_MIN_IMAGE_SIDE = 500
+# eBay EPS rejects uploads whose longest side exceeds 15000 pixels
+# (Trading error 21916604). Stay slightly under the hard limit.
+EPS_MAX_IMAGE_SIDE = 14000
+# eBay also rejects when width + height exceeds 15000 (same error code).
+# Square 8335x8335 Giga assets hit this even though each side is under 15000.
+EPS_MAX_COMBINED_DIMENSION = 14900
 UNBRANDED_MARKERS = {"unbranded", "unbrand", "generic"}
 VALID_ASSEMBLY_STATUS_VALUES = {"Part Assembled", "Fully Assembled", "Ready to Assemble"}
 INVALID_MOTORS_COMPATIBILITY_ERROR_CODES = {"21916723", "21916724"}
@@ -177,6 +183,8 @@ def normalize_eps_image_data(
     *,
     max_bytes: int = EPS_TARGET_MAX_IMAGE_BYTES,
     min_side: int = EPS_MIN_IMAGE_SIDE,
+    max_side: int = EPS_MAX_IMAGE_SIDE,
+    max_combined: int = EPS_MAX_COMBINED_DIMENSION,
 ) -> tuple[bytes, str, tuple[int, int]]:
     """Prepare source image bytes for eBay EPS constraints."""
     from io import BytesIO
@@ -188,6 +196,9 @@ def normalize_eps_image_data(
             len(image_data) > max_bytes
             or width < min_side
             or height < min_side
+            or width > max_side
+            or height > max_side
+            or (width + height) > max_combined
             or content_type.lower() not in {"image/jpeg", "image/jpg", "image/png"}
         )
 
@@ -204,6 +215,14 @@ def normalize_eps_image_data(
         width, height = img.size
         if width < min_side or height < min_side:
             scale = max(min_side / max(width, 1), min_side / max(height, 1))
+            img = img.resize((int(width * scale + 0.5), int(height * scale + 0.5)), Image.LANCZOS)
+            width, height = img.size
+        if width > max_side or height > max_side or (width + height) > max_combined:
+            scale = min(
+                max_side / max(width, 1),
+                max_side / max(height, 1),
+                max_combined / max(width + height, 1),
+            )
             img = img.resize((int(width * scale + 0.5), int(height * scale + 0.5)), Image.LANCZOS)
             width, height = img.size
 
