@@ -1,0 +1,151 @@
+你是接手 Dajian_Listing_Tool 存量 CRITICAL 清理任务的执行方。这是**放行指令**。
+
+仓库：C:\Users\poonx\Dajian_Listing_Tool
+分支：codex/live-audit-semantic-guard（不要切换、不要新建）
+原任务书：docs/HANDOFF_CRITICAL_BACKLOG_20260726.md —— 红线部分仍然全部有效
+
+═══════════════════════════════════════════
+【一、你上一轮做得对，先说清楚】
+═══════════════════════════════════════════
+
+你按我给的三条 grep 自检跑出非 0，然后停下来报告。**这是正确的。**
+
+但那三条 grep 是**我写错了**：预览文件同时含 `### Before`（当前 live 内容，
+本来就带着旧文案）和 `### After`（改写提案），grep 扫全文必然命中。
+按 After 段重测：**0 条命中**，修复其实是生效的。
+
+你没有自作主张判断"这大概是误报，继续推"——这正是红线该起的作用。
+
+═══════════════════════════════════════════
+【二、这一轮的两个变化】
+═══════════════════════════════════════════
+
+### 变化 1：不再用 grep，改用校验脚本
+
+新增 `scripts/verify_rewrite_preview.py`（已提交，12 条测试覆盖）。
+它**只读 After 段**，并且把缺陷分成两级：
+
+- **BLOCK（退出码 1）** = 源不支持的声明。编造卖点、模板标记缺失、
+  出现中文、粘连段标题。→ **停下报告，不许推。**
+- **warn（退出码 0）** = 内容真实但冗余（PERFECT FOR 重复了功能条目）。
+  → **可以推。**这类是源 HTML 缺句号造成的粘连，属供应商数据瑕疵。
+
+> 🔴 只看退出码和 RESULT 行，不要自己另写 grep 判断。
+> 分级就是为了避免上一轮那种"良性问题触发停止"的假警报。
+
+### 变化 2：又修了一个问题（`6dc565b`）
+
+上一轮我复查 v2 预览时发现：68 条待推里 **46 条的 PERFECT FOR 与
+KEY FEATURES 首条一字不差**。两处从同一批源句子里挑，撞车了。
+内容不假，但买家会连读两遍同一句。已修：把已选中的功能条目传进去做去重。
+在 400 条真实源数据上验证，重复率从约 68% 降到 1.25%。
+
+**你的 v2 预览是这个修复之前生成的**，所以会有 46 条 warn。
+用新校验脚本跑 v2 的结果是 `OK WITH WARNINGS, exit 0` —— 意思是
+**没有不实声明，可以安全推送**，冗余问题下一次重建描述时自动消失。
+
+═══════════════════════════════════════════
+【三、这一轮做什么】
+═══════════════════════════════════════════
+
+### Step 1 — 金丝雀 10 条（已替你选好）
+
+`logs/_canary10.txt` 我已生成，不要自己换。选择依据：
+- 覆盖全部 5 种 CRITICAL 类型（material / dimension / capacity / certification / count）
+- **其中 8 条是原本中招"提供实用座椅"的**，用来真实验证修复生效
+
+清单：
+```
+70879.00          semantic_material        [原中招]
+LP000677AAE-1     semantic_material        [原中招]
+LP000678AAF-1     semantic_dimension       [原中招]
+W5532P458419      semantic_capacity
+W5568P478817      semantic_capacity
+GX000346AAD       semantic_certification   [原中招]
+W2787P377338      semantic_certification   [原中招]
+W465P369979       semantic_count           [原中招]
+LP000677AAF-1     (seating 修复验证)        [原中招]
+W1586P268018      (seating 修复验证)        [原中招]
+```
+
+推送前先跑一次校验（这一步必做）：
+```
+PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/verify_rewrite_preview.py reports/crit_backlog_preview_v2
+```
+退出码 1 → 停。退出码 0 → 继续：
+
+```
+PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/semantic_rewrite.py --sku-file logs/_canary10.txt --apply
+```
+
+### Step 2 — 逐条人工验收（10 条全验，不抽样）
+
+对每一条确认：
+- [ ] **在 offer 的 `listingDescription` 上验**，不是 inventory 那份
+      （后者截断到 4000 字符，验它会误判）
+- [ ] banner（AquaVerve）+ footer（`✦ Ships from US Warehouse ✦` /
+      `Quality Guaranteed • Fast US Shipping • Trusted Seller`）齐全
+- [ ] **8 条原中招的：确认 live 描述里再无 "adds practical seating" /
+      "everyday comfort"**，PERFECT FOR 要么是真实场景句、要么整块不存在
+- [ ] 标题不残（无截断、无半句话结尾）
+- [ ] 材质大小写：`MDF` 不是 `Mdf`，`PU` 不是 `Pu`
+- [ ] **listing_id / offer_id 未变**（必须原位更新）
+- [ ] 描述无中文、无原始源 HTML 结构
+
+**把 10 条的逐条结果报回来，等放行再进 Step 3。**
+
+### Step 3 — 分批推余下（放行后）
+
+余下约 58 条，**每批 ≤ 30**，批间停下核对上一批 live 正常。
+
+### Step 4 — 鸡舍 W3166P455683（本次授权写入描述）
+
+你上一轮已 dry-run 确认过（`fixes_applied: []`，没写入，正确）。
+本次**授权执行描述修复**：
+
+```
+PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/audit_fix_active_listings.py --sku W3166P455683 --live --fix-key __rebuild_description_from_source__ --fix
+```
+
+重建结果我已直接验证：3660 字符、banner+footer 齐全、无中文、
+PERFECT FOR 已按新规则正确省略、无编造座椅声明。
+
+> 🔴 标题 `chicken coop` 仍然只许出建议，不许自动改。
+> `repair_broken_listings.py` 对它会 `SKIP (title_rebuild_failed)`，
+> 因为源标题本身就是 "chicken coop"。不要在那个脚本上反复试。
+>
+> 提 2–3 个候选标题给验收人选。已核实存在于源的事实：
+> 尺寸 123"L x 26"W x 44.5"H、容量 4–8 只鸡、含产蛋箱 / 坡道 / 架高主体。
+> 每个词都要有源依据。不许加源里没有的材质，不许加 "waterproof /
+> all-weather" 这类未经源证实的形容词。
+
+═══════════════════════════════════════════
+【四、红线（只能触发停止，你无权重新解释）】
+═══════════════════════════════════════════
+
+历史教训：曾有执行方在正确触发"批量回滚>2条则停止"后，自行把它重新解释成
+"批次栅栏——结束本批、继续下一批"。**红线的唯一合法反应是：停下来，报告，等指示。**
+
+- 校验脚本退出码 1（BLOCK）→ 停止
+- 单批回滚 > 2 条 → 停止
+- 任何 end-listing / relist（必须原位更新 listing_id/offer_id）→ 停止
+- 金丝雀 10 条里任意一条验收不过 → 停止，不要进 Step 3
+- W3166P455683 的标题被自动改写 → 停止
+- 转人工的 19 条被绕过校验推送 → 停止
+- 修改或删除既有测试断言 → 禁止（只能新增）
+- `git add -A` / `git add .` → 禁止。工作区有并行 session 的改动，只能 git add <具体路径>
+- 修改 .env / 杀重启调度守护进程 / git push → 禁止
+- 绕过 PricingEngine / RepricingGuard / EbayPublisher → 禁止
+
+═══════════════════════════════════════════
+【五、其他】
+═══════════════════════════════════════════
+
+- 测试基线现在是 **2114 passed**
+  `$env:PYTHONPATH='C:\Users\poonx\Dajian_Listing_Tool'; .\.venv\Scripts\python.exe -m pytest tests/ -q`
+- LLM 提取有 run-to-run 抖动，数字与上轮有出入是正常的。
+  只对连续两次都被标记的问题动手，不要去"修"提取器。
+- 仍**只处理 CRITICAL**，不碰 MEDIUM（上千条是预期内的营销措辞噪声）。
+- 推送失败自动回滚是既有机制，别绕过它。回滚超过 2 条就是红线。
+
+**不要自评"任务完成"。** Step 2 逐条报完等放行；遇到红线或判断不了的，停下来问。

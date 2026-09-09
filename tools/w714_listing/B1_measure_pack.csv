@@ -1,0 +1,25 @@
+﻿sku,is_combo,combo_box_count,net_weight_lbs,gross_weight_lbs,child_combo,assembled_length_in,assembled_width_in,assembled_height_in,package_length_in,package_width_in,package_height_in,page_price,page_shipping,giga_url,status,notes
+W714S01988,True,2,98.0,106.0,W714P520808*1 | W714P520847*1,76.4,38.2,37,37.0,30.0,9.0,232.2,75.7,https://www.gigab2b.com/product/W714S01988,collected,"assembled_from_vl,package_from_children"
+W714S01989,True,3,121.0,132.0,W714P520808*1 | W714P520847*1W714P520815*1,,,,,,,,,https://www.gigab2b.com/product/W714S01989,pending,
+W714S01990,True,4,144.0,158.0,W714P520808*1 | W714P520847*1W714P520815*2,,,,,,,,,https://www.gigab2b.com/product/W714S01990,pending,
+W714S01991,True,3,136.0,147.0,W714P520808*1 | W714P520847*1 | W714P520814*1,,,,,,,,,https://www.gigab2b.com/product/W714S01991,pending,
+W714S01992,True,4,159.0,173.0,W714P520808*1 | W714P520847*1 | W714P520814*1 | W714P520815*1,,,,,,,,,https://www.gigab2b.com/product/W714S01992,pending,
+W714S01995,True,4,174.0,188.0,W714P520808*1 | W714P520847*1 | W714P520814*2,132.3,38.2,37,37.0,30.0,9.0,392.16,125.84,https://www.gigab2b.com/product/W714S01995,collected,"assembled_from_vl,package_from_children"
+W714S01998,True,2,98.0,106.0,W714P520817*1 | W714P520818*1,76.4,38.2,37,37.0,30.0,9.0,232.2,75.7,https://www.gigab2b.com/product/W714S01998,collected,"assembled_from_vl,package_from_children"
+W714S01999,True,3,121.0,132.0,W714P520817*1 | W714P520818*1 | W714P520820*1,76.4,63.4,37,37.0,30.0,9.0,290.68,93.87,https://www.gigab2b.com/product/W714S01999,collected,"assembled_from_vl,package_from_children"
+W714S02000,True,4,144.0,158.0,W714P520817*1 | W714P520818*1 | W714P520820*2,76.4,53,37,37.0,30.0,9.0,349.16,112.04,https://www.gigab2b.com/product/W714S02000,collected,"assembled_from_vl,package_from_children"
+W714S02001,True,3,136.0,147.0,W714P520817*1 | W714P520818*1 | W714P520819*1,104,38.2,37,37.0,30.0,9.0,312.18,100.77,https://www.gigab2b.com/product/W714S02001,collected,"assembled_from_vl,package_from_children"
+W714S02002,True,4,159.0,173.0,W714P520817*1 | W714P520818*1 | W714P520819*1 | W714P520820*1,104,63.4,37,37.0,30.0,9.0,370.66,118.94,https://www.gigab2b.com/product/W714S02002,collected,"assembled_from_vl,package_from_children"
+W714S02005,True,4,174.0,188.0,W714P520817*1 | W714P520818*1 | W714P520819*2,132.3,38.2,37,37.0,30.0,9.0,392.16,125.84,https://www.gigab2b.com/product/W714S02005,collected,"assembled_from_vl,package_from_children"
+W714S02008,True,2,98.0,106.0,W714P520821*1 | W714P520822*1,76.4,38.2,37,37.0,30.0,9.0,232.2,75.7,https://www.gigab2b.com/product/W714S02008,collected,"assembled_from_vl,package_from_children"
+W714S02009,True,3,121.0,132.0,W714P520821*1 | W714P520822*1 | W714P520824*1,76.4,63.4,37,37.0,30.0,9.0,290.68,93.87,https://www.gigab2b.com/product/W714S02009,collected,"assembled_from_vl,package_from_children"
+W714S02010,True,4,144.0,158.0,W714P520821*1 | W714P520822*1 | W714P520824*2,76.4,53,37,37.0,30.0,9.0,349.16,112.04,https://www.gigab2b.com/product/W714S02010,collected,"assembled_from_vl,package_from_children"
+W714S02011,True,3,136.0,147.0,W714P520821*1 | W714P520822*1 | W714P520823*1,104,38.2,37,37.0,30.0,9.0,312.18,100.77,https://www.gigab2b.com/product/W714S02011,collected,"assembled_from_vl,package_from_children"
+W714S02012,True,4,159.0,173.0,W714P520821*1 | W714P520822*1 | W714P520823*1 | W714P520824*1,104,81,37,37.0,30.0,9.0,370.66,118.94,https://www.gigab2b.com/product/W714S02012,collected,"assembled_from_vl,package_from_children"
+W714S02015,True,4,174.0,188.0,W714P520821*1 | W714P520822*1 | W714P520823*2,132.3,38.2,37,37.0,30.0,9.0,392.16,125.84,https://www.gigab2b.com/product/W714S02015,collected,"assembled_from_vl,package_from_children"
+W714S02018,True,2,98.0,106.0,W714P520826*1 | W714P520827*1,76.4,38.2,37,37.0,30.0,9.0,232.2,75.7,https://www.gigab2b.com/product/W714S02018,collected,"assembled_from_vl,package_from_children"
+W714S02019,True,3,121.0,132.0,W714P520826*1 | W714P520827*1 | W714P520829*1,76.4,63.4,37,37.0,30.0,9.0,290.68,93.87,https://www.gigab2b.com/product/W714S02019,collected,"assembled_from_vl,package_from_children"
+W714S02020,True,4,144.0,158.0,W714P520826*1 | W714P520827*1 | W714P520829*2,76.4,53,37,37.0,30.0,9.0,349.16,112.04,https://www.gigab2b.com/product/W714S02020,collected,"assembled_from_vl,package_from_children"
+W714S02021,True,3,136.0,147.0,W714P520826*1 | W714P520827*1 | W714P520828*1,104,38.2,37,37.0,30.0,9.0,312.18,100.77,https://www.gigab2b.com/product/W714S02021,collected,"assembled_from_vl,package_from_children"
+W714S02022,True,4,159.0,173.0,W714P520826*1 | W714P520827*1 | W714P520828*1 | W714P520829*1,104,63.4,37,37.0,30.0,9.0,370.66,118.94,https://www.gigab2b.com/product/W714S02022,collected,"assembled_from_vl,package_from_children"
+W714S02025,True,4,174.0,188.0,W714P520826*1 | W714P520827*1 | W714P520828*2,132.3,38.2,37,37.0,30.0,9.0,392.16,125.84,https://www.gigab2b.com/product/W714S02025,collected,"assembled_from_vl,package_from_children"

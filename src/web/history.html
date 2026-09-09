@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Product History - AquaVerve Collection System</title>
+    <title>Product History</title>
     <style>
         * {
             margin: 0;
@@ -224,7 +224,7 @@
 
 <body>
     <div class="container">
-        <h1>🐟 Product Collection History</h1>
+        <h1 id="history-title">Product Collection History</h1>
         <div id="productGrid" class="product-grid">
             <div class="loading">Loading products...</div>
         </div>
@@ -349,10 +349,24 @@
             }
         }
 
+        async function applyStoreBranding() {
+            try {
+                const res = await fetch("/api/store-info");
+                const info = await res.json();
+                const name = info.display_name || info.brand_name || "Store";
+                document.title = `Product History - ${name}`;
+                const titleEl = document.getElementById("history-title");
+                if (titleEl) titleEl.textContent = `${name} · Collection History`;
+            } catch (e) {
+                console.warn("store-info unavailable", e);
+            }
+        }
+
         // Auto-refresh every 10 seconds to see analysis progress
         setInterval(loadProducts, 10000);
 
         // Initial load
+        applyStoreBranding();
         loadProducts();
     </script>
 </body>

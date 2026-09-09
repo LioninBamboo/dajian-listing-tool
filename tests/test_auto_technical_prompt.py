@@ -1,0 +1,206 @@
+"""Tests for the auto-parts / tools listing prompt + finalizer (P0-A2)."""
+
+import dataclasses
+
+import pytest
+
+from src.services.auto_technical_prompt import (
+    AUTO_MODE_FITMENT,
+    AUTO_MODE_TOOL,
+    build_auto_technical_system_prompt,
+    build_auto_technical_user_prompt,
+    detect_auto_mode,
+    finalize_auto_technical_listing,
+)
+from src.utils.store_profile import StoreProfile
+
+
+def _auto_profile(force_house_brand=True):
+    return dataclasses.replace(
+        StoreProfile(),
+        brand_name="AquaRides",
+        brand_tagline="PERFORMANCE AUTO PARTS & ACCESSORIES",
+        description_footer_line1="✦ Ships from US Warehouse ✦",
+        description_footer_line2="Quality Guaranteed • Fast US Shipping",
+        quality_footer_marker="ships from",
+        template_style="auto_technical",
+        force_house_brand=force_house_brand,
+    )
+
+
+class _CompatObj:
+    mode = "by_year"
+    compatible_products = [
+        {"compatibilityProperties": [{"name": "Make", "value": "Ford"}]}
+    ]
+
+
+class TestDetectMode:
+    def test_part_by_keyword(self):
+        assert detect_auto_mode(
+            "Class 3 Trailer Hitch 2 Inch Receiver", "rear receiver",
+            {"Type": ["Receiver Hitch"]},
+        ) == AUTO_MODE_FITMENT
+
+    def test_tool_by_keyword(self):
+        assert detect_auto_mode(
+            "1/2 in Cordless Impact Wrench Kit", "high torque", {}
+        ) == AUTO_MODE_TOOL
+
+    def test_running_board_is_a_part_not_a_tool(self):
+        # False-friend guard: "running board" must not trip a tool signal.
+        assert detect_auto_mode("Running Board Nerf Bar Side Step", "", {}) == AUTO_MODE_FITMENT
+
+    def test_tool_word_but_part_present_stays_part(self):
+        assert detect_auto_mode("Brake Rotor Kit with wrench", "", {}) == AUTO_MODE_FITMENT
+
+    def test_ambiguous_defaults_to_fitment(self):
+        assert detect_auto_mode("Universal Rubber Floor Mats", "", {}) == AUTO_MODE_FITMENT
+
+    def test_structured_compatibility_forces_fitment(self):
+        assert detect_auto_mode("anything at all", "", {}, _CompatObj()) == AUTO_MODE_FITMENT
+
+    def test_list_compatibility_forces_fitment(self):
+        entries = [{"compatibilityProperties": [{"name": "Make", "value": "Ford"}]}]
+        assert detect_auto_mode("anything", "", {}, entries) == AUTO_MODE_FITMENT
+
+
+class TestSystemPrompt:
+    def test_tool_prompt_has_no_vehicle_fitment(self):
+        sp = build_auto_technical_system_prompt(_auto_profile(), AUTO_MODE_TOOL)
+        assert "TOOLS" in sp
+        assert "universal" in sp.lower()          # tools are universal, no YMM
+        assert "WHAT'S IN THE BOX" in sp
+
+    def test_fitment_prompt_warns_against_inventing_fitment(self):
+        sp = build_auto_technical_system_prompt(_auto_profile(), AUTO_MODE_FITMENT)
+        assert "PARTS" in sp
+        assert "do not invent" in sp.lower() or "not invent" in sp.lower()
+        assert "compatibility" in sp.lower()
+
+    def test_user_prompt_carries_source_facts(self):
+        up = build_auto_technical_user_prompt(
+            title="Hitch", description="steel receiver", mode=AUTO_MODE_FITMENT,
+            attributes={"Material": ["Steel"]}, specs={"weight": "30 lb"},
+            market_intel={"top_keywords": ["trailer hitch"], "price_stats": {"min": 40, "max": 90, "avg": 60}},
+        )
+        assert "Hitch" in up and "Steel" in up and "trailer hitch" in up
+
+
+class TestFinalize:
+    def test_forces_house_brand_over_source(self):
+        out = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>x</div>",
+             "aspects": {"Brand": ["Bosch"], "Type": ["Hitch"]}},
+            _auto_profile(force_house_brand=True), AUTO_MODE_FITMENT,
+        )
+        assert out["aspects"]["Brand"] == ["AquaRides"]
+        assert out["aspects"]["Type"] == ["Hitch"]
+
+    def test_keeps_source_brand_when_not_forcing(self):
+        out = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>x</div>", "aspects": {"Brand": ["Bosch"]}},
+            _auto_profile(force_house_brand=False), AUTO_MODE_TOOL,
+        )
+        assert out["aspects"]["Brand"] == ["Bosch"]
+
+    def test_title_clamped_to_80(self):
+        out = finalize_auto_technical_listing(
+            {"title": "X" * 120, "description": "<div>x</div>", "aspects": {}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        assert len(out["title"]) == 80
+
+    def test_footer_appended_once(self):
+        first = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>x</div>", "aspects": {}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        assert "Ships from US Warehouse" in first["description"]
+        again = finalize_auto_technical_listing(
+            {"title": "T", "description": first["description"], "aspects": {}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        assert again["description"].count("Ships from US Warehouse") == 1
+
+    def test_brand_banner_prepended_once(self):
+        first = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>body</div>", "aspects": {}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        assert "AQUARIDES" in first["description"]          # branded banner present
+        assert first["description"].index("AQUARIDES") < first["description"].index("body")
+        again = finalize_auto_technical_listing(
+            {"title": "T", "description": first["description"], "aspects": {}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        assert again["description"].count("AQUARIDES") == 1  # idempotent, no double banner
+
+    def test_fitment_prompt_forbids_a_compatibility_section(self):
+        sp = build_auto_technical_system_prompt(_auto_profile(), AUTO_MODE_FITMENT)
+        low = sp.lower()
+        assert "compatible models include" not in low
+        assert "do not add any fitment" in low          # eBay renders it natively
+
+    def test_deterministic_spec_table_injected_and_legible(self):
+        out = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>body</div>",
+             "aspects": {"Type": ["Receiver Hitch"], "Material": ["Carbon Steel"],
+                         "Brand": ["AquaRides"]}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        d = out["description"]
+        assert "Specifications" in d and "<table" in d
+        assert "#1f2329" in d and "#f6f7f9" in d            # dark header + light row = high contrast
+        assert "Carbon Steel" in d
+        assert d.count("<table") == 1                        # single, deterministic
+        assert ">Brand<" not in d                            # Brand is not a spec row
+
+    def test_hero_band_surfaces_key_numbers(self):
+        out = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>body</div>",
+             "aspects": {"Hitch Class": ["Class 3"], "Load Capacity": ["4500 lbs"],
+                         "Receiver Size": ["2 in"], "Material": ["Carbon Steel"]}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        d = out["description"]
+        assert "26px" in d                                   # hero stat cards present
+        assert "4500 lbs" in d and "Class 3" in d
+        # hero band comes before the body prose
+        assert d.index("4500 lbs") < d.index("body")
+
+    def test_spec_table_folds_dimensions_and_caps_rows(self):
+        aspects = {
+            "Item Length": ["32.5 in"], "Item Width": ["17.0 in"], "Item Height": ["8.3 in"],
+            "Type": ["Receiver Hitch"], "Material": ["Carbon Steel"], "Finish": ["Black Powder Coat"],
+            "Hitch Class": ["Class 3"], "Receiver Size": ["2 in"], "Tongue Weight": ["675 lbs"],
+            "Mounting": ["Bolt-on"], "Placement on Vehicle": ["Rear"], "Fitment Type": ["Vehicle Specific Fit"],
+            "Warranty": ["1 Year"], "Max Gross Trailer Weight": ["4500 lbs"],
+        }
+        out = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>body</div>", "aspects": aspects},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        d = out["description"]
+        # three dimension rows folded into one L × W × H row
+        assert "Dimensions (L × W × H)" in d
+        assert "32.5 × 17.0 × 8.3 in" in d
+        assert ">Item Length<" not in d and ">Item Width<" not in d
+        # capped at 10 data rows (+1 header row)
+        assert d.count("<tr") == 11
+
+    def test_spec_table_not_injected_when_llm_made_one(self):
+        # Guard against double tables if the model ignores the instruction.
+        out = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div><th>x</th></div>", "aspects": {"Type": ["Hitch"]}},
+            _auto_profile(), AUTO_MODE_FITMENT,
+        )
+        assert out["description"].count("<table") == 0
+
+    def test_mode_recorded_and_features_defaulted(self):
+        out = finalize_auto_technical_listing(
+            {"title": "T", "description": "<div>x</div>", "aspects": {}},
+            _auto_profile(), AUTO_MODE_TOOL,
+        )
+        assert out["mode"] == AUTO_MODE_TOOL
+        assert out["features"] == []

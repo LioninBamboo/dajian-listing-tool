@@ -48,13 +48,26 @@ class EbayClient:
     def get_oauth_token(self) -> str:
         """
         获取 OAuth 2.0 Token
-        优先使用 User Token (Refresh Token Flow)，否则回退到 Application Token
+        优先从 SQLite 获取 (EbayOAuthService)，支持自动刷新
         """
         # 0. 检查缓存
         if self.access_token and time.time() < self.token_expires_at:
             return self.access_token
 
-        # 1. 尝试使用 Refresh Token 获取 User Token
+        # 1. 优先从 EbayOAuthService 获取（支持自动刷新）
+        try:
+            from src.services.ebay_auth import EbayOAuthService
+            env_name = "PRODUCTION" if self.env == "production" else "SANDBOX"
+            oauth_service = EbayOAuthService(env_name)
+            if oauth_service.is_authorized():
+                token = oauth_service.get_valid_token()  # 自动刷新过期token
+                self.access_token = token
+                self.token_expires_at = time.time() + 7000  # 约2小时缓存
+                return self.access_token
+        except Exception as e:
+            print(f"[WARN] EbayOAuthService failed: {e}, falling back to env var")
+        
+        # 2. 回退：尝试使用环境变量的 Refresh Token
         refresh_token = os.getenv("EBAY_REFRESH_TOKEN")
         
         credentials = f"{self.app_id}:{self.cert_id}"

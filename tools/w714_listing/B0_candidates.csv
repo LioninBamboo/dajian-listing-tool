@@ -1,0 +1,9 @@
+﻿batch,sheet,sku,name,table_discount_price,table_shipping,stock,net_weight_lbs,gross_weight_lbs,child_combo,combo_box_count,is_combo,shipping_source
+B0,98系列,W714P501023,2S,205.2,71.73,19.0,94.0,103.0,,1,False,estimated_from_gross_ratio
+B0,98系列,W714S01975,2S+1O,268.2,91.23,19.0,116.0,131.0,W714P501023x1 | W714P501029x1,2,True,estimated_from_gross_ratio
+B0,98系列,W714S01976,2S+2O,331.2,110.72,19.0,138.0,159.0,W714P501023 x1 | W714P501029 x2,3,True,estimated_from_gross_ratio
+B0,98系列,W714S01977,3S+1O,358.2,119.08,19.0,153.0,171.0,W714P501023 x1 | W714P501028 x1,2,True,estimated_from_gross_ratio
+B0,98系列,W714P500997,2S,205.2,71.73,57.0,94.0,103.0,,1,False,estimated_from_gross_ratio
+B0,98系列,W714S01969,2S+1O,268.2,91.23,57.0,116.0,131.0,W714P500997 x1 | W714P501021 x1,2,True,estimated_from_gross_ratio
+B0,98系列,W714S01970,2S+2O,331.2,110.72,46.0,138.0,159.0,W714P500997 x1 | W714P501021 x2,3,True,estimated_from_gross_ratio
+B0,98系列,W714S01971,3S+1O,358.2,119.08,57.0,153.0,171.0,W714P500997 x1 | W714P501015 x1,2,True,estimated_from_gross_ratio

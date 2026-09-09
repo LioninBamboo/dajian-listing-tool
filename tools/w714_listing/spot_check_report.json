@@ -1,0 +1,128 @@
+{
+  "sampled": 12,
+  "pool": 111,
+  "ok": 12,
+  "issues": 0,
+  "rows": [
+    {
+      "sku": "W714P541784",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366657859896",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['chenille'] ['fabric'] ['chenille']"
+    },
+    {
+      "sku": "W714S01998",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366656419474",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['corduroy'] ['fabric'] ['corduroy']"
+    },
+    {
+      "sku": "W714S01977",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366656120594",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['chenille'] ['fabric'] ['chenille']"
+    },
+    {
+      "sku": "W714P499778",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366658242062",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['chenille'] ['fabric'] ['chenille']"
+    },
+    {
+      "sku": "W714S02070",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366657530363",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['chenille'] ['fabric'] ['chenille']"
+    },
+    {
+      "sku": "W714S02025",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366656568008",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['corduroy'] ['fabric'] ['corduroy']"
+    },
+    {
+      "sku": "W714S02020",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366656540511",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['corduroy'] ['fabric'] ['corduroy']"
+    },
+    {
+      "sku": "W714S02001",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366656423281",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['corduroy'] ['corduroy'] ['corduroy']"
+    },
+    {
+      "sku": "W714S01995",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366656417638",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['corduroy'] ['corduroy'] ['corduroy']"
+    },
+    {
+      "sku": "W714S01945",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366658220544",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['chenille'] ['fabric'] ['chenille']"
+    },
+    {
+      "sku": "W714S02090",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366657823002",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['chenille'] ['fabric'] ['chenille']"
+    },
+    {
+      "sku": "W714S01991",
+      "ok": true,
+      "issues": [],
+      "quantity": 1,
+      "listing_id": "366656410517",
+      "listing_status": "ACTIVE",
+      "aquaverve_count": 1,
+      "materials": "['corduroy'] ['corduroy'] ['corduroy']"
+    }
+  ]
+}
