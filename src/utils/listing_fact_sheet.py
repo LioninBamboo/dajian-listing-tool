@@ -711,6 +711,23 @@ def compare_fact_sheets(
         # context, but the live copy/aspects do not actually claim it.
         if live_text is not None and not _claim_in_text(feature, live_text):
             continue
+        # Align with listing_quality_gate.source_supports_foldable: tents /
+        # umbrellas / camping chairs legitimately receive Features=Foldable from
+        # normalize_generated_listing. The LLM source sheet often omits that
+        # word even when the arbiter says supported — don't HIGH-block it.
+        if (
+            source_text is not None
+            and re.search(r"\bfold(?:able|ing)?\b|\bcollaps(?:ible|e)\b", feature, re.I)
+        ):
+            from src.utils.listing_quality_gate import source_supports_foldable
+
+            # source_text is title+description+attrs blob; feed both slots so
+            # NATURALLY_FOLDABLE_TITLE_KEYWORDS (tent/umbrella/…) still match.
+            if source_supports_foldable(
+                source_title=source_text,
+                source_description=source_text,
+            ):
+                continue
         if not _supported_by_any(feature, source["features"], source_blob_tokens, source_blob_text):
             violations.append(
                 {
