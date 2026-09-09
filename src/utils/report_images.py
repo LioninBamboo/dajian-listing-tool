@@ -1,15 +1,8 @@
-import base64
-import logging
-import mimetypes
 import re
 from functools import lru_cache
 from typing import Iterable, List
 
-import requests
-import urllib3
-
-logger = logging.getLogger(__name__)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import requests  # kept for tests that monkeypatch report_images.requests
 
 _JUNK_IMAGE_MARKERS = (
     "logo",
@@ -83,25 +76,12 @@ def normalize_thumbnail_url(url: str) -> str:
 
 @lru_cache(maxsize=256)
 def inline_image_src(url: str) -> str:
-    normalized_url = normalize_thumbnail_url(url)
-    if not normalized_url:
-        return ''
+    """Return a https thumbnail URL for report HTML.
 
-    try:
-        response = requests.get(normalized_url, timeout=20, verify=False)
-        if response.status_code != 200 or not response.content:
-            return normalized_url
-
-        content_type = (response.headers.get('Content-Type') or '').split(';')[0].strip().lower()
-        if not content_type.startswith('image/'):
-            guessed, _ = mimetypes.guess_type(normalized_url)
-            content_type = guessed or 'image/jpeg'
-
-        encoded = base64.b64encode(response.content).decode('ascii')
-        return f'data:{content_type};base64,{encoded}'
-    except Exception as exc:
-        logger.warning(f'报告缩略图内嵌失败: {normalized_url[:120]} ({exc})')
-        return normalized_url
+    Do NOT embed data:image base64 here — that ballooned GrovePop ops emails
+    to 150MB+. SMTP path still CIDs remote images via email_sender.
+    """
+    return normalize_thumbnail_url(url)
 
 
 def build_thumbnail_img_html(url: str, width: int = 40, height: int = 40) -> str:

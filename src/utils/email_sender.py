@@ -36,12 +36,29 @@ from typing import Optional, List, Tuple
 import requests
 from dotenv import load_dotenv
 from src.utils.report_retention import EMAIL_REPORT_PATTERNS, purge_named_artifacts
+from src.utils.store_profile import get_store_profile
 
 logger = logging.getLogger(__name__)
 IMG_SRC_PATTERN = re.compile(r'(<img\b[^>]*?\bsrc=["\'])(https?://[^"\']+)(["\'][^>]*>)', re.IGNORECASE)
+_BRACKET_PREFIX = re.compile(r"^\[[^\]]+\]\s*")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _ENV_LOADED = False
 EMAIL_REPORT_RETENTION_DAYS = int(os.getenv("EMAIL_REPORT_RETENTION_DAYS", "3") or 3)
+
+
+def brand_email_subject(subject: str) -> str:
+    """Prefix subject with [brand_name] for multi-store inbox filtering.
+
+    Already-bracketed subjects are left alone so callers that already brand
+    (MI digest, inventory ops) do not get stacked prefixes.
+    """
+    text = str(subject or "").strip()
+    if not text:
+        text = "(no subject)"
+    if _BRACKET_PREFIX.match(text):
+        return text
+    brand = str(getattr(get_store_profile(), "brand_name", "") or "").strip() or "Store"
+    return f"[{brand}] {text}"
 # ---------------------------------------------------------------------------
 # SMTP 提供商配置: (显示名, 主机, 端口, 是否SSL, 是否STARTTLS)
 # ---------------------------------------------------------------------------
@@ -152,6 +169,7 @@ def send_email(
         是否发送成功（True=邮件已送达, False=所有方式均失败但报告已保存本地）
     """
     _ensure_env_loaded()
+    subject = brand_email_subject(subject)
 
     # ---- 本地保存（保底） ----
     local_path = _save_local_report(subject, html_body)
