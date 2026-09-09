@@ -580,6 +580,14 @@ def _status_counts(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     return counts
 
 
+def should_email_cro_title_report(rep: Dict[str, Any]) -> bool:
+    """Skip empty completion emails when the queue produced nothing actionable."""
+    counts = _status_counts(rep.get("rows") or [])
+    if int(rep.get("input_skus") or 0) > 0:
+        return True
+    return bool(counts["done"] or counts["failed"] or counts["proposed"])
+
+
 def render_email_html(rep: Dict[str, Any]) -> str:
     counts = _status_counts(rep.get("rows") or [])
     changed_rows = [
@@ -1045,6 +1053,9 @@ def main() -> int:
     print(f"Report → {out_path}")
 
     if args.email:
+        if not should_email_cro_title_report(rep):
+            print("Email skipped (0 candidates / no actionable rows)")
+            return 0
         try:
             if _send_email(rep, out_path):
                 print("Email sent")
