@@ -9,6 +9,7 @@ This file is for future coding agents working in this repository. It is intentio
 - `daily_tasks.py` also runs `run_cro_diagnose()`; CRO execution is then consumed later by scheduler jobs rather than inline in the same step.
 - Generated listing correctness is centralized in `src/utils/listing_quality_gate.py`; do not fork product-family, item-specific, image, or measurement blockers in one-off scripts.
 - `StoreProfile.qc_profile` defaults to `furniture`. AquaRides sets `motors`, which skips furniture FactSheet / quality-gate rules and blocks incomplete Motors fitment instead.
+- Substore `scheduler_profile: ops` stays inventory-only unless `scheduler_enable_qc_autofix` / `scheduler_enable_ads` are flipped in that instance's local yaml. Do not switch substores onto `scheduler_profile: full` to get QC or ads.
 - Do not publish READY drafts before running `scripts/audit_fix_ready_drafts.py` and checking `logs/ready_draft_audit_*.json`.
 - Treat any `quality_gate` unresolved entry in `logs/ready_draft_audit_*.json` as a publish blocker.
 - The scheduled `11:30` live listing audit is detect-only: `scripts/audit_fix_active_listings.py --live --email` reports and emails, but does not auto-fix the full live corpus.

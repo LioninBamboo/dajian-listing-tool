@@ -96,6 +96,7 @@ TASK_TIMEOUT = {
     'bid_rollback': 3600,      # 1小时
     'blacklist_cleanup': 1800, # 30分钟
     'guard_anomaly': 600,      # 10分钟
+    'ads_enroll': 3600,        # 1小时 (子店安全开广告)
     'health_check': 3600,      # 1小时
     'cro_consume': 5400,
     'cro_image_refresh': 1800,
@@ -227,6 +228,20 @@ def _scheduler_profile_name() -> str:
 
 def _is_ops_scheduler() -> bool:
     return _scheduler_profile_name() == 'ops'
+
+
+def _ops_qc_autofix_enabled() -> bool:
+    try:
+        return bool(get_store_profile().ops_qc_autofix_enabled)
+    except Exception:
+        return False
+
+
+def _ops_ads_enabled() -> bool:
+    try:
+        return bool(get_store_profile().ops_ads_enabled)
+    except Exception:
+        return False
 
 
 def release_lock():
@@ -985,7 +1000,10 @@ def task_auto_analyze():
 
 
 def task_smart_reprice():
-    """手动智能重新定价（保留给人工触发，不再定时调度）"""
+    """智能重新定价。主店走 daily_tasks 内部门控; 子店 ads 切片周一/周四调度."""
+    if _task_succeeded_today('smart_reprice'):
+        logger.info("↪ 跳过智能调价: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
     run_task(
         'smart_reprice',
         [str(PROJECT_ROOT / 'scripts' / 'batch_smart_reprice.py'), '--apply', '--email'],
@@ -1409,6 +1427,27 @@ def task_cro_delist_email():
     )
 
 
+def task_ads_enroll():
+    """子店广告入驻 — 确保 campaign 存在, 对未推广 live listing 走 create_ad_safe.
+
+    不跑 CRO diagnose / cro_promote: 那条链路依赖 daily_tasks 入队, ops 档没有
+    daily_tasks, 硬接会天天 skip. 入驻仍复用主店同一套利润/黑名单守卫.
+    """
+    if _task_succeeded_today('ads_enroll'):
+        logger.info("↪ 跳过子店广告入驻: 今日已成功执行")
+        return True, 'Skipped (already succeeded today)'
+
+    run_task(
+        'ads_enroll',
+        [
+            str(PROJECT_ROOT / 'scripts' / 'store_marketing.py'),
+            '--levers', 'promoted',
+            '--apply',
+        ],
+        timeout_sec=TASK_TIMEOUT['ads_enroll'],
+    )
+
+
 def task_ad_restore():
     """广告自动恢复审计 — 把因触底被关掉的广告在条件改善后重新打开 (Phase 3 闭环).
 
@@ -1746,15 +1785,49 @@ def setup_schedule():
 
 
 def _setup_schedule_ops():
-    """子店 lean 档: 库存运营 + 出单源复核 only."""
+    """子店 lean 档: 库存运营 + 出单源复核; QC/广告切片按 profile 开关叠加."""
     schedule.every().day.at("09:30").do(task_ops_daily).tag('daily', 'ops')
     schedule.every(6).hours.do(task_order_recheck).tag('recurring', 'order_recheck')
+
+    qc_on = _ops_qc_autofix_enabled()
+    ads_on = _ops_ads_enabled()
+    if ads_on:
+        schedule.every().monday.at("09:35").do(task_smart_reprice).tag('weekly', 'smart_reprice')
+        schedule.every().thursday.at("09:35").do(task_smart_reprice).tag('weekly', 'smart_reprice')
+        schedule.every().day.at("09:40").do(task_ad_restore).tag('daily', 'ad_restore')
+        schedule.every().day.at("09:45").do(task_blacklist_cleanup).tag('daily', 'bl_cleanup')
+        schedule.every().day.at("09:50").do(task_guard_anomaly).tag('daily', 'guard_alert')
+        schedule.every().day.at("10:25").do(task_ads_enroll).tag('daily', 'ads_enroll')
+        schedule.every().tuesday.at("10:00").do(task_smart_bid).tag('weekly', 'smart_bid')
+        schedule.every().tuesday.at("11:00").do(task_bid_rollback).tag('weekly', 'bid_rollback')
+        schedule.every(6).hours.do(task_promotion_rotate).tag('recurring', 'promotion')
+    if qc_on:
+        schedule.every().day.at("10:55").do(task_source_refresh).tag('daily', 'source_refresh')
+        schedule.every().day.at("11:30").do(task_listing_audit).tag('daily', 'listing_audit')
+        schedule.every().day.at("12:10").do(task_source_aspect_autofix).tag('daily', 'source_aspect_autofix')
+        schedule.every().day.at("12:30").do(task_semantic_rewrite).tag('daily', 'semantic_rewrite')
+        schedule.every().day.at("13:00").do(task_missing_video_autofix).tag('daily', 'missing_video_autofix')
 
     profile = get_store_profile()
     logger.info("调度表已配置 (scheduler_profile=ops):")
     logger.info(f"  店铺: {profile.brand_name} | mutex={profile.resolved_scheduler_mutex_name()}")
     logger.info("  09:30  库存运营包 (daily_tasks.py --ops-only)")
     logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 48 --email)")
+    if ads_on:
+        logger.info("  周一/周四 09:35  智能调价 (batch_smart_reprice --apply --email)")
+        logger.info("  09:40  广告恢复审计 (ad_restore_audit --apply --email)")
+        logger.info("  09:45  广告黑名单清理 (ad_blacklist_cleanup)")
+        logger.info("  09:50  守门员异常告警 (guard_anomaly_alert)")
+        logger.info("  10:25  广告入驻 (store_marketing --levers promoted --apply)")
+        logger.info("  周二 10:00  分级 Bid 优化 (batch_smart_bid --apply --email)")
+        logger.info("  周二 11:00  Bid 7 天回溯 (bid_rollback_audit --apply --email)")
+        logger.info("  每 6h  促销轮转 (auto_rotate_promotions.py)")
+    if qc_on:
+        logger.info("  10:55  源内容刷新 (source_content_refresh --email)")
+        logger.info("  11:30  eBay/GIGA live listing 内容审计 (audit --live --email)")
+        logger.info("  12:10  源参数写回 live (白名单 --fix-key, 不含 categoryId)")
+        logger.info("  12:30  语义改写闭环 (需 SEMANTIC_REWRITE_APPLY_ENABLED=1)")
+        logger.info("  13:00  缺视频限量同步 (limit 80)")
 
 
 def _setup_schedule_full():
@@ -2029,7 +2102,7 @@ def recover_missed_tasks(log_when_clean=True):
 def _get_critical_recovery_tasks():
     """Return missed-task recovery entries for the active scheduler profile."""
     if _is_ops_scheduler():
-        return [
+        tasks = [
             {
                 'name': 'ops_daily',
                 'scheduled_time': '09:30',
@@ -2039,6 +2112,68 @@ def _get_critical_recovery_tasks():
                 'priority': 20,
             },
         ]
+        if _ops_ads_enabled():
+            tasks.extend(
+                [
+                    {
+                        'name': 'smart_reprice',
+                        'scheduled_time': '09:35',
+                        'recovery_grace_minutes': 20,
+                        'func': task_smart_reprice,
+                        'label': '子店智能调价',
+                        'priority': 25,
+                        'weekday': 0,
+                    },
+                    {
+                        'name': 'smart_reprice',
+                        'scheduled_time': '09:35',
+                        'recovery_grace_minutes': 20,
+                        'func': task_smart_reprice,
+                        'label': '子店智能调价',
+                        'priority': 26,
+                        'weekday': 3,
+                    },
+                    {
+                        'name': 'ad_restore',
+                        'scheduled_time': '09:40',
+                        'recovery_grace_minutes': 20,
+                        'func': task_ad_restore,
+                        'label': '广告恢复审计',
+                        'priority': 30,
+                    },
+                    {
+                        'name': 'ads_enroll',
+                        'scheduled_time': '10:25',
+                        'recovery_grace_minutes': 20,
+                        'func': task_ads_enroll,
+                        'label': '子店广告入驻',
+                        'priority': 40,
+                    },
+                ]
+            )
+        if _ops_qc_autofix_enabled():
+            tasks.extend(
+                [
+                    {
+                        'name': 'listing_audit',
+                        'scheduled_time': '11:30',
+                        'recovery_grace_minutes': 15,
+                        'func': task_listing_audit,
+                        'label': '刊登内容审计',
+                        'priority': 50,
+                    },
+                    {
+                        'name': 'source_aspect_autofix',
+                        'scheduled_time': '12:10',
+                        'recovery_grace_minutes': 20,
+                        'func': task_source_aspect_autofix,
+                        'label': '源参数自动修复',
+                        'priority': 52,
+                        'depends_on_success': 'listing_audit',
+                    },
+                ]
+            )
+        return tasks
 
     tasks = [
             {
@@ -2409,7 +2544,7 @@ def main():
     parser.add_argument('--once', action='store_true',
                        help='立即执行全部任务一次后退出')
     parser.add_argument('--task', type=str,
-                       choices=['title', 'listing_audit', 'source_aspect_autofix', 'missing_video_autofix', 'daily', 'ops_daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_snapshot', 'mi_self_check', 'listing_status_sync', 'auto_publish', 'ad_restore', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_title_rewrite', 'cro_lifecycle_evaluate', 'cro_send_offer', 'source_refresh', 'order_recheck', 'semantic_rewrite', 'finance_sync', 'giga_dropship_push', 'giga_dropship_sync'],
+                       choices=['title', 'listing_audit', 'source_aspect_autofix', 'missing_video_autofix', 'daily', 'ops_daily', 'analyze', 'reprice', 'health', 'promotion', 'mi_snapshot', 'mi_self_check', 'listing_status_sync', 'auto_publish', 'ad_restore', 'ads_enroll', 'blacklist_cleanup', 'guard_anomaly', 'cro_monthly_report', 'cro_consume', 'smart_bid', 'cro_image_refresh', 'cro_fill_specifics', 'cro_promote', 'cro_sentinel', 'bid_rollback', 'cro_delist_email', 'cro_ops', 'cro_lifecycle_detect', 'cro_title_rewrite', 'cro_lifecycle_evaluate', 'cro_send_offer', 'source_refresh', 'order_recheck', 'semantic_rewrite', 'finance_sync', 'giga_dropship_push', 'giga_dropship_sync'],
                        help='立即执行指定单个任务后退出')
     parser.add_argument('--status', action='store_true',
                        help='显示守护进程状态')
@@ -2461,6 +2596,7 @@ def main():
             'listing_status_sync': task_listing_status_sync,
             'auto_publish': task_auto_publish,
             'ad_restore': task_ad_restore,
+            'ads_enroll': task_ads_enroll,
             'blacklist_cleanup': task_blacklist_cleanup,
             'guard_anomaly': task_guard_anomaly,
             'cro_monthly_report': task_cro_monthly_report,

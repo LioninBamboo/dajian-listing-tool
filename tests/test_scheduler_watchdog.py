@@ -496,6 +496,8 @@ def test_watchdog_ops_profile_recovers_only_ops_daily(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
     monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
     monkeypatch.setattr(scheduler_watchdog, '_is_ops_scheduler', lambda: True)
+    monkeypatch.setattr(scheduler_watchdog, '_ops_qc_autofix_enabled', lambda: False)
+    monkeypatch.setattr(scheduler_watchdog, '_ops_ads_enabled', lambda: False)
 
     scheduler_watchdog.check_overdue_critical_tasks()
 
@@ -505,6 +507,38 @@ def test_watchdog_ops_profile_recovers_only_ops_daily(tmp_path, monkeypatch):
     assert 'listing_audit' not in aliases
     assert 'cro_sentinel' not in aliases
     assert 'ad_restore' not in aliases
+
+
+def test_watchdog_ops_ads_and_qc_slices_recover_without_full_catalog(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(json.dumps({}, ensure_ascii=False), encoding='utf-8')
+
+    launched = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+    monkeypatch.setattr(scheduler_watchdog, '_is_ops_scheduler', lambda: True)
+    monkeypatch.setattr(scheduler_watchdog, '_ops_qc_autofix_enabled', lambda: True)
+    monkeypatch.setattr(scheduler_watchdog, '_ops_ads_enabled', lambda: True)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert 'ops_daily' in aliases
+    assert 'reprice' in aliases
+    assert 'ad_restore' in aliases
+    assert 'ads_enroll' in aliases
+    assert 'listing_audit' in aliases
+    assert 'daily' not in aliases
+    assert 'cro_sentinel' not in aliases
+    assert 'cro_consume' not in aliases
+    assert 'auto_publish' not in aliases
 
 
 def test_watchdog_tick_stops_when_maintenance_starts_between_phases(tmp_path, monkeypatch):

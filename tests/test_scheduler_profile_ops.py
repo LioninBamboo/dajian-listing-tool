@@ -96,3 +96,111 @@ def test_ops_task_daily_full_dispatches_to_ops_only(monkeypatch):
     assert any(str(arg).endswith("daily_tasks.py") for arg in cmd_args)
     assert "--ops-only" in cmd_args
     assert timeout_sec == mod.TASK_TIMEOUT["ops_daily"]
+
+
+def _job_tags(mod=None):
+    return {frozenset(job.tags) for job in schedule.get_jobs()}
+
+
+def test_ops_qc_autofix_slice_registers_main_store_qc_chain(monkeypatch):
+    from src.utils import store_profile as sp
+    from src.utils.store_profile import StoreProfile
+
+    profile = StoreProfile(
+        scheduler_profile="ops",
+        brand_name="GrovePop",
+        scheduler_enable_qc_autofix=True,
+    )
+    monkeypatch.setattr(sp, "get_store_profile", lambda: profile)
+
+    mod = _load_scheduler()
+    mod.setup_schedule()
+
+    tags = _job_tags()
+    assert frozenset({"daily", "ops"}) in tags
+    assert frozenset({"recurring", "order_recheck"}) in tags
+    assert frozenset({"daily", "listing_audit"}) in tags
+    assert frozenset({"daily", "source_aspect_autofix"}) in tags
+    assert frozenset({"daily", "missing_video_autofix"}) in tags
+    assert frozenset({"daily", "semantic_rewrite"}) in tags
+    assert frozenset({"daily", "source_refresh"}) in tags
+    assert frozenset({"daily", "mi_snapshot"}) not in tags
+    assert frozenset({"daily", "cro_consume"}) not in tags
+    assert frozenset({"daily", "auto_publish"}) not in tags
+
+
+def test_ops_ads_slice_registers_ad_chain_without_cro_consume(monkeypatch):
+    from src.utils import store_profile as sp
+    from src.utils.store_profile import StoreProfile
+
+    profile = StoreProfile(
+        scheduler_profile="ops",
+        brand_name="AquaRides",
+        scheduler_enable_ads=True,
+    )
+    monkeypatch.setattr(sp, "get_store_profile", lambda: profile)
+
+    mod = _load_scheduler()
+    mod.setup_schedule()
+
+    tags = _job_tags()
+    assert frozenset({"daily", "ops"}) in tags
+    assert frozenset({"daily", "ad_restore"}) in tags
+    assert frozenset({"daily", "bl_cleanup"}) in tags
+    assert frozenset({"daily", "guard_alert"}) in tags
+    assert frozenset({"daily", "ads_enroll"}) in tags
+    assert frozenset({"weekly", "smart_bid"}) in tags
+    assert frozenset({"weekly", "bid_rollback"}) in tags
+    assert frozenset({"weekly", "smart_reprice"}) in tags
+    assert frozenset({"recurring", "promotion"}) in tags
+    assert frozenset({"daily", "cro_consume"}) not in tags
+    assert frozenset({"daily", "cro_promote"}) not in tags
+    assert frozenset({"daily", "mi_snapshot"}) not in tags
+    assert frozenset({"daily", "listing_audit"}) not in tags
+
+
+def test_ops_qc_recovery_includes_audit_chain(monkeypatch):
+    from src.utils import store_profile as sp
+    from src.utils.store_profile import StoreProfile
+
+    monkeypatch.setattr(
+        sp,
+        "get_store_profile",
+        lambda: StoreProfile(
+            scheduler_profile="ops",
+            brand_name="GrovePop",
+            scheduler_enable_qc_autofix=True,
+        ),
+    )
+
+    mod = _load_scheduler()
+    names = [t["name"] for t in mod._get_critical_recovery_tasks()]
+    assert names[0] == "ops_daily"
+    assert "listing_audit" in names
+    assert "source_aspect_autofix" in names
+    assert "daily_tasks" not in names
+    assert "cro_consume" not in names
+
+
+def test_ops_ads_recovery_includes_enroll_and_restore(monkeypatch):
+    from src.utils import store_profile as sp
+    from src.utils.store_profile import StoreProfile
+
+    monkeypatch.setattr(
+        sp,
+        "get_store_profile",
+        lambda: StoreProfile(
+            scheduler_profile="ops",
+            brand_name="AquaRides",
+            scheduler_enable_ads=True,
+        ),
+    )
+
+    mod = _load_scheduler()
+    names = [t["name"] for t in mod._get_critical_recovery_tasks()]
+    assert names[0] == "ops_daily"
+    assert "ads_enroll" in names
+    assert "ad_restore" in names
+    assert "smart_reprice" in names
+    assert "daily_tasks" not in names
+    assert "cro_promote" not in names

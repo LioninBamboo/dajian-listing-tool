@@ -50,6 +50,11 @@ class TestProfileDefaultsContract:
         assert p.is_ops_scheduler is False
         assert p.scheduler_mutex_name == ""
         assert p.resolved_scheduler_mutex_name() == "Global\\DajianSchedulerDaemonMutex"
+        # Substore opt-in slices must stay off so the main cadence is unchanged.
+        assert p.scheduler_enable_qc_autofix is False
+        assert p.scheduler_enable_ads is False
+        assert p.ops_qc_autofix_enabled is False
+        assert p.ops_ads_enabled is False
 
     def test_main_store_return_policy_is_buyer_paid_everywhere(self):
         # The Motors seller-paid return is auto-parts-only. With no Motors return

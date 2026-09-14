@@ -132,6 +132,11 @@ class StoreProfile:
     scheduler_profile: str = "full"  # full | ops
     # Windows Named Mutex for scheduler_daemon. Empty => main-store default.
     scheduler_mutex_name: str = ""
+    # Opt-in ops slices. Defaults stay False so a sub-store that has not
+    # flipped them keeps the lean inventory-only cadence, and the main
+    # store (scheduler_profile=full) ignores these flags.
+    scheduler_enable_qc_autofix: bool = False
+    scheduler_enable_ads: bool = False
 
     @property
     def brand_name_lower(self) -> str:
@@ -182,6 +187,16 @@ class StoreProfile:
     @property
     def is_ops_scheduler(self) -> bool:
         return str(self.scheduler_profile or "full").strip().lower() == "ops"
+
+    @property
+    def ops_qc_autofix_enabled(self) -> bool:
+        """True only on an ops instance that opted into the QC autofix slice."""
+        return self.is_ops_scheduler and bool(self.scheduler_enable_qc_autofix)
+
+    @property
+    def ops_ads_enabled(self) -> bool:
+        """True only on an ops instance that opted into the ads/marketing slice."""
+        return self.is_ops_scheduler and bool(self.scheduler_enable_ads)
 
     def resolved_scheduler_mutex_name(self) -> str:
         """Kernel mutex name for scheduler_daemon (one per store instance)."""
@@ -247,6 +262,8 @@ _SECTION_FIELD_MAP = {
         "server_port",
         "scheduler_profile",
         "scheduler_mutex_name",
+        "scheduler_enable_qc_autofix",
+        "scheduler_enable_ads",
     },
 }
 
@@ -268,7 +285,12 @@ _SECTION_KEY_ALIASES = {
 
 _INT_FIELDS = {"server_port"}
 _FLOAT_FIELDS = {"undercut_pct", "undercut_min_abs", "fixed_shipping_amount"}
-_BOOL_FIELDS = {"price_ends_99", "force_house_brand"}
+_BOOL_FIELDS = {
+    "price_ends_99",
+    "force_house_brand",
+    "scheduler_enable_qc_autofix",
+    "scheduler_enable_ads",
+}
 _TUPLE_FIELDS = {"banned_terms"}
 
 

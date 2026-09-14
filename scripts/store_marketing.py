@@ -54,28 +54,78 @@ def _is_scope_error(exc) -> bool:
     return "1100" in s or "insufficient permission" in s or "access denied" in s or "403" in s
 
 
+def _ad_service():
+    from src.services.ebay_ad_service import EbayAdService
+    return EbayAdService()
+
+
 # ── Lever: Promoted Listings ────────────────────────────────────────────────
 def lever_promoted(brand, listing_ids, bid, apply):
-    from src.services.ebay_ad_service import EbayAdService
-    svc = EbayAdService()
+    """Enroll live listings through create_ad_safe — same margin/blacklist gate as main."""
+    svc = _ad_service()
     try:
         running = svc.fetch_campaigns(status="RUNNING") or []
     except Exception as e:
         return f"promoted: SKIPPED — {_SCOPE_HINT}" if _is_scope_error(e) else f"promoted: error {str(e)[:80]}"
     camp = running[0] if running else None
-    cid = camp.get("campaignId") if camp else None
+    cid = (camp or {}).get("campaignId") or (camp or {}).get("id")
     if not cid:
         if not apply:
-            return f"promoted: DRY — would create campaign '{brand} Store {date.today()}' (CPS {bid}%) + enroll {len(listing_ids)} listings"
+            return (
+                f"promoted: DRY — would create campaign '{brand} Store {date.today()}' "
+                f"(CPS {bid}%) + enroll {len(listing_ids)} listings via create_ad_safe"
+            )
         cid = svc.create_campaign(f"{brand} Store {date.today()}", bid_percentage=bid)
         if not cid:
-            return f"promoted: FAILED to create campaign — {_SCOPE_HINT}"
-    # enroll live listings not yet promoted
-    to_add = [lid for lid in listing_ids if not svc.is_listing_promoted(lid)]
+            detail = getattr(svc, "last_campaign_error", "") or _SCOPE_HINT
+            if "35067" in detail or "terms and conditions" in detail.lower():
+                return (
+                    "promoted: FAILED — seller must accept Promoted Listings T&C "
+                    "(US: https://useragreement.ebay.com/usragmt/agreement/PROMOTED_LISTINGS_USER_AGREEMENT). "
+                    f"API: {detail[:240]}"
+                )
+            return f"promoted: FAILED to create campaign — {detail[:240]}"
+    to_add = []
+    try:
+        for lid in listing_ids:
+            if not svc.is_listing_promoted(lid):
+                to_add.append(lid)
+    except Exception as e:
+        return f"promoted: SKIPPED — {_SCOPE_HINT}" if _is_scope_error(e) else f"promoted: error {str(e)[:80]}"
     if not apply:
-        return f"promoted: DRY — campaign {cid}, would enroll {len(to_add)} of {len(listing_ids)} live at {bid}%"
-    res = svc.batch_create_ads(cid, to_add, bid_percentage=bid)
-    return f"promoted: enrolled {len(to_add)} listings in campaign {cid} at {bid}% (result: {res})"
+        return (
+            f"promoted: DRY — campaign {cid}, would enroll {len(to_add)} of "
+            f"{len(listing_ids)} live at {bid}% via create_ad_safe"
+        )
+    enrolled = 0
+    skipped_unsafe = 0
+    failed = 0
+    for lid in to_add:
+        try:
+            res = svc.create_ad_safe(cid, lid, bid_percentage=bid) or {}
+        except Exception as e:
+            if _is_scope_error(e):
+                return (
+                    f"promoted: SKIPPED — {_SCOPE_HINT} "
+                    f"(enrolled {enrolled} before scope error)"
+                )
+            failed += 1
+            continue
+        if res.get("success"):
+            enrolled += 1
+        elif res.get("reason") in ("unsafe", "blacklisted"):
+            skipped_unsafe += 1
+        elif _is_scope_error(res.get("error") or res.get("reason") or ""):
+            return (
+                f"promoted: SKIPPED — {_SCOPE_HINT} "
+                f"(enrolled {enrolled} before scope error)"
+            )
+        else:
+            failed += 1
+    return (
+        f"promoted: enrolled {enrolled} listings in campaign {cid} at {bid}% "
+        f"(unsafe/blacklisted {skipped_unsafe}, failed {failed})"
+    )
 
 
 # ── Lever: Markdown / Sale ──────────────────────────────────────────────────

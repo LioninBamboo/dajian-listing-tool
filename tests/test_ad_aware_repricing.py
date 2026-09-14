@@ -334,11 +334,13 @@ class CreateAdSafeTests(unittest.TestCase):
         svc.create_ad.assert_called_once()
 
     def test_no_live_price_fails_open(self):
-        """API 取不到 live_price → fail-open."""
+        """Inventory 和 Trading 都取不到 live_price → fail-open."""
         svc = self._make_svc()
         with patch('src.services.repricing_guard._fetch_cost_and_listing',
                    return_value=(50.0, 'L1')), \
              patch('src.services.ebay_ad_service.requests.get') as mock_get, \
+             patch('src.services.ebay_ad_service._trading_live_price',
+                   return_value=None), \
              patch('src.services.ebay_auth.EbayOAuthService') as mock_oauth:
             mock_oauth.return_value.get_valid_token.return_value = 'tok'
             mock_get.return_value.status_code = 200
@@ -346,6 +348,38 @@ class CreateAdSafeTests(unittest.TestCase):
             res = svc.create_ad_safe('CAMP', 'L1', sku='SKU-A', bid_percentage=5.0)
         self.assertTrue(res['success'])
         svc.create_ad.assert_called_once()
+
+    def test_empty_inventory_uses_trading_price_and_can_reject(self):
+        """Trading listing 在 Inventory 不可见时, 用 GetItem 现价做利润守卫."""
+        svc = self._make_svc()
+        with patch('src.services.repricing_guard._fetch_cost_and_listing',
+                   return_value=(100.0, 'L1')), \
+             patch('src.services.ebay_ad_service.requests.get') as mock_get, \
+             patch('src.services.ebay_ad_service._trading_live_price',
+                   return_value=115.0), \
+             patch('src.services.ebay_auth.EbayOAuthService') as mock_oauth:
+            mock_oauth.return_value.get_valid_token.return_value = 'tok'
+            mock_get.return_value.status_code = 200
+            mock_get.return_value.json.return_value = {'offers': []}
+            res = svc.create_ad_safe('CAMP', 'L1', sku='SKU-A', bid_percentage=5.0)
+        self.assertFalse(res['success'])
+        self.assertEqual(res['reason'], 'unsafe')
+        svc.create_ad.assert_not_called()
+
+    def test_empty_inventory_uses_trading_price_and_can_allow(self):
+        svc = self._make_svc()
+        with patch('src.services.repricing_guard._fetch_cost_and_listing',
+                   return_value=(50.0, 'L1')), \
+             patch('src.services.ebay_ad_service.requests.get') as mock_get, \
+             patch('src.services.ebay_ad_service._trading_live_price',
+                   return_value=200.0), \
+             patch('src.services.ebay_auth.EbayOAuthService') as mock_oauth:
+            mock_oauth.return_value.get_valid_token.return_value = 'tok'
+            mock_get.return_value.status_code = 200
+            mock_get.return_value.json.return_value = {'offers': []}
+            res = svc.create_ad_safe('CAMP', 'L1', sku='SKU-A', bid_percentage=5.0)
+        self.assertTrue(res['success'])
+        svc.create_ad.assert_called_once_with('CAMP', 'L1', 5.0)
 
 
 if __name__ == '__main__':

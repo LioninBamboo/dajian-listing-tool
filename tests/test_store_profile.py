@@ -129,6 +129,50 @@ class TestOverrides:
         assert profile.scheduler_profile == "ops"
         assert profile.is_ops_scheduler is True
         assert profile.resolved_scheduler_mutex_name() == "Global\\GrovePopSchedulerDaemonMutex"
+        assert profile.scheduler_enable_qc_autofix is False
+        assert profile.scheduler_enable_ads is False
+        assert profile.ops_qc_autofix_enabled is False
+        assert profile.ops_ads_enabled is False
+
+    def test_ops_optional_slices_default_off_and_can_opt_in(self, tmp_path):
+        yaml_file = tmp_path / "ops_slices.yaml"
+        yaml_file.write_text(
+            textwrap.dedent(
+                """
+                server:
+                  scheduler_profile: ops
+                  scheduler_enable_qc_autofix: true
+                  scheduler_enable_ads: true
+                store:
+                  brand_name: GrovePop
+                """
+            ),
+            encoding="utf-8",
+        )
+        profile = load_store_profile(yaml_file)
+        assert profile.scheduler_enable_qc_autofix is True
+        assert profile.scheduler_enable_ads is True
+        assert profile.ops_qc_autofix_enabled is True
+        assert profile.ops_ads_enabled is True
+
+    def test_full_profile_ignores_ops_slice_flags(self, tmp_path):
+        yaml_file = tmp_path / "full_slices.yaml"
+        yaml_file.write_text(
+            textwrap.dedent(
+                """
+                server:
+                  scheduler_profile: full
+                  scheduler_enable_qc_autofix: true
+                  scheduler_enable_ads: true
+                """
+            ),
+            encoding="utf-8",
+        )
+        profile = load_store_profile(yaml_file)
+        assert profile.scheduler_enable_qc_autofix is True
+        assert profile.is_ops_scheduler is False
+        assert profile.ops_qc_autofix_enabled is False
+        assert profile.ops_ads_enabled is False
 
     def test_v2_listing_and_pricing_sections(self, tmp_path):
         yaml_file = tmp_path / "blindbox.yaml"

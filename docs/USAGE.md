@@ -236,12 +236,23 @@ python daily_tasks.py --audit-only
 
 ### 子店 ops 调度（GrovePop / AquaRides）
 
-子店实例在 `config/store_profile.local.yaml` 设置 `scheduler_profile: ops` 后，只跑库存运营与出单源复核，不触发主店的 MI/CRO/语义改写任务。
+子店实例在 `config/store_profile.local.yaml` 设置 `scheduler_profile: ops` 后，默认只跑库存运营与出单源复核，**不会**跑主店的 MI 自动刊登、CRO 改价消费、GIGA 履约推单。
+
+可选切片用两个默认关闭的开关叠加，**不会改主店 `scheduler_profile: full` 日程**：
+
+| 开关 | 谁开 | 叠加任务 |
+|------|------|----------|
+| `scheduler_enable_qc_autofix` | GrovePop（户外家具，`qc_profile: furniture`） | 与主店相同的 11:30 只读审计 → 12:10 白名单修复 → 12:30 语义改写（仍需 env）→ 13:00 缺视频 |
+| `scheduler_enable_ads` | GrovePop + AquaRides | 周一/周四智能调价 / 广告恢复 / 黑名单 / 守门员告警 / `ads_enroll`（`create_ad_safe`，Trading 现价回退）/ 周二 bid / 促销轮转 |
+
+AquaRides 的 Motors 内容 QC / Fitment 仍走专用 Windows 任务，不要给汽配打开 `scheduler_enable_qc_autofix`（那是家具白名单）。
 
 | 时间 | 任务 | 入口 |
 |------|------|------|
 | 每天 09:30 | 库存运营包 | `daily_tasks.py --ops-only`（增量同步 + 幽灵缺货恢复 + 精简邮件） |
 | 每 6 小时 | 出单源复核 | `scripts/order_source_recheck.py --hours-back 48 --email` |
+| 每天 10:25（ads 开） | 安全开广告 | `scripts/store_marketing.py --levers promoted --apply` |
+| 每天 11:30–13:00（QC 开） | 内容审计 + 白名单修复 | 与主店同一组 `audit_fix_active_listings` / `semantic_rewrite` 任务 |
 
 金丝雀验收（子店目录内）：
 
@@ -261,10 +272,16 @@ python scheduler_daemon.py --status
 `store_profile.local.yaml` 示例：
 
 ```yaml
-scheduler_profile: ops
-scheduler_mutex_name: Global\GrovePopSchedulerDaemonMutex
-qc_profile: arttoy   # AquaRides 用 motors
+quality_gate:
+  qc_profile: furniture               # AquaRides 用 motors
+server:
+  scheduler_profile: ops
+  scheduler_mutex_name: Global\GrovePopSchedulerDaemonMutex
+  scheduler_enable_qc_autofix: true   # 仅 GrovePop；AquaRides 保持 false
+  scheduler_enable_ads: true
 ```
+
+广告切片需要该店 token 已授 `sell.marketing`。未授权时 `ads_enroll` 会 SKIPPED 而不是把库存/QC 打挂。2026-09-14 实测 GrovePop / AquaRides 仍是 `403 errorId 1100`。补授步骤见 `docs/SUBSTORE_ADS_REAUTH.md`；复查：`python scripts/probe_marketing_scope.py`。
 
 ### 库存日报口径
 

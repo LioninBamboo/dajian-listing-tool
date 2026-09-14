@@ -50,20 +50,45 @@ CRITICAL_OPS_DAILY_TASKS = [
 ]
 
 
-def _is_ops_scheduler():
-    """Match daemon scheduler_profile=ops so substores never recover the full catalog."""
+def _store_profile():
     try:
         sys.path.insert(0, str(PROJECT_ROOT))
         from src.utils.store_profile import get_store_profile
-        return bool(get_store_profile().is_ops_scheduler)
+        return get_store_profile()
     except Exception:
-        return False
+        return None
+
+
+def _is_ops_scheduler():
+    """Match daemon scheduler_profile=ops so substores never recover the full catalog."""
+    profile = _store_profile()
+    return bool(getattr(profile, 'is_ops_scheduler', False)) if profile is not None else False
+
+
+def _ops_qc_autofix_enabled():
+    profile = _store_profile()
+    return bool(getattr(profile, 'ops_qc_autofix_enabled', False)) if profile is not None else False
+
+
+def _ops_ads_enabled():
+    profile = _store_profile()
+    return bool(getattr(profile, 'ops_ads_enabled', False)) if profile is not None else False
 
 
 def _watchdog_critical_tasks():
-    if _is_ops_scheduler():
-        return CRITICAL_OPS_DAILY_TASKS
-    return CRITICAL_DAILY_TASKS
+    if not _is_ops_scheduler():
+        return CRITICAL_DAILY_TASKS
+    tasks = list(CRITICAL_OPS_DAILY_TASKS)
+    if _ops_ads_enabled():
+        tasks.extend([
+            {'health_name': 'smart_reprice', 'deadline': '09:55', 'daemon_task': 'reprice', 'weekday': 0},
+            {'health_name': 'smart_reprice', 'deadline': '09:55', 'daemon_task': 'reprice', 'weekday': 3},
+            {'health_name': 'ad_restore', 'deadline': '09:50', 'daemon_task': 'ad_restore'},
+            {'health_name': 'ads_enroll', 'deadline': '10:40', 'daemon_task': 'ads_enroll'},
+        ])
+    if _ops_qc_autofix_enabled():
+        tasks.append({'health_name': 'listing_audit', 'deadline': '11:45', 'daemon_task': 'listing_audit'})
+    return tasks
 
 
 def _daemon_task_command(task_alias):
