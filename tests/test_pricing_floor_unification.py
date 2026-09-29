@@ -217,7 +217,7 @@ class UpdateEbayPriceGuardTests(unittest.TestCase):
 
     def test_allows_safe_price(self):
         svc = self._make_service()
-        safe = PricingEngine.safe_floor_price(100.0, 0.05)  # 5% 缓冲
+        safe = PricingEngine.safe_floor_price(100.0, 0.10)  # 口径 A: 成本 10%
         with patch("src.services.repricing_guard._fetch_cost_and_listing",
                    return_value=(100.0, "L1")), \
              patch("requests.get") as mock_get, \

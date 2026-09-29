@@ -4,12 +4,12 @@
 手工改价 / MI 建议价) 调用本模块前都不会触碰 eBay API.
 
 🛡️ 三层防线:
-  1. 业务层公式 (PricingEngine.calculate_smart_price 自带 5% 安全缓冲)
-  2. 业务侧软底价 (safe_floor_price, safety_margin > 0)
-  3. 末端死线 + 广告自适应 (本模块) ←最后兜底
+  1. 业务层公式 (PricingEngine.calculate_smart_price, min_margin = 成本的 10%)
+  2. 业务侧软底价 (safe_floor_price, 口径 A = 成本的 10%)
+  3. 末端守卫 + 广告自适应 (本模块) ←最后兜底
 
-🎯 广告自适应: AD_RATE 不是钉死的. 当目标价 < 带广告死线但 >= 关广告死线时,
-自动关掉该 listing 的广告 (维持竞争力但绝不亏本).
+🎯 广告自适应: 目标价必须至少留下成本的 10%。低于「带 5% 广告的 10% 底」
+但高于「关广告的 10% 底」时关掉广告再放行; 关广告后仍不足 10% 则拒绝。
 """
 from __future__ import annotations
 
@@ -24,14 +24,25 @@ logger = logging.getLogger(__name__)
 # ─── DB 查询小工具 ───
 
 def _fetch_cost_and_listing(db_path: str, sku: str) -> Tuple[Optional[float], Optional[str]]:
-    """一次性取 SKU 的 total_dajian_cost 和 listing_id."""
+    """一次性取 SKU 的到岸成本 (含运费回填) 和 listing_id."""
+    try:
+        from src.services.pricing_engine import PricingEngine
+    except Exception:
+        PricingEngine = None  # type: ignore
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
-        cur.execute(
-            "SELECT cost_breakdown, listing_id FROM collected_products WHERE sku = ?",
-            (sku,),
-        )
+        try:
+            cur.execute(
+                "SELECT cost_breakdown, listing_id, shipping, specs, attributes "
+                "FROM collected_products WHERE sku = ?",
+                (sku,),
+            )
+        except sqlite3.OperationalError:
+            cur.execute(
+                "SELECT cost_breakdown, listing_id FROM collected_products WHERE sku = ?",
+                (sku,),
+            )
         row = cur.fetchone()
         conn.close()
     except Exception:
@@ -42,9 +53,32 @@ def _fetch_cost_and_listing(db_path: str, sku: str) -> Tuple[Optional[float], Op
     if row[0]:
         try:
             cb = json.loads(row[0])
-            tc = cb.get('total_dajian_cost')
-            if tc and float(tc) > 0:
-                cost = float(tc)
+            shipping = float(row[2] or 0) if len(row) > 2 else 0.0
+            specs = {}
+            attrs = {}
+            if len(row) > 3 and row[3]:
+                try:
+                    specs = json.loads(row[3]) if isinstance(row[3], str) else (row[3] or {})
+                except Exception:
+                    specs = {}
+            if len(row) > 4 and row[4]:
+                try:
+                    attrs = json.loads(row[4]) if isinstance(row[4], str) else (row[4] or {})
+                except Exception:
+                    attrs = {}
+            if PricingEngine is not None and hasattr(PricingEngine, "resolve_landed_cost"):
+                landed = PricingEngine.resolve_landed_cost(
+                    cb,
+                    shipping_fallback=shipping,
+                    specs=specs if isinstance(specs, dict) else {},
+                    attributes=attrs if isinstance(attrs, dict) else {},
+                )
+                if landed and float(landed) > 0:
+                    cost = float(landed)
+            if cost is None:
+                tc = cb.get('total_dajian_cost')
+                if tc and float(tc) > 0:
+                    cost = float(tc)
         except Exception:
             pass
     listing_id = str(row[1]) if row[1] else None
@@ -111,22 +145,24 @@ def precheck_price(sku: str, new_price: float, *,
         # 数据缺失 → fail-open (避免业务被新增校验阻塞)
         return True, "no_cost_data"
 
-    # 第一道: 假设广告开着的死线
+    cost_floor = float(PricingEngine.MIN_NET_MARGIN_ON_COST)
+
+    # 第一道: 带 5% 广告仍留成本的 10%
     ok_with_ad, reason_with_ad = PricingEngine.assert_safe_price(
-        price=new_price, total_cost=total_cost, safety_margin=0.0,
+        price=new_price, total_cost=total_cost, safety_margin=cost_floor,
     )
     if ok_with_ad:
         return True, "ok"
 
-    # 第二道: 假设广告关掉的死线 (更低)
+    # 第二道: 关广告后仍必须留成本的 10% (更低的标价, 同一利润口径)
     ok_no_ad, reason_no_ad = PricingEngine.assert_safe_price(
         price=new_price, total_cost=total_cost,
-        safety_margin=0.0, ad_rate=0.0,
+        safety_margin=cost_floor, ad_rate=0.0,
     )
     if not ok_no_ad:
-        # 关广告也救不了
         logger.error(
-            f"🚫 [PRICE GUARD] {sku}: 拒绝改价 - 即使关广告仍亏本. "
+            f"🚫 [PRICE GUARD] {sku}: 拒绝改价 - 即使关广告仍低于成本 "
+            f"{cost_floor*100:.0f}% 净利. "
             f"with_ad: {reason_with_ad}; no_ad: {reason_no_ad}"
         )
         return False, f"unsafe_even_without_ad: {reason_no_ad}"

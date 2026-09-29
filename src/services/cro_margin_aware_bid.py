@@ -53,16 +53,21 @@ def _load_sku_economics(db_path: Path, sku: str) -> Optional[dict]:
 
 def bid_cap_for_sku(sku: str, db_path: Optional[Path] = None,
                     margin_calc=None) -> float:
-    """\u8fd4\u56de\u8be5 SKU \u52a8\u6001 max bid %. \u627e\u4e0d\u5230\u6570\u636e \u2192 HARD_FLOOR_PCT."""
+    """Max bid % that still leaves 10% of cost (口径 A).
+
+    ``margin_calc`` is accepted for call-site compatibility but ignored.
+    Unknown economics still return HARD_FLOOR_PCT.
+    """
     db = Path(db_path) if db_path else DEFAULT_DB
     eco = _load_sku_economics(db, sku)
     if not eco or eco['price'] <= 0 or eco['cost'] <= 0:
         return HARD_FLOOR_PCT
-    if margin_calc is None:
-        try:
-            from src.web.pages.competition_monitor import calc_net_margin
-            margin_calc = calc_net_margin
-        except Exception:
-            return HARD_FLOOR_PCT
-    margin = float(margin_calc(eco['price'], eco['cost']) or 0.0)
-    return bid_cap_for_margin(margin)
+    from src.services.pricing_engine import PricingEngine
+    max_ad = PricingEngine.required_ad_rate_for(
+        eco['price'],
+        eco['cost'],
+        safety_margin=float(PricingEngine.MIN_NET_MARGIN_ON_COST),
+    )
+    if max_ad < 0:
+        return 0.0
+    return round(min(HARD_CEILING_PCT, float(max_ad) * 100.0), 2)

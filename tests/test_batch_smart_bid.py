@@ -122,6 +122,26 @@ class BuildPlanTests(unittest.TestCase):
         self.assertEqual(plan[0]['tier'], 'mid')
         self.assertEqual(plan[0]['decision'], 'no_change')
 
+    def test_inventory_client_caps_floor_sku_using_get_offers_by_sku(self):
+        """Production RealEbayClient has get_offers_by_sku, not get_offer_by_sku."""
+        from src.services.pricing_engine import PricingEngine
+
+        cost = 100.0
+        floor = PricingEngine.safe_floor_price(cost, 0.10)
+        products = [{'sku': 'FLOOR', 'listing_id': 'L4', 'impressions': 1000, 'ctr': 0.05, 'sold_qty': 2}]
+        ads = {'L4': {'campaign_id': 'C1', 'bid_percentage': 7.0}}
+        cost_map = {'FLOOR': {'total_cost': cost, 'listing_id': 'L4'}}
+
+        class InventoryClient:
+            def get_offers_by_sku(self, sku):
+                return [{'pricingSummary': {'price': {'value': f'{floor:.2f}'}}}]
+
+        plan = bsb.build_plan(products, ads, cost_map, real_client=InventoryClient())
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]['decision'], 'adjust')
+        self.assertLessEqual(plan[0]['new_bid'], 5.5)
+        self.assertGreaterEqual(plan[0]['new_bid'], 4.5)
+
 
 class SummarizeTests(unittest.TestCase):
 
@@ -139,6 +159,38 @@ class SummarizeTests(unittest.TestCase):
         self.assertEqual(s['by_decision']['skip_unsafe'], 1)
         self.assertEqual(s['by_tier']['high'], 1)
         self.assertEqual(s['by_tier']['mid'], 2)
+
+
+class FetchCostMapTests(unittest.TestCase):
+
+    def test_reads_total_dajian_cost_from_production_schema(self):
+        import json
+        import sqlite3
+
+        tmp = tempfile.TemporaryDirectory()
+        db = Path(tmp.name) / "ebay_collection.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "CREATE TABLE collected_products ("
+            "sku TEXT PRIMARY KEY, listing_id TEXT, cost_breakdown TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO collected_products VALUES (?, ?, ?)",
+            (
+                "W5230P450589",
+                "366352664198",
+                json.dumps({"total_dajian_cost": 119.43, "product_price": 83.25}),
+            ),
+        )
+        conn.commit()
+        conn.close()
+        try:
+            with patch.object(bsb, "DB_PATH", db):
+                cost_map = bsb._fetch_cost_map()
+        finally:
+            tmp.cleanup()
+        self.assertAlmostEqual(cost_map["W5230P450589"]["total_cost"], 119.43)
+        self.assertEqual(cost_map["W5230P450589"]["listing_id"], "366352664198")
 
 
 class RunWiringTests(unittest.TestCase):

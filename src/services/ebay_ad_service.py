@@ -209,12 +209,12 @@ class EbayAdService:
             return {'success': False, 'error': str(e)}
 
     def create_ad_safe(self, campaign_id, listing_id, sku=None,
-                       bid_percentage=5.0, safety_margin=0.05,
+                       bid_percentage=5.0, safety_margin=None,
                        db_path='ebay_collection.db'):
         """安全创建广告: 先用 PricingEngine.required_ad_rate_for 校验现价能否撑得起.
 
         若 SKU 当前 listing price 在扣完 fees + bid_percentage% 广告费后
-        仍能保留 safety_margin 利润 → 调 create_ad
+        仍能保留 safety_margin 利润 (默认 = 成本的 10%, 口径 A) → 调 create_ad
         否则 → 拒绝创建, 返回 {'success': False, 'reason': 'unsafe', ...}
 
         被 batch_publish / 手动开广告 / ad_restore_audit 共用, 杜绝
@@ -225,7 +225,7 @@ class EbayAdService:
             listing_id: eBay item id
             sku: 商品 SKU (用于查 cost; 若 None 则按 sku=listing_id 在 DB 找不到)
             bid_percentage: 期望 bid (默认 5.0)
-            safety_margin: 净利润缓冲 (默认 0.05 即 5%)
+            safety_margin: 相对成本的净利润缓冲 (默认 PricingEngine.MIN_NET_MARGIN_ON_COST = 10%)
             db_path: ebay_collection.db 路径
 
         Returns:
@@ -235,6 +235,9 @@ class EbayAdService:
         from src.services.repricing_guard import _fetch_cost_and_listing
         from src.services.pricing_engine import PricingEngine
         from src.services import ad_blacklist
+
+        if safety_margin is None:
+            safety_margin = float(PricingEngine.MIN_NET_MARGIN_ON_COST)
 
         # 找 SKU + cost
         if not sku:

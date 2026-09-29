@@ -97,6 +97,10 @@ Image handling rule:
 - `src/utils/listing_quality_gate.py` is the local product-identity layer before taxonomy. If a generated draft is clearly a coffee table, bench, storage ottoman, dining chair, patio set, or sofa, normalize that profile before trusting AI or taxonomy suggestions.
 - Legacy category IDs still appear in historical data. Important remaps include `177815 -> 38204` and `177816 -> 107578`.
 
+## Pricing Floor (口径 A)
+
+Write, ads, and CRO bid increases all keep **net profit ≥ 10% of landed cost** after 5% store discount + 13.25% FVF + modeled ads + $0.30. Constant: `PricingEngine.MIN_NET_MARGIN_ON_COST`. `repricing_guard.precheck_price` uses that margin (not break-even). `create_ad_safe` / CRO `bid_cap_for_sku` cannot raise ads past the rate that would eat the 10% cost buffer. New publishes may still use the higher listing-price 15% floor in `batch_publish.py`.
+
 ## Repricing Truthfulness
 
 Three flows can change live eBay prices:

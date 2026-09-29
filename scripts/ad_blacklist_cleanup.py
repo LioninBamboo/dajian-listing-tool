@@ -33,7 +33,7 @@ if str(PROJECT_ROOT) not in sys.path:
 logger = logging.getLogger(__name__)
 DB_PATH = PROJECT_ROOT / 'ebay_collection.db'
 LOG_DIR = PROJECT_ROOT / 'logs'
-SAFETY_MARGIN = 0.05
+SAFETY_MARGIN = 0.10  # 口径 A: 相对成本的 10%
 TARGET_AD_RATE = 0.05  # 5% 广告; max_ad >= 此值才算 safe
 
 

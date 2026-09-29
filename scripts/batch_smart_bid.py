@@ -50,7 +50,7 @@ HIGH_BID = 7.0  # %
 MID_BID = 5.0
 LOW_BID = 3.0
 
-SAFETY_MARGIN = 0.05  # 5% 净利润安全边际
+SAFETY_MARGIN = 0.10  # 口径 A: 相对成本的 10%
 BID_DELTA_THRESHOLD = 0.5  # 与现 bid 差异 < 0.5% 视为无需调整
 
 
@@ -77,7 +77,7 @@ def _fetch_cost_map() -> Dict[str, Dict[str, Any]]:
             continue
         try:
             cb = json.loads(cost_json) if cost_json else {}
-            tc = float(cb.get('total_cost') or 0)
+            tc = float(cb.get('total_dajian_cost') or cb.get('total_cost') or 0)
         except Exception:
             tc = 0.0
         out[sku] = {'total_cost': tc, 'listing_id': str(lid)}
@@ -114,7 +114,15 @@ def _load_active_experiments() -> List[Dict[str, Any]]:
 
 def _fetch_live_price(sku: str, real_client) -> Optional[float]:
     try:
-        offer = real_client.get_offer_by_sku(sku)
+        offer = None
+        getter = getattr(real_client, "get_offer_by_sku", None)
+        if callable(getter):
+            offer = getter(sku)
+        if not offer:
+            list_getter = getattr(real_client, "get_offers_by_sku", None)
+            if callable(list_getter):
+                offers = list_getter(sku) or []
+                offer = offers[0] if offers else None
     except Exception as exc:
         logger.warning(f"获取 offer {sku} 失败: {exc}")
         return None

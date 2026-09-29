@@ -26,6 +26,11 @@ class PricingEngine:
     # Store Discount (长期店铺折扣)
     STORE_DISCOUNT_RATE = Decimal("0.05")  # 5% 买家折扣
 
+    # 口径 A: 写出 / 开广告 / CRO 加价的统一净利底 = 到岸成本的 10%。
+    # 智能定价 min_margin 已经是这个数; 改价死线与广告守卫必须同一口径,
+    # 不能再用盈亏平衡 (0%) 或广告后只留 5%。
+    MIN_NET_MARGIN_ON_COST = Decimal("0.10")
+
     @staticmethod
     def calculate_dajian_cost(
         product_price: float,
@@ -119,6 +124,47 @@ class PricingEngine:
             "cost_basis": "giga_order",
             "total_dajian_cost": float(total_dajian_cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
         }
+
+    @staticmethod
+    def resolve_landed_cost(
+        cost_breakdown: dict | None = None,
+        *,
+        shipping_fallback: float = 0.0,
+        specs: dict | None = None,
+        attributes: dict | None = None,
+    ) -> float | None:
+        """Rebuild total landed cost when freight was omitted from the snapshot.
+
+        Freight is the higher of ``cost_breakdown.shipping_cost`` and
+        ``shipping_fallback`` (usually ``collected_products.shipping``). When
+        ``product_price`` is present the full Dajian model is recalculated.
+        Otherwise the stored ``total_dajian_cost`` is kept.
+        """
+        breakdown = cost_breakdown or {}
+        try:
+            product = float(breakdown.get("product_price") or 0)
+        except (TypeError, ValueError):
+            product = 0.0
+        try:
+            stored_ship = float(breakdown.get("shipping_cost") or 0)
+        except (TypeError, ValueError):
+            stored_ship = 0.0
+        try:
+            fallback_ship = float(shipping_fallback or 0)
+        except (TypeError, ValueError):
+            fallback_ship = 0.0
+        shipping = max(stored_ship, fallback_ship)
+        oversize = "Dimensions" in (specs or {}) or "Dimensions" in (attributes or {})
+        if product > 0:
+            return PricingEngine.calculate_dajian_cost(product, shipping, oversize)[
+                "total_dajian_cost"
+            ]
+        try:
+            stored_total = float(breakdown.get("total_dajian_cost") or 0)
+        except (TypeError, ValueError):
+            stored_total = 0.0
+        return stored_total if stored_total > 0 else None
+
 
     # ════════════════════════════════════════════════════════════════════
     # 死线 / 安全底 / 守门员 — 所有改价入口必须遵守的统一防线
@@ -357,9 +403,9 @@ class PricingEngine:
         inner_min = min(competitive_lp, ceiling_lp)
         final_lp = max(floor_lp, inner_min)
         
-        # 防亏损保护: 考虑折扣后仍保证 ≥5% 利润
-        min_safe_margin = Decimal("1.05")
-        anti_loss_floor = (cost * min_safe_margin + fixed_fee) / discount_denom
+        # 防亏损保护: 不低于口径 A (成本的 10%), 即使调用方传入更低的 min_margin
+        min_safe = max(min_m, PricingEngine.MIN_NET_MARGIN_ON_COST)
+        anti_loss_floor = (cost * (Decimal("1") + min_safe) + fixed_fee) / discount_denom
         
         if final_lp < anti_loss_floor:
             final_lp = anti_loss_floor
