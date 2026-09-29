@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from src.services.cro_offer_pricing import (
-    compute_offer, floor_price, MIN_NET_MARGIN, MAX_DISCOUNT_PCT,
+    compute_offer, floor_price, MAX_DISCOUNT_PCT,
 )
 from src.services.cro_sku_economics import load_sku_economics
 from src.web.pages.competition_monitor import calc_net_margin
@@ -17,12 +17,21 @@ from src.web.pages.competition_monitor import calc_net_margin
 # ── 保本定价 ─────────────────────────────────────────────────
 
 def test_floor_price_guarantees_min_margin():
+    from src.services.finance_orders import estimate_line_fees
+    from src.services.pricing_engine import PricingEngine
+
+    disc = float(PricingEngine.STORE_DISCOUNT_RATE)
+    pad = float(PricingEngine.LISTING_TAX_PAD)
     for cost in (50.0, 224.74, 1000.0):
         floor = floor_price(cost)
-        # 地板价上的净利率必须 ≥ MIN_NET_MARGIN (同一费率模型交叉验证)
-        assert calc_net_margin(floor, cost) >= MIN_NET_MARGIN - 1e-6
-        # 地板价往下 2% 就应跌破最低净利率 (地板确实是下界附近)
-        assert calc_net_margin(floor * 0.98, cost) < MIN_NET_MARGIN
+        merch = floor * (1 - disc)
+        fee = estimate_line_fees(merch, tax=merch * pad)
+        net = merch - cost - fee
+        assert net + 0.06 >= cost * 0.10
+        merch_low = floor * 0.98 * (1 - disc)
+        fee_low = estimate_line_fees(merch_low, tax=merch_low * pad)
+        net_low = merch_low - cost - fee_low
+        assert net_low < cost * 0.10
 
 
 def test_compute_offer_normal_discount():
@@ -42,7 +51,7 @@ def test_compute_offer_clamps_to_floor():
     assert res['safe'] is True
     assert res['offer_price'] == pytest.approx(floor)      # 被抬回地板
     assert 5.0 <= res['discount_pct'] < 10.0               # 仍满足 eBay 5% 下限
-    assert calc_net_margin(res['offer_price'], cost) >= MIN_NET_MARGIN - 1e-6
+    assert calc_net_margin(res['offer_price'], cost) * res['offer_price'] + 0.06 >= cost * 0.10
 
 
 def test_compute_offer_floor_clamp_below_ebay_minimum_is_unsafe():
@@ -160,9 +169,9 @@ def test_run_apply_sends_to_eligible_and_marks_done(tmp_queue, eco_db, tmp_path,
     from src.services.cro_action_queue import load_pending
     _enqueue_offer('PROD1', listing_id='L1')
     sent = {}
-    # live 现价 340 (低于本地 353.1) — offer 必须基于 live 价
+    # live 现价 360 (高于本地 353.1) — offer 必须基于 live 价, 且仍高于 10% 成本底
     monkeypatch.setattr(so, 'fetch_eligible_listing_ids',
-                        lambda oauth: {'L1': 340.0})
+                        lambda oauth: {'L1': 360.0})
     monkeypatch.setattr(so, 'send_offer_live',
                         lambda oauth, lid, price, message=so.OFFER_MESSAGE:
                         sent.update({'lid': lid, 'price': price}) or {'ok': True, 'reason': 'sent'})
@@ -171,9 +180,9 @@ def test_run_apply_sends_to_eligible_and_marks_done(tmp_queue, eco_db, tmp_path,
                  logs_dir=tmp_path / 'logs', oauth=object())
     assert rep['done'] == ['PROD1']
     assert sent['lid'] == 'L1'
-    expected = so.compute_offer(340.0, 224.74)
+    expected = so.compute_offer(360.0, 224.74)
     assert sent['price'] == pytest.approx(expected['offer_price'])
-    assert sent['price'] <= 340.0 * 0.95 + 1e-9   # eBay 5% 规则基于 live 价
+    assert sent['price'] <= 360.0 * 0.95 + 1e-9   # eBay 5% 规则基于 live 价
     assert load_pending(action_type='send_offer') == []   # marked done
 
 

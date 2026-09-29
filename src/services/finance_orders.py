@@ -1,7 +1,8 @@
 """Finance F0: order-level PnL from eBay sales + GIGA cost snapshots.
 
 COGS basis: PricingEngine.calculate_dajian_cost (GIGA order product+shipping+insurance+alipay).
-Fees: estimated eBay FVF + ad + fixed fee on the eBay transacted amount.
+Fees: 13.6% FVF + 1.3% international + modeled ads on the tax-inclusive
+sale total (item + shipping charged + collected tax) plus $0.40 per order.
 eBay Fulfillment lineItemCost / priceSubtotal already includes markdown;
 order PnL must not apply another store discount.
 """
@@ -139,19 +140,48 @@ def estimate_line_fees(
     *,
     ad_rate: float = 0.05,
     store_discount: float = DEFAULT_STORE_DISCOUNT,
-    fvf: float = 0.1325,
-    fixed_fee: float = 0.30,
+    fvf: float | None = None,
+    fixed_fee: float | None = None,
+    tax: float = 0.0,
+    shipping: float = 0.0,
     order_line_count: int = 1,
 ) -> float:
-    """Estimate platform fees for one line (share of fixed fee across lines)."""
-    gross = _d(line_gross)
-    if gross <= 0:
+    """Estimate platform fees for one line (share of fixed fee across lines).
+
+    FVF + international fee + Promoted Listings apply to the tax-inclusive
+    sale total (merchandise after any modeled store discount + shipping + tax).
+    """
+    from src.services.pricing_engine import PricingEngine
+
+    if fvf is None:
+        fvf = float(PricingEngine.EBAY_FEE_RATE)
+    if fixed_fee is None:
+        fixed_fee = float(PricingEngine.FIXED_FEE)
+    intl = float(PricingEngine.INTERNATIONAL_FEE_RATE)
+    merch = _d(line_gross) * (Decimal("1") - _d(store_discount))
+    if merch <= 0:
         return 0.0
-    fee_base = gross * (Decimal("1") - _d(store_discount))
-    variable = fee_base * (_d(fvf) + _d(ad_rate))
+    fee_base = merch + _d(tax) + _d(shipping)
+    variable = fee_base * (_d(fvf) + _d(intl) + _d(ad_rate))
     n = max(int(order_line_count or 1), 1)
     fixed_share = _d(fixed_fee) / Decimal(n)
     return _q2(variable + fixed_share)
+
+
+def _order_tax_and_shipping(order: dict) -> tuple[float, float]:
+    pricing = order.get("pricingSummary") or {}
+    try:
+        shipping = float((pricing.get("deliveryCost") or {}).get("value") or 0)
+    except (TypeError, ValueError):
+        shipping = 0.0
+    tax = 0.0
+    for li in order.get("lineItems") or []:
+        for t in li.get("ebayCollectAndRemitTaxes") or []:
+            try:
+                tax += float((t.get("amount") or {}).get("value") or 0)
+            except (TypeError, ValueError):
+                continue
+    return tax, shipping
 
 
 def _line_cost_key(line_item_id: str, sku: str) -> str:
@@ -256,6 +286,15 @@ def build_lines_from_ebay_order(
     raw_lines = [li for li in (order.get("lineItems") or []) if li.get("sku")]
     n = max(len(raw_lines), 1)
     snapshots = cost_snapshots or {}
+    order_tax, order_ship = _order_tax_and_shipping(order)
+    merch_sum = 0.0
+    for li in raw_lines:
+        try:
+            merch_sum += float((li.get("lineItemCost") or {}).get("value") or 0) or float(
+                (li.get("total") or {}).get("value") or 0
+            )
+        except (TypeError, ValueError):
+            continue
     out: list[LinePnl] = []
 
     for li in raw_lines:
@@ -278,10 +317,13 @@ def build_lines_from_ebay_order(
         else:
             unit_cost, cost_source = lookup_giga_unit_cost(conn, sku)
             line_cogs = round(unit_cost * qty, 2)
+        share = (line_gross / merch_sum) if merch_sum > 0 else (1.0 / n)
         fee = estimate_line_fees(
             line_gross,
             ad_rate=ad_rate,
             store_discount=store_discount,
+            tax=order_tax * share,
+            shipping=order_ship * share,
             order_line_count=n,
         )
         revenue = merchandise_after_store_discount(
@@ -329,13 +371,8 @@ def upsert_finance_order(
 
     pricing = order.get("pricingSummary") or {}
     gross = float((pricing.get("priceSubtotal") or {}).get("value") or 0)
-    ship = float((pricing.get("deliveryCost") or {}).get("value") or 0)
+    tax, ship = _order_tax_and_shipping(order)
     total = float((pricing.get("total") or {}).get("value") or 0)
-    # tax often in ebayCollectAndRemitTaxes on lines — approximate from total-gross-ship
-    tax = 0.0
-    for li in order.get("lineItems") or []:
-        for t in li.get("ebayCollectAndRemitTaxes") or []:
-            tax += float((t.get("amount") or {}).get("value") or 0)
 
     # Preserve first captured positive COGS so later supplier/cost refreshes
     # cannot rewrite paid-time economics on every sync.
@@ -498,13 +535,17 @@ def recompute_stored_pnls(
     ensure_finance_tables(conn)
     orders = conn.execute(
         """
-        SELECT platform, platform_order_id, gross_sales, total_cogs
+        SELECT platform, platform_order_id, gross_sales, total_cogs,
+               tax_collected, shipping_charged
         FROM finance_orders
         """
     ).fetchall()
     now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
     updated = 0
-    for platform, oid, gross, cogs in orders:
+    for platform, oid, gross, cogs, tax_collected, shipping_charged in orders:
+        tax = float(tax_collected or 0)
+        ship = float(shipping_charged or 0)
+        gross_f = float(gross or 0)
         lines = conn.execute(
             """
             SELECT id, line_gross, line_cogs
@@ -517,10 +558,14 @@ def recompute_stored_pnls(
         if lines:
             total_fees = 0.0
             for line_id, line_gross, line_cogs in lines:
+                lg = float(line_gross or 0)
+                share = (lg / gross_f) if gross_f > 0 else (1.0 / n)
                 fee = estimate_line_fees(
-                    float(line_gross or 0),
+                    lg,
                     ad_rate=ad_rate,
                     store_discount=store_discount,
+                    tax=tax * share,
+                    shipping=ship * share,
                     order_line_count=n,
                 )
                 revenue = merchandise_after_store_discount(
@@ -535,9 +580,11 @@ def recompute_stored_pnls(
             total_fees = round(total_fees, 2)
         else:
             total_fees = estimate_line_fees(
-                float(gross or 0),
+                gross_f,
                 ad_rate=ad_rate,
                 store_discount=store_discount,
+                tax=tax,
+                shipping=ship,
                 order_line_count=1,
             )
         revenue = merchandise_after_store_discount(

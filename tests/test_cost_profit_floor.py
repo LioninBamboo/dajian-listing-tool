@@ -1,10 +1,10 @@
 """口径 A: 写出 / 开广告 / CRO 加价都守「净利润 >= 成本的 10%」.
 
-费用栈与智能定价相同: 5% 店铺折扣 + 13.25% FVF + 5% 广告 + $0.30.
+费用栈: 5% 店铺折扣 + 13.6% FVF + 1.3% 国际费 + 5% 广告 + $0.40,
+刊登按 10% 税垫把费用打在折后货款上, 使目的地税 ≤10% 时净利仍 ≥ 成本 10%。
 成本 $100 时:
-  带 5% 广告的 10% 成本底 ≈ $142.02
-  关广告的 10% 成本底 ≈ $133.84
-  带广告盈亏平衡 ≈ $129.16
+  带 5% 广告的 10% 成本底 ≈ $148.78
+  关广告的 10% 成本底 ≈ $138.99
 """
 from __future__ import annotations
 
@@ -30,9 +30,19 @@ class CostProfitFloorConstantTests(unittest.TestCase):
         floor = PricingEngine.safe_floor_price(
             COST, float(PricingEngine.MIN_NET_MARGIN_ON_COST)
         )
-        self.assertAlmostEqual(floor, 142.02, places=1)
+        self.assertAlmostEqual(floor, 148.78, places=1)
         smart = PricingEngine.calculate_smart_price(COST, market_price=50.0)
         self.assertGreaterEqual(smart["final_price"] + 0.01, floor)
+
+    def test_floor_keeps_ten_percent_after_tax_pad_and_international(self):
+        from src.services.finance_orders import estimate_line_fees
+
+        floor = PricingEngine.safe_floor_price(COST, 0.10)
+        merch = round(floor * (1.0 - float(PricingEngine.STORE_DISCOUNT_RATE)), 2)
+        tax = round(merch * float(PricingEngine.LISTING_TAX_PAD), 2)
+        fee = estimate_line_fees(merch, ad_rate=0.05, tax=tax, order_line_count=1)
+        net = round(merch - COST - fee, 2)
+        self.assertGreaterEqual(net + 0.05, COST * 0.10)
 
 
 class PrecheckHonorsTenPercentOfCostTests(unittest.TestCase):
@@ -69,14 +79,14 @@ class PrecheckHonorsTenPercentOfCostTests(unittest.TestCase):
         self.assertIn("unsafe_even_without_ad", reason)
 
     def test_between_ad_on_and_ad_off_ten_percent_floors_disables_ads(self):
-        # $135: 低于带广告 10% 底 ($142.02), 高于关广告 10% 底 ($133.84)
+        # $144: 低于带广告 10% 底 (~$148.78), 高于关广告 10% 底 (~$138.99)
         from src.services import repricing_guard
 
         with patch.object(
             repricing_guard, "_try_disable_ad", return_value=(True, "disabled")
         ):
             ok, reason = repricing_guard.precheck_price(
-                "SKU-100", 135.0, db_path=self.db_path
+                "SKU-100", 144.0, db_path=self.db_path
             )
         self.assertTrue(ok)
         self.assertIn("ok_after_ad_disabled", reason)

@@ -29,30 +29,39 @@ _Q2 = Decimal("0.01")
 class PlatformFeeProfile:
     """单一平台的费率画像. Decimal 精确.
 
-    fee_rate           平台 FVF (eBay 13.25% / Amazon 15% / Walmart 6-15%)
+    fee_rate           平台 FVF (eBay 13.6% / Amazon 15% / Walmart 6-15%)
     default_ad_rate    平台默认广告率 (用于 ad_rate=None 调用)
-    fixed_fee          每单固定费 (eBay $0.30; Amazon 通常 0)
+    fixed_fee          每单固定费 (eBay $0.40; Amazon 通常 0)
     store_discount_rate 长期店铺折扣 (买家折扣)
+    international_fee_rate  跨境国际费 (eBay APAC 1.3%)
+    listing_tax_pad    刊登阶段对费用税基的目的地税垫
     """
     name: str
     fee_rate: Decimal
     default_ad_rate: Decimal
     fixed_fee: Decimal
     store_discount_rate: Decimal = field(default=Decimal("0"))
+    international_fee_rate: Decimal = field(default=Decimal("0"))
+    listing_tax_pad: Decimal = field(default=Decimal("0"))
 
     def _resolve_ad(self, ad_rate: Optional[float]) -> Decimal:
         if ad_rate is None:
             return self.default_ad_rate
         return Decimal(str(ad_rate))
 
+    def _variable_take(self, ad_rate: Optional[float] = None) -> Decimal:
+        return self.fee_rate + self.international_fee_rate + self._resolve_ad(ad_rate)
+
     def discount_denom(self, ad_rate: Optional[float] = None) -> Decimal:
         ad = self._resolve_ad(ad_rate)
-        if ad < 0 or ad >= Decimal("1") - self.fee_rate:
+        take = self._variable_take(ad_rate)
+        padded = take * (Decimal("1") + self.listing_tax_pad)
+        if ad < 0 or padded >= Decimal("1"):
             raise ValueError(
                 f"ad_rate must be in [0, {1 - float(self.fee_rate)}), got {ad_rate}"
             )
         return (Decimal("1") - self.store_discount_rate) * (
-            Decimal("1") - self.fee_rate - ad
+            Decimal("1") - padded
         )
 
     def absolute_floor(self, cost, ad_rate: Optional[float] = None) -> Decimal:
@@ -75,20 +84,25 @@ class PlatformFeeProfile:
         # net = price × (1-discount) × (1-fvf-ad) - fixed_fee >= target_net
         # → (1-fvf-ad) >= (target_net + fixed) / [price × (1-discount)]
         # → ad <= 1 - fvf - (target_net + fixed) / [price × (1-discount)]
-        denom_no_ad_factor = price_d * (Decimal("1") - self.store_discount_rate)
-        if denom_no_ad_factor <= 0:
+        merch = price_d * (Decimal("1") - self.store_discount_rate)
+        fee_base = merch * (Decimal("1") + self.listing_tax_pad)
+        if merch <= 0 or fee_base <= 0:
             return Decimal("-1")
-        max_ad = Decimal("1") - self.fee_rate - (target_net + self.fixed_fee) / denom_no_ad_factor
+        max_ad = (merch - target_net - self.fixed_fee) / fee_base - (
+            self.fee_rate + self.international_fee_rate
+        )
         return max_ad
 
 
 # ─── 内置 Profile (与 PricingEngine 数字 100% 一致) ─────────
 EBAY_PROFILE = PlatformFeeProfile(
     name='ebay',
-    fee_rate=Decimal("0.1325"),
+    fee_rate=Decimal("0.136"),
     default_ad_rate=Decimal("0.05"),
-    fixed_fee=Decimal("0.30"),
+    fixed_fee=Decimal("0.40"),
     store_discount_rate=Decimal("0.05"),
+    international_fee_rate=Decimal("0.013"),
+    listing_tax_pad=Decimal("0.10"),
 )
 
 # 占位 — 实际接入时再校准

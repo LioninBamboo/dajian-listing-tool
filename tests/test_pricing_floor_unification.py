@@ -31,17 +31,20 @@ from src.services.pricing_engine import PricingEngine
 # 1. 死线公式正确性
 # ─────────────────────────────────────────────────────────────────────
 class AbsoluteFloorTests(unittest.TestCase):
-    """死线 = (cost + 0.30) / ((1-0.05) × (1-0.1325-0.05))"""
+    """死线 = (cost + FIXED) / ((1-discount) × (1-FVF-ad))"""
 
     def test_floor_formula_matches_break_even_definition(self):
-        # cost = 100 → 净收必须 = 100
-        # listing × 0.95 × 0.8175 - 0.30 = 100  →  listing = 100.30 / 0.776625 ≈ 129.16
         cost = 100.0
         floor = PricingEngine.absolute_floor_price(cost)
-        # 反向验证: 在 floor 价位上利润恰好 ≈ 0
-        net = floor * 0.95 * (1 - 0.1325 - 0.05) - 0.30
+        merch = floor * (1.0 - float(PricingEngine.STORE_DISCOUNT_RATE))
+        tax = merch * float(PricingEngine.LISTING_TAX_PAD)
+        take = float(
+            PricingEngine.EBAY_FEE_RATE
+            + PricingEngine.INTERNATIONAL_FEE_RATE
+            + PricingEngine.AD_RATE
+        )
+        net = merch - (merch + tax) * take - float(PricingEngine.FIXED_FEE)
         self.assertAlmostEqual(net, cost, places=1)
-        self.assertAlmostEqual(floor, 129.16, places=1)
 
     def test_floor_zero_cost_returns_zero(self):
         self.assertEqual(PricingEngine.absolute_floor_price(0), 0.0)
@@ -49,13 +52,11 @@ class AbsoluteFloorTests(unittest.TestCase):
         self.assertEqual(PricingEngine.absolute_floor_price(None), 0.0)  # type: ignore[arg-type]
 
     def test_safe_floor_with_5pct_safety_matches_calculate_smart_price_anti_loss(self):
-        # 验证 safe_floor_price(cost, 0.05) == calculate_smart_price 内的 anti_loss_floor
         cost = 100.0
         safe = PricingEngine.safe_floor_price(cost, 0.05)
-        # 内联公式 (cost × 1.05 + 0.30) / 0.776625
-        expected = (Decimal("100") * Decimal("1.05") + Decimal("0.30")) / (
-            Decimal("0.95") * (Decimal("1") - Decimal("0.1825"))
-        )
+        expected = (
+            Decimal("100") * Decimal("1.05") + PricingEngine.FIXED_FEE
+        ) / PricingEngine._discount_denom()
         self.assertAlmostEqual(safe, float(expected), places=2)
 
     def test_safe_floor_safety_margin_zero_equals_absolute(self):

@@ -18,10 +18,17 @@ class PricingEngine:
     # Wayfair Net-30 remittance fee (sales settlement, not GIGA product price).
     WAYFAIR_NET30_REMIT_RATE = Decimal("0.02")   # 2% 30天汇款
 
-    # eBay Costs
-    EBAY_FEE_RATE = Decimal("0.1325") # 13.25%
-    AD_RATE = Decimal("0.05")         # 5.00%
-    FIXED_FEE = Decimal("0.30")       # $0.30
+    # eBay Costs — FVF 13.6% + APAC international 1.3% of the tax-inclusive
+    # sale total + $0.40/order. Live US-bound orders on this account print
+    # FVF ~12.7% + intl 1.3% (=14.0%); we keep 13.6%+1.3% so the 10% floor
+    # is slightly conservative. Listing floors pad a 10% destination tax on
+    # the fee base so net still ≥ 10% of cost when collected tax ≤ 10%.
+    # Order PnL uses collected tax, not the pad.
+    EBAY_FEE_RATE = Decimal("0.136")            # 13.6% FVF
+    INTERNATIONAL_FEE_RATE = Decimal("0.013")   # 1.3% APAC international
+    LISTING_TAX_PAD = Decimal("0.10")           # 10% tax pad at list time
+    AD_RATE = Decimal("0.05")                   # 5.00%
+    FIXED_FEE = Decimal("0.40")                 # $0.40
 
     # Store Discount (长期店铺折扣)
     STORE_DISCOUNT_RATE = Decimal("0.05")  # 5% 买家折扣
@@ -170,28 +177,45 @@ class PricingEngine:
     # 死线 / 安全底 / 守门员 — 所有改价入口必须遵守的统一防线
     # ════════════════════════════════════════════════════════════════════
     #
-    # 公式推导 (考虑 5% 店铺折扣 + 13.25% eBay FVF + 5% 广告 + $0.30 固定费):
-    #   买家实付 = listing_price × (1 - discount)
-    #   卖家净收 = 买家实付 × (1 - fvf - ad) - fixed_fee
-    #            = listing_price × discount_denom - fixed_fee
+    # 公式推导 (5% 折扣 + 13.6% FVF + 1.3% 国际费 + 广告 + $0.40, 刊登 10% 税垫):
+    #   买家货款 = listing_price × (1 - discount)
+    #   费用税基 = 货款 × (1 + tax_pad)
+    #   卖家净收 = 货款 − 费用税基 × (fvf + intl + ad) − fixed_fee
+    #            = listing_price × discount_denom − fixed_fee
     #   利润    = 净收 - cost
     #
     # 死线 (margin=0): 净收 = cost  →  listing_price = (cost + fixed) / discount_denom
     # 安全底 (margin=s): 净收 = cost × (1+s)  →  listing_price = (cost×(1+s) + fixed) / discount_denom
 
     @staticmethod
+    def marketplace_fee_rate() -> Decimal:
+        """FVF + international fee (excludes ads and the listing tax pad)."""
+        return PricingEngine.EBAY_FEE_RATE + PricingEngine.INTERNATIONAL_FEE_RATE
+
+    @staticmethod
+    def _variable_take(ad_rate: float = None) -> Decimal:
+        ad = PricingEngine.AD_RATE if ad_rate is None else Decimal(str(ad_rate))
+        return PricingEngine.marketplace_fee_rate() + ad
+
+    @staticmethod
     def _discount_denom(ad_rate: float = None) -> Decimal:
-        """(1 - 折扣) × (1 - eBay FVF - ad_rate).
+        """(1 - 折扣) × (1 - (FVF+国际费+ad) × (1+税垫)).
 
         ad_rate=None  → 用 PricingEngine.AD_RATE (5%, 默认假设广告开着)
         ad_rate=0     → 假设广告关掉, 死线下降 (扩大让价空间)
         ad_rate=0.04  → 假设降低竞价率
         """
         ad = PricingEngine.AD_RATE if ad_rate is None else Decimal(str(ad_rate))
-        if ad < 0 or ad >= Decimal("1") - PricingEngine.EBAY_FEE_RATE:
-            raise ValueError(f"ad_rate must be in [0, {1 - float(PricingEngine.EBAY_FEE_RATE)}), got {ad_rate}")
+        take = PricingEngine._variable_take(ad_rate)
+        padded = take * (Decimal("1") + PricingEngine.LISTING_TAX_PAD)
+        if ad < 0 or padded >= Decimal("1"):
+            cap = float(
+                (Decimal("1") / (Decimal("1") + PricingEngine.LISTING_TAX_PAD))
+                - PricingEngine.marketplace_fee_rate()
+            )
+            raise ValueError(f"ad_rate must be in [0, {cap}), got {ad_rate}")
         return (Decimal("1") - PricingEngine.STORE_DISCOUNT_RATE) * (
-            Decimal("1") - PricingEngine.EBAY_FEE_RATE - ad
+            Decimal("1") - padded
         )
 
     @staticmethod
@@ -291,13 +315,13 @@ class PricingEngine:
         p = Decimal(str(price))
         safety = Decimal(str(safety_margin))
         discount = Decimal("1") - PricingEngine.STORE_DISCOUNT_RATE
-        # 净收 = price × discount × (1 - fvf - ad) - fixed = cost × (1 + safety)
-        # → (1 - fvf - ad) = (cost(1+safety) + fixed) / (price × discount)
-        # → ad = 1 - fvf - (cost(1+safety) + fixed) / (price × discount)
-        if p * discount <= 0:
+        merch = p * discount
+        fee_base = merch * (Decimal("1") + PricingEngine.LISTING_TAX_PAD)
+        if merch <= 0 or fee_base <= 0:
             return -1.0
-        max_combined = (cost * (Decimal("1") + safety) + PricingEngine.FIXED_FEE) / (p * discount)
-        ad = Decimal("1") - PricingEngine.EBAY_FEE_RATE - max_combined
+        target = cost * (Decimal("1") + safety) + PricingEngine.FIXED_FEE
+        # merch - fee_base * (fvf+intl+ad) - fixed >= cost*(1+safety)
+        ad = (merch - target) / fee_base - PricingEngine.marketplace_fee_rate()
         return float(ad.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
 
 
@@ -326,9 +350,11 @@ class PricingEngine:
         cost = Decimal(str(total_cost))
         margin = Decimal(str(target_margin))
         
-        total_rate = PricingEngine.EBAY_FEE_RATE + PricingEngine.AD_RATE
+        total_rate = PricingEngine._variable_take() * (
+            Decimal("1") + PricingEngine.LISTING_TAX_PAD
+        )
         discount = PricingEngine.STORE_DISCOUNT_RATE
-        # (1 - discount) × (1 - fees) - margin
+        # (1 - discount) × (1 - padded take) - margin
         denominator = (Decimal("1.0") - discount) * (Decimal("1.0") - total_rate) - margin
         
         if denominator <= Decimal("0.01"):
@@ -355,28 +381,16 @@ class PricingEngine:
         
         所有价格均为 eBay listing price (已包含 eBay 费用 + 店铺折扣)。
         
-        考虑 5% 店铺折扣后的卖家净收:
-          净收 = listing_price × (1 - 折扣) × (1 - eBay费率 - 广告费率) - 固定费
-               = listing_price × 0.95 × 0.8175 - $0.30
-        
-        公式 (所有边界均基于折扣后利润):
-          discount_denom = 0.95 × 0.8175  (= 0.776625)
-          floor_lp   = (cost × (1 + min_margin) + $0.30) / discount_denom
-          ceiling_lp = (cost × (1 + max_margin) + $0.30) / discount_denom
-          competitive_lp = market × 0.95
-          final_lp = max(floor_lp, min(competitive_lp, ceiling_lp))
+        考虑 5% 店铺折扣后的卖家净收 (含国际费与 10% 税垫):
+          净收 = listing_price × discount_denom - $0.40
         """
         cost = Decimal(str(total_cost))
         market = Decimal(str(market_price)) if market_price and market_price > 0 else Decimal("0")
         min_m = Decimal(str(min_margin))
         max_m = Decimal(str(max_margin))
         
-        # eBay 费用参数 (考虑店铺折扣)
-        total_fee_rate = PricingEngine.EBAY_FEE_RATE + PricingEngine.AD_RATE  # 0.1825
-        denom = Decimal("1") - total_fee_rate  # 0.8175
-        discount_rate = Decimal("1") - PricingEngine.STORE_DISCOUNT_RATE  # 0.95
-        discount_denom = discount_rate * denom  # 0.776625
-        fixed_fee = PricingEngine.FIXED_FEE  # $0.30
+        discount_denom = PricingEngine._discount_denom()
+        fixed_fee = PricingEngine.FIXED_FEE
         
         # 计算 listing price 边界 (基于折扣后净收)
         floor_lp = (cost * (1 + min_m) + fixed_fee) / discount_denom

@@ -68,8 +68,27 @@ def _seed_product(conn: sqlite3.Connection, sku: str = "FINANCE-TEST-SKU") -> di
 
 def test_estimate_line_fees_positive():
     fee = estimate_line_fees(100.0, ad_rate=0.05, order_line_count=1)
-    # Transacted amount is the fee base: 100*(0.1325+0.05)+0.30 = 18.55
-    assert abs(fee - 18.55) < 0.02
+    # Merchandise-only: 100*(0.136+0.013+0.05)+0.40 = 20.30
+    assert abs(fee - 20.30) < 0.02
+
+
+def test_estimate_line_fees_uses_tax_inclusive_total():
+    """FVF + international + ads apply to item + tax; per-order fee is $0.40."""
+    # 05-15228-64124: item 77.49, tax 7.36, order total 84.85
+    # 84.85 * 0.199 + 0.40 = 17.29
+    fee = estimate_line_fees(77.49, ad_rate=0.05, tax=7.36, order_line_count=1)
+    assert abs(fee - 17.29) < 0.02
+
+
+def test_today_4pack_fees_include_international():
+    """18-15212-82176: 90.84 * (13.6%+1.3%+5%) + $0.40 = $18.48."""
+    paid = 83.63
+    tax = 7.21
+    cost = 61.88
+    fee = estimate_line_fees(paid, ad_rate=0.05, tax=tax, order_line_count=1)
+    net = round(paid - cost - fee, 2)
+    assert abs(fee - 18.48) < 0.02
+    assert abs(net - 3.27) < 0.05
 
 
 def test_order_pnl_does_not_apply_a_second_store_discount():
@@ -78,12 +97,15 @@ def test_order_pnl_does_not_apply_a_second_store_discount():
 
     paid = 77.49  # 81.57 listing after 5% sale
     cost = 55.13
-    fee = estimate_line_fees(paid, ad_rate=0.05, order_line_count=1)
+    fee = estimate_line_fees(paid, ad_rate=0.05, tax=7.36, order_line_count=1)
     net = round(paid - cost - fee, 2)
-    assert abs(fee - 14.44) < 0.02
-    assert abs(net - 7.92) < 0.02
+    assert abs(fee - 17.29) < 0.02
+    assert abs(net - 5.07) < 0.02
     double_cut_revenue = round(paid * 0.95, 2)
-    double_cut_net = round(double_cut_revenue - cost - estimate_line_fees(paid, store_discount=0.05), 2)
+    double_cut_net = round(
+        double_cut_revenue - cost - estimate_line_fees(paid, store_discount=0.05, tax=7.36),
+        2,
+    )
     assert net > double_cut_net + 2
 
 
@@ -98,7 +120,7 @@ def test_upsert_uses_ebay_transacted_amount_as_revenue(tmp_path):
         "pricingSummary": {
             "priceSubtotal": {"value": "77.49", "currency": "USD"},
             "deliveryCost": {"value": "0.0", "currency": "USD"},
-            "total": {"value": "77.49", "currency": "USD"},
+            "total": {"value": "84.85", "currency": "USD"},
         },
         "lineItems": [
             {
@@ -108,6 +130,9 @@ def test_upsert_uses_ebay_transacted_amount_as_revenue(tmp_path):
                 "title": "Trellis",
                 "quantity": 1,
                 "lineItemCost": {"value": "77.49", "currency": "USD"},
+                "ebayCollectAndRemitTaxes": [
+                    {"amount": {"value": "7.36", "currency": "USD"}}
+                ],
             }
         ],
     }
@@ -119,7 +144,7 @@ def test_upsert_uses_ebay_transacted_amount_as_revenue(tmp_path):
     conn.commit()
     summary = upsert_finance_order(conn, order, ad_rate=0.05)
     assert summary["gross_sales"] == 77.49
-    assert abs(summary["total_fees_est"] - 14.44) < 0.02
+    assert abs(summary["total_fees_est"] - 17.29) < 0.02
     assert abs(summary["net_est"] - (77.49 - 55.13 - summary["total_fees_est"])) < 0.02
     assert abs(summary["margin_est"] - summary["net_est"] / 77.49) < 0.0002
     conn.close()
@@ -132,9 +157,9 @@ def test_recompute_stored_pnls_removes_second_discount(tmp_path):
         """
         INSERT INTO finance_orders (
             platform, platform_order_id, order_date, payment_status,
-            gross_sales, total_cogs, total_fees_est, net_est, margin_est
+            gross_sales, tax_collected, total_cogs, total_fees_est, net_est, margin_est
         ) VALUES ('ebay', '05-15228-64124', '2026-09-26 23:25:50', 'PAID',
-                  77.49, 55.13, 13.73, 4.76, 0.0647)
+                  77.49, 7.36, 55.13, 13.73, 4.76, 0.0647)
         """
     )
     fid = conn.execute("SELECT id FROM finance_orders").fetchone()[0]
@@ -154,9 +179,9 @@ def test_recompute_stored_pnls_removes_second_discount(tmp_path):
     row = conn.execute(
         "SELECT total_fees_est, net_est, margin_est FROM finance_orders"
     ).fetchone()
-    assert abs(row[0] - 14.44) < 0.02
-    assert abs(row[1] - 7.92) < 0.02
-    assert abs(row[2] - 7.92 / 77.49) < 0.0002
+    assert abs(row[0] - 17.29) < 0.02
+    assert abs(row[1] - 5.07) < 0.02
+    assert abs(row[2] - 5.07 / 77.49) < 0.0002
     conn.close()
 
 
