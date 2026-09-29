@@ -88,10 +88,11 @@ GIGA 订单基数 = 商品价 + 运费          ← 不是 eBay 售价
 
 | 类型 | eBay 预估 | 以后实收 |
 |------|-----------|----------|
-| 成交费 FVF | 13.25% × 折扣后成交额 | eBay 月结/CSV |
-| 店铺折扣影响 | 买家 5% 折扣下的净收模型 | 同上 |
-| 广告 | 默认 5% 或实际 campaign | 推广报告 |
-| 固定费 | $0.30 / 单 | 同上 |
+| 成交费 FVF | 13.6% × (货款 + 买家运费 + 代收税) | eBay 月结/CSV |
+| 国际费 | 1.3% × 同上税基（APAC 卖家 → 美国买家） | 同上 |
+| 店铺折扣影响 | 刊登报价用 5% 折后模型；订单 GMV 已是买家实付 | 同上 |
+| 广告 | 默认 5% 或实际 campaign，税基与 FVF 相同 | 推广报告 |
+| 固定费 | $0.40 / 单 | 同上 |
 | 支付宝 | 已在 COGS | GIGA 账单 |
 | Wayfair Net-30 2% | 仅 Wayfair 渠道 | Wayfair 汇款单 |
 
@@ -104,15 +105,17 @@ GIGA 订单基数 = 商品价 + 运费          ← 不是 eBay 售价
 ### 单行预估净利
 
 ```text
-line_net ≈ line_gross_after_store_discount
-         − ebay_fvf − ad_share − fixed_fee_share
+line_net ≈ eBay lineItemCost (buyer-paid merchandise)
+         − ebay_fvf − international − ad_share − fixed_fee_share
          − line_cogs
 ```
 
-与现有死线一致的「最差净收」：
+eBay Fulfillment `lineItemCost` / `priceSubtotal` already includes markdown.
+Order PnL does **not** apply another 5% store discount. The listing-price
+「最差净收」still uses 5% markdown when quoting unpublished prices:
 
 ```text
-worst_net = sell_price × 0.95 × (1 − 0.1325 − ad_rate) − 0.30
+worst_net = sell_price × 0.95 × (1 − (0.136 + 0.013 + ad_rate) × 1.10) − 0.40
 profit    = worst_net − unit_giga_cost
 ```
 

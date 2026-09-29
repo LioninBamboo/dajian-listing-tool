@@ -34,10 +34,11 @@ load_dotenv(PROJECT_ROOT / ".env")
 # eBay 费用常量 — 单一真相源在 PricingEngine。这里转 float 是因为本页大量
 # 用 pandas / Streamlit 计算，全用 Decimal 反而会到处类型错配。
 from src.services.pricing_engine import PricingEngine
-EBAY_FEE_RATE = float(PricingEngine.EBAY_FEE_RATE)
+EBAY_FEE_RATE = float(PricingEngine.marketplace_fee_rate())
 AD_RATE = float(PricingEngine.AD_RATE)
 FIXED_FEE = float(PricingEngine.FIXED_FEE)
 STORE_DISCOUNT_RATE = float(PricingEngine.STORE_DISCOUNT_RATE)
+LISTING_TAX_PAD = float(PricingEngine.LISTING_TAX_PAD)
 
 DEFAULT_DELIST_MIN_AGE_DAYS = 60
 
@@ -90,10 +91,11 @@ def calc_net_margin(selling_price, total_cost):
     """计算扣除eBay费用后的净利润率 (考虑5%店铺折扣)"""
     if selling_price <= 0 or total_cost <= 0:
         return 0
-    # 买家实付 = listing_price × (1 - 5%折扣)
+    # 买家实付 = listing_price × (1 - 5%折扣); 费用打在含 10% 税垫的税基上
     actual_revenue = selling_price * (1 - STORE_DISCOUNT_RATE)
-    ebay_fee = actual_revenue * EBAY_FEE_RATE
-    ad_fee = actual_revenue * AD_RATE
+    fee_base = actual_revenue * (1 + LISTING_TAX_PAD)
+    ebay_fee = fee_base * EBAY_FEE_RATE
+    ad_fee = fee_base * AD_RATE
     net_profit = actual_revenue - ebay_fee - ad_fee - FIXED_FEE - total_cost
     return net_profit / selling_price
 

@@ -67,8 +67,54 @@ def _seed_product(conn: sqlite3.Connection, sku: str = "FINANCE-TEST-SKU") -> di
 
 def test_estimate_line_fees_positive():
     fee = estimate_line_fees(100.0, ad_rate=0.05, order_line_count=1)
-    assert fee > 10  # roughly 0.95*100*0.1825 + 0.30
-    assert fee < 30
+    # Merchandise-only: 100*(0.136+0.013+0.05)+0.40 = 20.30
+    assert abs(fee - 20.30) < 0.02
+
+
+def test_estimate_line_fees_uses_tax_inclusive_total():
+    """FVF + international + ads apply to item + tax; per-order fee is $0.40."""
+    # 84.85 * 0.199 + 0.40 = 17.29
+    fee = estimate_line_fees(77.49, ad_rate=0.05, tax=7.36, order_line_count=1)
+    assert abs(fee - 17.29) < 0.02
+
+
+def test_upsert_uses_tax_inclusive_fees(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "f.db"))
+    _seed_product(conn)
+    order = {
+        "orderId": "05-15228-64124",
+        "creationDate": "2026-09-26T23:25:50.000Z",
+        "orderPaymentStatus": "PAID",
+        "orderFulfillmentStatus": "FULFILLED",
+        "pricingSummary": {
+            "priceSubtotal": {"value": "77.49", "currency": "USD"},
+            "deliveryCost": {"value": "0.0", "currency": "USD"},
+            "total": {"value": "84.85", "currency": "USD"},
+        },
+        "lineItems": [
+            {
+                "lineItemId": "1",
+                "legacyItemId": "366484453913",
+                "sku": "FINANCE-TEST-SKU",
+                "title": "Trellis",
+                "quantity": 1,
+                "lineItemCost": {"value": "77.49", "currency": "USD"},
+                "ebayCollectAndRemitTaxes": [
+                    {"amount": {"value": "7.36", "currency": "USD"}}
+                ],
+            }
+        ],
+    }
+    conn.execute(
+        "UPDATE collected_products SET cost_breakdown = ?",
+        (json.dumps({"total_dajian_cost": 55.13}),),
+    )
+    conn.commit()
+    summary = upsert_finance_order(conn, order, ad_rate=0.05)
+    assert summary["gross_sales"] == 77.49
+    assert abs(summary["total_fees_est"] - 17.29) < 0.02
+    assert abs(summary["net_est"] - (77.49 - 55.13 - summary["total_fees_est"])) < 0.02
+    conn.close()
 
 
 def test_upsert_finance_order_with_recomputed_cost(tmp_path):

@@ -1,7 +1,10 @@
 """Finance F0: order-level PnL from eBay sales + GIGA cost snapshots.
 
 COGS basis: PricingEngine.calculate_dajian_cost (GIGA order product+shipping+insurance+alipay).
-Fees: estimated eBay FVF + ad + fixed fee (store discount model).
+Fees: 13.6% FVF + 1.3% international + modeled ads on the tax-inclusive
+sale total (item + shipping charged + collected tax) plus $0.40 per order.
+eBay Fulfillment lineItemCost / priceSubtotal already includes markdown;
+order PnL must not apply another store discount.
 """
 from __future__ import annotations
 
@@ -119,19 +122,48 @@ def estimate_line_fees(
     *,
     ad_rate: float = 0.05,
     store_discount: float = 0.0,
-    fvf: float = 0.1325,
-    fixed_fee: float = 0.30,
+    fvf: float | None = None,
+    fixed_fee: float | None = None,
+    tax: float = 0.0,
+    shipping: float = 0.0,
     order_line_count: int = 1,
 ) -> float:
-    """Estimate platform fees for one line (share of fixed fee across lines)."""
-    gross = _d(line_gross)
-    if gross <= 0:
+    """Estimate platform fees for one line (share of fixed fee across lines).
+
+    FVF + international fee + Promoted Listings apply to the tax-inclusive
+    sale total (merchandise after any modeled store discount + shipping + tax).
+    """
+    from src.services.pricing_engine import PricingEngine
+
+    if fvf is None:
+        fvf = float(PricingEngine.EBAY_FEE_RATE)
+    if fixed_fee is None:
+        fixed_fee = float(PricingEngine.FIXED_FEE)
+    intl = float(PricingEngine.INTERNATIONAL_FEE_RATE)
+    merch = _d(line_gross) * (Decimal("1") - _d(store_discount))
+    if merch <= 0:
         return 0.0
-    fee_base = gross * (Decimal("1") - _d(store_discount))
-    variable = fee_base * (_d(fvf) + _d(ad_rate))
+    fee_base = merch + _d(tax) + _d(shipping)
+    variable = fee_base * (_d(fvf) + _d(intl) + _d(ad_rate))
     n = max(int(order_line_count or 1), 1)
     fixed_share = _d(fixed_fee) / Decimal(n)
     return _q2(variable + fixed_share)
+
+
+def _order_tax_and_shipping(order: dict) -> tuple[float, float]:
+    pricing = order.get("pricingSummary") or {}
+    try:
+        shipping = float((pricing.get("deliveryCost") or {}).get("value") or 0)
+    except (TypeError, ValueError):
+        shipping = 0.0
+    tax = 0.0
+    for li in order.get("lineItems") or []:
+        for t in li.get("ebayCollectAndRemitTaxes") or []:
+            try:
+                tax += float((t.get("amount") or {}).get("value") or 0)
+            except (TypeError, ValueError):
+                continue
+    return tax, shipping
 
 
 def lookup_giga_unit_cost(conn: sqlite3.Connection, sku: str) -> tuple[float, str]:
@@ -182,6 +214,15 @@ def build_lines_from_ebay_order(
 ) -> list[LinePnl]:
     raw_lines = [li for li in (order.get("lineItems") or []) if li.get("sku")]
     n = max(len(raw_lines), 1)
+    order_tax, order_ship = _order_tax_and_shipping(order)
+    merch_sum = 0.0
+    for li in raw_lines:
+        try:
+            merch_sum += float((li.get("lineItemCost") or {}).get("value") or 0) or float(
+                (li.get("total") or {}).get("value") or 0
+            )
+        except (TypeError, ValueError):
+            continue
     out: list[LinePnl] = []
 
     for li in raw_lines:
@@ -193,7 +234,14 @@ def build_lines_from_ebay_order(
         unit_sell = round(line_gross / qty, 2) if qty else line_gross
         unit_cost, cost_source = lookup_giga_unit_cost(conn, sku)
         line_cogs = round(unit_cost * qty, 2)
-        fee = estimate_line_fees(line_gross, ad_rate=ad_rate, order_line_count=n)
+        share = (line_gross / merch_sum) if merch_sum > 0 else (1.0 / n)
+        fee = estimate_line_fees(
+            line_gross,
+            ad_rate=ad_rate,
+            tax=order_tax * share,
+            shipping=order_ship * share,
+            order_line_count=n,
+        )
         net = round(line_gross - line_cogs - fee, 2)
         out.append(
             LinePnl(

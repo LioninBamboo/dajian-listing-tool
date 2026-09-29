@@ -33,8 +33,13 @@ AD_CACHE_TTL_HOURS = 4
 
 
 def _calc_margin_on_actual_price(actual_price, total_cost, ad_rate,
-                                 ebay_fee_rate=0.1325, fixed_fee=0.30):
+                                 ebay_fee_rate=None, fixed_fee=None):
     """Margin denominator = actual transaction price, with ad cost based on actual bid%."""
+    from src.services.pricing_engine import PricingEngine
+    if ebay_fee_rate is None:
+        ebay_fee_rate = float(PricingEngine.marketplace_fee_rate())
+    if fixed_fee is None:
+        fixed_fee = float(PricingEngine.FIXED_FEE)
     if actual_price <= 0 or total_cost <= 0:
         return 0.0
     net_profit = actual_price - actual_price * ebay_fee_rate - actual_price * ad_rate - fixed_fee - total_cost

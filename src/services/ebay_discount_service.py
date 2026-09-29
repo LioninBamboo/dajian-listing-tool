@@ -833,7 +833,7 @@ def calc_discounted_price(original_price, discount_pct=None):
 
 
 def calc_net_margin_with_discount(selling_price, total_cost, discount_pct=None,
-                                   ebay_fee_rate=0.1325, ad_rate=0.05, fixed_fee=0.30):
+                                   ebay_fee_rate=None, ad_rate=0.05, fixed_fee=None):
     """
     计算折扣后的净利润率
 
@@ -849,6 +849,11 @@ def calc_net_margin_with_discount(selling_price, total_cost, discount_pct=None,
     """
     if discount_pct is None:
         discount_pct = get_active_discount_pct()
+    from src.services.pricing_engine import PricingEngine
+    if ebay_fee_rate is None:
+        ebay_fee_rate = float(PricingEngine.marketplace_fee_rate())
+    if fixed_fee is None:
+        fixed_fee = float(PricingEngine.FIXED_FEE)
 
     actual_price = selling_price * (1 - discount_pct / 100.0) if discount_pct > 0 else selling_price
 
