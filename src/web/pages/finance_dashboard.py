@@ -15,6 +15,7 @@ def render_finance_dashboard():
     st.caption(
         "eBay 已付款订单 × GIGA 采购成本快照 × 预估平台费 × 履约阶段。"
         " 成本基数 = GIGA 订单（货+运+保险+支付宝），不是售价。"
+        " GMV = eBay 成交额（买家实付，店铺折扣已含在内，不再另扣 5%）。"
         " 费用为估算（FVF+广告+固定费），标「估」。"
         " **全额/部分退款不计入 GMV/净利。**"
     )
@@ -227,7 +228,7 @@ def render_finance_dashboard():
         st.caption(
             "Item# = eBay Item Number；Trans# = eBay Transaction ID（与 GIGA 推单字段一致）。"
             " GIGA阶段：未推 / 已推未付 / 处理中 / 已发货 / 异常。"
-            " 利润率(估) = 净利(估) / GMV。"
+            " 利润率(估) = 净利(估) / GMV（买家实付成交额）。"
         )
 
     conn.close()

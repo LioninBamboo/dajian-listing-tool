@@ -118,7 +118,7 @@ def estimate_line_fees(
     line_gross: float,
     *,
     ad_rate: float = 0.05,
-    store_discount: float = 0.05,
+    store_discount: float = 0.0,
     fvf: float = 0.1325,
     fixed_fee: float = 0.30,
     order_line_count: int = 1,
@@ -127,9 +127,8 @@ def estimate_line_fees(
     gross = _d(line_gross)
     if gross <= 0:
         return 0.0
-    # After store discount (buyer pays less → FVF base lower)
-    after_discount = gross * (Decimal("1") - _d(store_discount))
-    variable = after_discount * (_d(fvf) + _d(ad_rate))
+    fee_base = gross * (Decimal("1") - _d(store_discount))
+    variable = fee_base * (_d(fvf) + _d(ad_rate))
     n = max(int(order_line_count or 1), 1)
     fixed_share = _d(fixed_fee) / Decimal(n)
     return _q2(variable + fixed_share)
