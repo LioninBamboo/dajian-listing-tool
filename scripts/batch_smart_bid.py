@@ -50,7 +50,7 @@ HIGH_BID = 7.0  # %
 MID_BID = 5.0
 LOW_BID = 3.0
 
-SAFETY_MARGIN = 0.05  # 5% 净利润安全边际
+SAFETY_MARGIN = 0.10  # 口径 A: 相对成本的 10%
 BID_DELTA_THRESHOLD = 0.5  # 与现 bid 差异 < 0.5% 视为无需调整
 
 

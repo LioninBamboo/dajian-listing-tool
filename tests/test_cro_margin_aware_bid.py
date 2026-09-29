@@ -43,9 +43,8 @@ def test_bid_cap_for_sku_uses_high_margin(tmp_path: Path):
         c.execute("INSERT INTO products VALUES ('HIGH', 100.0, 30.0)")
         c.commit()
     # \u4f20\u5165\u4e00\u4e2a fake margin_calc \u907f\u514d\u4f9d\u8d56 streamlit
-    cap = bid_cap_for_sku('HIGH', db_path=db,
-                          margin_calc=lambda p, c: (p - c) / p)
-    # margin = 0.70 \u2192 cap = HARD_CEILING_PCT
+    cap = bid_cap_for_sku('HIGH', db_path=db)
+    # 价 100 / 成本 30: 口径 A 可承受广告远高于 40% 天花板
     assert cap == HARD_CEILING_PCT
 
 
@@ -55,6 +54,5 @@ def test_bid_cap_for_sku_low_margin(tmp_path: Path):
         c.execute("CREATE TABLE products (sku TEXT, ourPrice REAL, total_cost REAL)")
         c.execute("INSERT INTO products VALUES ('THIN', 100.0, 98.0)")
         c.commit()
-    cap = bid_cap_for_sku('THIN', db_path=db,
-                          margin_calc=lambda p, c: (p - c) / p)
-    assert cap == HARD_FLOOR_PCT
+    cap = bid_cap_for_sku('THIN', db_path=db)
+    assert cap == 0.0

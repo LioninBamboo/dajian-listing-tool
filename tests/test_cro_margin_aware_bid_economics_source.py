@@ -28,15 +28,13 @@ def test_bid_cap_reads_collected_products_on_production_schema(tmp_path):
     db = tmp_path / 'prod.db'
     # 高毛利 (价 400 / 成本 150): cap 必须明显高于 5% 硬地板
     _seed_collected(db, 'HIGH', 400.0, 150.0)
-    cap = bid_cap_for_sku('HIGH', db_path=db,
-                          margin_calc=lambda p, c: (p - c) / p)
+    cap = bid_cap_for_sku('HIGH', db_path=db)
     assert cap > HARD_FLOOR_PCT
 
-    # 微利 (价 100 / 成本 98): 仍压回硬地板
+    # 微利 (价 100 / 成本 98): 撑不起成本 10% 净利 → 不允许加广告
     _seed_collected(db, 'THIN', 100.0, 98.0)
-    cap_thin = bid_cap_for_sku('THIN', db_path=db,
-                               margin_calc=lambda p, c: (p - c) / p)
-    assert cap_thin == HARD_FLOOR_PCT
+    cap_thin = bid_cap_for_sku('THIN', db_path=db)
+    assert cap_thin == 0.0
 
 
 def test_bid_cap_missing_everything_returns_floor(tmp_path):

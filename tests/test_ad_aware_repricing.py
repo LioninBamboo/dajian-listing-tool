@@ -140,7 +140,7 @@ class PrecheckPriceTests(unittest.TestCase):
         from src.services import repricing_guard
         with patch.object(repricing_guard, '_try_disable_ad', return_value=(False, 'no_ad')):
             ok, reason = repricing_guard.precheck_price(
-                'SKU-100', 122.0, db_path=self.db_path,
+                'SKU-100', 135.0, db_path=self.db_path,
             )
         self.assertTrue(ok)
         self.assertEqual(reason, 'ok_no_ad_to_disable')
@@ -149,7 +149,7 @@ class PrecheckPriceTests(unittest.TestCase):
         from src.services import repricing_guard
         with patch.object(repricing_guard, '_try_disable_ad', return_value=(True, 'disabled')):
             ok, reason = repricing_guard.precheck_price(
-                'SKU-100', 122.0, db_path=self.db_path,
+                'SKU-100', 135.0, db_path=self.db_path,
             )
         self.assertTrue(ok)
         self.assertIn('ok_after_ad_disabled', reason)
@@ -158,7 +158,7 @@ class PrecheckPriceTests(unittest.TestCase):
         from src.services import repricing_guard
         with patch.object(repricing_guard, '_try_disable_ad', return_value=(False, 'failed')):
             ok, reason = repricing_guard.precheck_price(
-                'SKU-100', 122.0, db_path=self.db_path,
+                'SKU-100', 135.0, db_path=self.db_path,
             )
         self.assertFalse(ok)
         self.assertIn('ad_disable_failed', reason)
@@ -166,7 +166,7 @@ class PrecheckPriceTests(unittest.TestCase):
     def test_allow_ad_disable_false_rejects_below_ad_floor(self):
         from src.services.repricing_guard import precheck_price
         ok, reason = precheck_price(
-            'SKU-100', 122.0, db_path=self.db_path, allow_ad_disable=False,
+            'SKU-100', 135.0, db_path=self.db_path, allow_ad_disable=False,
         )
         self.assertFalse(ok)
         self.assertIn('unsafe_with_ad_no_disable', reason)

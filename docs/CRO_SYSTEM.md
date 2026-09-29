@@ -97,7 +97,7 @@ The readable CRO email is rendered by `src/services/cro_email_digest.py`. The im
 
 The per-product table shows the thumbnail, product title, status, reason, and links. For `promote`, the most common skip reason is:
 
-- `already at cap (...)`: the SKU already sits at its margin-aware safe bid ceiling, so CRO checked it but refused to raise the ad bid further.
+- `already at cap (...)`: the SKU already sits at its margin-aware safe bid ceiling, so CRO checked it but refused to raise the ad bid further. The ceiling is the ad rate that still leaves 10% of landed cost (口径 A, `PricingEngine.MIN_NET_MARGIN_ON_COST`).
 
 SKUs skipped `already at cap` within the last 7 days enter a promote cooldown: `src/services/cro_promote_escalation.py` reads recent `logs/cro_promote_*.json` reports and the daily runner stops re-enqueueing `promote` for them, freeing the daily enqueue slots for SKUs whose bid can still move. These SKUs surface in the daily report under `promote_escalation` — the ad lever is exhausted for them, so they are the operator's candidates for non-ad levers (title/keyword rewrite, relist lifecycle). `promote_at_cap_cooldown_dropped` in the daily report counts how many promote recommendations the cooldown suppressed that day.
 

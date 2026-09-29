@@ -41,6 +41,41 @@ def _calc_margin_on_actual_price(actual_price, total_cost, ad_rate,
     return net_profit / actual_price
 
 
+def _trading_live_price(listing_id) -> float | None:
+    """Trading GetItem current price for listings Inventory cannot see.
+
+    Motors / Trading-channel listings return empty Inventory offers. Without
+    this fallback create_ad_safe fail-opens and can enroll ads the margin
+    guard would have rejected. Returns None on any error so callers keep
+    the existing fail-open path.
+    """
+    if not listing_id:
+        return None
+    try:
+        from src.clients.ebay_client import EbayClient
+        from src.clients.ebay_trading_client import EbayTradingClient
+        environment = os.getenv('EBAY_ENVIRONMENT', 'PRODUCTION').upper()
+        ebay = EbayClient(
+            os.getenv('EBAY_APP_ID'),
+            os.getenv('EBAY_CERT_ID'),
+            os.getenv('EBAY_DEV_ID'),
+            env='production' if environment == 'PRODUCTION' else 'sandbox',
+        )
+        trading = EbayTradingClient(ebay)
+        import xml.etree.ElementTree as ET
+        resp = trading.call('GetItem', f'<ItemID>{listing_id}</ItemID>')
+        root = ET.fromstring(resp)
+        ns = {'e': 'urn:ebay:apis:eBLBaseComponents'}
+        status = root.find('.//e:SellingStatus/e:ListingStatus', ns)
+        price = root.find('.//e:SellingStatus/e:CurrentPrice', ns)
+        if (status is not None and status.text == 'Active'
+                and price is not None and price.text):
+            return float(price.text)
+    except Exception as exc:
+        logger.debug(f"Trading GetItem {listing_id} 现价回退失败: {exc}")
+    return None
+
+
 class EbayAdService:
     """eBay 广告/推广数据服务"""
 
@@ -110,10 +145,12 @@ class EbayAdService:
             "startDate": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         }
         url = f"{self.base}/sell/marketing/v1/ad_campaign"
+        self.last_campaign_error = ""
         try:
             r = requests.post(url, headers=self._headers(), json=payload, timeout=60, verify=False)
         except Exception as e:
             logger.error(f"create_campaign failed: {e}")
+            self.last_campaign_error = str(e)
             return None
         if r.status_code in (200, 201):
             loc = r.headers.get('Location', '') or ''
@@ -124,6 +161,7 @@ class EbayAdService:
             except Exception:
                 return None
         logger.error(f"create_campaign {r.status_code}: {r.text[:300]}")
+        self.last_campaign_error = f"HTTP {r.status_code}: {(r.text or '')[:400]}"
         return None
 
     # ─── 获取 campaign 内的广告链接 ───
@@ -171,12 +209,12 @@ class EbayAdService:
             return {'success': False, 'error': str(e)}
 
     def create_ad_safe(self, campaign_id, listing_id, sku=None,
-                       bid_percentage=5.0, safety_margin=0.05,
+                       bid_percentage=5.0, safety_margin=None,
                        db_path='ebay_collection.db'):
         """安全创建广告: 先用 PricingEngine.required_ad_rate_for 校验现价能否撑得起.
 
         若 SKU 当前 listing price 在扣完 fees + bid_percentage% 广告费后
-        仍能保留 safety_margin 利润 → 调 create_ad
+        仍能保留 safety_margin 利润 (默认 = 成本的 10%, 口径 A) → 调 create_ad
         否则 → 拒绝创建, 返回 {'success': False, 'reason': 'unsafe', ...}
 
         被 batch_publish / 手动开广告 / ad_restore_audit 共用, 杜绝
@@ -187,7 +225,7 @@ class EbayAdService:
             listing_id: eBay item id
             sku: 商品 SKU (用于查 cost; 若 None 则按 sku=listing_id 在 DB 找不到)
             bid_percentage: 期望 bid (默认 5.0)
-            safety_margin: 净利润缓冲 (默认 0.05 即 5%)
+            safety_margin: 相对成本的净利润缓冲 (默认 PricingEngine.MIN_NET_MARGIN_ON_COST = 10%)
             db_path: ebay_collection.db 路径
 
         Returns:
@@ -197,6 +235,9 @@ class EbayAdService:
         from src.services.repricing_guard import _fetch_cost_and_listing
         from src.services.pricing_engine import PricingEngine
         from src.services import ad_blacklist
+
+        if safety_margin is None:
+            safety_margin = float(PricingEngine.MIN_NET_MARGIN_ON_COST)
 
         # 找 SKU + cost
         if not sku:
@@ -258,6 +299,13 @@ class EbayAdService:
             logger.warning(f"⚠️ create_ad_safe {sku}: 取现网价失败 ({e}), fail-open")
             return self.create_ad(campaign_id, listing_id, bid_percentage)
 
+        if not live_price:
+            live_price = _trading_live_price(listing_id)
+            if live_price:
+                logger.info(
+                    f"create_ad_safe {sku}: Inventory 无 offer, "
+                    f"Trading GetItem 现价 ${live_price:.2f}"
+                )
         if not live_price:
             logger.warning(f"⚠️ create_ad_safe {sku}: 无 live_price, fail-open")
             return self.create_ad(campaign_id, listing_id, bid_percentage)

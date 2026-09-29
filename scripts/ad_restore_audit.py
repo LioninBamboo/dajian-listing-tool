@@ -470,7 +470,7 @@ def main():
     p.add_argument('--apply', action='store_true', help='真正调 eBay 开广告 (默认 dry-run)')
     p.add_argument('--email', action='store_true', help='发送审计邮件')
     p.add_argument('--target-bid', type=float, default=5.0, help='目标广告 bid 百分比 (默认 5.0)')
-    p.add_argument('--safety', type=float, default=0.05, help='利润安全缓冲 (默认 0.05 即 5%%)')
+    p.add_argument('--safety', type=float, default=0.10, help='利润安全缓冲 (默认 0.10 即成本的 10%%)')
     p.add_argument('--limit', type=int, default=None, help='仅审计前 N 个 SKU (调试用)')
     args = p.parse_args()
 
