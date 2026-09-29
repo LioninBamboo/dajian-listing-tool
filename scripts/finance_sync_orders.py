@@ -28,32 +28,49 @@ def main() -> int:
     parser.add_argument("--ad-rate", type=float, default=0.05, help="Estimated ad rate (default 5%)")
     parser.add_argument("--db", default=str(PROJECT_ROOT / "ebay_collection.db"))
     parser.add_argument("--out", default="")
+    parser.add_argument(
+        "--recompute-local",
+        action="store_true",
+        help="Rewrite fee/net from stored GMV/COGS; do not pull eBay",
+    )
     args = parser.parse_args()
 
     os.environ.setdefault("EBAY_ENVIRONMENT", "PRODUCTION")
 
-    from src.services.finance_orders import sync_orders_from_ebay, query_finance_summary
+    from src.services.finance_orders import (
+        query_finance_summary,
+        recompute_stored_pnls,
+        sync_orders_from_ebay,
+    )
     import sqlite3
 
-    print(f"Syncing eBay orders (last {args.days} days), ad_rate={args.ad_rate:.0%} ...")
-    try:
-        report = sync_orders_from_ebay(
-            days=args.days,
-            db_path=args.db,
-            ad_rate=args.ad_rate,
+    if args.recompute_local:
+        print(f"Recomputing local finance PnL, ad_rate={args.ad_rate:.0%} ...")
+        conn = sqlite3.connect(args.db)
+        report = recompute_stored_pnls(conn, ad_rate=args.ad_rate)
+        summary = query_finance_summary(conn)
+        conn.close()
+        print(f"Updated={report['updated']}")
+    else:
+        print(f"Syncing eBay orders (last {args.days} days), ad_rate={args.ad_rate:.0%} ...")
+        try:
+            report = sync_orders_from_ebay(
+                days=args.days,
+                db_path=args.db,
+                ad_rate=args.ad_rate,
+            )
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            return 1
+        conn = sqlite3.connect(args.db)
+        summary = query_finance_summary(conn)
+        conn.close()
+
+    if not args.recompute_local:
+        print(
+            f"Pulled={report['orders_pulled']} upserted={report['upserted']} "
+            f"errors={report['errors']}"
         )
-    except Exception as e:
-        print(f"[ERROR] {e}")
-        return 1
-
-    conn = sqlite3.connect(args.db)
-    summary = query_finance_summary(conn)
-    conn.close()
-
-    print(
-        f"Pulled={report['orders_pulled']} upserted={report['upserted']} "
-        f"errors={report['errors']}"
-    )
     print(
         f"Summary (PAID): orders={summary['order_count']} "
         f"GMV=${summary['gmv']:.2f} COGS=${summary['cogs']:.2f} "
@@ -66,7 +83,8 @@ def main() -> int:
         f"shipped={summary.get('shipped', 0)} "
         f"stages={summary.get('fulfill_stages')}"
     )
-    print(f"GIGA links updated: {report.get('giga_links_updated', 0)}")
+    if not args.recompute_local:
+        print(f"GIGA links updated: {report.get('giga_links_updated', 0)}")
 
     out = Path(args.out) if args.out else (
         PROJECT_ROOT / "reports" / f"finance_sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"

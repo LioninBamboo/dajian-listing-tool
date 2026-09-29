@@ -1,7 +1,9 @@
 """Finance F0: order-level PnL from eBay sales + GIGA cost snapshots.
 
 COGS basis: PricingEngine.calculate_dajian_cost (GIGA order product+shipping+insurance+alipay).
-Fees: estimated eBay FVF + ad + fixed fee (store discount model).
+Fees: estimated eBay FVF + ad + fixed fee on the eBay transacted amount.
+eBay Fulfillment lineItemCost / priceSubtotal already includes markdown;
+order PnL must not apply another store discount.
 """
 from __future__ import annotations
 
@@ -20,7 +22,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DB = PROJECT_ROOT / "ebay_collection.db"
 
 _Q2 = Decimal("0.01")
-DEFAULT_STORE_DISCOUNT = 0.05
+# Listing-price models still use 5% markdown. Order PnL defaults to 0:
+# Fulfillment amounts are already the buyer-paid merchandise total.
+DEFAULT_STORE_DISCOUNT = 0.0
+LISTING_STORE_DISCOUNT = 0.05
 
 
 def _d(value: Any) -> Decimal:
@@ -39,7 +44,12 @@ def merchandise_after_store_discount(
     *,
     store_discount: float = DEFAULT_STORE_DISCOUNT,
 ) -> float:
-    """Seller merchandise take-home after the modeled store discount."""
+    """Merchandise revenue used for order PnL.
+
+    Default ``store_discount`` is 0 because eBay order totals are already
+    transacted (markdown applied). Pass ``LISTING_STORE_DISCOUNT`` only when
+    converting a pre-discount listing price.
+    """
     return _q2(_d(gross) * (Decimal("1") - _d(store_discount)))
 
 
@@ -137,9 +147,8 @@ def estimate_line_fees(
     gross = _d(line_gross)
     if gross <= 0:
         return 0.0
-    # After store discount (buyer pays less → FVF base lower)
-    after_discount = gross * (Decimal("1") - _d(store_discount))
-    variable = after_discount * (_d(fvf) + _d(ad_rate))
+    fee_base = gross * (Decimal("1") - _d(store_discount))
+    variable = fee_base * (_d(fvf) + _d(ad_rate))
     n = max(int(order_line_count or 1), 1)
     fixed_share = _d(fixed_fee) / Decimal(n)
     return _q2(variable + fixed_share)
@@ -275,8 +284,6 @@ def build_lines_from_ebay_order(
             store_discount=store_discount,
             order_line_count=n,
         )
-        # Fees already use post-discount base; net must too or profit is
-        # inflated by roughly the store discount on every order.
         revenue = merchandise_after_store_discount(
             line_gross, store_discount=store_discount
         )
@@ -347,7 +354,6 @@ def upsert_finance_order(
 
     total_cogs = round(sum(l.line_cogs for l in lines), 2)
     total_fees = round(sum(l.fee_est for l in lines), 2)
-    # Net on merchandise after store discount: revenue - cogs - fees
     revenue = merchandise_after_store_discount(gross, store_discount=store_discount)
     net_est = round(revenue - total_cogs - total_fees, 2)
     margin = round(net_est / revenue, 4) if revenue > 0 else 0.0
@@ -480,6 +486,76 @@ def upsert_finance_order(
             for ln in lines
         ],
     }
+
+
+def recompute_stored_pnls(
+    conn: sqlite3.Connection,
+    *,
+    ad_rate: float = 0.05,
+    store_discount: float = DEFAULT_STORE_DISCOUNT,
+) -> dict:
+    """Rewrite fee/net/margin from stored gross and COGS without refetching eBay."""
+    ensure_finance_tables(conn)
+    orders = conn.execute(
+        """
+        SELECT platform, platform_order_id, gross_sales, total_cogs
+        FROM finance_orders
+        """
+    ).fetchall()
+    now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
+    updated = 0
+    for platform, oid, gross, cogs in orders:
+        lines = conn.execute(
+            """
+            SELECT id, line_gross, line_cogs
+            FROM finance_order_lines
+            WHERE platform_order_id = ?
+            """,
+            (oid,),
+        ).fetchall()
+        n = max(len(lines), 1)
+        if lines:
+            total_fees = 0.0
+            for line_id, line_gross, line_cogs in lines:
+                fee = estimate_line_fees(
+                    float(line_gross or 0),
+                    ad_rate=ad_rate,
+                    store_discount=store_discount,
+                    order_line_count=n,
+                )
+                revenue = merchandise_after_store_discount(
+                    float(line_gross or 0), store_discount=store_discount
+                )
+                net = round(revenue - float(line_cogs or 0) - fee, 2)
+                conn.execute(
+                    "UPDATE finance_order_lines SET fee_est = ?, net_est = ? WHERE id = ?",
+                    (fee, net, line_id),
+                )
+                total_fees += fee
+            total_fees = round(total_fees, 2)
+        else:
+            total_fees = estimate_line_fees(
+                float(gross or 0),
+                ad_rate=ad_rate,
+                store_discount=store_discount,
+                order_line_count=1,
+            )
+        revenue = merchandise_after_store_discount(
+            float(gross or 0), store_discount=store_discount
+        )
+        net_est = round(revenue - float(cogs or 0) - total_fees, 2)
+        margin = round(net_est / revenue, 4) if revenue > 0 else 0.0
+        conn.execute(
+            """
+            UPDATE finance_orders
+            SET total_fees_est = ?, net_est = ?, margin_est = ?, updated_at = ?
+            WHERE platform = ? AND platform_order_id = ?
+            """,
+            (total_fees, net_est, margin, now, platform, oid),
+        )
+        updated += 1
+    conn.commit()
+    return {"updated": updated}
 
 
 def sync_orders_from_ebay(

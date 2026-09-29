@@ -13,6 +13,7 @@ from src.services.finance_orders import (
     estimate_line_fees,
     query_finance_orders,
     query_finance_summary,
+    recompute_stored_pnls,
     refresh_giga_links,
     render_finance_email_html,
     resolve_finance_date_range,
@@ -67,21 +68,96 @@ def _seed_product(conn: sqlite3.Connection, sku: str = "FINANCE-TEST-SKU") -> di
 
 def test_estimate_line_fees_positive():
     fee = estimate_line_fees(100.0, ad_rate=0.05, order_line_count=1)
-    assert fee > 10  # roughly 0.95*100*0.1825 + 0.30
-    assert fee < 30
+    # Transacted amount is the fee base: 100*(0.1325+0.05)+0.30 = 18.55
+    assert abs(fee - 18.55) < 0.02
 
 
-def test_line_net_uses_post_discount_revenue():
-    """Fees are on post-discount base; net must not keep pre-discount gross."""
-    from src.services.finance_orders import merchandise_after_store_discount
+def test_order_pnl_does_not_apply_a_second_store_discount():
+    """eBay lineItemCost is already what the buyer paid (markdown included)."""
+    from src.services.finance_orders import estimate_line_fees
 
-    fee = estimate_line_fees(100.0, ad_rate=0.05, order_line_count=1)
-    revenue = merchandise_after_store_discount(100.0)
-    # Inflated (buggy) net would be ~100 - fee; correct is ~95 - fee.
-    inflated = round(100.0 - fee, 2)
-    correct = round(revenue - fee, 2)
-    assert abs(inflated - correct - 5.0) < 0.02
-    assert correct < inflated
+    paid = 77.49  # 81.57 listing after 5% sale
+    cost = 55.13
+    fee = estimate_line_fees(paid, ad_rate=0.05, order_line_count=1)
+    net = round(paid - cost - fee, 2)
+    assert abs(fee - 14.44) < 0.02
+    assert abs(net - 7.92) < 0.02
+    double_cut_revenue = round(paid * 0.95, 2)
+    double_cut_net = round(double_cut_revenue - cost - estimate_line_fees(paid, store_discount=0.05), 2)
+    assert net > double_cut_net + 2
+
+
+def test_upsert_uses_ebay_transacted_amount_as_revenue(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "f.db"))
+    _seed_product(conn)
+    order = {
+        "orderId": "05-15228-64124",
+        "creationDate": "2026-09-26T23:25:50.000Z",
+        "orderPaymentStatus": "PAID",
+        "orderFulfillmentStatus": "FULFILLED",
+        "pricingSummary": {
+            "priceSubtotal": {"value": "77.49", "currency": "USD"},
+            "deliveryCost": {"value": "0.0", "currency": "USD"},
+            "total": {"value": "77.49", "currency": "USD"},
+        },
+        "lineItems": [
+            {
+                "lineItemId": "1",
+                "legacyItemId": "366484453913",
+                "sku": "FINANCE-TEST-SKU",
+                "title": "Trellis",
+                "quantity": 1,
+                "lineItemCost": {"value": "77.49", "currency": "USD"},
+            }
+        ],
+    }
+    # Force known COGS so the assertion is about discount math, not cost lookup.
+    conn.execute(
+        "UPDATE collected_products SET cost_breakdown = ?",
+        (json.dumps({"total_dajian_cost": 55.13}),),
+    )
+    conn.commit()
+    summary = upsert_finance_order(conn, order, ad_rate=0.05)
+    assert summary["gross_sales"] == 77.49
+    assert abs(summary["total_fees_est"] - 14.44) < 0.02
+    assert abs(summary["net_est"] - (77.49 - 55.13 - summary["total_fees_est"])) < 0.02
+    assert abs(summary["margin_est"] - summary["net_est"] / 77.49) < 0.0002
+    conn.close()
+
+
+def test_recompute_stored_pnls_removes_second_discount(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "f.db"))
+    ensure_finance_tables(conn)
+    conn.execute(
+        """
+        INSERT INTO finance_orders (
+            platform, platform_order_id, order_date, payment_status,
+            gross_sales, total_cogs, total_fees_est, net_est, margin_est
+        ) VALUES ('ebay', '05-15228-64124', '2026-09-26 23:25:50', 'PAID',
+                  77.49, 55.13, 13.73, 4.76, 0.0647)
+        """
+    )
+    fid = conn.execute("SELECT id FROM finance_orders").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO finance_order_lines (
+            finance_order_id, platform_order_id, sku, qty, unit_sell_price,
+            line_gross, unit_giga_cost, line_cogs, fee_est, net_est
+        ) VALUES (?, '05-15228-64124', 'W1586P268034', 1, 77.49,
+                  77.49, 55.13, 55.13, 13.73, 4.76)
+        """,
+        (fid,),
+    )
+    conn.commit()
+    out = recompute_stored_pnls(conn, ad_rate=0.05)
+    assert out["updated"] == 1
+    row = conn.execute(
+        "SELECT total_fees_est, net_est, margin_est FROM finance_orders"
+    ).fetchone()
+    assert abs(row[0] - 14.44) < 0.02
+    assert abs(row[1] - 7.92) < 0.02
+    assert abs(row[2] - 7.92 / 77.49) < 0.0002
+    conn.close()
 
 
 def test_upsert_preserves_paid_time_cogs_snapshot(tmp_path):
@@ -121,11 +197,10 @@ def test_upsert_finance_order_with_recomputed_cost(tmp_path):
     assert summary["lines"][0]["ebay_item_number"] == "366518074803"
     assert summary["lines"][0]["ebay_transaction_id"] == "10085330527613"
 
-    # net = post-discount revenue - cogs - fees
-    from src.services.finance_orders import merchandise_after_store_discount
-
-    revenue = merchandise_after_store_discount(summary["gross_sales"])
-    assert abs(summary["net_est"] - (revenue - summary["total_cogs"] - summary["total_fees_est"])) < 0.02
+    assert abs(
+        summary["net_est"]
+        - (summary["gross_sales"] - summary["total_cogs"] - summary["total_fees_est"])
+    ) < 0.02
 
     s = query_finance_summary(conn)
     assert s["order_count"] == 1

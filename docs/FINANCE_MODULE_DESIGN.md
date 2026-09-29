@@ -104,12 +104,14 @@ GIGA 订单基数 = 商品价 + 运费          ← 不是 eBay 售价
 ### 单行预估净利
 
 ```text
-line_net ≈ line_gross_after_store_discount
+line_net ≈ eBay lineItemCost (buyer-paid merchandise)
          − ebay_fvf − ad_share − fixed_fee_share
          − line_cogs
 ```
 
-与现有死线一致的「最差净收」：
+eBay Fulfillment `lineItemCost` / `priceSubtotal` already includes markdown.
+Order PnL does **not** apply another 5% store discount. The listing-price
+「最差净收」still uses 5% markdown when quoting unpublished prices:
 
 ```text
 worst_net = sell_price × 0.95 × (1 − 0.1325 − ad_rate) − 0.30
