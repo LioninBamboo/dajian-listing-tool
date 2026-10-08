@@ -2283,3 +2283,17 @@ def test_package_includes_skips_type_that_is_already_a_set():
     description = "<h3>PACKAGE INCLUDES</h3><p>1 x Wood Chisel Set</p>"
     aspects = {"Type": ["Wood Chisel Set"], "Number of Items in Set": ["10"]}
     assert find_package_includes_set_qty_mismatch(title, description, aspects) is None
+
+
+def test_package_includes_does_not_block_one_of_n_piece_singular_type():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    title = "3 Piece Sectional Sofa"
+    description = "<h3>PACKAGE INCLUDES</h3><p>1 x Sectional</p>"
+    aspects = {"Type": ["Sectional"], "Number of Items in Set": ["3"]}
+    assert find_package_includes_set_qty_mismatch(title, description, aspects) is None
+
+    coffee = "3-Piece Coffee Table Set with 2 End Tables"
+    coffee_desc = "<h3>PACKAGE INCLUDES</h3><p>1 x Coffee Table</p>"
+    coffee_aspects = {"Type": ["Coffee Table"], "Number of Items in Set": ["3"]}
+    assert find_package_includes_set_qty_mismatch(coffee, coffee_desc, coffee_aspects) is None

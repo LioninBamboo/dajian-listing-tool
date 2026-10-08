@@ -2427,38 +2427,65 @@ def ensure_store_description_template(
 
 
 
+def _qty_above_one(raw: object) -> int | None:
+    if raw is None:
+        return None
+    try:
+        n = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return n if n > 1 else None
+
+
+def _piece_component_count(title: str) -> int | None:
+    """N-piece / N pc count from a title.
+
+    Same leading patterns as ``infer_number_of_items_in_set``. That number is
+    how many mixed parts make one product (sectional sections, table plus
+    ends), not how many of the listed Type ship.
+    """
+    match = re.search(
+        r"\b(\d+)\s*-\s*piece\b|\b(\d+)\s+piece\b|\b(\d+)\s*-?\s*pc\b",
+        title or "",
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    raw = next(group for group in match.groups() if group)
+    return _qty_above_one(raw)
+
+
 def expected_package_includes_main_qty(
     title: str,
     aspects: Mapping[str, Any] | None = None,
 ) -> int | None:
     """Expected main-product qty in PACKAGE INCLUDES for singular Type listings.
 
-    Returns None when Type already denotes a set product, or when no set count
-    is stated in aspects/title. Used by the quality gate and tests.
+    Homogeneous ``set of N`` (2 x Dining Chair) returns N. N-piece / N pc is a
+    mixed component count, including when it was copied into Number of Items
+    in Set, so a 3-piece sectional stays one Sectional. Returns None when Type
+    already denotes a set product, or when no homogeneous set count is stated.
     """
     aspects = aspects or {}
     type_name = first_aspect_text(aspects, "Type") or ""
     if re.search(r"\bsets?\b", type_name, flags=re.IGNORECASE):
         return None
 
-    nis = first_aspect_text(aspects, "Number of Items in Set")
-    if nis:
-        try:
-            n = int(str(nis).strip())
-            if n > 1:
-                return n
-        except (TypeError, ValueError):
-            pass
+    piece_n = _piece_component_count(title or "")
+    nis_n = _qty_above_one(first_aspect_text(aspects, "Number of Items in Set"))
+    set_of_match = re.search(r"\bset\s+of\s+(\d+)\b", title or "", flags=re.IGNORECASE)
+    set_of_n = _qty_above_one(set_of_match.group(1)) if set_of_match else None
+    # NIS is often the N-piece figure written by aspect completion. Do not
+    # treat that copy as N of Type. A different "set of N" still counts.
+    if piece_n and (nis_n is None or nis_n == piece_n):
+        if set_of_n and set_of_n != piece_n:
+            return set_of_n
+        return None
 
-    inferred = infer_number_of_items_in_set(title or "")
-    if inferred:
-        try:
-            n = int(str(inferred).strip())
-            if n > 1:
-                return n
-        except (TypeError, ValueError):
-            pass
-    return None
+    if nis_n:
+        return nis_n
+
+    return _qty_above_one(infer_number_of_items_in_set(title or ""))
 
 
 def parse_package_includes_main_qty(description: str) -> int | None:

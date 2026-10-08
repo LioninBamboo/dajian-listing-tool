@@ -31,3 +31,28 @@ def test_resolve_package_main_qty_from_title_when_aspect_missing():
         "Outdoor Adirondack Chair Set of 2",
         {"Type": ["Adirondack Chair"]},
     ) == 2
+
+
+def test_resolve_package_main_qty_ignores_n_piece_mixed_set():
+    assert _resolve_package_main_qty(
+        "3 Piece Sectional Sofa",
+        {"Type": ["Sectional"], "Number of Items in Set": ["3"]},
+    ) == 1
+    assert _resolve_package_main_qty(
+        "3-Piece Coffee Table with End Tables",
+        {"Type": ["Coffee Table"], "Number of Items in Set": ["3"]},
+    ) == 1
+    assert _resolve_package_main_qty(
+        "3 Piece Sectional Sofa",
+        {"Type": ["Sectional"]},
+    ) == 1
+
+
+def test_build_package_includes_uses_one_sectional_for_n_piece():
+    copy = _build_package_includes_copy(
+        "3 Piece Sectional Sofa",
+        "",
+        {"Type": ["Sectional"], "Number of Items in Set": ["3"]},
+        None,
+    )
+    assert copy.startswith("1 x Sectional")

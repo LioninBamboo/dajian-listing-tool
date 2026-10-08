@@ -107,6 +107,7 @@ from src.utils.publish_autofix import (
 from src.utils.html_truncator import smart_truncate_html
 from src.utils.listing_quality_gate import (
     classify_listing_profile,
+    expected_package_includes_main_qty,
     expected_store_brand,
     find_assembly_description_contradictions,
     has_expected_assembly_copy,
@@ -463,32 +464,13 @@ def _store_hides_assembly() -> bool:
 def _resolve_package_main_qty(title: str, aspects: dict) -> int:
     """Main product count for PACKAGE INCLUDES.
 
-    Prefer aspect Number of Items in Set, then title set-of-N / N-piece.
+    Homogeneous "set of N" with a singular Type uses N (2 x Dining Chair).
+    N-piece / N pc is a mixed component count, so a 3-piece sectional stays
+    1 x Sectional even when Number of Items in Set copies that 3.
     If Type already names a set product ("... Set"), keep qty=1 (one set in box).
     """
-    type_name = first_aspect_text(aspects, "Type") or ""
-    if re.search(r"\bsets?\b", type_name, flags=re.IGNORECASE):
-        return 1
-
-    qty = 1
-    nis = first_aspect_text(aspects, "Number of Items in Set")
-    if nis:
-        try:
-            n = int(str(nis).strip())
-            if n > 1:
-                qty = n
-        except (TypeError, ValueError):
-            pass
-    if qty <= 1:
-        inferred = infer_number_of_items_in_set(title or "")
-        if inferred:
-            try:
-                n = int(str(inferred).strip())
-                if n > 1:
-                    qty = n
-            except (TypeError, ValueError):
-                pass
-    return max(1, qty)
+    qty = expected_package_includes_main_qty(title, aspects)
+    return qty if qty and qty > 1 else 1
 
 
 def _build_package_includes_copy(
