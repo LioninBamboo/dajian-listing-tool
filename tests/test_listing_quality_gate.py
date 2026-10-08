@@ -2226,3 +2226,60 @@ def test_assembly_conflict_still_fires_when_aspect_missing():
         attributes=attrs, specs=specs,
     )
     assert _has_conflict(issues)
+
+
+def test_package_includes_set_qty_mismatch_flags_set_of_2_vs_1x():
+    from src.utils.listing_quality_gate import (
+        find_package_includes_set_qty_mismatch,
+        validate_listing_quality,
+    )
+
+    title = "Dining Chairs Set of 2 Solid Ash Wood Mid-Century Modern Upholstered Seat Walnut"
+    description = (
+        "<h3>PACKAGE INCLUDES</h3>"
+        "<p>1 x Dining Chair, 1 x Hardware Kit, 1 x Assembly Instructions</p>"
+    )
+    aspects = {
+        "Type": ["Dining Chair"],
+        "Number of Items in Set": ["2"],
+        "Set Includes": ["Chairs"],
+    }
+    issue = find_package_includes_set_qty_mismatch(title, description, aspects)
+    assert issue is not None
+    assert issue.code == "package_includes_set_qty_mismatch"
+
+    issues = validate_listing_quality(
+        {
+            "title": title,
+            "description": (
+                '<div style="max-width:900px">'
+                '<div>AQUAVERVE</div>'
+                "<h2>KEY FEATURES</h2><ul><li>Set of 2 chairs</li></ul>"
+                + description
+                + "<div>Thoughtfully curated for modern living</div>"
+                "</div>"
+            ),
+            "aspects": aspects,
+        },
+        source_title=title,
+        images=["https://example.com/a.jpg", "https://example.com/b.jpg"],
+    )
+    assert any(i.code == "package_includes_set_qty_mismatch" for i in issues)
+
+
+def test_package_includes_set_qty_ok_when_qty_matches():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    title = "Dining Chairs Set of 2 Solid Ash Wood"
+    description = "<h3>PACKAGE INCLUDES</h3><p>2 x Dining Chair, 1 x Hardware Kit</p>"
+    aspects = {"Type": ["Dining Chair"], "Number of Items in Set": ["2"]}
+    assert find_package_includes_set_qty_mismatch(title, description, aspects) is None
+
+
+def test_package_includes_skips_type_that_is_already_a_set():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    title = "10Pcs Premium Wood Chisel Set"
+    description = "<h3>PACKAGE INCLUDES</h3><p>1 x Wood Chisel Set</p>"
+    aspects = {"Type": ["Wood Chisel Set"], "Number of Items in Set": ["10"]}
+    assert find_package_includes_set_qty_mismatch(title, description, aspects) is None

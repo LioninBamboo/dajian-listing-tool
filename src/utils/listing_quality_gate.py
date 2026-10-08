@@ -2426,6 +2426,93 @@ def ensure_store_description_template(
     return wrapped or desc
 
 
+
+def expected_package_includes_main_qty(
+    title: str,
+    aspects: Mapping[str, Any] | None = None,
+) -> int | None:
+    """Expected main-product qty in PACKAGE INCLUDES for singular Type listings.
+
+    Returns None when Type already denotes a set product, or when no set count
+    is stated in aspects/title. Used by the quality gate and tests.
+    """
+    aspects = aspects or {}
+    type_name = first_aspect_text(aspects, "Type") or ""
+    if re.search(r"\bsets?\b", type_name, flags=re.IGNORECASE):
+        return None
+
+    nis = first_aspect_text(aspects, "Number of Items in Set")
+    if nis:
+        try:
+            n = int(str(nis).strip())
+            if n > 1:
+                return n
+        except (TypeError, ValueError):
+            pass
+
+    inferred = infer_number_of_items_in_set(title or "")
+    if inferred:
+        try:
+            n = int(str(inferred).strip())
+            if n > 1:
+                return n
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def parse_package_includes_main_qty(description: str) -> int | None:
+    """Parse the first non-accessory Nx item from the PACKAGE INCLUDES block."""
+    if not description:
+        return None
+    match = re.search(
+        r"PACKAGE\s+INCLUDES</h3>\s*<p[^>]*>\s*([^<]+)",
+        description,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        # plain-text fallback
+        match = re.search(
+            r"PACKAGE\s+INCLUDES\s*[:\n]\s*([^\n<]+)",
+            description,
+            flags=re.IGNORECASE,
+        )
+    if not match:
+        return None
+    pkg_text = html_lib.unescape(match.group(1)).strip()
+    skip = ("hardware", "assembly", "instruction", "pillow", "screw", "bolt")
+    for qm in re.finditer(r"(\d+)\s*[x\u00d7]\s*([^,;<]+)", pkg_text, flags=re.IGNORECASE):
+        name = qm.group(2).strip().lower()
+        if any(token in name for token in skip):
+            continue
+        try:
+            return int(qm.group(1))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def find_package_includes_set_qty_mismatch(
+    title: str,
+    description: str,
+    aspects: Mapping[str, Any] | None = None,
+) -> ListingQualityIssue | None:
+    """Flag title/aspect set-of-N vs PACKAGE INCLUDES main qty mismatch."""
+    expected = expected_package_includes_main_qty(title, aspects)
+    if not expected or expected <= 1:
+        return None
+    actual = parse_package_includes_main_qty(description)
+    if actual is None:
+        return None
+    if actual == expected:
+        return None
+    return ListingQualityIssue(
+        "package_includes_set_qty_mismatch",
+        f"PACKAGE INCLUDES main qty is {actual} but title/aspects say set of {expected}",
+        field="description",
+    )
+
+
 def validate_listing_quality(
     optimization: Mapping[str, Any] | None,
     *,
@@ -2496,6 +2583,11 @@ def validate_listing_quality(
                     field="description",
                 )
             )
+
+    pkg_mismatch = find_package_includes_set_qty_mismatch(title, description, aspects)
+    if pkg_mismatch:
+        issues.append(pkg_mismatch)
+
     if image_count < MIN_READY_IMAGE_COUNT:
         issues.append(
             ListingQualityIssue(

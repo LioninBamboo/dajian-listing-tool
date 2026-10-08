@@ -460,6 +460,37 @@ def _store_hides_assembly() -> bool:
         return False
 
 
+def _resolve_package_main_qty(title: str, aspects: dict) -> int:
+    """Main product count for PACKAGE INCLUDES.
+
+    Prefer aspect Number of Items in Set, then title set-of-N / N-piece.
+    If Type already names a set product ("... Set"), keep qty=1 (one set in box).
+    """
+    type_name = first_aspect_text(aspects, "Type") or ""
+    if re.search(r"\bsets?\b", type_name, flags=re.IGNORECASE):
+        return 1
+
+    qty = 1
+    nis = first_aspect_text(aspects, "Number of Items in Set")
+    if nis:
+        try:
+            n = int(str(nis).strip())
+            if n > 1:
+                qty = n
+        except (TypeError, ValueError):
+            pass
+    if qty <= 1:
+        inferred = infer_number_of_items_in_set(title or "")
+        if inferred:
+            try:
+                n = int(str(inferred).strip())
+                if n > 1:
+                    qty = n
+            except (TypeError, ValueError):
+                pass
+    return max(1, qty)
+
+
 def _build_package_includes_copy(
     title: str,
     source_description: str,
@@ -468,7 +499,8 @@ def _build_package_includes_copy(
 ) -> str:
     package_items = []
     type_name = first_aspect_text(aspects, "Type") or title or "Main Product"
-    package_items.append(f"1 x {type_name}")
+    main_qty = _resolve_package_main_qty(title, aspects)
+    package_items.append(f"{main_qty} x {type_name}")
 
     source_text = f"{title} {source_description}".lower()
     if "lumbar pillow" in source_text:
