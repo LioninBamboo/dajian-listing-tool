@@ -20,6 +20,8 @@ ASSEMBLY_AUTO_YES_CATEGORY_IDS = frozenset({
     "116380",  # Strollers
     "75671",   # Wheelbarrows, Carts & Wagons
     "177031",  # Outdoor Furniture Covers
+    "43538",   # Trellises (flat-pack garden supports)
+    "180993",  # Arbors & Arches
 })
 
 

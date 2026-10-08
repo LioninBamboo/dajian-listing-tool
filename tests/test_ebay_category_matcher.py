@@ -83,15 +83,37 @@ def test_real_sofa_still_remapped_to_sofas():
     assert category_name == "Sofas, Armchairs & Couches"
 
 
-def test_legacy_rocking_chair_category_uses_current_leaf():
+def test_indoor_rocking_chair_category_uses_rockers_gliders_leaf():
     matcher = EbayCategoryMatcher(_DummyOauth())
-    title = "Outdoor Rocking Chair with Thick Comfy Cushion for Patio Living Room Reading"
+    title = "Upholstered Nursery Rocking Chair Glider for Living Room Reading"
 
     assert matcher._fallback_category(title)[0] == "66690"
     assert matcher.canonicalize_category(title, "20877", "Rocking Chairs") == (
         "66690",
         "Rockers, Gliders",
     )
+
+
+def test_outdoor_porch_rocker_canonicalizes_to_outdoor_chairs():
+    """GrovePop W465P255396: porch/outdoor rockers were stuck in indoor 66690
+    because keyword 'rocking chair' beat outdoor-chair remap (2026-09-29)."""
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    title = (
+        "Wooden Porch Rocker Chair, Fir Log Outdoor Rocking Chair, "
+        "Patio Rockers for Outside, Light Gray"
+    )
+
+    assert matcher._fallback_category(title) == ("79684", "Outdoor Chairs")
+    assert matcher.canonicalize_category(title, "66690", "Rockers, Gliders") == (
+        "79684",
+        "Outdoor Chairs",
+    )
+    assert matcher.canonicalize_category(title, "20877", "Rocking Chairs") == (
+        "79684",
+        "Outdoor Chairs",
+    )
+    # plausible() canonicalizes first, so a stale 66690 input becomes 79684 and passes.
+    assert matcher.is_category_plausible_for_text(title, "79684", "Outdoor Chairs") is True
 
 
 def test_legacy_laundry_hamper_category_uses_current_leaf():

@@ -152,9 +152,9 @@ def health_price_floor(total_cost, min_margin: float = MIN_MARGIN):
         from src.services.pricing_engine import PricingEngine
         return float(PricingEngine.safe_floor_price(cost, min_margin))
     except Exception:
-        # Mirror PricingEngine discount denom: (1-5% store) * (1-13.25% fvf - 5% ad)
-        discount_denom = 0.95 * 0.8175
-        fixed_fee = 0.30
+        # Mirror PricingEngine listing denom with intl + 10% tax pad
+        discount_denom = 0.95 * (1 - (0.136 + 0.013 + 0.05) * 1.10)
+        fixed_fee = 0.40
         return round((cost * (1 + float(min_margin)) + fixed_fee) / discount_denom, 2)
 
 
@@ -172,7 +172,8 @@ def evaluate_live_loss(ebay_price: float, total_cost: float) -> dict | None:
     if live <= 0 or cost <= 0:
         return None
     # Same worst-case net as integrity check: 5% store discount + FVF + ad + fixed fee
-    worst_net = live * 0.95 * 0.8175 - 0.30
+    from src.services.pricing_engine import PricingEngine
+    worst_net = live * float(PricingEngine._discount_denom()) - float(PricingEngine.FIXED_FEE)
     if worst_net >= cost:
         return None
     return {
@@ -891,11 +892,14 @@ class SalesHealthChecker:
                 checked += 1
 
                 loss_info = evaluate_live_loss(ebay_price, total_cost)
+                from src.services.pricing_engine import PricingEngine
+                denom = float(PricingEngine._discount_denom())
+                fixed = float(PricingEngine.FIXED_FEE)
+                worst_net = ebay_price * denom - fixed
                 actual_margin = (
                     loss_info['actual_margin']
                     if loss_info
-                    else round(((ebay_price * 0.95 * 0.8175 - 0.30) - total_cost)
-                               / max(ebay_price * 0.95 * 0.8175 - 0.30, 0.01) * 100, 1)
+                    else round((worst_net - total_cost) / max(worst_net, 0.01) * 100, 1)
                 )
 
                 # 检查1: 偏差 > 5% (only when local suggested is usable)

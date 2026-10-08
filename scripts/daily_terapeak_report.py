@@ -239,9 +239,9 @@ class DailyTerapeakReport:
                 market_avg = category_data.get('avg_price', 0)
                 
                 # 精确利润计算：扣除 eBay 费用后的净利润
-                # eBay 费率: 13.25% 佣金 + 5% 广告 + $0.30 固定费
-                ebay_fee_rate = 0.1325 + 0.05  # 18.25%
-                ebay_fixed_fee = 0.30
+                from src.services.pricing_engine import PricingEngine
+                ebay_fee_rate = float(PricingEngine._variable_take())
+                ebay_fixed_fee = float(PricingEngine.FIXED_FEE)
                 net_revenue = market_avg * (1 - ebay_fee_rate) - ebay_fixed_fee
                 net_profit = net_revenue - cost
                 net_margin = net_profit / cost if cost > 0 else 0

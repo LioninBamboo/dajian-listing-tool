@@ -1070,6 +1070,7 @@ class RealEbayClient:
             aspects=product.get("aspects") or {},
             image_urls=product.get("image_urls") or product.get("images") or [],
             compatibility=product.get("compatibility") or [],
+            sku=product.get("sku") or "",
         )
 
         token = self.oauth.get_valid_token()

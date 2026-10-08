@@ -533,12 +533,15 @@ def get_ebay_client():
 
 def get_published_products():
     """获取所有 PUBLISHED 产品及成本数据"""
+    from src.services.pricing_engine import PricingEngine
+
     db_path = PROJECT_ROOT / "ebay_collection.db"
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
 
     rows = conn.execute("""
-        SELECT sku, title, images, cost_breakdown, optimization, listing_id
+        SELECT sku, title, images, cost_breakdown, optimization, listing_id,
+               price, shipping, suggested_price, attributes, specs
         FROM collected_products
         WHERE status = 'PUBLISHED'
           AND cost_breakdown IS NOT NULL
@@ -549,9 +552,60 @@ def get_published_products():
     for r in rows:
         cost = json.loads(r['cost_breakdown']) if r['cost_breakdown'] else {}
         opt = json.loads(r['optimization']) if r['optimization'] else {}
-        total_cost = cost.get('total_dajian_cost', 0)
+        attrs = {}
+        specs = {}
+        try:
+            attrs = json.loads(r['attributes']) if r['attributes'] else {}
+        except Exception:
+            attrs = {}
+        try:
+            specs = json.loads(r['specs']) if r['specs'] else {}
+        except Exception:
+            specs = {}
+
+        shipping = float(r['shipping'] or 0)
+        # Rebuild when snapshot omitted freight (shipping column > cb.shipping_cost).
+        total_cost = PricingEngine.resolve_landed_cost(
+            cost,
+            shipping_fallback=shipping,
+            specs=specs if isinstance(specs, dict) else {},
+            attributes=attrs if isinstance(attrs, dict) else {},
+        ) or float(cost.get('total_dajian_cost') or 0)
         if total_cost <= 0:
             continue
+
+        # Keep an up-to-date breakdown for DB write-back after successful reprice.
+        product_price = float(
+            cost.get('product_price')
+            or r['price']
+            or 0
+        )
+        stored_ship = float(cost.get('shipping_cost') or 0)
+        ship_for_cb = max(stored_ship, shipping)
+        if product_price > 0 and (
+            abs(float(cost.get('total_dajian_cost') or 0) - total_cost) > 0.01
+            or ship_for_cb > stored_ship + 0.009
+        ):
+            oversize = (
+                'Dimensions' in (attrs or {})
+                or 'Dimensions' in (specs or {})
+            )
+            rebuilt = PricingEngine.calculate_dajian_cost(
+                product_price, ship_for_cb, is_oversize=oversize
+            )
+            # Preserve market / strategy metadata from prior snapshot.
+            for key in (
+                'market_price', 'market_avg_price', 'market_source',
+                'market_sample_size', 'market_auth_mode', 'market_fallback_reason',
+                'pricing_strategy', 'pricing_margin', 'pricing_margin_basis',
+                'selling_price', 'repriced_at', 'health_repriced_at',
+            ):
+                if key in cost and key not in rebuilt:
+                    rebuilt[key] = cost[key]
+                elif key in cost:
+                    rebuilt[key] = cost[key]
+            cost = rebuilt
+            total_cost = float(cost['total_dajian_cost'])
 
         cat_id = str(opt.get('categoryId', ''))
         title = opt.get('title', '') or r['title'] or ''
@@ -564,6 +618,7 @@ def get_published_products():
             'total_cost': total_cost,
             'listing_id': r['listing_id'],
             'cost_breakdown': cost,
+            'suggested_price': float(r['suggested_price'] or 0),
         })
 
     conn.close()

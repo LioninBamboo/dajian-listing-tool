@@ -544,6 +544,21 @@ def analyze_product_task(sku: str):
             wt = dajian_dims.get('productWeight')
             if wt and 'Product Weight (lbs.)' not in attrs:
                 attrs['Product Weight (lbs.)'] = str(wt)
+            # Tools / kits often have assembled L/W/H = "Not Applicable". Fall
+            # back to package dims so Item Length/Width/Height can be filled.
+            for a_key, p_key in (
+                ("Assembled Length (in.)", "Package Length (in.)"),
+                ("Assembled Width (in.)", "Package Width (in.)"),
+                ("Assembled Height (in.)", "Package Height (in.)"),
+            ):
+                if a_key not in attrs and specs.get(p_key):
+                    try:
+                        float(specs[p_key])
+                        attrs[a_key] = str(specs[p_key])
+                    except (TypeError, ValueError):
+                        pass
+            if "Product Weight (lbs.)" not in attrs and specs.get("Package Weight (lbs.)"):
+                attrs["Product Weight (lbs.)"] = str(specs["Package Weight (lbs.)"])
             product.specs = specs
             product.attributes = attrs
             flag_modified(product, 'specs')

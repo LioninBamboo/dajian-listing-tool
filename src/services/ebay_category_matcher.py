@@ -205,32 +205,68 @@ class EbayCategoryMatcher:
                 "outdoor sectional",
             )
         )
+        # Porch/outdoor rockers are patio seating, not indoor Rockers & Gliders
+        # (66690). Keyword "rocking chair" alone used to win and leave GrovePop
+        # W465P255396 stuck in 66690 (2026-09-29).
+        has_outdoor_rocker = (
+            not has_porch_swing
+            and any(
+                kw in title_lower
+                for kw in (
+                    "outdoor rocking",
+                    "outdoor rocker",
+                    "patio rocking",
+                    "patio rocker",
+                    "porch rocker",
+                    "porch rocking",
+                    "garden rocking",
+                    "garden rocker",
+                    "rockers for outside",
+                    "rocker for outside",
+                    "rocking chair for outside",
+                    "outdoor rocking chair",
+                    "patio rocking chair",
+                    "porch rocking chair",
+                )
+            )
+        ) or (
+            has_outdoor_context
+            and not has_porch_swing
+            and any(kw in title_lower for kw in ("rocking chair", "rocker", "rockers", "glider"))
+            and not any(
+                kw in title_lower
+                for kw in ("nursery", "living room", "bedroom", "indoor", "office")
+            )
+        )
         has_outdoor_chair = (
             has_outdoor_context
             and not has_outdoor_daybed
             and not any(kw in title_lower for kw in ("sofa", "couch", "loveseat", "sectional"))
             and re.search(r"\btable\b", title_lower) is None
-            and any(
-                kw in title_lower
-                for kw in (
-                    "outdoor chair",
-                    "patio chair",
-                    "club chair",
-                    "club chairs",
-                    "armchair",
-                    "armchairs",
-                    "patio armchair",
-                    "patio armchairs",
-                    "outdoor dining chair",
-                    "outdoor dining chairs",
-                    "patio dining chair",
-                    "patio dining chairs",
-                    "outdoor lounge chair",
-                    "outdoor lounge chairs",
-                    "patio lounge",
-                    "sun lounger",
-                    "camping chair",
-                    "camping chairs",
+            and (
+                has_outdoor_rocker
+                or any(
+                    kw in title_lower
+                    for kw in (
+                        "outdoor chair",
+                        "patio chair",
+                        "club chair",
+                        "club chairs",
+                        "armchair",
+                        "armchairs",
+                        "patio armchair",
+                        "patio armchairs",
+                        "outdoor dining chair",
+                        "outdoor dining chairs",
+                        "patio dining chair",
+                        "patio dining chairs",
+                        "outdoor lounge chair",
+                        "outdoor lounge chairs",
+                        "patio lounge",
+                        "sun lounger",
+                        "camping chair",
+                        "camping chairs",
+                    )
                 )
             )
         )
@@ -281,6 +317,18 @@ class EbayCategoryMatcher:
             "hutch cabinet",
             "microwave shelf",
         )
+        has_tool_storage_cabinet = any(
+            kw in product_text_lower
+            for kw in (
+                "tool storage cabinet",
+                "tool cabinet",
+                "tool chest",
+                "garage tool cabinet",
+                "metal tool storage",
+                "steel tool storage",
+                "steel tool cabinet",
+            )
+        )
         # Kitchen coffee-bar / fridge cabinets often say "wine cabinet" in
         # marketing while remaining buffets/sideboards. Do not force those
         # into Wine Racks 20689 (N707 residual CRITICAL after 183322, 2026-08-06).
@@ -315,6 +363,7 @@ class EbayCategoryMatcher:
             not (has_bunk_bed or has_bed_frame)
             and not has_wine_storage
             and not has_hall_tree
+            and not has_tool_storage_cabinet
             and (
                 any(kw in text_lower for kw in pantry_markers)
                 or (
@@ -416,6 +465,10 @@ class EbayCategoryMatcher:
             )
         )
 
+        # Outdoor rockers must win over the retired 20877→66690 leaf remap.
+        if has_outdoor_rocker and cid != "79684":
+            return "79684", "Outdoor Chairs"
+
         direct_replacements = {
             "116363": ("100411", "Litter Boxes"),
             "20751": ("20744", "Beds"),
@@ -485,6 +538,14 @@ class EbayCategoryMatcher:
 
         if has_hall_tree and cid != "261263":
             return "261263", "Hall Trees & Stands"
+
+        # Aqua/Motors: garage tool cabinets stay on tree-100 shop leaves.
+        if (
+            get_store_profile().is_motors
+            and has_tool_storage_cabinet
+            and cid != "179444"
+        ):
+            return "179444", "Garage/Shop Tool Chests"
 
         if has_pantry_cabinet and cid != "20487":
             return "20487", "Cabinets & Cupboards"
@@ -704,14 +765,42 @@ class EbayCategoryMatcher:
         # Motors stores publish against category tree 100. The keyword fallback map
         # holds tree-0 ids (e.g. 174020 Trailer Hitches) that do not exist in tree
         # 100; the Taxonomy API is queried against the store's OWN tree, so its
-        # suggestion is the correct tree-100 leaf (e.g. 33653). Trust the API there
-        # rather than the wrong-tree keyword id. Furniture (tree 0) is unaffected.
+        # suggestion is usually the correct tree-100 leaf (e.g. 33653). Prefer the
+        # API when it is plausible — but when Taxonomy drifts (e.g. motorcycle
+        # hitch carrier → 184478 motorcycle accessory), fall back to the keyword
+        # match remapped onto known tree-100 leaves.
+        _MOTORS_TREE0_TO_TREE100 = {
+            "174020": ("33653", "Trailer Hitches"),
+            "174021": ("33653", "Trailer Hitches"),  # hitch cargo / scooter hauler
+            "262210": ("33650", "Running Boards & Step Bars"),
+            "262216": ("33651", "Roof Racks & Cross Bars"),
+            "262093": ("33654", "Body Moldings & Trims"),
+        }
         if get_store_profile().is_motors and api_cat_id:
-            if kw_cat_id and kw_cat_id != api_cat_id:
-                logging.info(
-                    f"[CAT] Motors tree 100: using API={api_cat_id} ({api_cat_name}) "
-                    f"over tree-0 keyword={kw_cat_id} ({kw_cat_name})"
+            if self._is_api_category_plausible(title, api_cat_id, api_cat_name):
+                if kw_cat_id and kw_cat_id != api_cat_id:
+                    logging.info(
+                        f"[CAT] Motors tree 100: using API={api_cat_id} ({api_cat_name}) "
+                        f"over tree-0 keyword={kw_cat_id} ({kw_cat_name})"
+                    )
+                return api_cat_id, api_cat_name
+            mapped = _MOTORS_TREE0_TO_TREE100.get(str(kw_cat_id or "").strip())
+            if mapped:
+                logging.warning(
+                    f"[CAT] Motors API={api_cat_id} ({api_cat_name}) implausible for "
+                    f"title; using tree-100 keyword map {mapped[0]} ({mapped[1]})"
                 )
+                return mapped
+            if kw_cat_id:
+                logging.warning(
+                    f"[CAT] Motors API={api_cat_id} ({api_cat_name}) implausible; "
+                    f"falling back to keyword={kw_cat_id} ({kw_cat_name})"
+                )
+                return kw_cat_id, kw_cat_name
+            logging.warning(
+                f"[CAT] Motors API={api_cat_id} ({api_cat_name}) implausible and no "
+                f"keyword fallback; returning API anyway"
+            )
             return api_cat_id, api_cat_name
 
         if kw_cat_id and kw_cat_id != "38208":  # Not the generic fallback default
@@ -763,7 +852,9 @@ class EbayCategoryMatcher:
             "running board", "running boards", "nerf bar", "nerf bars",
             "side step", "side steps", "step bar", "truck step",
             "roof rack", "cross bar", "crossbars", "cargo carrier",
-            "trailer hitch", "tailgate assist", "tailgate ladder", "tailgate handle", "silverado", "sierra", "wrangler",
+            "trailer hitch", "scooter hauler", "motorcycle hitch", "hitch mount",
+            "hitch carrier", "tailgate assist", "tailgate ladder", "tailgate handle",
+            "silverado", "sierra", "wrangler",
             "f-150", "f150", "tacoma", "ram 1500", "glc", "glb", "pickup",
         ]
         # eBay Motors ids plus tree-0 equivalents. An account without eBay Motors
@@ -781,6 +872,22 @@ class EbayCategoryMatcher:
             # 33653 is live-publish verified; add each new tree-100 leaf here as it
             # is confirmed by a real publish.
             "33653",   # Trailer Hitches (tree 100) — verified live 2026-07-23
+            # Tree-100 leaves confirmed via Taxonomy API name-check 2026-08-12
+            # (category name matches product type — running boards, racks, trims).
+            "33650",   # Running Boards & Step Bars
+            "33651",   # Roof Racks & Cross Bars
+            "33654",   # Body Moldings & Trims
+            "33655",   # Truck Bed Accessories
+            "33746",   # Other Tire Accessories
+            "14769",   # Other Exterior Parts & Accessories
+            "63690",   # Cargo Nets, Pet Barriers & Storage Bins (vehicle MOLLE storage)
+            "63700",   # Other Shop Equipment — live verified
+            "179446",  # Tool Storage Organizers — live verified (kayak rack / slatwall)
+            "179444",  # Garage/Shop Tool Chests
+            "179512",  # Roller Seats & Creepers
+            "179511",  # Jacks & Jack Stands
+            "43994",   # Wrenches
+            "35625",   # Other Automotive Hand Tools
         }
         outdoor_chair_categories = {"79682", "79684", "138996"}
         porch_swing_categories = {"79694"}
@@ -993,7 +1100,14 @@ class EbayCategoryMatcher:
                 if cid not in pet_categories and not any(kw in title_lower for kw in motors_keywords):
                     return False
 
-        if cid in pet_categories and not any(marker in title_lower for marker in pet_product_markers):
+        # Some ids collide across trees: 14769 is a pet category in tree 0 but
+        # "Other Exterior Parts & Accessories" in Motors tree 100. Don't apply the
+        # pet-marker guard when the title is clearly an auto part.
+        if (
+            cid in pet_categories
+            and not any(marker in title_lower for marker in pet_product_markers)
+            and not any(kw in title_lower for kw in motors_keywords)
+        ):
             return False
 
         if any(marker in title_lower for marker in fountain_markers):
@@ -1090,11 +1204,7 @@ class EbayCategoryMatcher:
                 return False
 
         has_ottoman_title = any(marker in title_lower for marker in ottoman_markers + ("ottoman", "footstool", "pouf")) and not any(
-            marker in title_lower for marker in sofa_markers + (
-                "sofa", "couch", "armchair", "accent chair", "reading chair",
-                "club chair", "chaise lounge", "recliner", "manual reclining",
-                "reclining footrest",
-            )
+            marker in title_lower for marker in sofa_markers + ("armchair", "accent chair", "reading chair", "club chair", "chaise lounge", "recliner", "manual reclining", "reclining footrest")
         )
         if has_ottoman_title:
             return cid in ottoman_categories
@@ -1234,6 +1344,9 @@ class EbayCategoryMatcher:
             if cid != "63108":
                 return False
 
+        # "pillar" alone also matches automotive A-pillar/B-pillar/C-pillar trim
+        # parts (e.g. "Carbon Fiber A-Pillar"); require garden context so an auto
+        # trim piece is not misread as a plant-stand column.
         plant_stand_title = any(
             kw in title_lower
             for kw in (
@@ -1242,9 +1355,10 @@ class EbayCategoryMatcher:
                 "garden pedestal",
                 "roman column",
                 "column pedestal",
-                "pillar",
             )
-        )
+        ) or ("pillar" in title_lower and not any(
+            p in title_lower for p in ("a-pillar", "b-pillar", "c-pillar", "a pillar", "b pillar", "c pillar")
+        ))
         if plant_stand_title and not any(marker in title_lower for marker in fountain_markers):
             allowed_plant_stand_categories = set(plant_stand_categories)
             if any(marker in title_lower for marker in arbor_markers):
@@ -1279,6 +1393,31 @@ class EbayCategoryMatcher:
 
         if "adirondack" in title_lower and cid != "79684":
             return False
+
+        outdoor_rocker_markers = (
+            "outdoor rocking",
+            "outdoor rocker",
+            "patio rocking",
+            "patio rocker",
+            "porch rocker",
+            "porch rocking",
+            "garden rocking",
+            "garden rocker",
+            "rockers for outside",
+            "rocker for outside",
+            "rocking chair for outside",
+            "outdoor rocking chair",
+            "patio rocking chair",
+            "porch rocking chair",
+        )
+        if any(kw in title_lower for kw in outdoor_rocker_markers) or (
+            any(kw in title_lower for kw in ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "porch"))
+            and any(kw in title_lower for kw in ("rocking chair", "rocker", "rockers"))
+            and "porch swing" not in title_lower
+            and not any(kw in title_lower for kw in ("nursery", "living room", "bedroom", "indoor", "office"))
+        ):
+            if cid not in outdoor_chair_categories:
+                return False
 
         has_outdoor_daybed_title = any(kw in title_lower for kw in ("outdoor daybed", "patio daybed", "sunbed")) or (
             "daybed" in title_lower
@@ -1430,6 +1569,7 @@ class EbayCategoryMatcher:
         mappings = [
             # ==================== MOTORS ====================
             (["running board", "running boards", "nerf bar", "nerf bars", "side step", "side steps", "step bar", "truck step"], "262210", "Running Boards & Nerf Bars"),
+            (["scooter hauler", "motorcycle hitch", "motorcycle trailer hitch", "hitch mount rack"], "174021", "Hitch Cargo Carriers"),
             (["trailer hitch", "receiver hitch"], "174020", "Trailer Hitches"),
             (["hitch cargo carrier", "cargo carrier hitch", "hitch carrier"], "174021", "Hitch Cargo Carriers"),
             (["roof rack", "cross bar", "cross bars", "crossbar", "cargo rack"], "262216", "Roof Racks & Cross Bars"),
@@ -1543,6 +1683,8 @@ class EbayCategoryMatcher:
             (["gaming chair"], "22513", "Gaming Chairs"),
             (["round chair", "cushioned backrest", "compressible chair"], "54235", "Chairs"),
             (["accent chair", "arm chair", "lounge chair", "club chair"], "54235", "Chairs"),
+            # Outdoor rockers before indoor Rockers/Gliders — see has_outdoor_rocker.
+            (["outdoor rocking chair", "outdoor rocker", "patio rocking chair", "patio rocker", "porch rocker", "porch rocking chair", "garden rocker", "rockers for outside"], "79684", "Outdoor Chairs"),
             (["rocking chair", "glider"], "66690", "Rockers, Gliders"),
             (["ottoman", "footstool", "pouf"], "20490", "Ottomans, Footstools & Poufs"),
             
@@ -1673,6 +1815,35 @@ class EbayCategoryMatcher:
             (["cabinet"], "38221", "Cabinets & Cupboards"),
         ]
 
+        if get_store_profile().is_motors:
+            # Tree-100 leaf — keep out of the shared furniture map so Main/tree-0
+            # stores never resolve garage slatwall to a Motors-only id.
+            insert_at = next(i for i, row in enumerate(mappings) if "storage cabinet" in row[0])
+            mappings.insert(
+                insert_at,
+                (
+                    ["slatwall", "slat wall", "garage wall storage", "wall storage system", "pvc wall panel"],
+                    "179446",
+                    "Tool Storage Organizers",
+                ),
+            )
+            # Tool / garage metal cabinets must not fall through to tree-0 20487.
+            mappings.insert(
+                insert_at,
+                (
+                    [
+                        "tool storage cabinet",
+                        "tool cabinet",
+                        "tool chest",
+                        "garage tool cabinet",
+                        "metal tool storage",
+                        "steel tool storage",
+                    ],
+                    "179444",
+                    "Garage/Shop Tool Chests",
+                ),
+            )
+
         generic_mappings = mappings[-3:]
         specific_mappings = mappings[:-3]
 
@@ -1733,8 +1904,15 @@ class EbayCategoryMatcher:
             "X-EBAY-C-MARKETPLACE-ID": profile.ebay_marketplace_id,
         }
 
-        # Auto parts live in the Motors tree (100); furniture/EBAY_US in tree 0.
-        tree_id = profile.category_tree_id
+        # Auto parts live in the Motors tree (100); furniture/EBAY_US and
+        # AquaRides kitchen/general leaves live in tree 0.
+        from src.services.vehicle_compatibility import TREE0_FORCE_INVENTORY_CATEGORIES
+
+        tree_id = (
+            "0"
+            if str(category_id or "").strip() in TREE0_FORCE_INVENTORY_CATEGORIES
+            else profile.category_tree_id
+        )
         url = f"{self.base_url}/commerce/taxonomy/v1/category_tree/{tree_id}/get_item_aspects_for_category"
         params = {"category_id": category_id}
         

@@ -611,6 +611,27 @@ def test_tool_free_full_assembly_and_treadmill_setup_are_yes():
     assert treadmill["required"] == "Yes"
 
 
+def test_garden_trellis_arbor_family_forces_assembly_yes():
+    decision = infer_assembly_decision(
+        source_title='4 Pack Metal Garden Trellis 86.7" x 19.7" Rustproof Trellis for Climbing',
+        source_description="",
+        attributes={
+            "Assembled Length (in.)": "80.00",
+            "Assembled Width (in.)": "19.7",
+            "Assembled Height (in.)": "86.70",
+        },
+        specs={
+            "Package Length (in.)": "45.7",
+            "Package Width (in.)": "21.8",
+            "Package Height (in.)": "4.72",
+        },
+        current_assembly="No",
+    )
+    assert decision["required"] == "Yes"
+    assert decision["status"] == "family"
+    assert decision["package"]["required_family"] == "garden_trellis_arbor"
+
+
 def test_quality_gate_catches_w808_style_description_no_assembly_claim():
     opt = {
         "title": "13 Gallon Tilt Out Trash Cabinet Freestanding Trash Bin Cabinet",
@@ -2010,7 +2031,7 @@ class TestSofaAccessoryTableExclusion:
             "", "38208",
         )
         assert profile.kind == "side_table"
-        assert profile.category_id == "54235"
+        assert profile.category_id == "38200"
         assert profile.category_name == "End Tables"
         assert profile.type_value == "End & Side Tables"
 

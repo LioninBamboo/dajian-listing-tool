@@ -74,9 +74,12 @@ from src.services.ebay_publisher import EbayPublisher
 from src.services.pricing_engine import PricingEngine
 from src.services.vehicle_compatibility import (
     EBAY_MOTORS_CATEGORIES,
+    MOTORS_TOOL_UNIVERSAL_CATEGORIES,
+    TREE0_FORCE_INVENTORY_CATEGORIES,
     analyze_ebay_motors_compatibility,
     apply_compatibility_aspects,
     serialize_compatibility_analysis,
+    uses_motors_trading_channel,
 )
 from src.services.listing_publish_readback import (
     build_publish_readback_expectation,
@@ -128,6 +131,12 @@ KNOWN_PUBLISHABLE_CATEGORY_IDS = {
     "63108",  # Chicken Coops
     "88057",  # Desks & Tables
     "175758", # Beds & Bed Frames
+    "179446", # Tool Storage Organizers (Motors tree-100)
+    "179444", # Garage/Shop Tool Chests (Motors tree-100)
+    "63700",  # Other Shop Equipment (Motors tree-100)
+    "173950", # Air Compressors (Motors tree-100)
+    "34999",  # Other Automotive Air Tools (Motors tree-100)
+    *TREE0_FORCE_INVENTORY_CATEGORIES,
 }
 # ═══════════════════════════════════════════════════════════════
 # Data Layer
@@ -322,7 +331,7 @@ def _is_invalid_category_error(error_msg: str) -> bool:
 
 
 def _is_sellable_leaf_category(oauth, category_id: str) -> bool:
-    """Validate category ID against EBAY_US taxonomy tree 0 and ensure it's a leaf."""
+    """Validate category ID against the correct taxonomy tree and ensure it's a leaf."""
     cid = str(category_id or "").strip()
     if not cid:
         return False
@@ -338,11 +347,16 @@ def _is_sellable_leaf_category(oauth, category_id: str) -> bool:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
-        # Validate against THIS instance's tree: Motors ids (33651 Roof Racks,
-        # 33653 Trailer Hitches, ...) exist only in tree 100 and 400 in tree 0.
+        # Kitchen / tree-0 general goods validate on tree 0. Motors P&A / shop
+        # tools validate on this instance's Motors tree (usually 100).
+        tree_id = (
+            "0"
+            if cid in TREE0_FORCE_INVENTORY_CATEGORIES
+            else get_store_profile().category_tree_id
+        )
         resp = requests.get(
             f"{oauth.api_base}/commerce/taxonomy/v1/category_tree/"
-            f"{get_store_profile().category_tree_id}/get_category_subtree",
+            f"{tree_id}/get_category_subtree",
             headers=headers,
             params={"category_id": cid},
             timeout=30,
@@ -351,6 +365,18 @@ def _is_sellable_leaf_category(oauth, category_id: str) -> bool:
         if resp.status_code == 200:
             node = (resp.json() or {}).get("categorySubtreeNode", {})
             valid = bool(node.get("leafCategoryTreeNode"))
+        # Fall back: Motors-primary store may still carry a tree-0 leaf that
+        # isn't in the force-inventory set yet.
+        if not valid and tree_id != "0":
+            resp0 = requests.get(
+                f"{oauth.api_base}/commerce/taxonomy/v1/category_tree/0/get_category_subtree",
+                headers=headers,
+                params={"category_id": cid},
+                timeout=30,
+            )
+            if resp0.status_code == 200:
+                node0 = (resp0.json() or {}).get("categorySubtreeNode", {})
+                valid = bool(node0.get("leafCategoryTreeNode"))
         _CATEGORY_VALIDITY_CACHE[cid] = valid
         return valid
     except Exception:
@@ -578,33 +604,76 @@ def calculate_smart_final_price(product: dict, market_price: float | None = None
     - COMPETITIVE: 5% below market, 10-25% margin  
     - CEILING_PRICE: high market price, ~26% margin
     - STANDARD: no market data, 15% margin
+
+    Hard floor: fee-aware 15% after refreshing live DaJian price+shippingFee.
+    Collection often stored shipping=0; without the refresh, smart pricing
+    understates landed cost and publishes near break-even.
     """
-    cb = product.get('cost_breakdown', {})
+    cb = product.get('cost_breakdown', {}) or {}
     total_cost = cb.get('total_dajian_cost', 0)
     current_price = product.get('suggested_price', 0) or product.get('price', 0)
-    
-    if not total_cost:
-        # Recalculate cost if missing
-        price = product.get('price', 0)
-        shipping = product.get('shipping', 0)
-        if price > 0:
-            cost_data = PricingEngine.calculate_dajian_cost(price, shipping, is_oversize=True)
-            total_cost = cost_data['total_dajian_cost']
-        else:
-            return current_price  # Can't recalculate
-    
+    product_price = float(product.get('price', 0) or 0)
+    shipping = float(product.get('shipping', 0) or 0)
+
+    # Refresh live supplier price + freight before pricing.
+    try:
+        from src.clients.dajian_client import DaJianClient
+        key = os.getenv("DAJIAN_API_KEY")
+        secret = os.getenv("DAJIAN_API_SECRET")
+        if key and secret:
+            info = DaJianClient(key, secret).get_stock_info(product.get("sku") or "")
+            live_price = info.get("price")
+            live_ship = info.get("shipping_fee")
+            if live_price is not None:
+                product_price = float(live_price)
+                product["price"] = product_price
+            if live_ship is not None:
+                shipping = float(live_ship)
+                product["shipping"] = shipping
+            logger.info(
+                f"  [PRICE] Live supplier cost: price=${product_price:.2f} "
+                f"ship=${shipping:.2f}"
+            )
+    except Exception as exc:
+        logger.warning(f"  [PRICE] Live supplier cost refresh failed: {exc}")
+
+    if product_price > 0:
+        attrs = product.get("attributes") or {}
+        specs = product.get("specs") or {}
+        is_oversize = "Dimensions" in attrs or "Dimensions" in specs
+        cost_data = PricingEngine.calculate_dajian_cost(
+            product_price, shipping, is_oversize=is_oversize
+        )
+        total_cost = cost_data["total_dajian_cost"]
+        product["cost_breakdown"] = cost_data
+    elif not total_cost:
+        return current_price  # Can't recalculate
+
+    # Fee-aware 15% hard floor (pipeline requirement).
+    safe_15 = PricingEngine.calculate_selling_price(float(total_cost), 0.15)["selling_price"]
+
     if market_price and market_price > 0:
         smart = PricingEngine.calculate_smart_price(total_cost, market_price)
         final = smart['final_price']
         strategy = smart['strategy']
         margin = smart['margin']
-        logger.info(f"  [PRICE] Smart: ${final:.2f} (strategy={strategy}, margin={margin:.1%}, "
-                    f"market=${market_price:.2f}, cost=${total_cost:.2f})")
+        if final < safe_15:
+            logger.info(
+                f"  [PRICE] Raise smart ${final:.2f} -> safe15 ${safe_15:.2f} "
+                f"(was strategy={strategy}, margin={margin:.1%}, "
+                f"market=${market_price:.2f}, cost=${total_cost:.2f})"
+            )
+            final = safe_15
+            strategy = "SAFE_15_FLOOR"
+        else:
+            logger.info(
+                f"  [PRICE] Smart: ${final:.2f} (strategy={strategy}, margin={margin:.1%}, "
+                f"market=${market_price:.2f}, cost=${total_cost:.2f})"
+            )
         return final
     else:
         # Standard 15% margin
-        result = PricingEngine.calculate_selling_price(total_cost, 0.15)
-        final = result['selling_price']
+        final = safe_15
         logger.info(f"  [PRICE] Standard: ${final:.2f} (15% margin, cost=${total_cost:.2f})")
         return final
 
@@ -928,6 +997,35 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     category_id = str(quality_opt.get("categoryId") or category_id)
     category_name = quality_opt.get("categoryName") or category_name
     completed_aspects = quality_opt.get("aspects") or completed_aspects
+    # Normalize / semantic rewrite can shove Motors shop tools into EBAY_US
+    # furniture cats (e.g. "Furniture Moving Dolly" → 38208 Sofas, workbench →
+    # 262980 Benches). Restore the audited Motors tool category before fitment
+    # + Trading publish. Also fall back to Other Shop Equipment when the leaf
+    # is known-invalid on SiteID 100.
+    _motors_invalid_leaves = {"262980", "38208", "38204", "107578", "20456"}
+    if get_store_profile().is_motors and category_id not in TREE0_FORCE_INVENTORY_CATEGORIES:
+        restore_cat = ""
+        restore_name = ""
+        if stored_cat in MOTORS_TOOL_UNIVERSAL_CATEGORIES and category_id != stored_cat:
+            restore_cat, restore_name = stored_cat, (stored_cat_name or category_name)
+        elif category_id in _motors_invalid_leaves:
+            restore_cat = (
+                stored_cat if stored_cat in MOTORS_TOOL_UNIVERSAL_CATEGORIES else "63700"
+            )
+            restore_name = (
+                stored_cat_name
+                if stored_cat in MOTORS_TOOL_UNIVERSAL_CATEGORIES
+                else "Other Shop Equipment"
+            )
+        if restore_cat and category_id != restore_cat:
+            logger.info(
+                f"  [CAT] Restoring Motors tool category {restore_cat} after normalize "
+                f"remapped to {category_id}"
+            )
+            category_id = restore_cat
+            category_name = restore_name or f"Category {restore_cat}"
+            quality_opt["categoryId"] = category_id
+            quality_opt["categoryName"] = category_name
     compatibility = analyze_ebay_motors_compatibility(
         category_id=category_id,
         title=title,
@@ -1013,7 +1111,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         # seller-paid return policy — mirror the Trading branch so the dry-run
         # reflects exactly what would go live, not the Inventory-path estimate.
         _prof = get_store_profile()
-        if _prof.listing_channel == "trading":
+        if uses_motors_trading_channel(category_id, listing_channel=_prof.listing_channel):
             _stored_fitment = (
                 (product.get("optimization") or {}).get("motorsCompatibility") or {}
             ).get("compatibleProducts") or []
@@ -1047,7 +1145,11 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             }
         return {
             "status": "dry_run",
-            "message": f"Would publish at ${final_price:.2f} in cat {category_id} ({category_name})",
+            "channel": "inventory",
+            "message": (
+                f"[INVENTORY] Would publish at ${final_price:.2f} in cat "
+                f"{category_id} ({category_name})"
+            ),
             "category_id": category_id,
             "category_name": category_name,
             "aspects_count": len(completed_aspects),
@@ -1126,6 +1228,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             pws = build_package_weight_and_size(attrs, specs)
             
             inv_product = {
+                "sku": sku,  # carried into Trading <SKU> (Custom Label) for order->supplier mapping
                 "title": title,
                 "description": description,
                 "image_urls": eps_images,
@@ -1144,7 +1247,10 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             # eBay Motors categories can't be published through the Inventory API
             # (errorId 25005). Trading AddFixedPriceItem on SiteID 100 does it in
             # one call (item + fitment + publish), so branch out entirely here.
-            if get_store_profile().listing_channel == "trading":
+            if uses_motors_trading_channel(
+                category_id,
+                listing_channel=get_store_profile().listing_channel,
+            ):
                 trading_product = dict(inv_product)
                 trading_product["description"] = description
                 # Fitment is authoritative structured source data (GIGA
@@ -1183,7 +1289,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                     "listing_id": listing_id,
                     "channel": "trading",
                 }
-            # --- default Inventory API path (furniture / general) --------------
+            # --- Inventory API path (tree-0 general / furniture) --------------
 
             ebay_client.create_or_replace_inventory_item(
                 sku=sku,
@@ -1481,7 +1587,6 @@ def _persist_video_status(sku: str, status: str, video_id: str | None = None) ->
     except Exception as exc:
         logger.warning(f"  Failed to persist video_status={status} for {sku}: {exc}")
 
-
 def _try_fix_missing_aspect(error_msg: str, aspects: dict, category_id: str) -> bool:
     """Try to auto-fix a missing/invalid aspect error. Returns True if fixed."""
     return try_fix_publish_error(
@@ -1496,16 +1601,20 @@ def _try_fix_missing_aspect(error_msg: str, aspects: dict, category_id: str) -> 
 
 def _try_fix_missing_product_identifier(error_msg: str, aspects: dict) -> bool:
     """Add eBay US's official unavailable text after an explicit missing-ID error."""
-    if re.search(r"<BrandMPN>\s+is\s+(?:invalid|missing)", error_msg or "", re.IGNORECASE):
+    msg = error_msg or ""
+    if re.search(r"<BrandMPN>\s+is\s+(?:invalid|missing)", msg, re.IGNORECASE) or re.search(
+        r"Manufacturer\s+Part\s+Number\s+is\s+missing", msg, re.IGNORECASE
+    ) or re.search(r"\bMPN\s+(?:field\s+)?is\s+missing\b", msg, re.IGNORECASE):
         aspects["MPN"] = [PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT]
+        aspects["Manufacturer Part Number"] = [PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT]
         logger.info(
-            f"  [FIX] BrandMPN is required but unavailable; "
+            f"  [FIX] MPN/Manufacturer Part Number is required but unavailable; "
             f"using eBay US identifier text '{PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT}'"
         )
         return True
 
     for aspect_name in ("UPC", "EAN", "ISBN"):
-        if re.search(rf"\b{aspect_name}\s+field\s+is\s+missing\b", error_msg or "", re.IGNORECASE):
+        if re.search(rf"\b{aspect_name}\s+field\s+is\s+missing\b", msg, re.IGNORECASE):
             aspects[aspect_name] = [PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT]
             logger.info(
                 f"  [FIX] {aspect_name} is required but unavailable; "

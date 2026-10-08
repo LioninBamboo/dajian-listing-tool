@@ -52,5 +52,7 @@ def test_assembly_key_matches_package_conflict():
 def test_category_policy_skips_gabion_allows_chairs():
     assert category_allows_assembly_auto_yes("54235")
     assert category_allows_assembly_auto_yes(79684)
+    assert category_allows_assembly_auto_yes("43538")
+    assert category_allows_assembly_auto_yes("180993")
     assert not category_allows_assembly_auto_yes("20518")
     assert not category_allows_assembly_auto_yes(None)

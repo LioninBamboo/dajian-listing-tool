@@ -29,9 +29,58 @@ EBAY_MOTORS_CATEGORIES = {
 }
 
 UNIVERSAL_FITMENT_CATEGORIES = {
+    "174020",  # Trailer Hitches (receiver/universal hitch accessories)
     "174021",
     "262216",
     "262093",
+}
+
+# Tree-100 Motors tools / shop equipment: publish as Universal Fitment Type
+# without structured YMM rows. Without this, listing_qc blocks every creeper /
+# jack / paint stand as "No vehicle compatibility data".
+MOTORS_TOOL_UNIVERSAL_CATEGORIES = {
+    "35000",   # Power Tools (shop / outdoor power on Motors)
+    "35625",   # Other Automotive Hand Tools
+    "43994",   # Wrenches
+    "43998",   # Other Auto Tools & Supplies
+    "50072",   # Other Trailer Leveling & Towing Parts
+    "63700",   # Other Shop Equipment
+    "173950",  # Air Compressors (accessory kits / tubing often land here)
+    "34999",   # Other Automotive Air Tools
+    "179442",  # Auto Safety Kits & Supplies
+    "179444",  # Garage/Shop Tool Chests
+    "179446",  # Tool Storage Organizers (slatwall / wall storage kits)
+    "179457",  # Vehicle Vacuums (shop vacs often land here)
+    "179462",  # Other Automotive Care Supplies
+    "179480",  # Leak Detection Tools
+    "179506",  # Dollies
+    "179507",  # Engine Hoists & Stands
+    "179508",  # Fluid Transfer Pumps
+    "179511",  # Jacks & Jack Stands
+    "179512",  # Roller Seats & Creepers
+    "262196",  # Other Interior Safety (often misfiled shop tools)
+}
+
+# Model names that are also common English words. For vehicle-mention gating,
+# require the associated make nearby so "edge trims" / "compass" furniture copy
+# does not block shop tools as incomplete fitment.
+AMBIGUOUS_MODEL_WORDS = {
+    "armada",
+    "canyon",
+    "compass",
+    "edge",
+    "escape",
+    "explorer",
+    "frontier",
+    "journey",
+    "legacy",
+    "outback",
+    "passport",
+    "pathfinder",
+    "pilot",
+    "ranger",
+    "summit",
+    "trailblazer",
 }
 
 VEHICLE_MAKES = {
@@ -140,6 +189,36 @@ UNIVERSAL_HINT_PATTERNS = (
     r"\bno drilling or modification required\b",
     r"\bdesigned for suvs, trucks, crossovers, and rvs\b",
     r"\bideal for suvs, trucks, sedans, and crossovers\b",
+    # Shop tools / hitch accessories that are receiver- or use-case based,
+    # not Year/Make/Model specific.
+    r"\bhitch mount\b",
+    r"\bhitch carrier\b",
+    r"\btrailer hitch carrier\b",
+    r"\bscooter hauler\b",
+    r"\bmotorcycle hitch\b",
+    r"\breceiver mount\b",
+    r"\bcargo carrier basket\b",
+    r"\btow chain\b",
+    r"\btransport chain\b",
+    r"\bbridle\b.*\bchain\b",
+    r"\btorque multiplier\b",
+    r"\bsuction cup\b",
+    r"\bemergency car kit\b",
+    r"\bchainsaw\b",
+    r"\blog splitter\b",
+    r"\bchop saw\b",
+    r"\bshop vac(?:uum)?\b",
+    r"\bwet[\s/-]?dry\b.*\bvac(?:uum)?\b",
+    r"\b(?:mig|tig|stick|arc|spot)\s+welder\b",
+    r"\bwelding cart\b",
+    r"\bmma welder\b",
+    r"\b(?:panel\s+)?dolly\b",
+    r"\btrailer dolly\b",
+    r"\butility cart\b",
+    r"\bslatwall\b",
+    r"\bslat wall\b",
+    r"\bgarage wall storage\b",
+    r"\bwall storage system\b",
 )
 
 GENERIC_VEHICLE_PATTERNS = (
@@ -500,6 +579,68 @@ class VehicleCompatibilityParser:
         return entry
 
 
+# Tree-0 Home & Garden / kitchen leaves that a Motors-primary store may still
+# sell. These must use Inventory/EBAY_US (not Trading SiteID 100) and skip
+# Motors fitment QC.
+TREE0_FORCE_INVENTORY_CATEGORIES = {
+    "20641",   # Peelers & Slicers
+    "20673",   # Food Processors
+    "20677",   # Juicers
+    "66751",   # Meat Grinders
+    "184971",  # Small Kitchen Appliance Accessories
+    "260139",  # Brewing / Wine Making Equipment
+    "260148",  # Food Mills
+    "260150",  # Manual Juicers
+}
+
+
+def is_motors_listing_category(category_id: str) -> bool:
+    """True for Motors P&A / Motors shop-tool leaves that use Trading + fitment rules."""
+    cid = str(category_id or "").strip()
+    if not cid:
+        return False
+    return (
+        cid in EBAY_MOTORS_CATEGORIES
+        or cid in UNIVERSAL_FITMENT_CATEGORIES
+        or cid in MOTORS_TOOL_UNIVERSAL_CATEGORIES
+    )
+
+
+def uses_motors_trading_channel(
+    category_id: str,
+    *,
+    listing_channel: str | None = None,
+) -> bool:
+    """Whether this category should publish via Trading/SiteID 100.
+
+    Motors-primary stores default to Trading, but known tree-0 general
+    merchandise (kitchen tools, etc.) must stay on Inventory/EBAY_US.
+    """
+    channel = str(listing_channel or "").strip().lower()
+    if channel != "trading":
+        return False
+    cid = str(category_id or "").strip()
+    if cid in TREE0_FORCE_INVENTORY_CATEGORIES:
+        return False
+    return True
+
+
+def category_needs_motors_fitment(
+    category_id: str,
+    *,
+    is_motors_store: bool = False,
+) -> bool:
+    """Whether Motors vehicle-fitment analysis/QC applies to this category."""
+    cid = str(category_id or "").strip()
+    if not cid or cid in TREE0_FORCE_INVENTORY_CATEGORIES:
+        return False
+    if is_motors_listing_category(cid):
+        return True
+    # Preserve historical Motors-store behavior for tree-100 orphans not yet
+    # whitelisted in the sets above.
+    return bool(is_motors_store)
+
+
 def analyze_ebay_motors_compatibility(
     category_id: str,
     title: str,
@@ -517,10 +658,13 @@ def analyze_ebay_motors_compatibility(
     is safe: it self-gates on the presence of vehicle data (a tool or universal
     accessory just yields empty ``compatible_products``, never a bogus fitment).
     Default False preserves the tree-0 gate for the furniture main store.
+
+    Known tree-0 kitchen / Home & Garden leaves always return ``not_applicable``
+    even on a Motors-primary store.
     """
 
     category_id = str(category_id or "").strip()
-    if not is_motors_store and category_id not in EBAY_MOTORS_CATEGORIES:
+    if not category_needs_motors_fitment(category_id, is_motors_store=is_motors_store):
         return CompatibilityAnalysis(mode="not_applicable")
 
     parser = VehicleCompatibilityParser()
@@ -820,12 +964,29 @@ def _looks_universal_fit(
     if any(re.search(pattern, lowered) for pattern in UNIVERSAL_HINT_PATTERNS):
         return True
 
+    if category_id in MOTORS_TOOL_UNIVERSAL_CATEGORIES:
+        return True
+
     if category_id in UNIVERSAL_FITMENT_CATEGORIES:
         compatibility_values = " ".join(aspects.get("Compatibility", [])).lower()
         generic_vehicle_classes = {"suv", "pickup truck", "rv", "crossover", "sedan"}
         if compatibility_values and all(any(cls in value for cls in generic_vehicle_classes) for value in compatibility_values.split(",") if value):
             return True
 
+    return False
+
+
+def _ambiguous_model_has_make_context(text: str, model: str, make: str) -> bool:
+    """True when an ambiguous model word sits near its make (e.g. Ford Edge)."""
+    lowered = text.lower()
+    make_l = (make or "").lower().strip()
+    model_l = (model or "").lower().strip()
+    if not make_l or not model_l:
+        return False
+    for match in re.finditer(rf"\b{re.escape(model_l)}\b", lowered):
+        window = lowered[max(0, match.start() - 48) : match.end() + 48]
+        if re.search(rf"\b{re.escape(make_l)}\b", window):
+            return True
     return False
 
 
@@ -836,7 +997,13 @@ def _has_vehicle_mentions(text: str, aspects: Dict[str, List[str]]) -> bool:
 
     if any(re.search(rf"\b{re.escape(make)}\b", lowered) for make in VEHICLE_MAKES):
         return True
-    if any(re.search(rf"\b{re.escape(model)}\b", lowered) for model in KNOWN_MODELS):
+    for model, make in KNOWN_MODELS.items():
+        if not re.search(rf"\b{re.escape(model)}\b", lowered):
+            continue
+        if model in AMBIGUOUS_MODEL_WORDS:
+            if _ambiguous_model_has_make_context(lowered, model, make):
+                return True
+            continue
         return True
 
     for key in ("Compatibility", "Compatible Make", "Compatible Model", "Compatible Year"):

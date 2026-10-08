@@ -316,10 +316,15 @@ def get_all_products() -> list:
 
 def _calc_transaction_margin(listing_price: float, total_cost: float,
                              discount_pct: float = 5.0,
-                             ebay_fee_rate: float = 0.1325,
+                             ebay_fee_rate: float | None = None,
                              ad_rate: float = 0.05,
-                             fixed_fee: float = 0.30) -> float:
+                             fixed_fee: float | None = None) -> float:
     """Margin on actual transaction price, matching the ad-monitor denominator."""
+    from src.services.pricing_engine import PricingEngine
+    if ebay_fee_rate is None:
+        ebay_fee_rate = float(PricingEngine.marketplace_fee_rate())
+    if fixed_fee is None:
+        fixed_fee = float(PricingEngine.FIXED_FEE)
     if listing_price <= 0 or total_cost <= 0:
         return 0.0
     actual_price = listing_price * (1 - discount_pct / 100.0)

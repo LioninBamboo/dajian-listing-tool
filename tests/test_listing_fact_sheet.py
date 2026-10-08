@@ -482,7 +482,7 @@ def test_cache_round_trip_records_current_versions_and_provenance(cache_conn):
 def test_cache_ignores_records_from_an_old_ruleset(cache_conn, monkeypatch):
     key = fact_sheet_content_hash("T-version", "D", {})
     store_fact_sheet(cache_conn, key, SOURCE_SHEET)
-    monkeypatch.setattr(lfs, "FACT_SHEET_RULESET_VERSION", "fact-sheet-rules-v2")
+    monkeypatch.setattr(lfs, "FACT_SHEET_RULESET_VERSION", "fact-sheet-rules-v3")
 
     assert get_cached_fact_sheet(cache_conn, key) is None
 

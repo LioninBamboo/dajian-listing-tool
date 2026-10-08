@@ -10,7 +10,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def test_sync_single_product_restocks_with_default_quantity_one():
+def test_sync_single_product_restocks_with_default_quantity_one(monkeypatch):
+    monkeypatch.setenv("EBAY_LISTING_QUANTITY_CAP", "1")
     from src.plugins.inventory_sync.sync_service import InventorySyncService
 
     service = InventorySyncService.__new__(InventorySyncService)
@@ -39,6 +40,36 @@ def test_sync_single_product_restocks_with_default_quantity_one():
     assert result.action == "restocked"
     assert result.new_value == "库存恢复为1"
     assert "恢复为 1" in result.message
+
+
+def test_sync_single_product_restocks_with_quantity_cap_two(monkeypatch):
+    monkeypatch.setenv("EBAY_LISTING_QUANTITY_CAP", "2")
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    service = InventorySyncService.__new__(InventorySyncService)
+    service.logger = logging.getLogger(__name__)
+    service.check_dajian_stock = lambda sku: (True, 120.0, 25.0, 7)
+    service.get_last_sync_action = lambda sku: "out_of_stock"
+    service._check_and_update_price = lambda *args, **kwargs: None
+
+    seen = {}
+
+    def fake_update_ebay_quantity(sku, quantity):
+        seen["sku"] = sku
+        seen["quantity"] = quantity
+        return True
+
+    service.update_ebay_quantity = fake_update_ebay_quantity
+
+    result = service._sync_single_product(
+        {"sku": "SKU-RESTOCK-2", "cost_breakdown": {}},
+        dry_run=False,
+        skip_ebay_check=True,
+        favorites_set=set(),
+    )
+
+    assert seen == {"sku": "SKU-RESTOCK-2", "quantity": 2}
+    assert result.new_value == "库存恢复为2"
 
 
 def test_sync_single_product_reports_zero_quantity_write_failure_as_error():

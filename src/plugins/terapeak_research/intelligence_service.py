@@ -447,7 +447,7 @@ class IntelligenceService:
         智能定价 — 委托到 PricingEngine.calculate_smart_price (单一真相源).
 
         ⚠️ 历史问题修复 (2026-05): 旧实现用 cost*(1+margin) 计算底价/利润率,
-        完全忽略 13.25% eBay FVF + 5% 广告 + 5% 店铺折扣 + $0.30 固定费,
+        完全忽略 13.6% eBay FVF + 1.3% 国际费 + 5% 广告 + 5% 店铺折扣 + $0.40 固定费,
         导致 MI / Tab 7 给的"建议价"系统性低估约 28%, 照建议价改价直接亏本.
         现已统一委托到 PricingEngine, 与 batch_smart_reprice / app.py / batch_publish 共用同一公式与死线.
 

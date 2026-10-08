@@ -254,6 +254,15 @@ def lookup_giga_unit_cost(conn: sqlite3.Connection, sku: str) -> tuple[float, st
         except Exception:
             cb = {}
 
+    # Prefer resolve_landed_cost so omitted freight in the snapshot is rebuilt
+    # from collected_products.shipping.
+    if hasattr(PricingEngine, "resolve_landed_cost"):
+        landed = PricingEngine.resolve_landed_cost(
+            cb, shipping_fallback=shipping or 0
+        )
+        if landed:
+            return float(landed), "resolve_landed_cost"
+
     stored = cb.get("total_dajian_cost")
     try:
         stored_f = float(stored or 0)

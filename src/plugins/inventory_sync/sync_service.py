@@ -24,6 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
 from src.clients.dajian_client import extract_available_inventory_quantity
+from src.utils.ebay_quantity import _listing_quantity_cap
 from src.utils.inventory_restock_hold import (
     is_restock_held,
     should_block_positive_quantity,
@@ -766,12 +767,12 @@ class InventorySyncService:
     def update_ebay_price(self, sku: str, new_price: float) -> bool:
         """更新 eBay 售价 (支持自动处理促销阻止 + 触底自动关广告).
 
-        🛡️ 安全护栏 (2026-05): 写出前调用 PricingEngine.assert_safe_price 校验.
-        若 new_price 低于 SKU 总到岸成本对应的"绝对死线" (含 5% 折扣 + 18.25%
-        eBay 费 + $0.30 固定费), 直接拒绝并写日志, 不调任何 eBay API.
+        🛡️ 安全护栏: 写出前走 repricing_guard.precheck_price.
+        口径 A: 标价必须至少留下到岸成本的 10% (含 5% 折扣 + 13.6% FVF + 1.3% 国际费 + 广告 + $0.40 + 10% 税垫).
+        低于该底则拒绝并写日志, 不调任何 eBay API.
 
-        🎯 广告自适应 (2026-05): 5% 广告费率不是钉死的. 当 new_price < 带广告死线
-        但 >= 关广告死线时:
+        🎯 广告自适应: 当 new_price < 带 5% 广告的 10% 成本底
+        但 >= 关广告的 10% 成本底时:
           - 若 listing 当前在广告中 → 自动关广告, 然后放行改价 (维持竞争力)
           - 若 listing 不在广告中 → 直接放行 (本就没付广告费)
         关广告/价改顺序: 先 delete_ad → 再 PUT offer, 避免转化期同时收到广告费.
@@ -1184,7 +1185,8 @@ class InventorySyncService:
             last_action = self.get_last_sync_action(sku)
             if last_action in ('out_of_stock', 'restock_held') and in_stock:
                 self.logger.info(f"  {sku}: 从缺货恢复，重新上架")
-                restore_quantity = 1
+                cap = _listing_quantity_cap()
+                restore_quantity = cap if isinstance(cap, int) and cap > 0 else 1
                 restored = True
                 if not dry_run:
                     restored = bool(self.update_ebay_quantity(sku, restore_quantity))

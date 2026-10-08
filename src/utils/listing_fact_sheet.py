@@ -21,7 +21,7 @@ from typing import Any, Mapping
 from src.utils.dimension_helpers import normalize_dimension_orientation
 
 FACT_SHEET_VERSION = 4
-FACT_SHEET_RULESET_VERSION = "fact-sheet-rules-v1"
+FACT_SHEET_RULESET_VERSION = "fact-sheet-rules-v2"
 FACT_SHEET_CACHE_SCHEMA_VERSION = 1
 
 # Deterministic material lexicon — backstop for LLM extraction misses.
@@ -212,7 +212,7 @@ JSON schema:
 Rules:
 1. materials: every material named for the product or its parts, INCLUDING material words inside the TITLE (a "Canvas Bell Tent" title claims "canvas"; a "Solid Wood Desk" title claims "solid wood"). Fabric names (canvas, oxford, polyester, velvet), wood species, metals, leather types, and plastics are all materials.
 2. features: functional capabilities only (not colors, not style words). INCLUDE usage-capability claims such as "4 season", "year-round use", "waterproof", "foldable".
-3. counts: only explicit "N <noun>" claims (2 doors, 8 poles, 3 tiers, 12 stakes).
+3. counts: only explicit quantity claims like "2 doors", "8 poles", "3 tiers", "12 stakes". NEVER treat size/diameter as a count — "8-inch wheels" / "8\" casters" means diameter, not 8 wheels.
 4. capacity: only explicit occupancy/seating claims.
 5. dimensions: overall product dimensions in inches/lbs if stated.
 6. Output raw JSON only, no markdown fences.
@@ -380,6 +380,41 @@ def _normalize_sheet(raw: Mapping[str, Any]) -> dict:
         "certifications": _str_list(raw.get("certifications")),
         "dimensions": dimensions,
     }
+
+
+_DIAMETER_WHEEL_CLAIM = re.compile(
+    r"\b(?P<n>\d+(?:\.\d+)?)\s*(?:-|–)?\s*(?:inch(?:es)?|in\.?|\"|”)\s+"
+    r"(?:[a-z0-9/-]+\s+){0,3}?(?P<noun>wheels?|casters?|tires?)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_diameter_misread_counts(counts: Mapping[str, int], text: str) -> dict[str, int]:
+    """Drop wheel/caster/tire counts that are really diameter claims (8-inch wheels)."""
+    if not counts:
+        return {}
+    hay = str(text or "")
+    diameter_hits: set[tuple[int, str]] = set()
+    for match in _DIAMETER_WHEEL_CLAIM.finditer(hay):
+        try:
+            n = int(float(match.group("n")))
+        except (TypeError, ValueError):
+            continue
+        noun = match.group("noun").lower()
+        stem = noun[:-1] if noun.endswith("s") else noun
+        diameter_hits.add((n, stem))
+        diameter_hits.add((n, stem + "s"))
+    if not diameter_hits:
+        return dict(counts)
+
+    cleaned: dict[str, int] = {}
+    for noun, count in counts.items():
+        key = str(noun).strip().lower()
+        stem = key[:-1] if key.endswith("s") else key
+        if (count, key) in diameter_hits or (count, stem) in diameter_hits or (count, stem + "s") in diameter_hits:
+            continue
+        cleaned[key] = count
+    return cleaned
 
 
 def extract_fact_sheet(
@@ -867,9 +902,11 @@ def fact_sheet_for_content(
     # Explicit eBay item aspects are more reliable than an LLM choosing an
     # axis from an unlabelled ``L x W x H`` sentence. Apply them to both cache
     # hits and fresh extractions so dimension orientation remains stable.
+    sheet = dict(sheet)
+    text_blob = f"{title or ''}\n{_strip_html(description or '')}"
+    sheet["counts"] = _strip_diameter_misread_counts(sheet.get("counts") or {}, text_blob)
     explicit_dimensions = _explicit_fact_sheet_dimensions(structured, title)
     if explicit_dimensions:
-        sheet = dict(sheet)
         dimensions = dict(sheet.get("dimensions") or {})
         dimensions.update(explicit_dimensions)
         sheet["dimensions"] = dimensions

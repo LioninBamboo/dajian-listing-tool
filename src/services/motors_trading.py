@@ -57,9 +57,46 @@ def format_compatibility_list(
     return f"<ItemCompatibilityList>{replace_all_xml}{''.join(blocks)}</ItemCompatibilityList>"
 
 
+# eBay US official unavailable identifier text for required UPC/EAN/ISBN.
+# https://developer.ebay.com/api-docs/sell/static/inventory/product-identifier-text.html
+UPC_UNAVAILABLE_TEXT = "Does not apply"
+_PRODUCT_ID_KEYS = frozenset({"upc", "ean", "isbn"})
+
+
+def _first_aspect_value(aspects: Optional[Mapping[str, Any]], key: str) -> str:
+    raw = (aspects or {}).get(key)
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            text = str(item or "").strip()
+            if text:
+                return text
+        return ""
+    return str(raw or "").strip()
+
+
+def _looks_like_real_upc(value: str) -> bool:
+    digits = re.sub(r"\D", "", value or "")
+    return digits.isdigit() and len(digits) in {8, 12, 13, 14}
+
+
+def _product_listing_details_xml(aspects: Optional[Mapping[str, Any]] = None) -> str:
+    """Motors often requires ProductListingDetails/UPC even for unbranded tools."""
+    upc = _first_aspect_value(aspects, "UPC")
+    if not _looks_like_real_upc(upc):
+        upc = UPC_UNAVAILABLE_TEXT
+    return (
+        "<ProductListingDetails>"
+        f"<UPC>{escape(upc)}</UPC>"
+        "</ProductListingDetails>"
+    )
+
+
 def _aspects_xml(aspects: Optional[Mapping[str, Any]]) -> str:
     rows: List[str] = []
     for name, value in (aspects or {}).items():
+        # UPC/EAN/ISBN belong in ProductListingDetails, not ItemSpecifics.
+        if str(name or "").strip().lower() in _PRODUCT_ID_KEYS:
+            continue
         values = value if isinstance(value, (list, tuple)) else [value]
         for v in values:
             v = str(v).strip()
@@ -146,6 +183,7 @@ def build_add_fixed_price_item_xml(
     condition_id: str = CONDITION_NEW,
     country: str = "US",
     currency: str = "USD",
+    sku: Optional[str] = None,
 ) -> str:
     """Build a full AddFixedPriceItem request for an eBay Motors parts listing.
 
@@ -168,6 +206,8 @@ def build_add_fixed_price_item_xml(
         f"<SellerPaymentProfile><PaymentProfileID>{pay}</PaymentProfileID></SellerPaymentProfile>"
         "</SellerProfiles>"
     )
+    sku_text = str(sku or "").strip()
+    sku_xml = f"<SKU>{escape(sku_text)}</SKU>" if sku_text else ""
 
     return (
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
@@ -185,6 +225,8 @@ def build_add_fixed_price_item_xml(
         f"<Location>{escape(str(location))}</Location>"
         f"<PostalCode>{escape(str(postal_code))}</PostalCode>"
         f"<ConditionID>{condition_id}</ConditionID>"
+        f"{sku_xml}"
+        f"{_product_listing_details_xml(aspects)}"
         f"{_pictures_xml(image_urls)}"
         f"{seller_profiles}"
         f"{_aspects_xml(aspects)}"

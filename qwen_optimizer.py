@@ -1998,6 +1998,13 @@ class QwenOptimizer:
             (["entry", "table"], "38205"),          # Entry Tables
             (["foyer", "table"], "38205"),          # Foyer Tables
             (["hall", "table"], "38205"),           # Hall Tables
+            # Statue/sculpture accent tables -> Garden Sculptures (20518), not End Tables.
+            # Matches published W5398 flamingo sibling and category_matcher decor rule.
+            (["statue", "table"], "20518"),
+            (["sculpture", "table"], "20518"),
+            (["figurine", "table"], "20518"),
+            (["animal", "head", "table"], "20518"),
+            (["head", "accent", "table"], "20518"),
             (["end", "table"], "38200"),            # End Tables
             (["side", "table"], "38200"),           # Side Tables
             (["accent", "table"], "38200"),         # Accent Tables

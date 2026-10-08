@@ -99,7 +99,7 @@ Image handling rule:
 
 ## Pricing Floor (口径 A)
 
-Write, ads, and CRO bid increases all keep **net profit ≥ 10% of landed cost** after 5% store discount + 13.25% FVF + modeled ads + $0.30. Constant: `PricingEngine.MIN_NET_MARGIN_ON_COST`. `repricing_guard.precheck_price` uses that margin (not break-even). `create_ad_safe` / CRO `bid_cap_for_sku` cannot raise ads past the rate that would eat the 10% cost buffer. New publishes may still use the higher listing-price 15% floor in `batch_publish.py`.
+Write, ads, and CRO bid increases all keep **net profit ≥ 10% of landed cost** after 5% store discount + 13.6% FVF + 1.3% international + modeled ads + $0.40. Listing floors pad a 10% destination tax on the fee base so that net still holds when collected tax ≤ 10%. Order PnL uses collected tax plus the same FVF/international/ad rates (no pad). Constant: `PricingEngine.MIN_NET_MARGIN_ON_COST`. `repricing_guard.precheck_price` uses that margin (not break-even). `create_ad_safe` / CRO `bid_cap_for_sku` cannot raise ads past the rate that would eat the 10% cost buffer. New publishes may still use the higher listing-price 15% floor in `batch_publish.py`.
 
 ## Repricing Truthfulness
 

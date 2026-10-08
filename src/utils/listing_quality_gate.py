@@ -783,6 +783,21 @@ def infer_package_assembly_evidence(
         required_family = "exercise_equipment_setup"
     elif (
         not negative_cues
+        and bool(
+            re.search(
+                r"\b(?:garden\s+trellis|metal\s+trellis|plant\s+trellis|"
+                r"trellis\s+for\s+climbing|garden\s+arch|rose\s+arch|"
+                r"garden\s+arbor|arbor\s+arch|arch\s+with\s+gate)\b",
+                title_text or text,
+                flags=re.IGNORECASE,
+            )
+        )
+    ):
+        # Trellises / arbors ship as rigid flat-pack panels and always need setup.
+        # Ops 2026-09-29: W1586P151254 new order wrongly said Assembly Required=No.
+        required_family = "garden_trellis_arbor"
+    elif (
+        not negative_cues
         and not compressed_title
         and combo_box_count is not None
         and combo_box_count >= 2
@@ -898,6 +913,7 @@ def infer_assembly_decision(
         "exercise_equipment_setup",
         "multi_box_combo",
         "modular_combo_sectional",
+        "garden_trellis_arbor",
     }
     if package.get("required_family") and (
         package["required_family"] in unconditional_required_families
@@ -1769,12 +1785,21 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         )
 
     if any(marker in title_text for marker in ("side table", "end table", "accent table", "lamp table")):
-        # End/side/accent tables are eBay End Tables (54235), not Coffee/Dining
-        # Tables (38204). Mapping to 38204 caused live CRITICAL false pressure
-        # to re-categorize 15–20" end tables as coffee tables (2026-08-06).
+        # Animal-head / statue accent tables are decorative sculpture (20518), same as
+        # published W5398 flamingo sibling. Plain furniture end tables use 38200.
+        # Never use 54235 (Chairs) or 38204 (Coffee Tables).
+        if any(m in title_text for m in ("statue", "figurine", "sculpture", "animal head", "head accent")):
+            return ListingProfile(
+                kind="decor_statue_table",
+                category_id="20518",
+                category_name="Garden Sculptures & Statues",
+                type_value="Statue",
+                room="Living Room",
+                remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
+            )
         return ListingProfile(
             kind="side_table",
-            category_id="54235",
+            category_id="38200",
             category_name="End Tables",
             type_value="End & Side Tables",
             room="Living Room",

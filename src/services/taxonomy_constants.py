@@ -22,6 +22,17 @@ PROTECTED_STORED_CATEGORY_IDS = {
     # Keep specialized furniture leaves from being remapped to generic cabinets.
     "20689",   # Wine Racks & Bottle Holders (bar / liquor cabinets)
     "261263",  # Hall Trees & Stands
+    # AquaRides Motors shop-tool leaves (prevent furniture remaps on SiteID 100)
+    "35000",   # Power Tools
+    "43994",   # Wrenches
+    "63700",   # Other Shop Equipment
+    "179506",  # Dollies
+    "179507",  # Engine Hoists & Stands
+    "179457",  # Vehicle Vacuums
+    # AquaRides tree-0 kitchen / Home leaves (must not be remapped to Motors)
+    "260150",  # Manual Juicers
+    "20677",   # Juicers
+    "260139",  # Brewing Equipment
 }
 
 
