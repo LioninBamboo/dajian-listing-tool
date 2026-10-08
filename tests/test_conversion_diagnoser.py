@@ -63,9 +63,29 @@ def test_low_cvr_overpriced_recommends_price_drop():
 
 
 def test_low_cvr_aligned_price_recommends_fill_specifics():
+    # aspect_count 未给 / 偏少 → 仍建议 fill_specifics
     d = diagnose_sku(_p(imp=2000, views=100, tx=1, sold=1, price=100), market_median=100)
     assert d.funnel_stage == 'low_cvr'
     assert any(a.type == 'fill_specifics' for a in d.actions)
+
+
+def test_low_cvr_aligned_rich_aspects_skips_fill_specifics():
+    p = _p(imp=2000, views=100, tx=1, sold=1, price=100)
+    p['aspect_count'] = 20
+    d = diagnose_sku(p, market_median=100)
+    assert d.funnel_stage == 'low_cvr'
+    assert not any(a.type == 'fill_specifics' for a in d.actions)
+    assert any(a.type == 'send_offer' for a in d.actions)
+
+
+def test_low_cvr_overpriced_floor_locked_skips_price_drop():
+    # 价高于市中位但已贴 SAFE_15 地板 → 不推 price_drop
+    p = _p(imp=2000, views=100, tx=1, sold=1, price=230)
+    p['floor_price'] = 230
+    d = diagnose_sku(p, market_median=100)
+    assert d.funnel_stage == 'low_cvr'
+    assert not any(a.type == 'price_drop' for a in d.actions)
+    assert any(a.detail.get('floor_locked') for a in d.actions)
 
 
 def test_healthy_funnel_no_actions_or_only_minor():

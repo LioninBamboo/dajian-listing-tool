@@ -276,17 +276,31 @@ def load_products_from_db():
         total_cost = cost_data.get('total_dajian_cost', 0)
         selling_price = row['suggested_price'] or 0
         cat_id = opt.get('categoryId', '?')
+        aspects = opt.get('item_specifics') or opt.get('aspects') or {}
+        aspect_count = len(aspects) if isinstance(aspects, dict) else 0
+        floor_price = 0.0
+        if total_cost:
+            try:
+                from src.services.pricing_engine import PricingEngine
+                floor_price = float(
+                    PricingEngine.calculate_selling_price(float(total_cost), 0.15)['selling_price']
+                )
+            except Exception:
+                floor_price = 0.0
         
-        # 提取第一张图片URL作为缩略图
+        # 提取第一张图片URL作为缩略图 + 全量 images 供 CRO 诊断
         image_url = ''
+        img_list = []
         try:
             images_raw = row['images']
             if images_raw:
                 img_list = json.loads(images_raw) if isinstance(images_raw, str) else images_raw
-                if isinstance(img_list, list) and img_list:
+                if not isinstance(img_list, list):
+                    img_list = []
+                if img_list:
                     image_url = img_list[0]
-        except:
-            pass
+        except Exception:
+            img_list = []
         
         products.append({
             'sku': row['sku'],
@@ -295,6 +309,10 @@ def load_products_from_db():
             'cat_name': CATEGORY_NAMES.get(cat_id, cat_id),
             'total_cost': total_cost,
             'selling_price': selling_price,
+            'floor_price': floor_price,
+            'safe_15': floor_price,
+            'aspect_count': aspect_count,
+            'images': img_list,
             'net_margin': calc_net_margin(selling_price, total_cost),
             'age_days': calc_listing_age_days(row['published_at'], row['created_at']),
             'listing_id': row['listing_id'],
@@ -2149,11 +2167,12 @@ def render_cro_tab(products, market_data):
         HEALTHY_CTR, HEALTHY_CVR, HEALTHY_STR, MIN_IMPRESSIONS_FOR_DIAGNOSIS,
     )
 
-    # 把 images 字段补上 (load_products_from_db 没存 list, 只存第一张 image_url)
+    # 补齐 images: 优先用 load_products_from_db 的全量 list, 否则回退缩略图
     enriched = []
     for p in products:
         q = dict(p)
-        q['images'] = [p['image_url']] if p.get('image_url') else []
+        if not q.get('images'):
+            q['images'] = [p['image_url']] if p.get('image_url') else []
         enriched.append(q)
 
     diagnoses = diagnose_batch(enriched, market_data=market_data)

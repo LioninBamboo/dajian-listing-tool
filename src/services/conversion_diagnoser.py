@@ -34,6 +34,11 @@ HEALTHY_STR = 0.0005
 PRICE_OVERPRICED = 1.15
 PRICE_PREMIUM = 1.05
 
+# fill_specifics 仅在 specifics 偏少时才入队, 避免 matcher 已完整时日日空跳过
+MIN_ASPECTS_FOR_FILL = 8
+# SAFE_15 / 成本地板相对市场中位: 再推 price_drop 无效 (不能破地板)
+FLOOR_OVER_MARKET_LOCK = 1.15
+
 
 @dataclass
 class CroAction:
@@ -127,8 +132,15 @@ def _build_actions(
     impressions: int, views: int, sold_qty: int,
     title_len: int, image_count: int, age_days: int,
     has_sales: bool, market_median: float, price: float,
+    aspect_count: Optional[int] = None,
+    floor_price: float = 0.0,
 ) -> List[CroAction]:
     actions: List[CroAction] = []
+    floor_locked = bool(
+        floor_price > 0 and market_median > 0
+        and floor_price >= market_median * FLOOR_OVER_MARKET_LOCK
+        and price > 0 and price <= floor_price * 1.02
+    )
 
     # 规则 1: 零展示 + 上架 > 14 天 → 推广
     if funnel == 'no_impression' and age_days >= 14 and not has_sales:
@@ -139,17 +151,28 @@ def _build_actions(
             detail={'suggested_bid_pct': 5.0},
         ))
 
-    # 规则 2: 低 CTR + 价格偏高 → 降价是最强杠杆
+    # 规则 2: 低 CTR + 价格偏高 → 降价是最强杠杆 (SAFE_15 地板锁除外)
     if funnel == 'low_ctr' and price_pos in ('overpriced', 'premium'):
         target = round(market_median * 1.0, 2)
-        actions.append(CroAction(
-            type='price_drop', priority=1,
-            reason=f'CTR {ctr*100:.2f}% < 健康 {HEALTHY_CTR*100:.1f}%; '
-                   f'售价 ${price:.0f} 高于市场中位 ${market_median:.0f} ({price_pos})',
-            expected_lift=f'+CTR (跟齐市场中位 ${target})',
-            detail={'current_price': price, 'suggested_price': target,
-                    'market_median': market_median, 'drop_pct': round((1 - target / price) * 100, 1)},
-        ))
+        if floor_locked:
+            actions.append(CroAction(
+                type='title_refresh' if title_len < 60 else 'image_refresh',
+                priority=1,
+                reason=f'CTR {ctr*100:.2f}% 低且价高于市中位, 但已贴 SAFE_15/成本地板 '
+                       f'${floor_price:.0f} (≥市中位 {FLOOR_OVER_MARKET_LOCK:.0%}); 降价空间为 0',
+                expected_lift='+CTR (非价格杠杆)',
+                detail={'current_price': price, 'floor_price': floor_price,
+                        'market_median': market_median, 'floor_locked': True},
+            ))
+        else:
+            actions.append(CroAction(
+                type='price_drop', priority=1,
+                reason=f'CTR {ctr*100:.2f}% < 健康 {HEALTHY_CTR*100:.1f}%; '
+                       f'售价 ${price:.0f} 高于市场中位 ${market_median:.0f} ({price_pos})',
+                expected_lift=f'+CTR (跟齐市场中位 ${target})',
+                detail={'current_price': price, 'suggested_price': target,
+                        'market_median': market_median, 'drop_pct': round((1 - target / price) * 100, 1)},
+            ))
 
     # 规则 3: 低 CTR + 价格 OK → 标题/主图问题
     if funnel == 'low_ctr' and price_pos in ('aligned', 'underpriced', 'unknown'):
@@ -172,19 +195,34 @@ def _build_actions(
     if funnel == 'low_cvr':
         if price_pos in ('overpriced', 'premium'):
             target = round(market_median * 0.98, 2)
-            actions.append(CroAction(
-                type='price_drop', priority=1,
-                reason=f'CVR {cvr*100:.2f}% < 健康 {HEALTHY_CVR*100:.1f}%; 浏览到下单流失大, 价格高于中位是首要因素',
-                expected_lift=f'+CVR (降至 ${target})',
-                detail={'current_price': price, 'suggested_price': target},
-            ))
+            if floor_locked:
+                actions.append(CroAction(
+                    type='title_refresh' if title_len < 60 else 'send_offer',
+                    priority=1,
+                    reason=f'CVR {cvr*100:.2f}% 低且价高于市中位, 但已贴 SAFE_15/成本地板 '
+                           f'${floor_price:.0f}; 无法再降价',
+                    expected_lift='+CVR (非价格杠杆)',
+                    detail={'current_price': price, 'floor_price': floor_price,
+                            'market_median': market_median, 'floor_locked': True},
+                ))
+            else:
+                actions.append(CroAction(
+                    type='price_drop', priority=1,
+                    reason=f'CVR {cvr*100:.2f}% < 健康 {HEALTHY_CVR*100:.1f}%; 浏览到下单流失大, 价格高于中位是首要因素',
+                    expected_lift=f'+CVR (降至 ${target})',
+                    detail={'current_price': price, 'suggested_price': target},
+                ))
         else:
-            actions.append(CroAction(
-                type='fill_specifics', priority=2,
-                reason=f'CVR {cvr*100:.2f}% < 健康 {HEALTHY_CVR*100:.1f}%; 价格 OK, 多半因 item specifics 或描述不全劝退',
-                expected_lift='+0.5-1.5% CVR',
-                detail={},
-            ))
+            # 仅当 specifics 偏少 (或未知) 时才入队 fill_specifics, 避免日日空跳过
+            needs_fill = (aspect_count is None) or (aspect_count < MIN_ASPECTS_FOR_FILL)
+            if needs_fill:
+                actions.append(CroAction(
+                    type='fill_specifics', priority=2,
+                    reason=f'CVR {cvr*100:.2f}% < 健康 {HEALTHY_CVR*100:.1f}%; 价格 OK, '
+                           f'specifics 偏少 (n={aspect_count if aspect_count is not None else "unknown"})',
+                    expected_lift='+0.5-1.5% CVR',
+                    detail={'aspect_count': aspect_count},
+                ))
             # 有点击不下单 → 给 watchers/加购买家发限时 offer 直接刺激下单.
             # 执行器 (cro_send_offer) 有保本地板价守门: offer 价不低于
             # PricingEngine 费率推导的最低净利率价, 无让利空间则 skip.
@@ -260,6 +298,29 @@ def diagnose_sku(product: Dict[str, Any], market_median: float = 0,
     title = product.get('title', '') or ''
     images = product.get('images', []) or []
     image_count = len(images) if isinstance(images, list) else int(images or 0)
+    raw_aspects = product.get('aspect_count', product.get('aspects'))
+    if raw_aspects is None:
+        aspect_count = None
+    elif isinstance(raw_aspects, dict):
+        aspect_count = len(raw_aspects)
+    elif isinstance(raw_aspects, list):
+        aspect_count = len(raw_aspects)
+    else:
+        try:
+            aspect_count = int(raw_aspects)
+        except Exception:
+            aspect_count = None
+    floor_price = float(product.get('floor_price') or product.get('safe_15') or 0)
+    if floor_price <= 0:
+        total_cost = float(product.get('total_cost') or 0)
+        if total_cost > 0:
+            try:
+                from src.services.pricing_engine import PricingEngine
+                floor_price = float(
+                    PricingEngine.calculate_selling_price(total_cost, 0.15)['selling_price']
+                )
+            except Exception:
+                floor_price = 0.0
 
     ctr = _calc_ctr(views, impressions)
     # CVR: 用 transactions/views; 若 transactions 缺失但 sold_qty 有, 退而求其次
@@ -276,6 +337,7 @@ def diagnose_sku(product: Dict[str, Any], market_median: float = 0,
         impressions=impressions, views=views, sold_qty=sold_qty,
         title_len=len(title), image_count=image_count, age_days=age_days,
         has_sales=has_sales, market_median=market_median, price=price,
+        aspect_count=aspect_count, floor_price=floor_price,
     )
 
     return CroDiagnosis(
