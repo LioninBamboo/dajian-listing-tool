@@ -111,6 +111,81 @@ def test_title_aspect_conflicts_flags_color_mismatch():
     }]
 
 
+def test_title_aspect_conflicts_allows_grey_gray_and_walnut_brown():
+    # 2026-10-08 rewrite log: Grey vs Gray and Walnut vs Brown skipped the run.
+    assert title_aspect_conflicts(
+        "Grey Velvet Sofa Modern Living Room Couch",
+        {"Color": ["Gray"]},
+    ) == []
+    assert title_aspect_conflicts(
+        "Gray Velvet Sofa Modern Living Room Couch",
+        {"Color": ["Grey"]},
+    ) == []
+    assert title_aspect_conflicts(
+        "Walnut Dining Table Mid Century",
+        {"Color": ["Brown"]},
+    ) == []
+    assert title_aspect_conflicts(
+        "Brown Dining Table Mid Century",
+        {"Color": ["Walnut"]},
+    ) == []
+    # "Light Grey" still names the gray family.
+    assert title_aspect_conflicts(
+        "Light Grey Bookshelf",
+        {"Color": ["Gray"]},
+    ) == []
+
+
+def test_title_aspect_conflicts_still_flags_different_hard_colors():
+    assert title_aspect_conflicts(
+        "Red Velvet Sofa Modern Living Room Couch",
+        {"Color": ["Blue"]},
+    ) == [{
+        "aspect": "Color",
+        "expected": "Blue",
+        "found": "RED",
+    }]
+    # Walnut does not excuse a different hard color written in the title.
+    assert title_aspect_conflicts(
+        "Red Walnut Dining Table",
+        {"Color": ["Brown"]},
+    ) == [{
+        "aspect": "Color",
+        "expected": "Brown",
+        "found": "RED",
+    }]
+    assert title_aspect_conflicts(
+        "Walnut Dining Table",
+        {"Color": ["Gray"]},
+    ) == [{
+        "aspect": "Color",
+        "expected": "Gray",
+        "found": "Walnut",
+    }]
+    # Nearby words stay mutually exclusive.
+    assert title_aspect_conflicts("Navy Sofa", {"Color": ["Blue"]}) == [{
+        "aspect": "Color",
+        "expected": "Blue",
+        "found": "Navy",
+    }]
+    assert title_aspect_conflicts("Espresso Desk", {"Color": ["Brown"]}) == [{
+        "aspect": "Color",
+        "expected": "Brown",
+        "found": "Espresso",
+    }]
+
+
+def test_title_aspect_conflicts_mattress_size_unchanged():
+    assert title_aspect_conflicts(
+        "Queen Upholstered Bed Frame",
+        {"Compatible Mattress Size": ["King"], "Color": ["Gray"]},
+    ) == [{
+        "aspect": "Compatible Mattress Size",
+        "expected": "King",
+        "found": "Queen",
+    }]
+
+
 def test_run_skips_candidate_with_title_aspect_conflict(tmp_db, tmp_path):
     conn = sqlite3.connect(str(tmp_db))
     conn.execute(
@@ -130,6 +205,26 @@ def test_run_skips_candidate_with_title_aspect_conflict(tmp_db, tmp_path):
     assert row['status'] == 'skipped'
     assert row['reason'] == 'title conflicts with SKU aspects'
     assert row['conflicts'][0]['aspect'] == 'Color'
+
+
+def test_run_allows_grey_title_against_gray_aspect(tmp_db, tmp_path):
+    conn = sqlite3.connect(str(tmp_db))
+    conn.execute(
+        "UPDATE collected_products SET optimization=? WHERE sku='PUB1'",
+        (json.dumps({
+            "title": "Grey Race Car Bed Kids Furniture",
+            "aspects": {"Color": ["Gray"], "Material": ["Plywood"]},
+        }),),
+    )
+    conn.commit()
+    conn.close()
+
+    rep = run(['PUB1'], apply_changes=False, limit=10,
+              db_path=tmp_db, logs_dir=tmp_path / 'logs')
+
+    row = next(r for r in rep['rows'] if r['sku'] == 'PUB1')
+    assert row['status'] == 'proposed'
+    assert 'Plywood' in row['new_title']
 
 
 # ── 防抖 (recently_rewritten_skus) ───────────────────────────
