@@ -88,6 +88,32 @@ def test_low_cvr_overpriced_floor_locked_skips_price_drop():
     assert any(a.detail.get('floor_locked') for a in d.actions)
 
 
+def test_low_ctr_floor_locked_short_title_uses_image_refresh():
+    # 短标题不能改推 title_refresh: 日队列不消费它
+    p = _p(imp=1000, views=5, tx=0, sold=0, price=230, title='short title')
+    p['floor_price'] = 230
+    d = diagnose_sku(p, market_median=100)
+    assert d.funnel_stage == 'low_ctr'
+    assert not any(a.type in ('price_drop', 'title_refresh') for a in d.actions)
+    images = [a for a in d.actions if a.type == 'image_refresh']
+    assert len(images) == 1
+    assert images[0].priority == 1
+    assert images[0].detail.get('floor_locked') is True
+
+
+def test_low_cvr_floor_locked_short_title_uses_send_offer():
+    # 短标题不能改推 title_refresh, 否则丢掉仍可执行的 send_offer
+    p = _p(imp=2000, views=100, tx=1, sold=1, price=230, title='short title')
+    p['floor_price'] = 230
+    d = diagnose_sku(p, market_median=100)
+    assert d.funnel_stage == 'low_cvr'
+    assert not any(a.type in ('price_drop', 'title_refresh') for a in d.actions)
+    offers = [a for a in d.actions if a.type == 'send_offer']
+    assert len(offers) == 1
+    assert offers[0].priority == 1
+    assert offers[0].detail.get('floor_locked') is True
+
+
 def test_healthy_funnel_no_actions_or_only_minor():
     # CTR=2%, CVR=3%, STR healthy
     d = diagnose_sku(_p(imp=1000, views=20, tx=1, sold=1, price=100), market_median=100)

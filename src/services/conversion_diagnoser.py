@@ -155,8 +155,9 @@ def _build_actions(
     if funnel == 'low_ctr' and price_pos in ('overpriced', 'premium'):
         target = round(market_median * 1.0, 2)
         if floor_locked:
+            # title_refresh 不在每日自动入队集合, 短标题也改走 image_refresh
             actions.append(CroAction(
-                type='title_refresh' if title_len < 60 else 'image_refresh',
+                type='image_refresh',
                 priority=1,
                 reason=f'CTR {ctr*100:.2f}% 低且价高于市中位, 但已贴 SAFE_15/成本地板 '
                        f'${floor_price:.0f} (≥市中位 {FLOOR_OVER_MARKET_LOCK:.0%}); 降价空间为 0',
@@ -196,8 +197,9 @@ def _build_actions(
         if price_pos in ('overpriced', 'premium'):
             target = round(market_median * 0.98, 2)
             if floor_locked:
+                # title_refresh 不在每日自动入队集合, 短标题也改走仍可执行的 send_offer
                 actions.append(CroAction(
-                    type='title_refresh' if title_len < 60 else 'send_offer',
+                    type='send_offer',
                     priority=1,
                     reason=f'CVR {cvr*100:.2f}% 低且价高于市中位, 但已贴 SAFE_15/成本地板 '
                            f'${floor_price:.0f}; 无法再降价',
