@@ -208,34 +208,39 @@ class EbayCategoryMatcher:
         # Porch/outdoor rockers are patio seating, not indoor Rockers & Gliders
         # (66690). Keyword "rocking chair" alone used to win and leave GrovePop
         # W465P255396 stuck in 66690 (2026-09-29).
-        has_outdoor_rocker = (
-            not has_porch_swing
-            and any(
-                kw in title_lower
-                for kw in (
-                    "outdoor rocking",
-                    "outdoor rocker",
-                    "patio rocking",
-                    "patio rocker",
-                    "porch rocker",
-                    "porch rocking",
-                    "garden rocking",
-                    "garden rocker",
-                    "rockers for outside",
-                    "rocker for outside",
-                    "rocking chair for outside",
-                    "outdoor rocking chair",
-                    "patio rocking chair",
-                    "porch rocking chair",
+        # A patio conversation/furniture set that merely includes a rocker is
+        # still a set (139849), not a single Outdoor Chair.
+        has_outdoor_rocker = (not has_patio_furniture_set) and (
+            (
+                not has_porch_swing
+                and any(
+                    kw in title_lower
+                    for kw in (
+                        "outdoor rocking",
+                        "outdoor rocker",
+                        "patio rocking",
+                        "patio rocker",
+                        "porch rocker",
+                        "porch rocking",
+                        "garden rocking",
+                        "garden rocker",
+                        "rockers for outside",
+                        "rocker for outside",
+                        "rocking chair for outside",
+                        "outdoor rocking chair",
+                        "patio rocking chair",
+                        "porch rocking chair",
+                    )
                 )
             )
-        ) or (
-            has_outdoor_context
-            and not has_porch_swing
-            and any(kw in title_lower for kw in ("rocking chair", "rocker", "rockers", "glider"))
-            and not any(
-                kw in title_lower
-                for kw in ("nursery", "living room", "bedroom", "indoor", "office")
+            or (
+                has_outdoor_context
+                and not has_porch_swing
+                and any(kw in title_lower for kw in ("rocking chair", "rocker", "rockers", "glider"))
+                and not any(
+                    kw in title_lower
+                    for kw in ("nursery", "living room", "bedroom", "indoor", "office")
+                )
             )
         )
         has_outdoor_chair = (
@@ -1204,7 +1209,7 @@ class EbayCategoryMatcher:
                 return False
 
         has_ottoman_title = any(marker in title_lower for marker in ottoman_markers + ("ottoman", "footstool", "pouf")) and not any(
-            marker in title_lower for marker in sofa_markers + ("armchair", "accent chair", "reading chair", "club chair", "chaise lounge", "recliner", "manual reclining", "reclining footrest")
+            marker in title_lower for marker in sofa_markers + ("sofa", "couch", "armchair", "accent chair", "reading chair", "club chair", "chaise lounge", "recliner", "manual reclining", "reclining footrest")
         )
         if has_ottoman_title:
             return cid in ottoman_categories
@@ -1410,12 +1415,14 @@ class EbayCategoryMatcher:
             "patio rocking chair",
             "porch rocking chair",
         )
-        if any(kw in title_lower for kw in outdoor_rocker_markers) or (
+        rocker_title = any(kw in title_lower for kw in outdoor_rocker_markers) or (
             any(kw in title_lower for kw in ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "porch"))
             and any(kw in title_lower for kw in ("rocking chair", "rocker", "rockers"))
             and "porch swing" not in title_lower
             and not any(kw in title_lower for kw in ("nursery", "living room", "bedroom", "indoor", "office"))
-        ):
+        )
+        # A conversation set that includes rockers is a patio set, not a chair.
+        if rocker_title and not any(marker in title_lower for marker in patio_furniture_set_markers):
             if cid not in outdoor_chair_categories:
                 return False
 

@@ -112,7 +112,13 @@ def _load_active_experiments() -> List[Dict[str, Any]]:
         return []
 
 
-def _fetch_live_price(sku: str, real_client) -> Optional[float]:
+def _fetch_live_price(sku: str, real_client, listing_id: Optional[str] = None) -> Optional[float]:
+    """Inventory offer price, then Trading GetItem for Motors listings.
+
+    Motors / Trading-channel listings have empty Inventory offers. Without the
+    GetItem fallback, live_price stays 0 and cap_bid_by_floor fail-opens.
+    """
+    price = 0.0
     try:
         offer = None
         getter = getattr(real_client, "get_offer_by_sku", None)
@@ -123,15 +129,27 @@ def _fetch_live_price(sku: str, real_client) -> Optional[float]:
             if callable(list_getter):
                 offers = list_getter(sku) or []
                 offer = offers[0] if offers else None
+        if offer:
+            price = float(offer.get('pricingSummary', {}).get('price', {}).get('value') or 0)
     except Exception as exc:
         logger.warning(f"获取 offer {sku} 失败: {exc}")
-        return None
-    if not offer:
+        price = 0.0
+    if price > 0:
+        return price
+    if not listing_id:
         return None
     try:
-        return float(offer.get('pricingSummary', {}).get('price', {}).get('value') or 0)
-    except Exception:
+        from src.services.ebay_ad_service import _trading_live_price
+        trading_price = _trading_live_price(listing_id)
+    except Exception as exc:
+        logger.warning(f"Trading GetItem 现价 {sku}/{listing_id} 失败: {exc}")
         return None
+    if trading_price and trading_price > 0:
+        logger.info(
+            f"{sku}: Inventory 无 offer, Trading GetItem 现价 ${float(trading_price):.2f}"
+        )
+        return float(trading_price)
+    return None
 
 
 def classify(impressions: int, ctr: float, sold_qty: int) -> str:
@@ -213,7 +231,7 @@ def build_plan(products_with_perf: List[Dict[str, Any]],
         total_cost = cost_info.get('total_cost', 0.0)
         live_price = 0.0
         if real_client and total_cost > 0:
-            lp = _fetch_live_price(sku, real_client)
+            lp = _fetch_live_price(sku, real_client, lid)
             if lp:
                 live_price = lp
 

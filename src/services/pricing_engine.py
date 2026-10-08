@@ -133,6 +133,30 @@ class PricingEngine:
         }
 
     @staticmethod
+    def _snapshot_is_oversize(
+        breakdown: dict | None,
+        specs: dict | None = None,
+        attributes: dict | None = None,
+    ) -> bool:
+        """Preserve the snapshot logistics-insurance class when rebuilding cost.
+
+        A stored 5% freight rate must not be recomputed at the 3.2% express
+        rate just because the caller omitted specs. ``Dimensions`` is only the
+        fallback when the snapshot has no recognized rate.
+        """
+        try:
+            rate = float((breakdown or {}).get("logistics_insurance_rate") or 0)
+        except (TypeError, ValueError):
+            rate = 0.0
+        freight = float(PricingEngine.LOGISTICS_INSURANCE_FREIGHT)
+        express = float(PricingEngine.LOGISTICS_INSURANCE_EXPRESS)
+        if abs(rate - freight) < 1e-6:
+            return True
+        if abs(rate - express) < 1e-6:
+            return False
+        return "Dimensions" in (specs or {}) or "Dimensions" in (attributes or {})
+
+    @staticmethod
     def resolve_landed_cost(
         cost_breakdown: dict | None = None,
         *,
@@ -161,7 +185,7 @@ class PricingEngine:
         except (TypeError, ValueError):
             fallback_ship = 0.0
         shipping = max(stored_ship, fallback_ship)
-        oversize = "Dimensions" in (specs or {}) or "Dimensions" in (attributes or {})
+        oversize = PricingEngine._snapshot_is_oversize(breakdown, specs, attributes)
         if product > 0:
             return PricingEngine.calculate_dajian_cost(product, shipping, oversize)[
                 "total_dajian_cost"

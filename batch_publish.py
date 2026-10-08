@@ -624,11 +624,22 @@ def calculate_smart_final_price(product: dict, market_price: float | None = None
             info = DaJianClient(key, secret).get_stock_info(product.get("sku") or "")
             live_price = info.get("price")
             live_ship = info.get("shipping_fee")
-            if live_price is not None:
-                product_price = float(live_price)
+            # get_stock_info returns 0 (not None) when price or freight is
+            # missing. A zero must not wipe a stored quote — especially a
+            # positive collected shipping amount.
+            try:
+                live_price_f = float(live_price) if live_price is not None else 0.0
+            except (TypeError, ValueError):
+                live_price_f = 0.0
+            try:
+                live_ship_f = float(live_ship) if live_ship is not None else 0.0
+            except (TypeError, ValueError):
+                live_ship_f = 0.0
+            if live_price_f > 0:
+                product_price = live_price_f
                 product["price"] = product_price
-            if live_ship is not None:
-                shipping = float(live_ship)
+            if live_ship_f > 0:
+                shipping = live_ship_f
                 product["shipping"] = shipping
             logger.info(
                 f"  [PRICE] Live supplier cost: price=${product_price:.2f} "

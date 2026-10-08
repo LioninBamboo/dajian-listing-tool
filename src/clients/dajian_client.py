@@ -444,6 +444,30 @@ class DaJianClient:
         """获取单个产品价格"""
         results = self.get_product_prices([sku])
         return results[0] if results else None
+
+    @staticmethod
+    def _quoted_shipping_fee(price_info: Dict) -> float:
+        """Use shippingFee when it is a real quote, else shippingFeeRange high end.
+
+        GIGA LTL freight often arrives only as ``shippingFeeRange``. Treating a
+        missing or zero ``shippingFee`` as $0 understates landed cost.
+        """
+        if not isinstance(price_info, dict):
+            return 0.0
+        raw = price_info.get("shippingFee")
+        try:
+            fee = float(raw) if raw is not None else 0.0
+        except (TypeError, ValueError):
+            fee = 0.0
+        if fee > 0:
+            return fee
+        rng = price_info.get("shippingFeeRange") or {}
+        if not isinstance(rng, dict):
+            return 0.0
+        try:
+            return float(rng.get("maxAmount") or 0)
+        except (TypeError, ValueError):
+            return 0.0
     
     # ==================== 库存查询 API ====================
     
@@ -858,7 +882,9 @@ class DaJianClient:
         
         available = price_info.get("skuAvailable", False)
         price = float(price_info.get("price", 0) or 0)
-        shipping = float(price_info.get("shippingFee", 0) or 0)
+        # LTL freight is often only in shippingFeeRange. A missing/zero
+        # shippingFee must not be reported as a real $0 freight quote.
+        shipping = self._quoted_shipping_fee(price_info)
         
         # 使用官方库存 API 获取数量
         qty = 0

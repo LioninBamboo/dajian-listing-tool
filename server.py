@@ -557,8 +557,6 @@ def analyze_product_task(sku: str):
                         attrs[a_key] = str(specs[p_key])
                     except (TypeError, ValueError):
                         pass
-            if "Product Weight (lbs.)" not in attrs and specs.get("Package Weight (lbs.)"):
-                attrs["Product Weight (lbs.)"] = str(specs["Package Weight (lbs.)"])
             product.specs = specs
             product.attributes = attrs
             flag_modified(product, 'specs')

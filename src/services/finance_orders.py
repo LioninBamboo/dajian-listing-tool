@@ -239,26 +239,44 @@ def lookup_giga_unit_cost(conn: sqlite3.Connection, sku: str) -> tuple[float, st
     """Return (unit_giga_cost, source) from collected_products."""
     from src.services.pricing_engine import PricingEngine
 
-    row = conn.execute(
-        "SELECT price, shipping, cost_breakdown FROM collected_products WHERE sku = ?",
-        (sku,),
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT price, shipping, cost_breakdown, specs, attributes "
+            "FROM collected_products WHERE sku = ?",
+            (sku,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = conn.execute(
+            "SELECT price, shipping, cost_breakdown FROM collected_products WHERE sku = ?",
+            (sku,),
+        ).fetchone()
     if not row:
         return 0.0, "sku_not_in_db"
 
     price, shipping, cb_raw = row[0], row[1], row[2]
-    cb = {}
-    if cb_raw:
+
+    def _as_obj(raw) -> dict:
+        if not raw:
+            return {}
         try:
-            cb = json.loads(cb_raw) if isinstance(cb_raw, str) else (cb_raw or {})
+            parsed = json.loads(raw) if isinstance(raw, str) else (raw or {})
         except Exception:
-            cb = {}
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    cb = _as_obj(cb_raw)
+    specs = _as_obj(row[3]) if len(row) > 3 else {}
+    attributes = _as_obj(row[4]) if len(row) > 4 else {}
 
     # Prefer resolve_landed_cost so omitted freight in the snapshot is rebuilt
-    # from collected_products.shipping.
+    # from collected_products.shipping. Pass specs/attributes so a missing
+    # insurance rate can still see the Dimensions oversize signal.
     if hasattr(PricingEngine, "resolve_landed_cost"):
         landed = PricingEngine.resolve_landed_cost(
-            cb, shipping_fallback=shipping or 0
+            cb,
+            shipping_fallback=shipping or 0,
+            specs=specs,
+            attributes=attributes,
         )
         if landed:
             return float(landed), "resolve_landed_cost"
