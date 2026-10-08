@@ -87,6 +87,15 @@ _COLOR_TERMS = {
     "beige", "cream", "ivory", "yellow", "pink", "purple", "orange",
     "gold", "silver", "navy", "natural", "walnut", "espresso",
 }
+# 同一族才视为同色. 只收已经能确定的同义:
+#   Grey/Gray 是拼写变体;
+#   Walnut 是棕色木纹, 不与 Brown 互斥.
+# 标题若另写了不同硬色 (Red、Blue, 或 Walnut 标题对 Gray aspect) 仍然冲突.
+# 刻意不并入 Navy/Blue、Espresso/Brown、Beige/Cream/Ivory 这类相近但不同的词.
+_COLOR_SYNONYM_GROUPS: Tuple[frozenset, ...] = (
+    frozenset({"gray", "grey"}),
+    frozenset({"brown", "walnut"}),
+)
 _MATTRESS_SIZE_TERMS = {
     "twin", "full", "queen", "king", "california king",
 }
@@ -173,13 +182,27 @@ def _aspect_value_key(aspects: Dict[str, Any], key: str) -> str:
     return _phrase_key(_first_meaningful_value((aspects or {}).get(key)))
 
 
+def _synonym_families(term: str,
+                      groups: Tuple[frozenset, ...]) -> set:
+    """Return synonym groups that contain this term or one of its tokens."""
+    tokens = set(term.split())
+    return {
+        group for group in groups
+        if term in group or tokens & group
+    }
+
+
 def _conflicting_known_term(title: str, expected: str,
-                            known_terms: set[str]) -> str:
+                            known_terms: set[str],
+                            synonym_groups: Tuple[frozenset, ...] = ()) -> str:
     if not expected:
         return ""
     expected_tokens = set(expected.split())
+    expected_families = _synonym_families(expected, synonym_groups)
     for term in sorted(known_terms, key=len, reverse=True):
         if term == expected or set(term.split()).issubset(expected_tokens):
+            continue
+        if expected_families & _synonym_families(term, synonym_groups):
             continue
         if _contains_phrase(title, term):
             return _title_case_keyword(term)
@@ -187,11 +210,17 @@ def _conflicting_known_term(title: str, expected: str,
 
 
 def title_aspect_conflicts(title: str, aspects: Dict[str, Any]) -> List[Dict[str, str]]:
-    """Return high-confidence title/SKU aspect mismatches before any live write."""
+    """Return high-confidence title/SKU aspect mismatches before any live write.
+
+    Color spelling twins (Grey/Gray) and the walnut/brown finish pair are the
+    same family, so they do not block a rewrite. A different hard color still
+    does. Mattress-size checks are unchanged.
+    """
     base = str(title or "")
     conflicts: List[Dict[str, str]] = []
     color = _aspect_value_key(aspects, "Color")
-    found_color = _conflicting_known_term(base, color, _COLOR_TERMS)
+    found_color = _conflicting_known_term(
+        base, color, _COLOR_TERMS, _COLOR_SYNONYM_GROUPS)
     if found_color:
         conflicts.append({
             "aspect": "Color",
