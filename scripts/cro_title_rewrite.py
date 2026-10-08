@@ -91,6 +91,7 @@ _COLOR_TERMS = {
 #   Grey/Gray 是拼写变体;
 #   Walnut 是棕色木纹, 不与 Brown 互斥.
 # 标题若另写了不同硬色 (Red、Blue, 或 Walnut 标题对 Gray aspect) 仍然冲突.
+# 复合色 (如 Gray, Walnut) 不并族: Brown 仍与其中的 Gray 冲突.
 # 刻意不并入 Navy/Blue、Espresso/Brown、Beige/Cream/Ivory 这类相近但不同的词.
 _COLOR_SYNONYM_GROUPS: Tuple[frozenset, ...] = (
     frozenset({"gray", "grey"}),
@@ -184,12 +185,25 @@ def _aspect_value_key(aspects: Dict[str, Any], key: str) -> str:
 
 def _synonym_families(term: str,
                       groups: Tuple[frozenset, ...]) -> set:
-    """Return synonym groups that contain this term or one of its tokens."""
+    """Return the synonym group that fully contains this term.
+
+    A compound such as "gray walnut" spans two groups and matches none, so
+    one component cannot excuse a different color in the same aspect.
+    """
     tokens = set(term.split())
-    return {
-        group for group in groups
-        if term in group or tokens & group
-    }
+    if not tokens:
+        return set()
+    return {group for group in groups if tokens <= group}
+
+
+def _synonym_present(title: str, value: str,
+                     groups: Tuple[frozenset, ...]) -> bool:
+    """True when the title already names this value's single synonym family."""
+    for group in _synonym_families(_phrase_key(value), groups):
+        for member in group:
+            if _contains_phrase(title, member):
+                return True
+    return False
 
 
 def _conflicting_known_term(title: str, expected: str,
@@ -213,8 +227,9 @@ def title_aspect_conflicts(title: str, aspects: Dict[str, Any]) -> List[Dict[str
     """Return high-confidence title/SKU aspect mismatches before any live write.
 
     Color spelling twins (Grey/Gray) and the walnut/brown finish pair are the
-    same family, so they do not block a rewrite. A different hard color still
-    does. Mattress-size checks are unchanged.
+    same family, so they do not block a rewrite. A compound color does not
+    inherit every family of its tokens. A different hard color still does.
+    Mattress-size checks are unchanged.
     """
     base = str(title or "")
     conflicts: List[Dict[str, str]] = []
@@ -260,17 +275,24 @@ def build_enriched_title(title: str, aspects: Dict[str, Any],
         candidate_title = " ".join(parts)
         if _contains_phrase(candidate_title, value):
             continue
+        if key == "Color" and _synonym_present(
+                candidate_title, value, _COLOR_SYNONYM_GROUPS):
+            continue
         if current_len + 1 + len(value) > max_length:
             continue
         parts.append(value)
         added.append(value)
         current_len += 1 + len(value)
+    color_key = _phrase_key(_first_meaningful_value((aspects or {}).get("Color")))
     for raw_keyword in hot_keywords or []:
         value = _supported_hot_keyword(raw_keyword, aspects or {})
         if not value:
             continue
         candidate_title = " ".join(parts)
         if _contains_phrase(candidate_title, value):
+            continue
+        if (color_key and _phrase_key(value) == color_key and _synonym_present(
+                candidate_title, value, _COLOR_SYNONYM_GROUPS)):
             continue
         if current_len + 1 + len(value) > max_length:
             continue

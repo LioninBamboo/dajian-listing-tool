@@ -44,6 +44,36 @@ def test_enrich_skips_keywords_already_in_title():
     assert build_enriched_title(title, aspects) is None
 
 
+def test_enrich_skips_color_synonym_already_in_title():
+    title = "Grey Race Car Bed Kids Furniture"
+    res = build_enriched_title(
+        title,
+        {"Color": ["Gray"], "Material": ["Plywood"]},
+        hot_keywords=["gray"],
+    )
+    assert res is not None
+    assert res["added_keywords"] == ["Plywood"]
+    assert "Gray" not in res["new_title"]
+    assert res["added_hot_keywords"] == []
+
+    walnut = build_enriched_title(
+        "Walnut Dining Table Mid Century",
+        {"Color": ["Brown"], "Material": ["Wood"]},
+    )
+    assert walnut is not None
+    assert "Brown" not in walnut["new_title"]
+    assert "Wood" in walnut["added_keywords"]
+
+    # Brown/Walnut are color twins only. A Walnut material still gets appended.
+    material = build_enriched_title(
+        "Brown Dining Table Mid Century",
+        {"Material": ["Walnut"]},
+        hot_keywords=["walnut"],
+    )
+    assert material is not None
+    assert "Walnut" in material["added_keywords"]
+
+
 def test_enrich_word_boundary_no_substring_false_positive():
     # 标题含 Blueprint, 但 Color=Blue 仍应被视为缺失
     title = "Blueprint Pattern Area Rug Soft"
@@ -175,6 +205,38 @@ def test_title_aspect_conflicts_still_flags_different_hard_colors():
     }]
 
 
+def test_title_aspect_conflicts_compound_color_does_not_share_families():
+    # Gray+Walnut must not excuse Brown: Brown still contradicts Gray.
+    assert title_aspect_conflicts(
+        "Brown Dining Table Mid Century",
+        {"Color": ["Gray, Walnut"]},
+    ) == [{
+        "aspect": "Color",
+        "expected": "Gray Walnut",
+        "found": "Brown",
+    }]
+    assert title_aspect_conflicts(
+        "Grey Dining Table Mid Century",
+        {"Color": ["Gray, Walnut"]},
+    ) == [{
+        "aspect": "Color",
+        "expected": "Gray Walnut",
+        "found": "Grey",
+    }]
+    assert title_aspect_conflicts(
+        "Gray Dining Table Mid Century",
+        {"Color": ["Walnut, Brown"]},
+    ) == [{
+        "aspect": "Color",
+        "expected": "Walnut Brown",
+        "found": "Gray",
+    }]
+    assert title_aspect_conflicts(
+        "Walnut Dining Table Mid Century",
+        {"Color": ["Gray, Walnut"]},
+    ) == []
+
+
 def test_title_aspect_conflicts_mattress_size_unchanged():
     assert title_aspect_conflicts(
         "Queen Upholstered Bed Frame",
@@ -225,6 +287,7 @@ def test_run_allows_grey_title_against_gray_aspect(tmp_db, tmp_path):
     row = next(r for r in rep['rows'] if r['sku'] == 'PUB1')
     assert row['status'] == 'proposed'
     assert 'Plywood' in row['new_title']
+    assert 'Gray' not in row['new_title']
 
 
 # ── 防抖 (recently_rewritten_skus) ───────────────────────────
