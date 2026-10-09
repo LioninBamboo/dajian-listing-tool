@@ -2427,7 +2427,8 @@ def ensure_store_description_template(
 
 
 
-_SET_WORD_RE = re.compile(r"\bsets?\b", re.IGNORECASE)
+# Own word only. \b still matches SET inside a hyphenated MPN such as ABC-SET-1.
+_SET_WORD_RE = re.compile(r"(?<![\w-])sets?(?![\w-])", re.IGNORECASE)
 _PKG_QTY_RE = re.compile(r"(\d+)\s*[x\u00d7]\s*([^,;<]+)", re.IGNORECASE)
 _PKG_ACCESSORY_TOKENS = ("hardware", "assembly", "instruction", "pillow", "screw", "bolt")
 
@@ -2459,16 +2460,30 @@ def _claimed_set_or_pieces_qty(
 
 
 def _text_claims_set(title: str, aspects: Mapping[str, Any] | None = None) -> bool:
+    """True when the title or Type calls this product a set.
+
+    Other item specifics are not a quantity claim. Sectional profiles write
+    Set Includes=Sofa Set for a single sofa, and MPNs may contain SET.
+    Piece counts are read separately.
+    """
     if _SET_WORD_RE.search(title or ""):
         return True
-    for value in (aspects or {}).values():
-        if isinstance(value, (list, tuple)):
-            blob = " ".join(str(item) for item in value)
-        else:
-            blob = str(value or "")
-        if _SET_WORD_RE.search(blob):
-            return True
-    return False
+    type_name = first_aspect_text(aspects or {}, "Type") or ""
+    return bool(_SET_WORD_RE.search(type_name))
+
+
+def _is_singular_piece_of_set_type(type_name: str, item_name: str) -> bool:
+    """Box line is the repeated product, not one component of a mixed set.
+
+    ``Floor Mat`` is the singular piece of Type ``Floor Mat Set``.
+    ``Dining Table`` is a component of Type ``Dining Set``.
+    """
+    if _SET_WORD_RE.search(item_name or ""):
+        return False
+    singular = _SET_WORD_RE.sub(" ", type_name or "")
+    singular = re.sub(r"\s+", " ", singular).strip(" -")
+    item = re.sub(r"\s+", " ", item_name or "").strip()
+    return bool(singular) and singular.casefold() == item.casefold()
 
 
 def expected_package_includes_main_qty(
@@ -2550,7 +2565,8 @@ def find_package_includes_set_qty_mismatch(
     """Flag title/aspect Set or Number of Pieces vs PACKAGE INCLUDES qty.
 
     A Type that already names a set product still passes when the box line is
-    ``1 x {that set}`` (one set ships). ``1 x`` of the singular piece, or any
+    ``1 x {that set}`` (one set ships), or when the box lists mixed components
+    such as a table and chairs. ``1 x`` of that Type's singular piece, or any
     other qty that disagrees with Set / Number of Pieces / Number of Items in
     Set, is a blocker. Motors QC calls this directly so universal-fit parts
     are not exempt.
@@ -2571,6 +2587,16 @@ def find_package_includes_set_qty_mismatch(
         actual == 1
         and _SET_WORD_RE.search(type_name)
         and _SET_WORD_RE.search(item_name)
+    ):
+        return None
+
+    # Dining, patio, and play table-and-chair sets list components. The first
+    # line's qty is not the set's piece count. A repeated singular piece
+    # ("1 x Floor Mat" for Type "Floor Mat Set") is still compared below.
+    if (
+        _SET_WORD_RE.search(type_name)
+        and not _SET_WORD_RE.search(item_name)
+        and not _is_singular_piece_of_set_type(type_name, item_name)
     ):
         return None
 

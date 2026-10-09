@@ -2333,3 +2333,49 @@ def test_package_includes_flags_set_type_when_box_lists_one_singular_item():
     )
     assert issue is not None
     assert issue.code == "package_includes_set_qty_mismatch"
+
+
+def test_package_includes_ignores_set_word_outside_title_and_type():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    # Sectional profiles write Set Includes=Sofa Set for one sofa.
+    assert find_package_includes_set_qty_mismatch(
+        "Modern U-Shaped Modular Sectional Sofa",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Sectional</p>",
+        {
+            "Type": ["Sectional"],
+            "Set Includes": ["Sofa Set"],
+            "Manufacturer Part Number": ["ABC-SET-1"],
+        },
+    ) is None
+    # A hyphenated MPN is not the word "set", even in the title.
+    assert find_package_includes_set_qty_mismatch(
+        "Cabin Air Filter ABC-SET-1",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Cabin Air Filter</p>",
+        {"Type": ["Cabin Air Filter"], "MPN": ["ABC-SET-1"]},
+    ) is None
+
+
+def test_package_includes_allows_mixed_component_sets():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    assert find_package_includes_set_qty_mismatch(
+        "5-Piece Outdoor Acacia Wood Round Dining Set with 4 Barrel Chairs",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Dining Table, 4 x Dining Chair</p>",
+        {
+            "Type": ["Dining Set"],
+            "Number of Pieces": ["5"],
+            "Number of Items in Set": ["5"],
+            "Set Includes": ["Dining Table & Chairs"],
+        },
+    ) is None
+    assert find_package_includes_set_qty_mismatch(
+        "Outdoor Patio Conversation Set with Cushions",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Sofa, 2 x Chair, 1 x Table</p>",
+        {"Type": ["Patio Furniture Set"], "Number of Pieces": ["4"], "Set Includes": ["Sofa Set"]},
+    ) is None
+    assert find_package_includes_set_qty_mismatch(
+        "Kids Play Table and Chair Set",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Play Table, 2 x Chair</p>",
+        {"Type": ["Play Table & Chair Set"], "Number of Pieces": ["3"]},
+    ) is None
