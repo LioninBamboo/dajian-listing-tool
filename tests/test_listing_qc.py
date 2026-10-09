@@ -599,6 +599,112 @@ def test_motors_blocks_invented_capacity_against_source(monkeypatch):
     assert not any(item.startswith("[Fitment]") for item in result["blockers"])
 
 
+def test_motors_capacity_ignores_displacement_seat_covers_and_install_labor():
+    violations = listing_qc.motors_deterministic_fact_violations(
+        {
+            "title": "5.0 Liter Intake Gasket",
+            "description": "Fits 5.0 liter engines. Includes 4 seat covers. 1 person assembly.",
+            "aspects": {},
+        },
+        source_title="Intake Gasket",
+        source_description="Intake gasket for the engine.",
+    )
+
+    assert not any(item["claim_type"] == "semantic_capacity" for item in violations)
+
+
+def test_motors_source_person_range_supports_values_inside_it():
+    for live in ("4 persons", "3 persons"):
+        violations = listing_qc.motors_deterministic_fact_violations(
+            {
+                "title": f"UTV Seat {live}",
+                "description": f"Seats {live}.",
+                "aspects": {},
+            },
+            source_title="UTV Seat",
+            source_description="Seats 2-4 persons.",
+        )
+        assert not any(item["claim_type"] == "semantic_capacity" for item in violations), live
+
+
+def test_motors_person_capacity_above_source_range_still_blocks():
+    violations = listing_qc.motors_deterministic_fact_violations(
+        {
+            "title": "6 Person UTV Seat",
+            "description": "Seats 6 persons.",
+            "aspects": {},
+        },
+        source_title="UTV Seat",
+        source_description="Seats 2-4 persons.",
+    )
+
+    assert any(item["claim_type"] == "semantic_capacity" and "6" in item["claim_text"] for item in violations)
+
+
+def test_motors_displacement_liter_does_not_authorize_a_fuel_can():
+    violations = listing_qc.motors_deterministic_fact_violations(
+        {
+            "title": "5 Gallon Fuel Can",
+            "description": "Portable 5 gallon fuel can.",
+            "aspects": {},
+        },
+        source_title="Intake Gasket",
+        source_description="Fits 5.0 liter engines.",
+    )
+
+    assert any(item["claim_type"] == "semantic_capacity" and "5" in item["claim_text"] for item in violations)
+
+
+def test_motors_liter_fuel_can_still_blocks_when_invented():
+    violations = listing_qc.motors_deterministic_fact_violations(
+        {
+            "title": "20 Liter Fuel Can",
+            "description": "Portable 20 liter fuel can.",
+            "aspects": {},
+        },
+        source_title="Fuel Can",
+        source_description="10 liter fuel can.",
+    )
+
+    assert any(item["claim_type"] == "semantic_capacity" and "20" in item["claim_text"] for item in violations)
+
+
+def test_motors_abs_brakes_are_not_a_material_invent():
+    violations = listing_qc.motors_deterministic_fact_violations(
+        {
+            "title": "ABS Wheel Speed Sensor",
+            "description": "Front ABS sensor with ABS module connector.",
+            "aspects": {"Material": ["ABS"]},
+        },
+        source_title="Wheel Speed Sensor",
+        source_description="Steel wheel speed sensor.",
+        source_attributes={"Material": "Steel"},
+    )
+
+    assert not any(
+        item["claim_type"] == "semantic_material" and item["claim_text"] == "abs"
+        for item in violations
+    )
+
+
+def test_motors_abs_plastic_still_blocks_when_invented():
+    violations = listing_qc.motors_deterministic_fact_violations(
+        {
+            "title": "Sensor Cover",
+            "description": "Molded ABS plastic housing.",
+            "aspects": {},
+        },
+        source_title="Sensor Cover",
+        source_description="Steel bracket.",
+        source_attributes={"Material": "Steel"},
+    )
+
+    assert any(
+        item["claim_type"] == "semantic_material" and item["claim_text"] == "abs"
+        for item in violations
+    )
+
+
 def test_motors_universal_fit_still_blocks_claim_invent(monkeypatch):
     _forbid_furniture_gate(monkeypatch)
     result = listing_qc.run_listing_qc(

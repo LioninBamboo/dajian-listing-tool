@@ -122,7 +122,9 @@ _COLOR_RE = re.compile(
 )
 _COLOR_CANONICAL = {"grey": "gray"}
 _CAPACITY_RE = re.compile(
-    r"\b(?P<num>\d+(?:\.\d+)?)\s*(?:(?:-|–|to)\s*\d+(?:\.\d+)?\s*)?"
+    r"\b(?P<num>\d+(?:\.\d+)?)"
+    r"(?:\s*(?:-|–|to)\s*(?P<high>\d+(?:\.\d+)?))?"
+    r"\s*"
     r"(?P<unit>persons?|people|seats?|seaters?|occupants?|gallons?|gals?|quarts?|liters?|litres?)\b",
     re.IGNORECASE,
 )
@@ -134,6 +136,28 @@ _VOLUME_UNITS = {
     "gallon", "gallons", "gal", "gals", "quart", "quarts",
     "liter", "liters", "litre", "litres",
 }
+# Bare "ABS" on AquaRides is anti-lock brakes, not ABS plastic.
+_ABS_PLASTIC_CONTEXT = re.compile(
+    r"\babs(?:\s*[-/]?\s*|\s+)(?:plastic|resin|polymer)\b",
+    re.IGNORECASE,
+)
+_SEAT_COVER_AFTER = re.compile(r"[\s-]+covers?\b", re.IGNORECASE)
+_INSTALL_LABOR_AFTER = re.compile(
+    r"\s+(?:(?:needed|required)\s+)?(?:to\s+)?"
+    r"(?:assembl(?:e|y|ing)|install(?:ation|ing)?)\b",
+    re.IGNORECASE,
+)
+# Liter is engine displacement unless the quantity names a container.
+# "5.0 liter" / "fuel injected 5.0 liter" must not become a fuel-can claim.
+_LITER_CONTAINER_AFTER = re.compile(
+    r"\s+(?:(?:fuel|gas|gasoline|petrol|diesel|oil|coolant|water|jerry)(?:\s+|-))?"
+    r"(?:cans?|tanks?|jugs?|bottles?|containers?|reservoirs?)\b",
+    re.IGNORECASE,
+)
+_MODAL_CAN_AFTER = re.compile(
+    r"\s+cans?\s+(?!for\b|with\b|and\b|or\b|plus\b)",
+    re.IGNORECASE,
+)
 
 
 def _plain_blob(*parts: object) -> str:
@@ -154,13 +178,20 @@ def _plain_blob(*parts: object) -> str:
 
 def _material_terms(text: str, structured: Mapping[str, Any] | None) -> list[str]:
     found = set(_fact_sheet.lexical_materials(text))
+    abs_is_plastic = bool(_ABS_PLASTIC_CONTEXT.search(text or ""))
+    if "abs" in found and not abs_is_plastic:
+        found.discard("abs")
     for key, value in (structured or {}).items():
         if "material" not in str(key).lower():
             continue
         raw_values = value if isinstance(value, (list, tuple, set)) else [value]
         for raw in raw_values:
-            for part in re.split(r"\s*(?:\+|,|/|&|\band\b)\s*", str(raw or ""), flags=re.IGNORECASE):
+            raw_text = str(raw or "")
+            raw_is_plastic = abs_is_plastic or bool(_ABS_PLASTIC_CONTEXT.search(raw_text))
+            for part in re.split(r"\s*(?:\+|,|/|&|\band\b)\s*", raw_text, flags=re.IGNORECASE):
                 cleaned = re.sub(r"\s+", " ", part).strip(" .;:()[]").lower()
+                if cleaned == "abs" and not raw_is_plastic:
+                    continue
                 if cleaned:
                     found.add(cleaned)
     return sorted(found)
@@ -214,19 +245,44 @@ def _capacity_number(raw: str) -> str:
     return f"{value:g}"
 
 
-def _capacity_mentions(text: str) -> list[tuple[str, str, str]]:
-    mentions: list[tuple[str, str, str]] = []
-    seen: set[tuple[str, str]] = set()
+def _capacity_match_is_noise(match: re.Match[str], text: str) -> bool:
+    """Seat-cover counts, install labor, and engine liters are not capacity."""
+    unit = match.group("unit").lower()
+    after = text[match.end():]
+    if unit in {"seat", "seats"} and _SEAT_COVER_AFTER.match(after):
+        return True
+    if unit in {"person", "persons", "people"} and _INSTALL_LABOR_AFTER.match(after):
+        return True
+    if unit in {"liter", "liters", "litre", "litres"}:
+        if not _LITER_CONTAINER_AFTER.match(after) or _MODAL_CAN_AFTER.match(after):
+            return True
+    return False
+
+
+def _capacity_mentions(text: str) -> list[tuple[float, float, str, str]]:
+    """Return (low, high, family, raw) spans. A single number has low == high.
+
+    ``2-4 persons`` keeps both ends so a live ``4 persons`` claim is inside
+    the source span. Interior values are inside the same span.
+    """
+    mentions: list[tuple[float, float, str, str]] = []
+    seen: set[tuple[float, float, str]] = set()
     for match in _CAPACITY_RE.finditer(text or ""):
+        if _capacity_match_is_noise(match, text or ""):
+            continue
         family = _capacity_family(match.group("unit"))
         if not family:
             continue
-        number = _capacity_number(match.group("num"))
-        key = (number, family)
+        low = float(match.group("num"))
+        high_raw = match.group("high")
+        high = float(high_raw) if high_raw else low
+        if high < low:
+            low, high = high, low
+        key = (low, high, family)
         if key in seen:
             continue
         seen.add(key)
-        mentions.append((number, family, match.group(0).strip().lower()))
+        mentions.append((low, high, family, match.group(0).strip().lower()))
     return mentions
 
 
@@ -301,15 +357,15 @@ def motors_deterministic_fact_violations(
         )
 
     source_caps = _capacity_mentions(source_text)
-    source_by_family: dict[str, set[str]] = {}
-    for number, family, _raw in source_caps:
-        source_by_family.setdefault(family, set()).add(number)
-    for number, family, raw in _capacity_mentions(candidate_text):
-        known = source_by_family.get(family) or set()
-        if number in known:
+    for low, high, family, raw in _capacity_mentions(candidate_text):
+        same_family = [span for span in source_caps if span[2] == family]
+        if any(src_low <= low and high <= src_high for src_low, src_high, _family, _raw in same_family):
             continue
-        if known:
-            evidence = ", ".join(sorted(known, key=float))
+        if same_family:
+            known_values = sorted(
+                {endpoint for src_low, src_high, _family, _raw in same_family for endpoint in (src_low, src_high)}
+            )
+            evidence = ", ".join(_capacity_number(str(value)) for value in known_values)
             severity = "CRITICAL"
             claim_text = f"{raw} (source: {evidence})"
         else:
