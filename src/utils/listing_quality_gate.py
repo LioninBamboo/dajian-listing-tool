@@ -2427,6 +2427,50 @@ def ensure_store_description_template(
 
 
 
+_SET_WORD_RE = re.compile(r"\bsets?\b", re.IGNORECASE)
+_PKG_QTY_RE = re.compile(r"(\d+)\s*[x\u00d7]\s*([^,;<]+)", re.IGNORECASE)
+_PKG_ACCESSORY_TOKENS = ("hardware", "assembly", "instruction", "pillow", "screw", "bolt")
+
+
+def _parse_piece_count(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    match = re.match(r"\s*(\d+)\b", str(raw).strip())
+    if not match:
+        return None
+    try:
+        count = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return count if count > 1 else None
+
+
+def _claimed_set_or_pieces_qty(
+    title: str,
+    aspects: Mapping[str, Any] | None = None,
+) -> int | None:
+    """Set-of-N from Number of Items in Set, Number of Pieces, or the title."""
+    aspects = aspects or {}
+    for key in ("Number of Items in Set", "Number of Pieces"):
+        count = _parse_piece_count(first_aspect_text(aspects, key))
+        if count:
+            return count
+    return _parse_piece_count(infer_number_of_items_in_set(title or ""))
+
+
+def _text_claims_set(title: str, aspects: Mapping[str, Any] | None = None) -> bool:
+    if _SET_WORD_RE.search(title or ""):
+        return True
+    for value in (aspects or {}).values():
+        if isinstance(value, (list, tuple)):
+            blob = " ".join(str(item) for item in value)
+        else:
+            blob = str(value or "")
+        if _SET_WORD_RE.search(blob):
+            return True
+    return False
+
+
 def expected_package_includes_main_qty(
     title: str,
     aspects: Mapping[str, Any] | None = None,
@@ -2434,35 +2478,17 @@ def expected_package_includes_main_qty(
     """Expected main-product qty in PACKAGE INCLUDES for singular Type listings.
 
     Returns None when Type already denotes a set product, or when no set count
-    is stated in aspects/title. Used by the quality gate and tests.
+    is stated in aspects/title. Number of Pieces is read the same way as
+    Number of Items in Set. Used by the quality gate and tests.
     """
     aspects = aspects or {}
     type_name = first_aspect_text(aspects, "Type") or ""
-    if re.search(r"\bsets?\b", type_name, flags=re.IGNORECASE):
+    if _SET_WORD_RE.search(type_name):
         return None
-
-    nis = first_aspect_text(aspects, "Number of Items in Set")
-    if nis:
-        try:
-            n = int(str(nis).strip())
-            if n > 1:
-                return n
-        except (TypeError, ValueError):
-            pass
-
-    inferred = infer_number_of_items_in_set(title or "")
-    if inferred:
-        try:
-            n = int(str(inferred).strip())
-            if n > 1:
-                return n
-        except (TypeError, ValueError):
-            pass
-    return None
+    return _claimed_set_or_pieces_qty(title, aspects)
 
 
-def parse_package_includes_main_qty(description: str) -> int | None:
-    """Parse the first non-accessory Nx item from the PACKAGE INCLUDES block."""
+def _package_includes_blob(description: str) -> str | None:
     if not description:
         return None
     match = re.search(
@@ -2470,26 +2496,50 @@ def parse_package_includes_main_qty(description: str) -> int | None:
         description,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    if not match:
-        # plain-text fallback
-        match = re.search(
-            r"PACKAGE\s+INCLUDES\s*[:\n]\s*([^\n<]+)",
-            description,
-            flags=re.IGNORECASE,
-        )
-    if not match:
+    if match:
+        return html_lib.unescape(match.group(1)).strip()
+    match = re.search(
+        r"PACKAGE\s+INCLUDES\s*[:\n]\s*([^\n<]+)",
+        description,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return html_lib.unescape(match.group(1)).strip()
+    loose = re.search(
+        r"PACKAGE\s+INCLUDES\b(.{0,500})",
+        description,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not loose:
         return None
-    pkg_text = html_lib.unescape(match.group(1)).strip()
-    skip = ("hardware", "assembly", "instruction", "pillow", "screw", "bolt")
-    for qm in re.finditer(r"(\d+)\s*[x\u00d7]\s*([^,;<]+)", pkg_text, flags=re.IGNORECASE):
-        name = qm.group(2).strip().lower()
-        if any(token in name for token in skip):
+    chunk = re.sub(r"<[^>]+>", " ", loose.group(1))
+    chunk = html_lib.unescape(chunk)
+    chunk = re.sub(r"\s+", " ", chunk).strip(" :-")
+    return chunk or None
+
+
+def parse_package_includes_main_item(description: str) -> tuple[int, str] | None:
+    """First non-accessory ``N x name`` pair in the PACKAGE INCLUDES block."""
+    pkg_text = _package_includes_blob(description)
+    if not pkg_text:
+        return None
+    for qm in _PKG_QTY_RE.finditer(pkg_text):
+        name = qm.group(2).strip()
+        if any(token in name.lower() for token in _PKG_ACCESSORY_TOKENS):
             continue
         try:
-            return int(qm.group(1))
+            return int(qm.group(1)), name
         except (TypeError, ValueError):
             return None
     return None
+
+
+def parse_package_includes_main_qty(description: str) -> int | None:
+    """Parse the first non-accessory Nx item from the PACKAGE INCLUDES block."""
+    parsed = parse_package_includes_main_item(description)
+    if parsed is None:
+        return None
+    return parsed[0]
 
 
 def find_package_includes_set_qty_mismatch(
@@ -2497,20 +2547,47 @@ def find_package_includes_set_qty_mismatch(
     description: str,
     aspects: Mapping[str, Any] | None = None,
 ) -> ListingQualityIssue | None:
-    """Flag title/aspect set-of-N vs PACKAGE INCLUDES main qty mismatch."""
-    expected = expected_package_includes_main_qty(title, aspects)
-    if not expected or expected <= 1:
+    """Flag title/aspect Set or Number of Pieces vs PACKAGE INCLUDES qty.
+
+    A Type that already names a set product still passes when the box line is
+    ``1 x {that set}`` (one set ships). ``1 x`` of the singular piece, or any
+    other qty that disagrees with Set / Number of Pieces / Number of Items in
+    Set, is a blocker. Motors QC calls this directly so universal-fit parts
+    are not exempt.
+    """
+    aspects = aspects or {}
+    parsed = parse_package_includes_main_item(description)
+    if parsed is None:
         return None
-    actual = parse_package_includes_main_qty(description)
-    if actual is None:
+    actual, item_name = parsed
+    expected = _claimed_set_or_pieces_qty(title, aspects)
+    if expected and actual == expected:
         return None
-    if actual == expected:
+
+    type_name = first_aspect_text(aspects, "Type") or ""
+    # One named set in the box: "1 x Wood Chisel Set" / "1 x Socket Set".
+    # The piece count describes what is inside that set, not extra sets.
+    if (
+        actual == 1
+        and _SET_WORD_RE.search(type_name)
+        and _SET_WORD_RE.search(item_name)
+    ):
         return None
-    return ListingQualityIssue(
-        "package_includes_set_qty_mismatch",
-        f"PACKAGE INCLUDES main qty is {actual} but title/aspects say set of {expected}",
-        field="description",
-    )
+
+    if expected and actual != expected:
+        return ListingQualityIssue(
+            "package_includes_set_qty_mismatch",
+            f"PACKAGE INCLUDES main qty is {actual} but title/aspects say set of {expected}",
+            field="description",
+        )
+
+    if actual == 1 and not _SET_WORD_RE.search(item_name) and _text_claims_set(title, aspects):
+        return ListingQualityIssue(
+            "package_includes_set_qty_mismatch",
+            "PACKAGE INCLUDES main qty is 1 but title/aspects say Set",
+            field="description",
+        )
+    return None
 
 
 def validate_listing_quality(
