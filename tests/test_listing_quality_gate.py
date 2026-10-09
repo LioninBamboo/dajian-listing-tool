@@ -2283,3 +2283,53 @@ def test_package_includes_skips_type_that_is_already_a_set():
     description = "<h3>PACKAGE INCLUDES</h3><p>1 x Wood Chisel Set</p>"
     aspects = {"Type": ["Wood Chisel Set"], "Number of Items in Set": ["10"]}
     assert find_package_includes_set_qty_mismatch(title, description, aspects) is None
+
+
+def test_package_includes_flags_number_of_pieces_vs_1x():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    issue = find_package_includes_set_qty_mismatch(
+        "Universal Fit Floor Mat",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Floor Mat</p>",
+        {"Type": ["Floor Mat"], "Number of Pieces": ["4"]},
+    )
+    assert issue is not None
+    assert issue.code == "package_includes_set_qty_mismatch"
+    assert "4" in issue.message
+    assert "1" in issue.message
+
+
+def test_package_includes_flags_set_word_when_box_lists_one_piece():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    issue = find_package_includes_set_qty_mismatch(
+        "Cabin Air Filter Set",
+        "<strong>PACKAGE INCLUDES</strong> 1 x Cabin Air Filter",
+        {"Type": ["Cabin Air Filter"]},
+    )
+    assert issue is not None
+    assert issue.code == "package_includes_set_qty_mismatch"
+
+
+def test_package_includes_flags_pieces_mismatch_other_than_one():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    issue = find_package_includes_set_qty_mismatch(
+        "Floor Mat",
+        "PACKAGE INCLUDES: 2 x Floor Mat",
+        {"Number of Pieces": ["4"]},
+    )
+    assert issue is not None
+    assert "4" in issue.message
+
+
+def test_package_includes_flags_set_type_when_box_lists_one_singular_item():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    issue = find_package_includes_set_qty_mismatch(
+        "All Weather Floor Mat",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Floor Mat</p>",
+        {"Type": ["Floor Mat Set"], "Number of Pieces": ["4"]},
+    )
+    assert issue is not None
+    assert issue.code == "package_includes_set_qty_mismatch"

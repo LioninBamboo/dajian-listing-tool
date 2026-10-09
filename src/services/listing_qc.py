@@ -68,6 +68,23 @@ def resolve_qc_profile(explicit: str | None = None) -> str:
         return "furniture"
 
 
+def motors_package_includes_issues(candidate: Mapping[str, Any]) -> list[Any]:
+    """Set / Number of Pieces vs PACKAGE INCLUDES. Independent of fitment.
+
+    Motors QC used to return after the fitment check alone. Universal-fit
+    parts therefore never saw the same deterministic mismatch Main already
+    flags as ``package_includes_set_qty_mismatch``. This does not synthesize
+    Year/Make/Model rows.
+    """
+    aspects = candidate.get("aspects") if isinstance(candidate.get("aspects"), Mapping) else {}
+    issue = _quality_gate.find_package_includes_set_qty_mismatch(
+        str(candidate.get("title") or ""),
+        str(candidate.get("description") or ""),
+        aspects,
+    )
+    return [issue] if issue is not None else []
+
+
 def motors_fitment_blockers(candidate: Mapping[str, Any]) -> list[str]:
     analysis = analyze_ebay_motors_compatibility(
         category_id=str(candidate.get("categoryId") or ""),
@@ -173,8 +190,12 @@ def run_listing_qc(
 
     if profile == "motors":
         result["fact_sheet_status"] = "skipped"
-        result["blockers"] = motors_fitment_blockers(candidate)
-        result["blockers"] = _dedupe(result["blockers"])
+        package_issues = motors_package_includes_issues(candidate)
+        result["quality_issues"] = [_serialize_quality_issue(issue) for issue in package_issues]
+        result["blockers"] = _dedupe(
+            motors_fitment_blockers(candidate)
+            + [str(getattr(issue, "message", issue)) for issue in package_issues]
+        )
         result["status"] = "blocked" if result["blockers"] else "pass"
         return result
 
