@@ -77,6 +77,30 @@ class TestTreeAwareGate:
         assert r.compatible_products == []
         assert r.issues
 
+    def test_universal_fitment_type_without_ymm_is_universal(self):
+        for fitment_value in ("Universal", "Universal Fit", "Universal Fitment Type"):
+            result = analyze_ebay_motors_compatibility(
+                "33650",
+                "Mechanic Rolling Creeper Seat for trucks and SUVs",
+                "Low profile shop seat.",
+                {"Fitment Type": [fitment_value]},
+                is_motors_store=True,
+            )
+            assert result.mode == "universal", fitment_value
+            assert result.compatible_products == []
+            assert not result.issues
+
+    def test_vehicle_specific_fitment_type_still_needs_a_ymm_table(self):
+        result = analyze_ebay_motors_compatibility(
+            "33650",
+            "Running Boards for Chevy trucks",
+            "Verify fitment before install.",
+            {"Fitment Type": ["Vehicle Specific Fit"]},
+            is_motors_store=True,
+        )
+        assert result.mode == "generic_vehicle"
+        assert result.issues
+
 
 class TestEndToEndDryRun:
     """Rehearse batch_publish's Trading branch offline: analyze -> XML."""

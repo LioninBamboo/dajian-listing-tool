@@ -179,6 +179,15 @@ SKIP_MODEL_WORDS = {
     "perfect", "points", "zero", "modifications",
 }
 
+# eBay Fitment Type values that mean "no Year/Make/Model table".
+# Bare "Universal" is the publisher default and does not match "\buniversal fit\b",
+# so those listings used to fall through to needs_review.
+_UNIVERSAL_FITMENT_TYPE_VALUE = re.compile(
+    r"universal(?:[\s-]+fit(?:ment)?)?(?:[\s-]+type)?",
+    re.IGNORECASE,
+)
+
+
 UNIVERSAL_HINT_PATTERNS = (
     r"\buniversal fit\b",
     r"\bfits all standard\b",
@@ -955,11 +964,31 @@ def _extract_fitment_note(text: str) -> str:
     return note[:250]
 
 
+def fitment_type_is_universal(aspects: Dict[str, Any] | None) -> bool:
+    """True when Fitment Type is Universal / Universal Fit / Universal Fitment Type.
+
+    Title words such as "universal joint" do not count. Only the aspect does,
+    so a vehicle-specific U-joint is not reclassified by copy alone.
+    """
+    normalized = _normalize_aspects(aspects or {})
+    for key, values in normalized.items():
+        if str(key).strip().lower() not in {"fitment type", "fitment"}:
+            continue
+        for value in values:
+            cleaned = re.sub(r"\s+", " ", str(value)).strip(" .;:()[]")
+            if _UNIVERSAL_FITMENT_TYPE_VALUE.fullmatch(cleaned):
+                return True
+    return False
+
+
 def _looks_universal_fit(
     category_id: str,
     text: str,
     aspects: Dict[str, List[str]],
 ) -> bool:
+    if fitment_type_is_universal(aspects):
+        return True
+
     lowered = text.lower()
     if any(re.search(pattern, lowered) for pattern in UNIVERSAL_HINT_PATTERNS):
         return True
