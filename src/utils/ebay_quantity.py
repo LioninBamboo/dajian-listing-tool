@@ -9,7 +9,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_EBAY_LISTING_QUANTITY_CAP = 1
+DEFAULT_EBAY_LISTING_QUANTITY_CAP = 2
 DEFAULT_EBAY_PUBLISH_FAILURE_FALLBACK_QUANTITY = DEFAULT_EBAY_LISTING_QUANTITY_CAP
 
 
@@ -63,6 +63,14 @@ def _publish_failure_fallback_quantity() -> int:
     if isinstance(cap, int) and cap > 0:
         return cap
     return DEFAULT_EBAY_PUBLISH_FAILURE_FALLBACK_QUANTITY
+
+
+def default_ebay_listing_quantity() -> int:
+    """Preferred in-stock listing quantity (= listing cap when set)."""
+    cap = _listing_quantity_cap()
+    if isinstance(cap, int) and cap > 0:
+        return cap
+    return DEFAULT_EBAY_LISTING_QUANTITY_CAP
 
 
 def normalize_ebay_listing_quantity(

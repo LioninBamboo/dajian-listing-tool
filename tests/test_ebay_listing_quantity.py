@@ -14,6 +14,7 @@ from src.utils.ebay_quantity import (
     assess_quantity_alignment,
     coerce_nonnegative_quantity,
     determine_target_ebay_quantity,
+    default_ebay_listing_quantity,
     normalize_ebay_listing_quantity,
     resolve_publish_quantity,
 )
@@ -163,3 +164,11 @@ def test_resolve_publish_quantity_raises_when_supplier_has_zero_stock(monkeypatc
         assert "SKU-OOS" in str(exc)
     else:
         raise AssertionError("expected SupplierOutOfStockError")
+
+
+def test_default_listing_quantity_is_two_when_env_unset(monkeypatch):
+    monkeypatch.delenv("EBAY_LISTING_QUANTITY_CAP", raising=False)
+
+    assert default_ebay_listing_quantity() == 2
+    assert normalize_ebay_listing_quantity(18) == 2
+    assert normalize_ebay_listing_quantity(1) == 1

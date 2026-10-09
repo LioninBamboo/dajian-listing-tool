@@ -627,11 +627,13 @@ class RealEbayClient:
             source_title=product.get("title", ""),
         )
 
+        from src.utils.ebay_quantity import default_ebay_listing_quantity
+
         payload = {
             "condition": product.get("condition", "NEW"),
             "availability": {
                 "shipToLocationAvailability": {
-                    "quantity": product.get("quantity", 1)
+                    "quantity": product.get("quantity") or default_ebay_listing_quantity()
                 }
             },
             "product": {

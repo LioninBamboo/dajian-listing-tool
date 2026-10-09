@@ -1356,6 +1356,7 @@ class SalesHealthChecker:
                         continue
 
                 from src.utils.ebay_quantity import (
+                    default_ebay_listing_quantity,
                     determine_target_ebay_quantity,
                     normalize_ebay_listing_quantity,
                 )
@@ -1369,7 +1370,7 @@ class SalesHealthChecker:
                         continue
                     if sku in sold_through_skus:
                         if available_quantity is None:
-                            target_qty = normalize_ebay_listing_quantity(1)
+                            target_qty = default_ebay_listing_quantity()
                         else:
                             target_qty = determine_target_ebay_quantity(available_quantity)
                         if target_qty <= 0:
