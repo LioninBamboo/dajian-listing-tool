@@ -20,6 +20,11 @@ gates still require a real median; without one they must not invent a browse
 ratio. SAFE_15_NO_MARKET listings are publishable and clearly flagged in logs /
 product dict for later audit.
 
+Before any LLM listing copy, analyze uses the same rule: a cached or live
+Browse/Terapeak median that leaves the SAFE_15 price above the near-market
+band (`median × 1.15`) skips copy with `far_above_market`. No median stays
+`SAFE_15_NO_MARKET` and still gets copy. See `src/utils/copy_skip_gate.py`.
+
 ## Code
 
 - `qwen_optimizer.QwenOptimizer.fetch_market_intelligence`
