@@ -88,6 +88,34 @@ _SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
         "microfiber fabric",
         "microsuede fabric",
     }),
+    # Soft-fill / cushion wording: suppliers often say sponge while the live
+    # rewrite expands to foam / memory foam — same fill, not an upgrade.
+    frozenset({
+        "foam",
+        "memory foam",
+        "high density foam",
+        "high-density foam",
+        "sponge",
+        "spongy foam",
+        "foam cushion",
+        "sponge cushion",
+    }),
+    # Linen family spellings (flax fibre vs linen fabric).
+    frozenset({
+        "linen",
+        "flax",
+        "linen fabric",
+        "flax linen",
+        "linen blend",
+    }),
+    # MDF expansions: sheet extractors sometimes expand the acronym.
+    frozenset({
+        "mdf",
+        "medium density fiberboard",
+        "medium-density fiberboard",
+        "medium density fibreboard",
+        "medium-density fibreboard",
+    }),
 )
 
 # Generalization is safe, specialization is the hallucination direction:
@@ -566,15 +594,49 @@ def _explicit_structured_capacity(structured: Mapping[str, Any] | None) -> tuple
     return None
 
 
+def _word_bounded_phrase_in(phrase: str, text: str) -> bool:
+    """True when `phrase` appears in `text` as a whole phrase (not a part-word).
+
+    Short material tokens like ``mdf`` / ``foam`` / ``linen`` must not match
+    inside unrelated words (e.g. ``pipeline``, ``sofa``).
+    """
+    phrase = re.sub(r"\s+", " ", str(phrase or "").lower()).strip()
+    text = re.sub(r"\s+", " ", str(text or "").lower())
+    if not phrase or not text:
+        return False
+    pattern = rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])"
+    return re.search(pattern, text) is not None
+
+
 def _generic_material_supported(material: str, source_materials: list[str]) -> bool:
     """live generic term (fabric/wood/metal/plastic) backed by a specific
-    source member of that category is not a hallucination."""
+    source member of that category is not a hallucination.
+
+    Also accepts the reverse direction for engineered-wood family claims:
+    live ``mdf`` / ``particle board`` is supported when the source umbrella
+    already says ``engineered wood`` (same retail family, not an upgrade).
+    """
     normalized = re.sub(r"\s+", " ", str(material or "").lower()).strip()
-    members = _GENERIC_MATERIAL_MEMBERS.get(normalized)
-    if not members:
-        return False
     source_text = " ".join(source_materials).lower()
-    return any(member in source_text for member in members) or normalized in source_text
+    members = _GENERIC_MATERIAL_MEMBERS.get(normalized)
+    if members:
+        if any(_word_bounded_phrase_in(member, source_text) for member in members):
+            return True
+        if _word_bounded_phrase_in(normalized, source_text):
+            return True
+    # Reverse: live member backed by source umbrella (engineered wood family).
+    for umbrella, umbrella_members in _GENERIC_MATERIAL_MEMBERS.items():
+        if "engineered wood" not in umbrella:
+            continue
+        if normalized in umbrella_members or any(
+            _word_bounded_phrase_in(normalized, member) for member in umbrella_members
+        ):
+            if _word_bounded_phrase_in(umbrella, source_text):
+                return True
+            # Also accept sibling members already present in source.
+            if any(_word_bounded_phrase_in(member, source_text) for member in umbrella_members):
+                return True
+    return False
 
 
 def _matches_synonym_group(text: str) -> frozenset[str] | None:

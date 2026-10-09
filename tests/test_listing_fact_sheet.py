@@ -903,3 +903,71 @@ class TestCapacityEquivalentPhrasings:
     def test_range_containment_unchanged(self):
         assert lfs._capacity_supported("6 person", "4-8 person") is True
         assert lfs._capacity_supported("10 person", "4-8 person") is False
+
+
+class TestFoamMdfLinenEngineeredDemotion:
+    """P0-2: past READY→ERROR false positives for foam/mdf/linen/engineered wood.
+
+    These cases used to CRITICAL-block publish when the live claim was only a
+    synonym, acronym expansion, or engineered-wood family sibling of the source
+    material. Soft-only sofas claiming engineered wood must still fail.
+    """
+
+    def test_foam_supported_by_sponge_synonym(self):
+        source = dict(SOURCE_SHEET, materials=["sponge", "steel"])
+        live = dict(SOURCE_SHEET, materials=["foam", "steel"])
+        violations = compare_fact_sheets(source, live)
+        assert not any(
+            v["claim_type"] == "semantic_material" and v["claim_text"] == "foam"
+            for v in violations
+        )
+
+    def test_memory_foam_supported_by_sponge(self):
+        source = dict(SOURCE_SHEET, materials=["sponge cushion", "fabric"])
+        live = dict(SOURCE_SHEET, materials=["memory foam"])
+        violations = compare_fact_sheets(source, live)
+        assert not any(v["claim_type"] == "semantic_material" for v in violations)
+
+    def test_linen_supported_by_flax_synonym(self):
+        source = dict(SOURCE_SHEET, materials=["flax", "wood"])
+        live = dict(SOURCE_SHEET, materials=["linen", "wood"])
+        violations = compare_fact_sheets(source, live)
+        assert not any(
+            v["claim_type"] == "semantic_material" and v["claim_text"] == "linen"
+            for v in violations
+        )
+
+    def test_mdf_supported_by_acronym_expansion(self):
+        source = dict(SOURCE_SHEET, materials=["medium density fiberboard", "steel"])
+        live = dict(SOURCE_SHEET, materials=["mdf", "steel"])
+        violations = compare_fact_sheets(source, live)
+        assert not any(
+            v["claim_type"] == "semantic_material" and v["claim_text"] == "mdf"
+            for v in violations
+        )
+
+    def test_mdf_supported_by_engineered_wood_umbrella(self):
+        # Reverse of the existing engineered-wood→mdf family rule.
+        assert _generic_material_supported("mdf", ["engineered wood", "glass"]) is True
+        source = dict(SOURCE_SHEET, materials=["engineered wood", "glass"])
+        live = dict(SOURCE_SHEET, materials=["mdf"])
+        violations = compare_fact_sheets(source, live)
+        assert not any(v["claim_type"] == "semantic_material" for v in violations)
+
+    def test_particle_board_sibling_supports_mdf(self):
+        assert _generic_material_supported("mdf", ["particle board", "steel"]) is True
+
+    def test_part_word_mdf_does_not_match_inside_unrelated_token(self):
+        # Word-boundary guard: a source mentioning "pipeline" must not back "linen".
+        assert _generic_material_supported("linen", ["pipeline steel"]) is False
+
+    def test_engineered_wood_on_soft_sofa_still_flags(self):
+        # Past true positive must keep failing (W2519* chenille/foam sofas).
+        assert _generic_material_supported("engineered wood", ["chenille", "foam"]) is False
+        source = dict(SOURCE_SHEET, materials=["chenille", "foam"])
+        live = dict(SOURCE_SHEET, materials=["engineered wood"])
+        violations = compare_fact_sheets(source, live)
+        assert any(
+            v["claim_type"] == "semantic_material" and "engineered wood" in v["claim_text"]
+            for v in violations
+        )

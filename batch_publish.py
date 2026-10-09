@@ -572,9 +572,10 @@ def _persist_enriched_data(sku: str, attrs: dict, specs: dict, description: str 
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_market_price(title: str) -> float | None:
-    """Fetch market average price from eBay Browse API (Terapeak-style).
-    
-    Returns median market price for similar products, or None if unavailable.
+    """Fetch market median price from Browse (cache/429 backoff) or Terapeak.
+
+    Returns median market price, or None when unavailable. When None, publish
+    pricing must use SAFE_15 and tag pricing_basis=SAFE_15_NO_MARKET.
     """
     try:
         from qwen_optimizer import QwenOptimizer
@@ -585,14 +586,21 @@ def fetch_market_price(title: str) -> float | None:
         intel = qwen.fetch_market_intelligence(title)
         if intel and intel.get('price_stats'):
             stats = intel['price_stats']
-            median = stats.get('median') or stats.get('average')
+            median = stats.get('median') or stats.get('average') or stats.get('avg')
             if median and median > 0:
-                logger.info(f"  [MARKET] median=${median:.2f}, "
-                            f"avg=${stats.get('average', 0):.2f}, "
-                            f"n={intel.get('total_listings', 0)}")
+                logger.info(
+                    f"  [MARKET] median=${median:.2f}, "
+                    f"avg=${stats.get('avg', stats.get('average', 0)):.2f}, "
+                    f"n={intel.get('total_listings', 0)}, "
+                    f"basis={intel.get('pricing_basis', 'BROWSE')}"
+                )
                 return float(median)
+        logger.info(
+            "  [MARKET] no usable price_stats; will price at SAFE_15 "
+            f"(basis={((intel or {}).get('pricing_basis') if intel else None) or 'SAFE_15_NO_MARKET'})"
+        )
     except Exception as e:
-        logger.warning(f"  [MARKET] Terapeak fetch failed: {e}")
+        logger.warning(f"  [MARKET] Browse/Terapeak fetch failed: {e}")
     return None
 
 
@@ -670,11 +678,19 @@ def calculate_smart_final_price(product: dict, market_price: float | None = None
                 f"  [PRICE] Smart: ${final:.2f} (strategy={strategy}, margin={margin:.1%}, "
                 f"market=${market_price:.2f}, cost=${total_cost:.2f})"
             )
+        product["pricing_basis"] = strategy
+        product["market_price"] = float(market_price)
         return final
     else:
-        # Standard 15% margin
+        # No market price (Browse 429/empty + Terapeak miss): still publish at
+        # SAFE_15 — do not hard-stop the collect→publish path. Flag clearly.
         final = safe_15
-        logger.info(f"  [PRICE] Standard: ${final:.2f} (15% margin, cost=${total_cost:.2f})")
+        product["pricing_basis"] = "SAFE_15_NO_MARKET"
+        product["market_price"] = None
+        logger.info(
+            f"  [PRICE] SAFE_15_NO_MARKET: ${final:.2f} "
+            f"(15% margin, cost=${total_cost:.2f}; no Browse/Terapeak median)"
+        )
         return final
 
 

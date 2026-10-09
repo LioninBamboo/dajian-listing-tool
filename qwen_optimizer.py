@@ -12,7 +12,10 @@ Qwen AI 优化器 - eBay 产品标题和描述优化
 from openai import OpenAI
 import builtins
 import os
+import hashlib
 import json
+import time
+from pathlib import Path
 import traceback
 import re
 import requests
@@ -141,20 +144,104 @@ class QwenOptimizer:
         )
         self.model = "qwen-plus-latest"
 
+    # Browse market-intel cache + 429 backoff (P0-3 collect→publish).
+    _BROWSE_CACHE_DIR = Path("cache") / "browse_market_intel"
+    _BROWSE_CACHE_TTL_SECS = 6 * 60 * 60  # 6h
+    _BROWSE_MAX_ATTEMPTS = 4
+
+    def _browse_cache_path(self, search_words: str, category_id: str | None) -> Path:
+        key = hashlib.sha1(f"{search_words}|{category_id or ''}".encode("utf-8")).hexdigest()
+        return self._BROWSE_CACHE_DIR / f"{key}.json"
+
+    def _load_browse_cache(
+        self,
+        search_words: str,
+        category_id: str | None,
+        *,
+        allow_stale: bool = False,
+    ) -> dict | None:
+        path = self._browse_cache_path(search_words, category_id)
+        try:
+            if not path.exists():
+                return None
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            age = time.time() - float(payload.get("cached_at", 0))
+            if age < 0:
+                return None
+            if (not allow_stale) and age > self._BROWSE_CACHE_TTL_SECS:
+                return None
+            data = payload.get("data")
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def _store_browse_cache(self, search_words: str, category_id: str | None, data: dict) -> None:
+        try:
+            self._BROWSE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            path = self._browse_cache_path(search_words, category_id)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps({"cached_at": time.time(), "data": data}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+        except Exception as exc:
+            print(f"   [WARN] Browse cache write failed: {exc}")
+
+    def _terapeak_price_fallback(self, search_words: str) -> dict:
+        """Best-effort Terapeak/sold-comp fallback when Browse is empty or 429'd."""
+        try:
+            from src.plugins.terapeak_research.research_client import TerapeakClient
+            client = TerapeakClient()
+            competition = client.analyze_competition(search_words) or {}
+            avg = competition.get("avg_price") or competition.get("average") or 0
+            median = competition.get("median_price") or competition.get("median") or avg
+            mn = competition.get("min_price") or competition.get("min") or 0
+            mx = competition.get("max_price") or competition.get("max") or 0
+            sample = competition.get("sample_size") or competition.get("total") or 0
+            if not median and not avg:
+                return {}
+            return {
+                "top_keywords": [],
+                "competitor_titles": [],
+                "common_aspects": {},
+                "price_stats": {
+                    "avg": float(avg or median or 0),
+                    "min": float(mn or 0),
+                    "max": float(mx or 0),
+                    "median": float(median or avg or 0),
+                },
+                "total_listings": int(sample or 0),
+                "pricing_basis": "TERAPEAK_FALLBACK",
+                "market_source": "terapeak",
+            }
+        except Exception as exc:
+            print(f"   [WARN] Terapeak fallback failed: {exc}")
+            return {}
+
     def fetch_market_intelligence(self, product_title: str, category_id: str = None) -> dict:
         """
         从 eBay Browse API 获取市场数据：
         - 竞品畅销标题（提取高频关键词）
         - 竞品 Item Specifics（找出必填和常用的 aspects）
         - 价格区间
-        
+
+        Resilience (P0-3):
+        - 429/5xx → exponential backoff retry (up to 4 attempts)
+        - disk cache (6h) for successful Browse payloads
+        - Terapeak competition fallback when Browse is empty/rate-limited
+        - when still no price_stats, callers should price at SAFE_15 and set
+          pricing_basis=SAFE_15_NO_MARKET (see batch_publish.calculate_smart_final_price)
+
         Returns:
             {
-                'top_keywords': ['keyword1', 'keyword2', ...],
-                'competitor_titles': ['title1', 'title2', ...],
-                'common_aspects': {'Type': ['value1', 'value2'], ...},
-                'price_stats': {'avg': float, 'min': float, 'max': float},
-                'total_listings': int
+                'top_keywords': [...],
+                'competitor_titles': [...],
+                'common_aspects': {...},
+                'price_stats': {'avg': float, 'min': float, 'max': float, 'median': float},
+                'total_listings': int,
+                'pricing_basis': 'BROWSE' | 'BROWSE_CACHE' | 'TERAPEAK_FALLBACK' | 'SAFE_15_NO_MARKET',
+                'market_source': str,
             }
         """
         result = {
@@ -162,9 +249,23 @@ class QwenOptimizer:
             'competitor_titles': [],
             'common_aspects': {},
             'price_stats': {},
-            'total_listings': 0
+            'total_listings': 0,
+            'pricing_basis': 'SAFE_15_NO_MARKET',
+            'market_source': 'none',
         }
-        
+
+        search_words = self._extract_search_keywords(product_title)
+        if not search_words:
+            return result
+
+        cached = self._load_browse_cache(search_words, category_id)
+        if cached and cached.get("price_stats"):
+            cached = dict(cached)
+            cached["pricing_basis"] = "BROWSE_CACHE"
+            cached["market_source"] = cached.get("market_source") or "browse_cache"
+            print(f"   [CACHE] Browse market intel hit for: {search_words}")
+            return cached
+
         try:
             from src.services.ebay_auth import EbayOAuthService
             oauth = EbayOAuthService(os.getenv("EBAY_ENVIRONMENT", "PRODUCTION"))
@@ -177,23 +278,18 @@ class QwenOptimizer:
                 token = oauth.get_valid_token()
 
             if not token:
-                print("   [WARN] No eBay token for market research, skipping")
-                return result
-            
+                print("   [WARN] No eBay token for market research, trying Terapeak fallback")
+                fb = self._terapeak_price_fallback(search_words)
+                return fb or result
+
             headers = {
                 'Authorization': f'Bearer {token}',
                 'Content-Type': 'application/json',
                 'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
             }
-            
-            # Extract search keywords from title (first 3-4 meaningful words)
-            search_words = self._extract_search_keywords(product_title)
-            if not search_words:
-                return result
-            
+
             print(f"   [SEARCH] Market research keywords: {search_words}")
-            
-            # Search eBay Browse API for competitor listings
+
             url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
             params = {
                 'q': search_words,
@@ -203,27 +299,50 @@ class QwenOptimizer:
             }
             if category_id:
                 params['category_ids'] = category_id
-            
-            resp = requests.get(url, headers=headers, params=params, timeout=20, verify=False)
-            if resp.status_code != 200:
+
+            data = None
+            last_status = None
+            for attempt in range(1, self._BROWSE_MAX_ATTEMPTS + 1):
+                resp = requests.get(url, headers=headers, params=params, timeout=20, verify=False)
+                last_status = resp.status_code
+                if resp.status_code == 200:
+                    data = resp.json()
+                    break
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    sleep_for = min(20.0, 1.5 * attempt)
+                    print(
+                        f"   [WARN] Browse API HTTP {resp.status_code}; "
+                        f"backoff {sleep_for:.1f}s (attempt {attempt}/{self._BROWSE_MAX_ATTEMPTS})"
+                    )
+                    time.sleep(sleep_for)
+                    continue
                 print(f"   [WARN] Browse API returned {resp.status_code}")
-                return result
-            
-            data = resp.json()
-            items = data.get('itemSummaries', [])
-            result['total_listings'] = data.get('total', 0)
-            
+                break
+
+            if data is None:
+                print(f"   [WARN] Browse unavailable (last HTTP {last_status}); trying cache/Terapeak")
+                stale = self._load_browse_cache(search_words, category_id, allow_stale=True)
+                if stale and stale.get("price_stats"):
+                    stale = dict(stale)
+                    stale["pricing_basis"] = "BROWSE_CACHE"
+                    stale["market_source"] = "browse_cache_stale_ok"
+                    return stale
+                fb = self._terapeak_price_fallback(search_words)
+                return fb or result
+
+            items = data.get('itemSummaries', []) or []
+            result['total_listings'] = data.get('total', 0) or 0
+
             if not items:
-                return result
-            
-            # Collect competitor titles
+                fb = self._terapeak_price_fallback(search_words)
+                return fb or result
+
             titles = [item.get('title', '') for item in items[:20]]
             result['competitor_titles'] = titles
-            
-            # Price stats
-            prices = [float(item.get('price', {}).get('value', 0)) 
+
+            prices = [float(item.get('price', {}).get('value', 0))
                       for item in items if item.get('price')]
-            prices = [p for p in prices if p > 10]  # filter noise
+            prices = [p for p in prices if p > 10]
             if prices:
                 result['price_stats'] = {
                     'avg': round(sum(prices) / len(prices), 2),
@@ -231,12 +350,10 @@ class QwenOptimizer:
                     'max': round(max(prices), 2),
                     'median': round(sorted(prices)[len(prices)//2], 2)
                 }
-            
-            # Extract top keywords from competitor titles
+
             keyword_freq = self._extract_keyword_frequencies(titles)
             result['top_keywords'] = keyword_freq[:20]
-            
-            # Fetch detailed item specifics from top 5 items
+
             aspect_counts = {}
             for item in items[:5]:
                 item_id = item.get('itemId')
@@ -258,15 +375,27 @@ class QwenOptimizer:
                                     aspect_counts[name].append(value)
                 except Exception:
                     continue
-            
+
             result['common_aspects'] = aspect_counts
-            
-            print(f"   [OK] Market intel: {len(titles)} titles, {len(aspect_counts)} aspect types, "
-                  f"avg price ${result['price_stats'].get('avg', 0)}")
-            
+
+            if result.get('price_stats'):
+                result['pricing_basis'] = 'BROWSE'
+                result['market_source'] = 'browse'
+                self._store_browse_cache(search_words, category_id, result)
+                print(f"   [OK] Market intel: {len(titles)} titles, {len(aspect_counts)} aspect types, "
+                      f"avg price ${result['price_stats'].get('avg', 0)}")
+            else:
+                fb = self._terapeak_price_fallback(search_words)
+                if fb:
+                    return fb
+                print("   [WARN] Browse returned no usable prices; pricing_basis=SAFE_15_NO_MARKET")
+
         except Exception as e:
             print(f"   [WARN] Market research failed: {e}")
-        
+            fb = self._terapeak_price_fallback(search_words) if search_words else {}
+            if fb:
+                return fb
+
         return result
     
     def _extract_search_keywords(self, title: str) -> str:
