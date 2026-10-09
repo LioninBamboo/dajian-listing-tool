@@ -292,15 +292,16 @@ def test_motors_profile_ignores_furniture_fact_sheet(monkeypatch):
             "aspects": {},
         },
         source_title="PU tubing kit",
-        source_description="pu steel",
+        source_description="pu steel blue",
         qc_profile="motors",
         fact_sheet_conn=sqlite3.connect(":memory:"),
     )
 
     assert called["quality"] is False
     assert called["fact"] is False
-    assert result["fact_sheet_status"] == "skipped"
-    assert not any("semantic_material" in item for item in result["blockers"])
+    assert result["fact_sheet_status"] == "pass"
+    assert result["status"] == "pass"
+    assert not any("semantic_material" in item or "polyurethane" in item.lower() for item in result["blockers"])
 
 
 def test_motors_profile_blocks_incomplete_vehicle_fitment(monkeypatch):
@@ -353,7 +354,7 @@ def test_motors_profile_passes_structured_fitment(monkeypatch):
         fact_sheet_conn=None,
     )
 
-    assert result["fact_sheet_status"] == "skipped"
+    assert result["fact_sheet_status"] == "pass"
     assert result["status"] == "pass"
     assert result["blockers"] == []
 
@@ -394,7 +395,7 @@ def test_motors_universal_fit_blocks_pieces_vs_package_includes_1x(monkeypatch):
         fact_sheet_conn=None,
     )
 
-    assert result["fact_sheet_status"] == "skipped"
+    assert result["fact_sheet_status"] == "pass"
     assert result["status"] == "blocked"
     assert any("package includes" in item.lower() for item in result["blockers"])
     assert not any(item.startswith("[Fitment]") for item in result["blockers"])
@@ -439,11 +440,13 @@ def test_motors_universal_fit_passes_when_package_qty_matches(monkeypatch):
     result = listing_qc.run_listing_qc(
         sku="MAT-OK",
         candidate=candidate,
+        source_title=candidate["title"],
+        source_description=candidate["description"],
         qc_profile="motors",
         fact_sheet_conn=None,
     )
 
-    assert result["fact_sheet_status"] == "skipped"
+    assert result["fact_sheet_status"] == "pass"
     assert result["status"] == "pass"
     assert result["blockers"] == []
 
@@ -493,3 +496,148 @@ def test_motors_fitment_block_still_reports_package_includes_mismatch(monkeypatc
     assert result["status"] == "blocked"
     assert any(item.startswith("[Fitment]") for item in result["blockers"])
     assert any("package includes" in item.lower() for item in result["blockers"])
+
+
+def test_motors_universal_fitment_type_without_ymm_does_not_hard_block(monkeypatch):
+    """Sergey: Universal Fitment Type with no YMM table must not be a fitment blocker."""
+    _forbid_furniture_gate(monkeypatch)
+    candidate = {
+        "title": "Mechanic Rolling Creeper Seat for trucks and SUVs",
+        "description": "Low profile steel shop seat, black.",
+        "categoryId": "33650",
+        "aspects": {
+            "Fitment Type": ["Universal"],
+            "Material": ["Steel"],
+            "Color": ["Black"],
+        },
+    }
+
+    result = listing_qc.run_listing_qc(
+        sku="CREEPER-UNI",
+        candidate=candidate,
+        source_title="Mechanic Rolling Creeper Seat",
+        source_description="Steel shop seat, black. Fits trucks and SUVs.",
+        source_attributes={"Material": "Steel", "Color": "Black"},
+        qc_profile="motors",
+        fact_sheet_conn=sqlite3.connect(":memory:"),
+    )
+
+    assert result["fact_sheet_status"] == "pass"
+    assert result["status"] == "pass"
+    assert result["blockers"] == []
+    assert not any(item.startswith("[Fitment]") for item in result["warnings"])
+
+
+def test_motors_universal_fit_still_blocks_invented_material(monkeypatch):
+    _forbid_furniture_gate(monkeypatch)
+    result = listing_qc.run_listing_qc(
+        sku="SEAT-CANVAS",
+        candidate={
+            "title": "Universal Canvas Seat Cover",
+            "description": "Canvas seat cover for trucks.",
+            "categoryId": "33650",
+            "aspects": {
+                "Fitment Type": ["Universal Fitment Type"],
+                "Material": ["Canvas"],
+            },
+        },
+        source_title="Seat Cover",
+        source_description="Polyester seat cover.",
+        source_attributes={"Material": "Polyester"},
+        qc_profile="motors",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["fact_sheet_status"] == "violations"
+    assert any("semantic_material" in item and "canvas" in item for item in result["blockers"])
+    assert not any(item.startswith("[Fitment]") for item in result["blockers"])
+
+
+def test_motors_blocks_invented_color_against_source(monkeypatch):
+    _forbid_furniture_gate(monkeypatch)
+    result = listing_qc.run_listing_qc(
+        sku="HITCH-COLOR",
+        candidate={
+            "title": "Universal Steel Trailer Hitch",
+            "description": "Steel hitch.",
+            "categoryId": "33653",
+            "aspects": {
+                "Fitment Type": ["Universal"],
+                "Material": ["Steel"],
+                "Color": ["Blue"],
+            },
+        },
+        source_title="Steel trailer hitch",
+        source_description="Black steel hitch.",
+        source_attributes={"Material": "Steel", "Color": "Black"},
+        qc_profile="motors",
+    )
+
+    assert result["status"] == "blocked"
+    assert any("semantic_color" in item and "blue" in item for item in result["blockers"])
+    assert not any(item.startswith("[Fitment]") for item in result["blockers"])
+
+
+def test_motors_blocks_invented_capacity_against_source(monkeypatch):
+    _forbid_furniture_gate(monkeypatch)
+    result = listing_qc.run_listing_qc(
+        sku="FUEL-CAN",
+        candidate={
+            "title": "Universal 5 Gallon Fuel Can",
+            "description": "Portable 5 gallon fuel can.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal Fit"]},
+        },
+        source_title="Fuel Can",
+        source_description="2 gallon portable fuel can.",
+        qc_profile="motors",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["fact_sheet_status"] == "violations"
+    assert any("semantic_capacity" in item and "5" in item for item in result["blockers"])
+    assert not any(item.startswith("[Fitment]") for item in result["blockers"])
+
+
+def test_motors_universal_fit_still_blocks_claim_invent(monkeypatch):
+    _forbid_furniture_gate(monkeypatch)
+    result = listing_qc.run_listing_qc(
+        sku="SEAT-WATER",
+        candidate={
+            "title": "Universal Shop Seat",
+            "description": "Waterproof shop seat.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal"]},
+        },
+        source_title="Shop Seat",
+        source_description="Steel frame shop seat.",
+        qc_profile="motors",
+    )
+
+    assert result["fact_sheet_status"] == "pass"
+    assert result["status"] == "blocked"
+    assert any(item.startswith("[Claim]") and "waterproof" in item for item in result["blockers"])
+    assert not any(item.startswith("[Fitment]") for item in result["blockers"])
+
+
+def test_motors_fitment_block_still_runs_material_invent(monkeypatch):
+    """Empty or failing fitment must not skip the deterministic FactSheet gate."""
+    _forbid_furniture_gate(monkeypatch)
+    result = listing_qc.run_listing_qc(
+        sku="BOARD-CANVAS",
+        candidate={
+            "title": "Running Boards for Chevy trucks",
+            "description": "Canvas running boards. Verify fitment before install.",
+            "categoryId": "33650",
+            "aspects": {"Material": ["Canvas"], "Fitment Type": ["Vehicle Specific Fit"]},
+        },
+        source_title="Running Boards",
+        source_description="Steel running boards for Chevy Silverado.",
+        source_attributes={"Material": "Steel"},
+        qc_profile="motors",
+    )
+
+    assert result["status"] == "blocked"
+    assert result["fact_sheet_status"] == "violations"
+    assert any(item.startswith("[Fitment]") for item in result["blockers"])
+    assert any("semantic_material" in item and "canvas" in item for item in result["blockers"])
