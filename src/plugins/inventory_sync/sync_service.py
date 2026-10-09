@@ -16,6 +16,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
+from xml.sax.saxutils import escape as xml_escape
 
 # 添加项目根目录到 path
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
@@ -28,6 +29,13 @@ from src.utils.ebay_quantity import _listing_quantity_cap
 from src.utils.inventory_restock_hold import (
     is_restock_held,
     should_block_positive_quantity,
+)
+from src.utils.sold_through_relist import (
+    completed_because_sold,
+    extract_item_id,
+    parse_trading_item_xml,
+    trading_ack_ok,
+    trading_site_id,
 )
 
 
@@ -478,7 +486,216 @@ class InventorySyncService:
             self.logger.warning(f"Failed to check Dajian stock for {sku}: {e}")
             return None, None, None, None
     
-    def update_ebay_quantity(self, sku: str, quantity: int) -> bool:
+    def _lookup_listing_id(self, sku: str) -> Optional[str]:
+        try:
+            conn = sqlite3.connect(self.db_path)
+            row = conn.execute(
+                """
+                SELECT listing_id FROM collected_products
+                WHERE sku = ?
+                ORDER BY CASE WHEN status = 'PUBLISHED' THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                (sku,),
+            ).fetchone()
+            conn.close()
+        except Exception as exc:
+            self.logger.warning(f"{sku}: 读取 listing_id 失败: {exc}")
+            return None
+        if not row or not row[0]:
+            return None
+        return str(row[0]).strip() or None
+
+    def _persist_listing_id(self, sku: str, listing_id: str) -> None:
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE collected_products SET listing_id = ? WHERE sku = ?",
+            (str(listing_id), sku),
+        )
+        conn.commit()
+        conn.close()
+
+    def _record_sold_through_restock(
+        self,
+        sku: str,
+        old_listing_id: str,
+        new_listing_id: str,
+        quantity: int,
+    ) -> None:
+        try:
+            self.record_sync(SyncResult(
+                sku=sku,
+                action="restocked",
+                old_value=str(old_listing_id or ""),
+                new_value=f"库存恢复为{quantity}",
+                message=(
+                    f"售完下架已 RelistFixedPriceItem，新 ItemID {new_listing_id}，"
+                    f"数量 {quantity}，SKU 保持不变"
+                ),
+                supplier_in_stock=True,
+            ))
+        except Exception as exc:
+            self.logger.warning(f"{sku}: 写入 inventory_sync_log 失败: {exc}")
+
+    def _trading_client(self):
+        from src.clients.ebay_client import EbayClient
+        from src.clients.ebay_trading_client import EbayTradingClient
+
+        ebay = EbayClient(
+            os.getenv("EBAY_APP_ID"),
+            os.getenv("EBAY_CERT_ID"),
+            os.getenv("EBAY_DEV_ID"),
+            env="production",
+        )
+        return EbayTradingClient(ebay), trading_site_id()
+
+    def _get_trading_snapshot(self, listing_id: str) -> Optional[dict]:
+        trading, site_id = self._trading_client()
+        response = trading.call(
+            "GetItem",
+            f"<ItemID>{xml_escape(str(listing_id))}</ItemID><DetailLevel>ReturnAll</DetailLevel>",
+            site_id=site_id,
+        )
+        return parse_trading_item_xml(response)
+
+    def _verify_trading_quantity(self, listing_id: str, expected_quantity: int, sku: str) -> bool:
+        for attempt in range(1, 4):
+            try:
+                live = self._get_trading_snapshot(listing_id)
+            except Exception as exc:
+                self.logger.warning(f"Trading quantity verification failed for {sku}: {exc}")
+                live = None
+            if live:
+                status = str(live.get("listing_status") or "")
+                available = live.get("available")
+                live_sku = str(live.get("sku") or "").strip()
+                sku_ok = (not live_sku) or live_sku == sku
+                if (
+                    sku_ok
+                    and available == expected_quantity
+                    and status.lower() == "active"
+                ):
+                    return True
+            if attempt < 3:
+                time.sleep(1)
+        return False
+
+    def _update_quantity_via_trading(
+        self,
+        sku: str,
+        quantity: int,
+        known_listing_id: Optional[str] = None,
+    ) -> bool:
+        """Revise or relist a Trading/Motors listing that has no Inventory offer.
+
+        RelistFixedPriceItem sends only ItemID, Quantity, and SKU. Fitment,
+        item specifics, and package dimensions stay on the ended listing.
+        """
+        listing_id = str(known_listing_id or "").strip() or self._lookup_listing_id(sku)
+        if not listing_id:
+            self.logger.error(f"No Trading listing ID for {sku}")
+            return False
+
+        try:
+            snapshot = self._get_trading_snapshot(listing_id)
+        except Exception as exc:
+            self.logger.warning(f"{sku}: Trading GetItem 失败，不视为下架: {exc}")
+            return False
+
+        if not snapshot or str(snapshot.get("listing_status") or "").upper() == "NOT_FOUND":
+            self.logger.warning(f"{sku}: Trading item {listing_id} NOT_FOUND，不修改 DB 状态")
+            return False
+
+        status = snapshot.get("listing_status")
+        ending_reason = snapshot.get("ending_reason")
+        quantity_sold = snapshot.get("quantity_sold")
+        site_id = trading_site_id()
+
+        if quantity <= 0 and (
+            completed_because_sold(status, ending_reason, quantity_sold)
+            or str(status or "").lower() in {"completed", "ended"}
+        ):
+            self.logger.info(f"{sku}: 链接已结束且目标数量为 0，不 Relist")
+            return True
+
+        if quantity > 0 and completed_because_sold(status, ending_reason, quantity_sold):
+            return self._relist_fixed_price_item(sku, listing_id, quantity, site_id)
+
+        if str(status or "").lower() in {"active", "outofstock"}:
+            return self._revise_trading_quantity(sku, listing_id, quantity, site_id)
+
+        self.logger.warning(
+            f"{sku}: Trading 状态 {status} / EndingReason {ending_reason or '-'}，不 Relist"
+        )
+        return False
+
+    def _revise_trading_quantity(self, sku: str, listing_id: str, quantity: int, site_id: str) -> bool:
+        trading, _site = self._trading_client()
+        xml_body = f"""
+        <InventoryStatus>
+            <ItemID>{xml_escape(str(listing_id))}</ItemID>
+            <Quantity>{int(quantity)}</Quantity>
+            <SKU>{xml_escape(sku)}</SKU>
+        </InventoryStatus>
+        """
+        try:
+            response = trading.call("ReviseInventoryStatus", xml_body, site_id=site_id)
+        except Exception as exc:
+            self.logger.warning(f"Failed to update {sku} quantity via Trading API: {exc}")
+            return False
+        if not trading_ack_ok(response):
+            self.logger.warning(f"Trading API failed for {sku}: {response[:200]}")
+            return False
+        if self._verify_trading_quantity(listing_id, quantity, sku):
+            self.logger.info(
+                f"Updated {sku} quantity to {quantity} via ReviseInventoryStatus (site {site_id})"
+            )
+            return True
+        self.logger.error(f"Trading quantity update for {sku} was not verified")
+        return False
+
+    def _relist_fixed_price_item(self, sku: str, listing_id: str, quantity: int, site_id: str) -> bool:
+        trading, _site = self._trading_client()
+        # ItemID + Quantity + SKU only. Do not send fitment, specifics, or dims.
+        xml_body = f"""
+        <Item>
+            <ItemID>{xml_escape(str(listing_id))}</ItemID>
+            <Quantity>{int(quantity)}</Quantity>
+            <SKU>{xml_escape(sku)}</SKU>
+        </Item>
+        """
+        try:
+            response = trading.call("RelistFixedPriceItem", xml_body, site_id=site_id)
+        except Exception as exc:
+            self.logger.warning(f"{sku}: RelistFixedPriceItem 失败: {exc}")
+            return False
+        if not trading_ack_ok(response):
+            self.logger.warning(f"{sku}: RelistFixedPriceItem Ack 失败: {response[:300]}")
+            return False
+        new_listing_id = extract_item_id(response)
+        if not new_listing_id:
+            self.logger.error(f"{sku}: RelistFixedPriceItem 成功但没有新 ItemID")
+            return False
+
+        # Persist before verify so a slow GetItem cannot cause a second relist.
+        try:
+            self._persist_listing_id(sku, new_listing_id)
+        except Exception as exc:
+            self.logger.warning(f"{sku}: 新 ItemID {new_listing_id} 写入 DB 失败: {exc}")
+
+        if not self._verify_trading_quantity(new_listing_id, quantity, sku):
+            self.logger.error(
+                f"{sku}: Relist ItemID {new_listing_id} 未通过数量回读，DB 已指向新链接"
+            )
+            return False
+
+        self._record_sold_through_restock(sku, listing_id, new_listing_id, quantity)
+        self.logger.info(
+            f"Relisted {sku} on site {site_id}: {listing_id} -> {new_listing_id} qty={quantity}"
+        )
+        return True
+
+    def update_ebay_quantity(self, sku: str, quantity: int, known_listing_id: Optional[str] = None) -> bool:
         """更新 eBay 库存数量，并回读验证 live offer 状态。"""
         if should_block_positive_quantity(sku, quantity):
             self.logger.warning(
@@ -631,19 +848,27 @@ class InventorySyncService:
                 self.logger.warning(f"Trading quantity verification failed for {sku}: {e}")
                 return False
 
-        # 1. 先获取 offer/listing ID
+        # 1. 先获取 offer/listing ID。Trading/Motors 链接没有 Inventory Offer。
         base = "https://api.ebay.com"
         offer_url = f"{base}/sell/inventory/v1/offer?sku={sku}"
         resp = requests.get(offer_url, headers=headers, timeout=30, verify=False)
-        
-        if resp.status_code != 200:
-            self.logger.error(f"Failed to get offer for {sku}: {resp.status_code}")
-            return False
-        
-        offers = resp.json().get('offers', [])
-        if not offers:
-            self.logger.error(f"No offer found for {sku}")
-            return False
+
+        offers = []
+        if resp.status_code == 200:
+            try:
+                offers = resp.json().get('offers') or []
+            except Exception:
+                offers = []
+        if resp.status_code != 200 or not offers:
+            self.logger.warning(
+                f"Inventory offer missing for {sku} ({resp.status_code}); "
+                f"using Trading ReviseInventoryStatus/RelistFixedPriceItem"
+            )
+            return self._update_quantity_via_trading(
+                sku,
+                quantity,
+                known_listing_id=known_listing_id,
+            )
 
         offer = _select_offer(offers)
         offer_id = offer.get('offerId') if offer else None

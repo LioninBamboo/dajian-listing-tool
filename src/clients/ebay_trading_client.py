@@ -56,7 +56,7 @@ class EbayTradingClient:
             "Content-Type": "text/xml"
         }
 
-    def call(self, call_name: str, payload_xml_body: str) -> str:
+    def call(self, call_name: str, payload_xml_body: str, site_id: str | None = None) -> str:
         """
         Make a Trading API call
         
@@ -64,6 +64,8 @@ class EbayTradingClient:
             call_name: e.g., 'AddFixedPriceItem'
             payload_xml_body: The XML body INSIDE the Request tag. 
                               (e.g. <Item>...</Item>)
+            site_id: Trading SiteID. None keeps the header default (0 = eBay US).
+                     eBay Motors parts listings use 100.
                               
         Returns:
             Response XML string
@@ -77,6 +79,8 @@ class EbayTradingClient:
 </{call_name}Request>"""
 
         headers = self._build_headers(call_name)
+        if site_id is not None and str(site_id).strip() != "":
+            headers["X-EBAY-API-SITEID"] = str(site_id).strip()
         
         response = self.session.post(
             self.endpoint,
@@ -90,7 +94,7 @@ class EbayTradingClient:
         
         return response.text
 
-    def get_item(self, item_id: str) -> str:
+    def get_item(self, item_id: str, site_id: str | None = None) -> str:
         """
         Get Item Details
         """
@@ -98,7 +102,7 @@ class EbayTradingClient:
             <ItemID>{item_id}</ItemID>
             <DetailLevel>ReturnAll</DetailLevel>
         """
-        return self.call("GetItem", xml_payload)
+        return self.call("GetItem", xml_payload, site_id=site_id)
 
     def revise_item(self, item_id: str, xml_body: str) -> str:
         """
@@ -131,7 +135,7 @@ class EbayTradingClient:
         """
         return self.call("EndFixedPriceItem", payload)
 
-    def get_active_listings(self, page: int = 1, limit: int = 20) -> str:
+    def get_active_listings(self, page: int = 1, limit: int = 20, site_id: str | None = None) -> str:
         """
         Get all active listings using GetMyeBaySelling.
         Returns XML response string.
@@ -146,4 +150,28 @@ class EbayTradingClient:
             </ActiveList>
             <DetailLevel>ReturnAll</DetailLevel>
         """
-        return self.call("GetMyeBaySelling", payload)
+        return self.call("GetMyeBaySelling", payload, site_id=site_id)
+
+    def get_sold_listings(
+        self,
+        page: int = 1,
+        limit: int = 200,
+        duration_days: int = 60,
+        site_id: str | None = None,
+    ) -> str:
+        """Recent sales via GetMyeBaySelling SoldList.
+
+        Completed sell-throughs leave ActiveList. DurationInDays max is 60.
+        """
+        payload = f"""
+            <SoldList>
+                <DurationInDays>{int(duration_days)}</DurationInDays>
+                <Include>true</Include>
+                <Pagination>
+                    <EntriesPerPage>{int(limit)}</EntriesPerPage>
+                    <PageNumber>{int(page)}</PageNumber>
+                </Pagination>
+            </SoldList>
+            <DetailLevel>ReturnAll</DetailLevel>
+        """
+        return self.call("GetMyeBaySelling", payload, site_id=site_id)

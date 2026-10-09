@@ -49,6 +49,13 @@ from src.utils.inventory_audit_contract import (
     empty_inventory_audit,
 )
 from src.utils.inventory_restock_hold import is_restock_held
+from src.utils.sold_through_relist import (
+    classify_zero_qty_listing,
+    completed_because_sold,
+    sold_relist_lookback_days,
+    trading_site_id,
+    uses_trading_channel,
+)
 
 
 def should_auto_restock_zero_listing(sku: str) -> bool:
@@ -577,6 +584,32 @@ class SalesHealthChecker:
         except Exception:
             return None
 
+    def _make_trading_client(self):
+        from src.clients.ebay_client import EbayClient
+        from src.clients.ebay_trading_client import EbayTradingClient
+
+        ebay = EbayClient(
+            os.getenv("EBAY_APP_ID"),
+            os.getenv("EBAY_CERT_ID"),
+            os.getenv("EBAY_DEV_ID"),
+            env="production",
+        )
+        return EbayTradingClient(ebay), trading_site_id()
+
+    def _fetch_trading_listing_snapshot(self, listing_id: str | None):
+        """GetItem status snapshot. None means the lookup itself failed."""
+        if not listing_id:
+            return None
+        try:
+            from src.utils.sold_through_relist import parse_trading_item_xml
+
+            trading, site_id = self._make_trading_client()
+            response = trading.get_item(str(listing_id), site_id=site_id)
+            return parse_trading_item_xml(response)
+        except Exception as exc:
+            log.warning(f"  Trading GetItem 失败 {listing_id}: {exc}")
+            return None
+
     def _fetch_trading_listing_available_quantity(self, listing_id: str | None):
         """Fetch available listing quantity from Trading API for cross-checking."""
         if not listing_id:
@@ -584,17 +617,9 @@ class SalesHealthChecker:
 
         try:
             import xml.etree.ElementTree as ET
-            from src.clients.ebay_client import EbayClient
-            from src.clients.ebay_trading_client import EbayTradingClient
 
-            ebay = EbayClient(
-                os.getenv("EBAY_APP_ID"),
-                os.getenv("EBAY_CERT_ID"),
-                os.getenv("EBAY_DEV_ID"),
-                env="production",
-            )
-            trading = EbayTradingClient(ebay)
-            response = trading.get_item(str(listing_id))
+            trading, site_id = self._make_trading_client()
+            response = trading.get_item(str(listing_id), site_id=site_id)
 
             root = ET.fromstring(response)
             ns = {'ebay': 'urn:ebay:apis:eBLBaseComponents'}
@@ -620,22 +645,14 @@ class SalesHealthChecker:
         result = {}
         try:
             import xml.etree.ElementTree as ET
-            from src.clients.ebay_client import EbayClient
-            from src.clients.ebay_trading_client import EbayTradingClient
 
-            ebay = EbayClient(
-                os.getenv("EBAY_APP_ID"),
-                os.getenv("EBAY_CERT_ID"),
-                os.getenv("EBAY_DEV_ID"),
-                env="production",
-            )
-            trading = EbayTradingClient(ebay)
+            trading, site_id = self._make_trading_client()
             ns = {'ebay': 'urn:ebay:apis:eBLBaseComponents'}
 
             page = 1
             total_pages = 1
             while page <= total_pages:
-                response = trading.get_active_listings(page=page, limit=200)
+                response = trading.get_active_listings(page=page, limit=200, site_id=site_id)
                 root = ET.fromstring(response)
                 total_pages_text = root.findtext(
                     './/ebay:PaginationResult/ebay:TotalNumberOfPages',
@@ -681,10 +698,137 @@ class SalesHealthChecker:
                 if page <= total_pages:
                     time.sleep(0.2)
 
-            log.info(f"  Trading ActiveList 数量缓存: {len(result)} listings")
+            log.info(f"  Trading ActiveList 数量缓存: {len(result)} listings (site {site_id})")
         except Exception as e:
             log.warning(f"加载 Trading ActiveList 数量缓存失败: {e}")
         return result
+
+    def _fetch_trading_recent_sold_map(self) -> tuple[dict, dict]:
+        """Recent Completed sell-throughs, keyed by SKU and by ItemID.
+
+        ActiveList does not include listings that Completed because they sold.
+        """
+        by_sku: dict = {}
+        by_item: dict = {}
+        try:
+            import xml.etree.ElementTree as ET
+
+            trading, site_id = self._make_trading_client()
+            ns = {'ebay': 'urn:ebay:apis:eBLBaseComponents'}
+            lookback = sold_relist_lookback_days()
+            page = 1
+            total_pages = 1
+            while page <= total_pages:
+                response = trading.get_sold_listings(
+                    page=page,
+                    limit=200,
+                    duration_days=lookback,
+                    site_id=site_id,
+                )
+                root = ET.fromstring(response)
+                total_pages_text = root.findtext(
+                    './/ebay:SoldList/ebay:PaginationResult/ebay:TotalNumberOfPages',
+                    default='',
+                    namespaces=ns,
+                )
+                if not total_pages_text:
+                    total_pages_text = root.findtext(
+                        './/ebay:PaginationResult/ebay:TotalNumberOfPages',
+                        default='1',
+                        namespaces=ns,
+                    )
+                try:
+                    total_pages = max(1, int(total_pages_text or 1))
+                except Exception:
+                    total_pages = 1
+
+                parent_map = {child: parent for parent in root.iter() for child in parent}
+                sold_items = root.findall('.//ebay:SoldList//ebay:Item', ns)
+                if not sold_items:
+                    sold_items = root.findall('.//ebay:ItemArray/ebay:Item', ns)
+                for item in sold_items:
+                    sku = (item.findtext('ebay:SKU', default='', namespaces=ns) or '').strip()
+                    item_id = (item.findtext('ebay:ItemID', default='', namespaces=ns) or '').strip()
+                    if not item_id and not sku:
+                        continue
+                    quantity_text = item.findtext('ebay:Quantity', default='0', namespaces=ns)
+                    sold_text = item.findtext('ebay:SellingStatus/ebay:QuantitySold', default='0', namespaces=ns)
+                    available_text = item.findtext('ebay:QuantityAvailable', default='', namespaces=ns)
+                    purchased_text = ''
+                    parent = parent_map.get(item)
+                    if parent is not None:
+                        purchased_text = parent.findtext('ebay:QuantityPurchased', default='', namespaces=ns) or ''
+                    try:
+                        quantity = int(float(quantity_text or 0))
+                        sold = int(float(sold_text or 0))
+                        purchased = int(float(purchased_text or 0))
+                        available = (
+                            int(float(available_text))
+                            if available_text not in (None, '')
+                            else max(0, quantity - max(sold, purchased))
+                        )
+                    except Exception:
+                        continue
+                    if sold <= 0 and purchased > 0:
+                        sold = purchased
+                    row = {
+                        'listing_id': item_id,
+                        'available': available,
+                        'quantity': quantity,
+                        'sold': sold,
+                        'listing_status': item.findtext(
+                            'ebay:SellingStatus/ebay:ListingStatus',
+                            default='',
+                            namespaces=ns,
+                        ) or '',
+                        'ending_reason': item.findtext(
+                            'ebay:ListingDetails/ebay:EndingReason',
+                            default='',
+                            namespaces=ns,
+                        ) or '',
+                    }
+                    confirmed = completed_because_sold(
+                        row['listing_status'], row['ending_reason'], row['sold'],
+                    )
+                    # SoldList sometimes omits ListingStatus. Zero available plus a
+                    # sale still needs GetItem before we relist.
+                    row['needs_confirmation'] = (
+                        not confirmed
+                        and not row['listing_status']
+                        and available == 0
+                        and sold > 0
+                    )
+                    if not confirmed and not row['needs_confirmation']:
+                        continue
+                    self._store_sold_row(by_sku, by_item, sku, item_id, row)
+
+                page += 1
+                if page <= total_pages:
+                    time.sleep(0.2)
+
+            log.info(f"  Trading SoldList 售完候选: {len(by_sku)} SKU (site {site_id}, {lookback}d)")
+        except Exception as e:
+            log.warning(f"加载 Trading SoldList 失败: {e}")
+        return by_sku, by_item
+
+    @staticmethod
+    def _store_sold_row(by_sku: dict, by_item: dict, sku: str, item_id: str, row: dict) -> None:
+        """Keep a confirmed sell-through ahead of an unconfirmed sold-list row."""
+        def _better(existing: dict | None) -> bool:
+            if not existing:
+                return True
+            new_confirmed = completed_because_sold(
+                row.get('listing_status'), row.get('ending_reason'), row.get('sold'),
+            )
+            old_confirmed = completed_because_sold(
+                existing.get('listing_status'), existing.get('ending_reason'), existing.get('sold'),
+            )
+            return new_confirmed and not old_confirmed
+
+        if sku and _better(by_sku.get(sku)):
+            by_sku[sku] = row
+        if item_id and _better(by_item.get(item_id)):
+            by_item[item_id] = row
 
     @staticmethod
     def _normalize_thumbnail_url(url: str) -> str:
@@ -988,6 +1132,9 @@ class SalesHealthChecker:
 
         场景: eBay 库存被设为 0 (如手动/eBay系统/同步异常)，
               但大建仍然有货，sync 因 last_action 不是 out_of_stock 而跳过恢复。
+
+        Trading / Motors（SiteID 100）卖完会把 listing 标成 Completed，不会留在
+        ActiveList。这类链接没有 Inventory Offer，需要 Relist，不能记成 DELISTED。
         """
         import requests
         self.quantity_audit = empty_inventory_audit(AUDIT_SCOPE_FULL_OOS)
@@ -1025,16 +1172,56 @@ class SalesHealthChecker:
         checked = 0
         error_count = 0
         qty_zero = []
+        listing_ids = {}
+        relist_listing_ids = {}
+        sold_through_skus = set()
         trading_quantity_map = self._fetch_trading_active_quantity_map()
+        sold_by_sku, sold_by_item = ({}, {})
+        if uses_trading_channel():
+            sold_by_sku, sold_by_item = self._fetch_trading_recent_sold_map()
 
         for r in rows:
             sku = r['sku']
             listing_id = r['listing_id']
+            listing_ids[sku] = listing_id
             checked += 1
             try:
                 trading_state = trading_quantity_map.get(sku) or {}
+                sold_state = sold_by_sku.get(sku) or sold_by_item.get(str(listing_id or "")) or {}
                 qty = None
                 trading_available = trading_state.get('available')
+
+                if trading_available is None and sold_state.get('needs_confirmation'):
+                    confirmed = self._fetch_trading_listing_snapshot(sold_state.get('listing_id'))
+                    if confirmed and completed_because_sold(
+                        confirmed.get('listing_status'),
+                        confirmed.get('ending_reason'),
+                        confirmed.get('quantity_sold'),
+                    ):
+                        sold_state = {
+                            **sold_state,
+                            'listing_status': confirmed.get('listing_status'),
+                            'ending_reason': confirmed.get('ending_reason'),
+                            'sold': confirmed.get('quantity_sold'),
+                            'listing_id': confirmed.get('item_id') or sold_state.get('listing_id'),
+                            'needs_confirmation': False,
+                        }
+                        if sku:
+                            sold_by_sku[sku] = sold_state
+
+                if trading_available is None and completed_because_sold(
+                    sold_state.get('listing_status'),
+                    sold_state.get('ending_reason'),
+                    sold_state.get('sold'),
+                ):
+                    # A live ActiveList row wins. This branch is only the
+                    # completed sell-through that ActiveList can no longer see.
+                    qty_zero.append(sku)
+                    sold_through_skus.add(sku)
+                    relist_listing_ids[sku] = str(
+                        sold_state.get('listing_id') or listing_id or ""
+                    )
+                    continue
 
                 if trading_available is None:
                     url = f"https://api.ebay.com/sell/inventory/v1/inventory_item/{sku}"
@@ -1101,7 +1288,7 @@ class SalesHealthChecker:
             return self.quantity_audit
 
         from src.plugins.inventory_sync.sync_service import InventorySyncService
-        svc = InventorySyncService()
+        svc = InventorySyncService(db_path=str(self.db_path))
 
         supplier_oos_skus = []
         restocked_items = []
@@ -1113,24 +1300,65 @@ class SalesHealthChecker:
                 except Exception:
                     offer_status = 'UNKNOWN'
 
-                if offer_status in ('ENDED', 'NOT_FOUND'):
-                    log.info(f"  {sku}: eBay offer 状态={offer_status}，跳过恢复 (可能是人工下架)")
-                    # 同步 DB 状态
-                    try:
-                        conn2 = sqlite3.connect(str(self.db_path))
-                        conn2.execute(
-                            "UPDATE collected_products SET status = 'DELISTED' WHERE sku = ? AND status = 'PUBLISHED'",
-                            (sku,))
-                        if conn2.total_changes > 0:
-                            log.info(f"    → 已将 DB 状态更新为 DELISTED")
-                        conn2.commit()
-                        conn2.close()
-                    except Exception as db_err:
-                        log.warning(f"    → DB 状态更新失败: {db_err}")
-                        self.quantity_audit["error_count"] += 1
-                    continue
+                recovery = 'revise'
+                if offer_status in ('ENDED', 'NOT_FOUND') or sku in sold_through_skus:
+                    listing_id = relist_listing_ids.get(sku) or listing_ids.get(sku)
+                    snapshot = self._fetch_trading_listing_snapshot(listing_id) or {}
+                    sold_state = sold_by_sku.get(sku) or sold_by_item.get(str(listing_id or "")) or {}
+                    snapshot_status = str(snapshot.get('listing_status') or '')
+                    # A Trading miss must not wipe a SoldList Completed/Sold row.
+                    if snapshot_status.upper() == 'NOT_FOUND' and sold_state.get('listing_status'):
+                        trading_status = sold_state.get('listing_status')
+                        ending_reason = sold_state.get('ending_reason')
+                        quantity_sold = sold_state.get('sold')
+                    else:
+                        trading_status = snapshot_status or sold_state.get('listing_status')
+                        ending_reason = snapshot.get('ending_reason') or sold_state.get('ending_reason')
+                        quantity_sold = snapshot.get('quantity_sold')
+                        if quantity_sold is None:
+                            quantity_sold = sold_state.get('sold')
+                    if not trading_status:
+                        trading_status = 'NOT_FOUND'
+                    recovery = classify_zero_qty_listing(
+                        inventory_offer_status=offer_status,
+                        trading_status=trading_status,
+                        ending_reason=ending_reason,
+                        quantity_sold=quantity_sold,
+                    )
+                    if recovery == 'relist':
+                        sold_through_skus.add(sku)
+                        relist_listing_ids[sku] = str(
+                            snapshot.get('item_id')
+                            or sold_state.get('listing_id')
+                            or listing_id
+                            or ""
+                        )
+                    elif recovery == 'delist':
+                        log.info(f"  {sku}: eBay offer 状态={offer_status}，Trading={trading_status}，同步为 DELISTED")
+                        try:
+                            conn2 = sqlite3.connect(str(self.db_path))
+                            conn2.execute(
+                                "UPDATE collected_products SET status = 'DELISTED' WHERE sku = ? AND status = 'PUBLISHED'",
+                                (sku,))
+                            if conn2.total_changes > 0:
+                                log.info(f"    → 已将 DB 状态更新为 DELISTED")
+                            conn2.commit()
+                            conn2.close()
+                        except Exception as db_err:
+                            log.warning(f"    → DB 状态更新失败: {db_err}")
+                            self.quantity_audit["error_count"] += 1
+                        continue
+                    elif recovery == 'skip':
+                        log.info(
+                            f"  {sku}: offer={offer_status}，Trading={trading_status}，"
+                            f"没有确认下架，不标 DELISTED"
+                        )
+                        continue
 
-                from src.utils.ebay_quantity import normalize_ebay_listing_quantity
+                from src.utils.ebay_quantity import (
+                    determine_target_ebay_quantity,
+                    normalize_ebay_listing_quantity,
+                )
 
                 in_stock, _, _, available_quantity = svc.check_dajian_stock(sku)
                 if in_stock:
@@ -1139,11 +1367,27 @@ class SalesHealthChecker:
                             f"  {sku}: restock hold 生效中，保持 eBay 库存为 0，不补为 1"
                         )
                         continue
-                    log.warning(f"  {sku}: eBay qty=0 但大建有货! (offer={offer_status})")
+                    if sku in sold_through_skus:
+                        if available_quantity is None:
+                            target_qty = normalize_ebay_listing_quantity(1)
+                        else:
+                            target_qty = determine_target_ebay_quantity(available_quantity)
+                        if target_qty <= 0:
+                            log.info(f"  {sku}: 售完待 Relist，但供应商可售数量为 0，不 Relist")
+                            supplier_oos_skus.append(sku)
+                            continue
+                        log.warning(
+                            f"  {sku}: 因售出 Completed，供应商库存 {available_quantity}，"
+                            f"准备 Relist 数量 {target_qty}"
+                        )
+                    else:
+                        target_qty = normalize_ebay_listing_quantity(available_quantity or 1)
+                        log.warning(f"  {sku}: eBay qty=0 但大建有货! (offer={offer_status})")
                     if auto_fix:
                         success = svc.update_ebay_quantity(
                             sku,
-                            normalize_ebay_listing_quantity(available_quantity or 1),
+                            target_qty,
+                            known_listing_id=relist_listing_ids.get(sku) or listing_ids.get(sku),
                         )
                         status = '已恢复' if success else '恢复失败'
                         log.info(f"    → 自动恢复库存: {status}")
