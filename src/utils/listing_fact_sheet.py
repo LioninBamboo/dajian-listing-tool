@@ -639,10 +639,20 @@ def _generic_material_supported(material: str, source_materials: list[str]) -> b
     return False
 
 
-def _matches_synonym_group(text: str) -> frozenset[str] | None:
+def _any_synonym_phrase_in(group: frozenset[str], text: str) -> bool:
+    """True when a synonym phrase appears as a whole phrase in `text`.
+
+    Hyphens fold to spaces so ``year-round`` still matches ``year round``.
+    Short tokens (``linen`` / ``foam`` / ``mdf``) must not match inside an
+    unrelated word such as ``pipeline``.
+    """
     normalized = re.sub(r"[\s-]+", " ", str(text or "").lower())
+    return any(_word_bounded_phrase_in(phrase, normalized) for phrase in group)
+
+
+def _matches_synonym_group(text: str) -> frozenset[str] | None:
     for group in _SYNONYM_GROUPS:
-        if any(phrase in normalized for phrase in group):
+        if _any_synonym_phrase_in(group, text):
             return group
     return None
 
@@ -650,7 +660,7 @@ def _matches_synonym_group(text: str) -> frozenset[str] | None:
 def _claim_in_text(claim: str, text: str) -> bool:
     """Is a material/certification claim textually present in `text`?
 
-    True when the claim appears as a substring, when all its significant
+    True when the claim appears as a whole phrase, when all its significant
     tokens appear, or when it matches via the material lexicon. Used to
     decide whether a fact-sheet violation is *grounded* — a listing cannot
     be "claiming" a material its copy never mentions (the LLM extractor
@@ -662,7 +672,7 @@ def _claim_in_text(claim: str, text: str) -> bool:
     if not claim_norm:
         return False
     text_norm = re.sub(r"\s+", " ", str(text).lower())
-    if claim_norm in text_norm:
+    if _word_bounded_phrase_in(claim_norm, text_norm):
         return True
     claim_tokens = _tokens(claim_norm)
     if claim_tokens and claim_tokens <= _tokens(text_norm):
@@ -672,10 +682,8 @@ def _claim_in_text(claim: str, text: str) -> bool:
         return True
     # Synonym groups: powder coated ↔ powder coating, foldable ↔ folding, etc.
     group = _matches_synonym_group(claim_norm)
-    if group is not None:
-        normalized = re.sub(r"[\s-]+", " ", text_norm)
-        if any(phrase in normalized for phrase in group):
-            return True
+    if group is not None and _any_synonym_phrase_in(group, text_norm):
+        return True
     return False
 
 
@@ -693,8 +701,7 @@ def _supported_by_any(claim: str, source_items: list[str], source_blob_tokens: s
         return True
     group = _matches_synonym_group(claim)
     if group is not None:
-        normalized_blob = re.sub(r"[\s-]+", " ", source_blob_text.lower())
-        return any(phrase in normalized_blob for phrase in group)
+        return _any_synonym_phrase_in(group, source_blob_text)
     return False
 
 

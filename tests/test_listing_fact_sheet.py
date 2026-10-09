@@ -960,6 +960,25 @@ class TestFoamMdfLinenEngineeredDemotion:
     def test_part_word_mdf_does_not_match_inside_unrelated_token(self):
         # Word-boundary guard: a source mentioning "pipeline" must not back "linen".
         assert _generic_material_supported("linen", ["pipeline steel"]) is False
+        source = dict(SOURCE_SHEET, materials=["pipeline steel"])
+        live = dict(SOURCE_SHEET, materials=["linen"])
+        violations = compare_fact_sheets(source, live)
+        assert any(
+            v["claim_type"] == "semantic_material" and v["claim_text"] == "linen"
+            for v in violations
+        )
+        # The live-audit gate passes raw copy, so a part-word in source text
+        # must not ground the claim either.
+        grounded = compare_fact_sheets(
+            source,
+            live,
+            live_text="Linen cushion cover",
+            source_text="Pipeline steel frame",
+        )
+        assert any(
+            v["claim_type"] == "semantic_material" and v["claim_text"] == "linen"
+            for v in grounded
+        )
 
     def test_engineered_wood_on_soft_sofa_still_flags(self):
         # Past true positive must keep failing (W2519* chenille/foam sofas).
