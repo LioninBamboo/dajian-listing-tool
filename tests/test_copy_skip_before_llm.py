@@ -180,6 +180,44 @@ def test_ebay_listing_price_is_not_supplier_cargo_without_a_live_quote():
     assert REASON_CARGO_COST not in decision.reasons
 
 
+def test_ebay_listing_price_does_not_trip_far_above_market():
+    decision = _decision(
+        product_price=400,
+        shipping=0,
+        specs={"_price_basis": "ebay_listing"},
+        apply_cargo=False,
+        market_median=400,
+        include_market=True,
+    )
+    assert decision.skip is False
+    assert REASON_FAR_ABOVE not in decision.reasons
+    assert REASON_CARGO_COST not in decision.reasons
+    assert decision.detail["pricing_basis"] == "ebay_listing"
+    assert "safe_15_price" not in decision.detail
+
+
+def test_matching_live_quote_keeps_cargo_cap_on_listing_basis():
+    from src.utils.copy_skip_gate import apply_live_supplier_quote, cargo_gate_applies
+
+    product = _Product(price=190, shipping=20, specs={"_price_basis": "ebay_listing"})
+    applied = apply_live_supplier_quote(product, {"price": 190, "shipping": 20})
+    assert applied is True
+    assert product.price == 190
+    assert product.shipping == 20
+    assert product.specs["_price_basis"] == "supplier_quote"
+    assert cargo_gate_applies(product.specs, live_quote_applied=applied) is True
+    # A later run with no fresh quote still sees supplier cost, not the listing basis.
+    assert cargo_gate_applies(product.specs, live_quote_applied=False) is True
+    decision = _decision(
+        product_price=product.price,
+        shipping=product.shipping,
+        specs=product.specs,
+        apply_cargo=True,
+        include_market=False,
+    )
+    assert REASON_CARGO_COST in decision.reasons
+
+
 def _function(path: Path, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
     tree = ast.parse(path.read_text(encoding="utf-8-sig"))
     for node in ast.walk(tree):
@@ -202,6 +240,19 @@ def _call_lines(func: ast.AST, callee: str) -> list[int]:
         if name == callee:
             lines.append(node.lineno)
     return lines
+
+
+def test_daily_and_batch_enrich_dims_before_copy_skip():
+    for relative, func_name in (
+        ("daily_tasks.py", "analyze_collected_products"),
+        ("batch_analyze.py", "main"),
+    ):
+        func = _function(ROOT / relative, func_name)
+        enrich_lines = _call_lines(func, "enrich_missing_item_dimensions")
+        gate_lines = _call_lines(func, "evaluate_copy_skip")
+        assert enrich_lines, relative
+        assert gate_lines, relative
+        assert min(enrich_lines) < min(gate_lines)
 
 
 def test_analyze_callers_gate_before_llm_copy():
@@ -286,10 +337,10 @@ class _Session:
         return None
 
 
-def _run_analyze(monkeypatch, product, *, intel, live_quote=None):
+def _run_analyze(monkeypatch, product, *, intel, live_quote=None, supplier_dims=None):
     import daily_tasks
 
-    calls = {"optimize": 0, "fact_sheet": 0, "market": 0, "live": 0}
+    calls = {"optimize": 0, "fact_sheet": 0, "market": 0, "live": 0, "dims": 0}
 
     def _optimize(*args, **kwargs):
         calls["optimize"] += 1
@@ -313,12 +364,17 @@ def _run_analyze(monkeypatch, product, *, intel, live_quote=None):
         calls["live"] += 1
         return live_quote
 
+    def _dims(sku):
+        calls["dims"] += 1
+        return supplier_dims or {}
+
     monkeypatch.setattr("src.db.collection_db.SessionLocal", lambda: _Session(product))
     monkeypatch.setattr("sqlalchemy.orm.attributes.flag_modified", lambda *args, **kwargs: None)
     monkeypatch.setattr("qwen_optimizer.optimize_product_full_with_timeout", _optimize)
     monkeypatch.setattr("src.utils.listing_fact_sheet.extract_fact_sheet", _fact_sheet)
     monkeypatch.setattr("qwen_optimizer.QwenOptimizer", lambda api_key: _Qwen())
     monkeypatch.setattr("src.utils.copy_skip_gate.lookup_live_supplier_quote", _live)
+    monkeypatch.setattr("src.utils.copy_skip_gate.fetch_supplier_assembled_dimensions", _dims)
     monkeypatch.setenv("QWEN_API_KEY", "dummy")
     monkeypatch.setattr(daily_tasks, "_open_listing_qc_connection", lambda: None)
 
@@ -391,6 +447,70 @@ def test_live_cargo_recheck_skips_before_llm(monkeypatch):
     assert product.price == 190
     assert product.shipping == 20
     assert REASON_CARGO_COST in result["skip_reasons"][product.sku]
+
+
+def test_missing_dims_are_filled_from_supplier_before_skip(monkeypatch):
+    product = _Product(attributes={}, description="Oak table. No measurements in the text.")
+    result, calls = _run_analyze(
+        monkeypatch,
+        product,
+        intel={"pricing_basis": "SAFE_15_NO_MARKET", "price_stats": {}, "total_listings": 0},
+        supplier_dims={"assembledLength": 40, "assembledWidth": 20, "assembledHeight": 18},
+    )
+    assert calls["dims"] == 1
+    assert calls["optimize"] == 1
+    assert product.status == "READY"
+    assert product.attributes["Assembled Length (in.)"] == "40"
+    assert product.attributes["Assembled Width (in.)"] == "20"
+    assert product.attributes["Assembled Height (in.)"] == "18"
+    assert result["success"] == 1
+    assert result["skipped"] == 0
+
+
+def test_package_dims_from_supplier_do_not_satisfy_item_axes(monkeypatch):
+    product = _Product(attributes={}, specs={}, description="")
+    result, calls = _run_analyze(
+        monkeypatch,
+        product,
+        intel=None,
+        supplier_dims={"length": 40, "width": 20, "height": 18},
+    )
+    assert calls["optimize"] == 0
+    assert calls["dims"] == 1
+    assert product.status == COPY_SKIP_STATUS
+    assert REASON_UNCLEAR_DIMS in result["skip_reasons"][product.sku]
+    assert "Assembled Length (in.)" not in (product.attributes or {})
+
+
+def test_ebay_listing_analyze_does_not_skip_far_above(monkeypatch):
+    product = _Product(price=400, shipping=0, specs={"_price_basis": "ebay_listing"})
+    result, calls = _run_analyze(
+        monkeypatch,
+        product,
+        intel={"price_stats": {"median": 400, "avg": 400}, "total_listings": 8},
+        live_quote=None,
+    )
+    assert calls["optimize"] == 1
+    assert calls["market"] == 1
+    assert product.status == "READY"
+    assert result["skipped"] == 0
+    assert product.specs["_price_basis"] == "ebay_listing"
+
+
+def test_matching_live_quote_skips_cargo_during_analyze(monkeypatch):
+    product = _Product(price=190, shipping=20, specs={"_price_basis": "ebay_listing"})
+    result, calls = _run_analyze(
+        monkeypatch,
+        product,
+        intel=None,
+        live_quote={"price": 190, "shipping": 20},
+    )
+    assert calls["optimize"] == 0
+    assert calls["market"] == 0
+    assert calls["live"] == 1
+    assert product.status == COPY_SKIP_STATUS
+    assert REASON_CARGO_COST in result["skip_reasons"][product.sku]
+    assert product.specs["_price_basis"] == "supplier_quote"
 
 
 def test_far_above_skips_after_market_fetch_and_before_copy(monkeypatch):

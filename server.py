@@ -624,8 +624,12 @@ def analyze_product_task(sku: str):
             lookup_live_supplier_quote,
         )
         specs = product.specs or {}
+        was_listing_price = str((specs or {}).get("_price_basis") or "").strip().lower() == "ebay_listing"
         live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(sku))
+        specs = product.specs or specs
         apply_cargo = cargo_gate_applies(specs, live_quote_applied=live_applied)
+        if live_applied and was_listing_price:
+            flag_modified(product, "specs")
         if live_applied:
             logging.info(
                 f"[PRICE] {sku} live supplier quote: price=${product.price} ship=${product.shipping}"

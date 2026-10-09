@@ -223,6 +223,7 @@ def analyze_collected_products(
                     apply_copy_skip,
                     apply_live_supplier_quote,
                     cargo_gate_applies,
+                    enrich_missing_item_dimensions,
                     evaluate_copy_skip,
                     lookup_live_supplier_quote,
                     market_median_from_intel,
@@ -232,12 +233,28 @@ def analyze_collected_products(
                 attributes = product.attributes or {}
                 is_oversize = 'Dimensions' in specs or 'Dimensions' in attributes
 
+                was_listing_price = str((specs or {}).get("_price_basis") or "").strip().lower() == "ebay_listing"
                 live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(product.sku))
                 if live_applied:
                     logger.info(
                         f"  💲 Live supplier quote: price=${product.price} ship=${product.shipping}"
                     )
+                specs = product.specs or specs
                 apply_cargo = cargo_gate_applies(specs, live_quote_applied=live_applied)
+                if live_applied and was_listing_price:
+                    _flag_modified(product, "specs")
+
+                # Collect defers empty item axes. Load DaJian assembled L/W/H
+                # before unclear_dims, or the row is SKIPPED and never retried.
+                if enrich_missing_item_dimensions(product):
+                    attributes = product.attributes or {}
+                    _flag_modified(product, "attributes")
+                    logger.info(
+                        "  📐 Supplier item dims: "
+                        f"{attributes.get('Assembled Length (in.)')} x "
+                        f"{attributes.get('Assembled Width (in.)')} x "
+                        f"{attributes.get('Assembled Height (in.)')}"
+                    )
 
                 dajian_costs = PricingEngine.calculate_dajian_cost(
                     product_price=product.price,

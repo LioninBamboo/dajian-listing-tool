@@ -11,7 +11,8 @@ Reason codes (stored on the product log and ``cost_breakdown``):
 - ``cargo_cost_over_200`` — supplier product + cargo (shipping) > USD 200
 - ``unclear_dims`` — item L/W/H missing, placeholder, or not source-grounded
 - ``far_above_market`` — a real market median exists and the SAFE_15 price
-  still sits above the near-market band (median × 1.15)
+  from landed GIGA cost still sits above the near-market band (median × 1.15).
+  An observed eBay listing price is not that cost and must not trip the check.
 - ``factsheet_material_conflict`` — source-grounded material clash that
   FactSheet already fails without an LLM invent
 
@@ -29,6 +30,7 @@ from typing import Any, Mapping
 
 from src.services.pricing_engine import PricingEngine
 from src.utils.dimension_helpers import (
+    extract_dajian_measurements,
     extract_numeric_inches,
     extract_product_dimensions_from_text,
 )
@@ -168,19 +170,29 @@ def lookup_live_supplier_quote(sku: str) -> dict[str, Any] | None:
 
 
 def apply_live_supplier_quote(product: Any, quote: Mapping[str, Any] | None) -> bool:
-    """Write a live quote onto ``product.price`` / ``product.shipping``."""
+    """Write a live quote onto ``product.price`` / ``product.shipping``.
+
+    Returns True when a usable supplier quote was obtained, including when
+    the stored numbers already match. Callers use that to turn the cargo cap
+    back on for eBay-link drafts. A matching quote still replaces
+    ``_price_basis=ebay_listing`` so a later analyze run keeps treating the
+    stored numbers as GIGA cost.
+    """
     if not quote:
         return False
-    changed = False
     price = _as_float(quote.get("price"))
     shipping = _as_float(quote.get("shipping"))
-    if price is not None and price > 0 and _as_float(getattr(product, "price", None)) != price:
+    if price is None or price <= 0:
+        return False
+    if _as_float(getattr(product, "price", None)) != price:
         product.price = price
-        changed = True
     if shipping is not None and shipping >= 0 and _as_float(getattr(product, "shipping", None)) != shipping:
         product.shipping = shipping
-        changed = True
-    return changed
+    specs = getattr(product, "specs", None)
+    if isinstance(specs, dict) and str(specs.get("_price_basis") or "").strip().lower() == "ebay_listing":
+        specs["_price_basis"] = "supplier_quote"
+        product.specs = dict(specs)
+    return True
 
 
 def _is_package_key(key: str) -> bool:
@@ -384,12 +396,83 @@ def market_median_from_intel(intel: Mapping[str, Any] | None) -> float | None:
 def cargo_gate_applies(specs: Mapping[str, Any] | None, *, live_quote_applied: bool) -> bool:
     """eBay-link drafts store an observed listing price, not GIGA cargo.
 
-    A live supplier quote replaces that price, so the cargo cap applies again.
+    ``live_quote_applied`` means a supplier quote was obtained this call, not
+    that price or shipping changed. A quote that already matches the stored
+    numbers still replaces the listing basis, so the cargo cap applies again.
     """
     if live_quote_applied:
         return True
     basis = str((specs or {}).get("_price_basis") or "").strip().lower()
     return basis != "ebay_listing"
+
+
+def _supplier_price_for_market(specs: Mapping[str, Any] | None, *, apply_cargo: bool) -> bool:
+    """SAFE_15 uses landed GIGA cost, never an observed eBay listing price."""
+    if apply_cargo:
+        return True
+    basis = str((specs or {}).get("_price_basis") or "").strip().lower()
+    return basis != "ebay_listing"
+
+
+_ASSEMBLED_ITEM_ATTRS = (
+    ("assembledLength", "Assembled Length (in.)"),
+    ("assembledWidth", "Assembled Width (in.)"),
+    ("assembledHeight", "Assembled Height (in.)"),
+)
+
+
+def fetch_supplier_assembled_dimensions(sku: str) -> dict[str, Any]:
+    """Live DaJian assembled L/W/H. Empty when unknown. Never raises."""
+    key = os.getenv("DAJIAN_API_KEY")
+    secret = os.getenv("DAJIAN_API_SECRET")
+    if not key or not secret or not str(sku or "").strip():
+        return {}
+    try:
+        from src.clients.dajian_client import DaJianClient
+
+        detail = DaJianClient(key, secret).get_product_detail_by_sku(str(sku).strip())
+        if not detail:
+            return {}
+        return extract_dajian_measurements(detail) or {}
+    except Exception:
+        return {}
+
+
+def enrich_missing_item_dimensions(product: Any) -> bool:
+    """Fill missing item L/W/H from DaJian before the copy-skip gate.
+
+    Collect defers empty axes. Daily and batch analyze must load supplier
+    assembled measurements or those COLLECTED rows are SKIPPED forever.
+    Package dimensions are never copied onto item axes.
+    """
+    attributes = getattr(product, "attributes", None) or {}
+    specs = getattr(product, "specs", None) or {}
+    description = str(getattr(product, "description", None) or "")
+    found, _saw_placeholder = resolve_item_dimensions(
+        attributes if isinstance(attributes, Mapping) else {},
+        specs if isinstance(specs, Mapping) else {},
+        description,
+    )
+    if not _dims_incomplete(found):
+        return False
+    fetched = fetch_supplier_assembled_dimensions(getattr(product, "sku", ""))
+    if not fetched:
+        return False
+    merged = dict(attributes) if isinstance(attributes, Mapping) else {}
+    changed = False
+    for src, dest in _ASSEMBLED_ITEM_ATTRS:
+        if str(merged.get(dest) or "").strip():
+            continue
+        raw = fetched.get(src)
+        number = _as_float(raw)
+        if number is None or not 0 < number <= 500:
+            continue
+        merged[dest] = str(raw)
+        changed = True
+    if not changed:
+        return False
+    product.attributes = merged
+    return True
 
 
 def evaluate_copy_skip(
@@ -452,7 +535,14 @@ def evaluate_copy_skip(
         detail["material_conflicts"] = conflicts
 
     median = _as_float(market_median)
-    if include_market and median is not None and median > 0:
+    supplier_priced = _supplier_price_for_market(specs, apply_cargo=apply_cargo)
+    if include_market and not supplier_priced:
+        # eBay-link intake stores the live sell price. SAFE_15 on that number
+        # sits above almost any median and would skip copy with no GIGA quote.
+        if median is not None and median > 0:
+            detail["market_median"] = median
+        detail["pricing_basis"] = "ebay_listing"
+    elif include_market and median is not None and median > 0:
         detail["market_median"] = median
         safe_price = safe_15_price(product_price, shipping, is_oversize=is_oversize)
         ceiling = median * NEAR_MARKET_BAND
