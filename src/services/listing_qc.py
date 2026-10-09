@@ -121,13 +121,25 @@ _COLOR_RE = re.compile(
     re.IGNORECASE,
 )
 _COLOR_CANONICAL = {"grey": "gray"}
+# Keep both ends of "2-4" / "2 to 4". A candidate span is supported only when
+# it sits inside a source span of the same family, so "4 persons" matches
+# source "2-4 persons" and "2-5 gallons" does not match source "2 gallon".
+# seat/seats is a product noun on motors copy ("2 Seat Cover"), not occupancy;
+# seater/people/occupant still count. person/persons skips install copy
+# ("1 person assembly", "1 person installation").
 _CAPACITY_RE = re.compile(
-    r"\b(?P<num>\d+(?:\.\d+)?)\s*(?:(?:-|–|to)\s*\d+(?:\.\d+)?\s*)?"
-    r"(?P<unit>persons?|people|seats?|seaters?|occupants?|gallons?|gals?|quarts?|liters?|litres?)\b",
+    r"\b(?P<num>\d+(?:\.\d+)?)"
+    r"(?:\s*(?:-|–|to)\s*(?P<high>\d+(?:\.\d+)?))?"
+    r"\s*"
+    r"(?P<unit>"
+    r"people|seaters?|occupants?|"
+    r"persons?(?![\s-]+(?:assembly|install(?:ation)?)\b)|"
+    r"gallons?|gals?|quarts?|liters?|litres?"
+    r")\b",
     re.IGNORECASE,
 )
 _OCCUPANCY_UNITS = {
-    "person", "persons", "people", "seat", "seats", "seater", "seaters",
+    "person", "persons", "people", "seater", "seaters",
     "occupant", "occupants",
 }
 _VOLUME_UNITS = {
@@ -207,26 +219,45 @@ def _capacity_family(unit: str) -> str:
     return ""
 
 
-def _capacity_number(raw: str) -> str:
+def _capacity_number(raw: float | str) -> str:
     value = float(raw)
     if value.is_integer():
         return str(int(value))
     return f"{value:g}"
 
 
-def _capacity_mentions(text: str) -> list[tuple[str, str, str]]:
-    mentions: list[tuple[str, str, str]] = []
-    seen: set[tuple[str, str]] = set()
+def _format_capacity_span(low: float, high: float) -> str:
+    low_text = _capacity_number(low)
+    if low == high:
+        return low_text
+    return f"{low_text}-{_capacity_number(high)}"
+
+
+def _capacity_span_supported(
+    low: float,
+    high: float,
+    known: list[tuple[float, float]],
+) -> bool:
+    return any(src_low <= low and high <= src_high for src_low, src_high in known)
+
+
+def _capacity_mentions(text: str) -> list[tuple[float, float, str, str]]:
+    mentions: list[tuple[float, float, str, str]] = []
+    seen: set[tuple[float, float, str]] = set()
     for match in _CAPACITY_RE.finditer(text or ""):
         family = _capacity_family(match.group("unit"))
         if not family:
             continue
-        number = _capacity_number(match.group("num"))
-        key = (number, family)
+        low = float(match.group("num"))
+        high_raw = match.group("high")
+        high = float(high_raw) if high_raw else low
+        if high < low:
+            low, high = high, low
+        key = (low, high, family)
         if key in seen:
             continue
         seen.add(key)
-        mentions.append((number, family, match.group(0).strip().lower()))
+        mentions.append((low, high, family, match.group(0).strip().lower()))
     return mentions
 
 
@@ -301,15 +332,18 @@ def motors_deterministic_fact_violations(
         )
 
     source_caps = _capacity_mentions(source_text)
-    source_by_family: dict[str, set[str]] = {}
-    for number, family, _raw in source_caps:
-        source_by_family.setdefault(family, set()).add(number)
-    for number, family, raw in _capacity_mentions(candidate_text):
-        known = source_by_family.get(family) or set()
-        if number in known:
+    source_by_family: dict[str, list[tuple[float, float]]] = {}
+    for low, high, family, _raw in source_caps:
+        source_by_family.setdefault(family, []).append((low, high))
+    for low, high, family, raw in _capacity_mentions(candidate_text):
+        known = source_by_family.get(family) or []
+        if _capacity_span_supported(low, high, known):
             continue
         if known:
-            evidence = ", ".join(sorted(known, key=float))
+            evidence = ", ".join(
+                _format_capacity_span(src_low, src_high)
+                for src_low, src_high in sorted(known)
+            )
             severity = "CRITICAL"
             claim_text = f"{raw} (source: {evidence})"
         else:

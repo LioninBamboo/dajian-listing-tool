@@ -599,6 +599,105 @@ def test_motors_blocks_invented_capacity_against_source(monkeypatch):
     assert not any(item.startswith("[Fitment]") for item in result["blockers"])
 
 
+def test_motors_capacity_range_accepts_endpoint_and_rejects_wider_span(monkeypatch):
+    """A value inside the source span passes; a candidate span past the source does not."""
+    _forbid_furniture_gate(monkeypatch)
+
+    inside = listing_qc.run_listing_qc(
+        sku="UTV-4",
+        candidate={
+            "title": "Universal Accessory",
+            "description": "Rated for 4 persons.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal Fit"]},
+        },
+        source_title="Accessory",
+        source_description="Rated for 2-4 persons.",
+        qc_profile="motors",
+    )
+    assert inside["status"] == "pass"
+    assert inside["blockers"] == []
+
+    worded = listing_qc.run_listing_qc(
+        sku="UTV-3",
+        candidate={
+            "title": "Universal Accessory",
+            "description": "Holds 3 persons.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal Fit"]},
+        },
+        source_title="Accessory",
+        source_description="Holds 2 to 4 persons.",
+        qc_profile="motors",
+    )
+    assert worded["status"] == "pass"
+    assert worded["blockers"] == []
+
+    wider = listing_qc.run_listing_qc(
+        sku="FUEL-RANGE",
+        candidate={
+            "title": "Universal Fuel Can",
+            "description": "Portable 2-5 gallon fuel can.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal Fit"]},
+        },
+        source_title="Fuel Can",
+        source_description="2 gallon portable fuel can.",
+        qc_profile="motors",
+    )
+    assert wider["status"] == "blocked"
+    assert any("semantic_capacity" in item and "5" in item for item in wider["blockers"])
+
+    seater = listing_qc.run_listing_qc(
+        sku="UTV-SEATER",
+        candidate={
+            "title": "Universal 6 Seater",
+            "description": "6 seater.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal Fit"]},
+        },
+        source_title="4 seater",
+        source_description="4 seater.",
+        qc_profile="motors",
+    )
+    assert seater["status"] == "blocked"
+    assert any("semantic_capacity" in item and "6" in item for item in seater["blockers"])
+
+
+def test_motors_seat_cover_and_person_assembly_are_not_capacity(monkeypatch):
+    _forbid_furniture_gate(monkeypatch)
+    result = listing_qc.run_listing_qc(
+        sku="SEAT-COVER-ASM",
+        candidate={
+            "title": "Universal 2 Seat Cover",
+            "description": "1 person assembly. Polyester seat cover.",
+            "categoryId": "33650",
+            "aspects": {
+                "Fitment Type": ["Universal Fit"],
+                "Material": ["Polyester"],
+            },
+        },
+        source_title="Seat Cover",
+        source_description="Polyester seat cover.",
+        source_attributes={"Material": "Polyester"},
+        qc_profile="motors",
+    )
+    assert result["fact_sheet_status"] == "pass"
+    assert result["fact_sheet_violations"] == []
+    assert not any("semantic_capacity" in item for item in result["blockers"])
+
+    installed = listing_qc.motors_deterministic_fact_violations(
+        {
+            "title": "Universal Cover",
+            "description": "1 person installation required.",
+            "aspects": {},
+        },
+        source_title="Cover",
+        source_description="Polyester cover.",
+    )
+    assert not any(item["claim_type"] == "semantic_capacity" for item in installed)
+
+
 def test_motors_universal_fit_still_blocks_claim_invent(monkeypatch):
     _forbid_furniture_gate(monkeypatch)
     result = listing_qc.run_listing_qc(
