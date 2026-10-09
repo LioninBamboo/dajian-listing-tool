@@ -2459,16 +2459,24 @@ def _claimed_set_or_pieces_qty(
 
 
 def _text_claims_set(title: str, aspects: Mapping[str, Any] | None = None) -> bool:
+    """Title or Type uses "set" as a quantity claim.
+
+    Other aspect values are product-family labels. ``Set Includes=Sofa Set``
+    on a sectional is not a box-qty claim.
+    """
     if _SET_WORD_RE.search(title or ""):
         return True
-    for value in (aspects or {}).values():
-        if isinstance(value, (list, tuple)):
-            blob = " ".join(str(item) for item in value)
-        else:
-            blob = str(value or "")
-        if _SET_WORD_RE.search(blob):
-            return True
-    return False
+    type_name = first_aspect_text(aspects or {}, "Type") or ""
+    return bool(_SET_WORD_RE.search(type_name))
+
+
+def _item_is_singular_form_of_set_type(type_name: str, item_name: str) -> bool:
+    """True for ``Floor Mat Set`` vs ``Floor Mat``, not ``Dining Set`` vs ``Dining Table``."""
+    if not type_name or not item_name or _SET_WORD_RE.search(item_name):
+        return False
+    singular = _SET_WORD_RE.sub(" ", type_name)
+    singular = re.sub(r"\s+", " ", singular).strip(" -/,")
+    return bool(singular) and singular.casefold() == item_name.strip().casefold()
 
 
 def expected_package_includes_main_qty(
@@ -2549,21 +2557,17 @@ def find_package_includes_set_qty_mismatch(
 ) -> ListingQualityIssue | None:
     """Flag title/aspect Set or Number of Pieces vs PACKAGE INCLUDES qty.
 
-    A Type that already names a set product still passes when the box line is
-    ``1 x {that set}`` (one set ships). ``1 x`` of the singular piece, or any
-    other qty that disagrees with Set / Number of Pieces / Number of Items in
-    Set, is a blocker. Motors QC calls this directly so universal-fit parts
-    are not exempt.
+    A Type that already names a set product passes when the box is
+    ``1 x {that set}`` or a furniture component (``1 x Dining Table`` /
+    ``1 x Sofa``). ``1 x Floor Mat`` for Type ``Floor Mat Set`` still blocks.
+    ``Set Includes`` values such as ``Sofa Set`` are not quantity claims.
+    Motors QC calls this directly so universal-fit parts are not exempt.
     """
     aspects = aspects or {}
     parsed = parse_package_includes_main_item(description)
     if parsed is None:
         return None
     actual, item_name = parsed
-    expected = _claimed_set_or_pieces_qty(title, aspects)
-    if expected and actual == expected:
-        return None
-
     type_name = first_aspect_text(aspects, "Type") or ""
     # One named set in the box: "1 x Wood Chisel Set" / "1 x Socket Set".
     # The piece count describes what is inside that set, not extra sets.
@@ -2572,6 +2576,18 @@ def find_package_includes_set_qty_mismatch(
         and _SET_WORD_RE.search(type_name)
         and _SET_WORD_RE.search(item_name)
     ):
+        return None
+    # Dining / patio sets list a component first. That line is not the
+    # motors "Type without the word Set" mismatch (Floor Mat Set → Floor Mat).
+    if (
+        _SET_WORD_RE.search(type_name)
+        and not _SET_WORD_RE.search(item_name)
+        and not _item_is_singular_form_of_set_type(type_name, item_name)
+    ):
+        return None
+
+    expected = _claimed_set_or_pieces_qty(title, aspects)
+    if expected and actual == expected:
         return None
 
     if expected and actual != expected:

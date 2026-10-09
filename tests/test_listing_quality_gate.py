@@ -2333,3 +2333,62 @@ def test_package_includes_flags_set_type_when_box_lists_one_singular_item():
     )
     assert issue is not None
     assert issue.code == "package_includes_set_qty_mismatch"
+
+
+def test_package_includes_allows_furniture_set_component_lines():
+    """Dining/patio sets and sectionals ship 1 x of a piece, not 1 x of the set name."""
+    from src.utils.listing_quality_gate import (
+        find_package_includes_set_qty_mismatch,
+        validate_listing_quality,
+    )
+
+    dining = find_package_includes_set_qty_mismatch(
+        "5-Piece Dining Set Solid Wood Table and 4 Chairs",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Dining Table, 4 x Dining Chair</p>",
+        {
+            "Type": ["Dining Set"],
+            "Number of Pieces": ["5"],
+            "Number of Items in Set": ["5"],
+            "Set Includes": ["Dining Table & Chairs"],
+        },
+    )
+    assert dining is None
+
+    patio = find_package_includes_set_qty_mismatch(
+        "Luxury Patio Furniture Set with Removable Cushions",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Sofa, 2 x Chair, 1 x Coffee Table</p>",
+        {
+            "Type": ["Patio Furniture Set"],
+            "Set Includes": ["Sofa Set"],
+            "Number of Pieces": ["4"],
+        },
+    )
+    assert patio is None
+
+    sectional = find_package_includes_set_qty_mismatch(
+        "L-Shaped Sectional Sofa with Chaise",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Sofa</p>",
+        {"Type": ["Sectional"], "Set Includes": ["Sofa Set"]},
+    )
+    assert sectional is None
+
+    issues = validate_listing_quality(
+        {
+            "title": "5-Piece Dining Set Solid Wood Table and 4 Chairs",
+            "description": (
+                '<div style="max-width:900px">'
+                "<div>AQUAVERVE</div>"
+                "<h2>KEY FEATURES</h2><ul><li>Five piece dining set</li></ul>"
+                "<h3>PACKAGE INCLUDES</h3><p>1 x Dining Table, 4 x Dining Chair</p>"
+                "<div>Thoughtfully curated for modern living</div>"
+                "</div>"
+            ),
+            "aspects": {
+                "Type": ["Dining Set"],
+                "Number of Pieces": ["5"],
+                "Set Includes": ["Dining Table & Chairs"],
+            },
+        },
+        images=["https://example.com/a.jpg", "https://example.com/b.jpg"],
+    )
+    assert not any(i.code == "package_includes_set_qty_mismatch" for i in issues)
