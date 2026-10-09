@@ -19,6 +19,8 @@ from src.utils.copy_skip_gate import (
     REASON_MATERIAL_CONFLICT,
     REASON_UNCLEAR_DIMS,
     evaluate_copy_skip,
+    fill_missing_assembled_dims,
+    lookup_supplier_assembled_dims,
     market_median_from_intel,
     safe_15_price,
     supplier_cargo_cost,
@@ -180,6 +182,101 @@ def test_ebay_listing_price_is_not_supplier_cargo_without_a_live_quote():
     assert REASON_CARGO_COST not in decision.reasons
 
 
+def test_ebay_listing_price_does_not_trip_far_above_without_a_live_quote():
+    price, shipping = 80, 0
+    safe = safe_15_price(price, shipping)
+    assert safe is not None and safe > price * NEAR_MARKET_BAND
+    # Listing sits on the Browse median. SAFE_15 on that number is far above.
+    decision = _decision(
+        product_price=price,
+        shipping=shipping,
+        specs={"_price_basis": "ebay_listing"},
+        apply_cargo=False,
+        include_market=True,
+        market_median=price,
+    )
+    assert decision.skip is False
+    assert REASON_FAR_ABOVE not in decision.reasons
+    assert decision.detail["pricing_basis"] == "SAFE_15_NO_MARKET"
+
+    # A live quote makes the stored price supplier cost, so far-above applies.
+    quoted = _decision(
+        product_price=price,
+        shipping=shipping,
+        specs={"_price_basis": "ebay_listing"},
+        apply_cargo=True,
+        include_market=True,
+        market_median=safe / NEAR_MARKET_BAND - 1,
+    )
+    assert REASON_FAR_ABOVE in quoted.reasons
+
+
+def test_fill_missing_assembled_dims_leaves_placeholders_and_ignores_package(monkeypatch):
+    monkeypatch.setattr(
+        "src.utils.copy_skip_gate.lookup_supplier_assembled_dims",
+        lambda sku: {
+            "Assembled Length (in.)": "40",
+            "Assembled Width (in.)": "20",
+            "Assembled Height (in.)": "18",
+        },
+    )
+    blank: dict = {}
+    assert fill_missing_assembled_dims(blank, "N710P100001") is True
+    assert blank == {
+        "Assembled Length (in.)": "40",
+        "Assembled Width (in.)": "20",
+        "Assembled Height (in.)": "18",
+    }
+
+    placeholder = {
+        "Assembled Length (in.)": "See Description",
+        "Assembled Width (in.)": "N/A",
+        "Assembled Height (in.)": "Refer to Product Images",
+    }
+    assert fill_missing_assembled_dims(dict(placeholder), "N710P100001") is False
+
+    present = dict(CLEAR_DIMS)
+    assert fill_missing_assembled_dims(present, "N710P100001") is False
+    assert present == CLEAR_DIMS
+
+
+def test_lookup_supplier_assembled_dims_skips_package_axes(monkeypatch):
+    monkeypatch.delenv("DAJIAN_API_KEY", raising=False)
+    monkeypatch.delenv("DAJIAN_API_SECRET", raising=False)
+    assert lookup_supplier_assembled_dims("N710P100001") == {}
+
+    monkeypatch.setenv("DAJIAN_API_KEY", "k")
+    monkeypatch.setenv("DAJIAN_API_SECRET", "s")
+
+    class _Client:
+        def __init__(self, key, secret):
+            self.key = key
+            self.secret = secret
+
+        def get_product_detail_by_sku(self, sku):
+            return {
+                "sku": sku,
+                "length": "55",
+                "width": "33",
+                "height": "22",
+                "weight": "40",
+                "assembledLength": "40",
+                "assembledWidth": "20",
+                "assembledHeight": "18",
+            }
+
+    monkeypatch.setattr("src.clients.dajian_client.DaJianClient", _Client)
+    dims = lookup_supplier_assembled_dims("N710P100001")
+    assert set(dims) == {
+        "Assembled Length (in.)",
+        "Assembled Width (in.)",
+        "Assembled Height (in.)",
+    }
+    assert float(dims["Assembled Length (in.)"]) == 40
+    assert float(dims["Assembled Width (in.)"]) == 20
+    assert float(dims["Assembled Height (in.)"]) == 18
+
+
 def _function(path: Path, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
     tree = ast.parse(path.read_text(encoding="utf-8-sig"))
     for node in ast.walk(tree):
@@ -217,6 +314,10 @@ def test_analyze_callers_gate_before_llm_copy():
         assert gate_lines, relative
         assert copy_lines, relative
         assert min(gate_lines) < min(copy_lines)
+        if relative != "server.py":
+            fill_lines = _call_lines(func, "fill_missing_assembled_dims")
+            assert fill_lines, relative
+            assert min(fill_lines) < min(gate_lines)
 
     analyze_src = ast.get_source_segment(
         (ROOT / "server.py").read_text(encoding="utf-8-sig"),
@@ -286,10 +387,17 @@ class _Session:
         return None
 
 
-def _run_analyze(monkeypatch, product, *, intel, live_quote=None):
+def _run_analyze(monkeypatch, product, *, intel, live_quote=None, fill_dims=None):
     import daily_tasks
 
     calls = {"optimize": 0, "fact_sheet": 0, "market": 0, "live": 0}
+
+    def _fill(attributes, sku):
+        if fill_dims is None:
+            return False
+        return fill_dims(attributes, sku)
+
+    monkeypatch.setattr("src.utils.copy_skip_gate.fill_missing_assembled_dims", _fill)
 
     def _optimize(*args, **kwargs):
         calls["optimize"] += 1
@@ -408,6 +516,27 @@ def test_far_above_skips_after_market_fetch_and_before_copy(monkeypatch):
     assert calls["fact_sheet"] == 0
     assert result["skip_reasons"][product.sku] == [REASON_FAR_ABOVE]
     assert product.status == COPY_SKIP_STATUS
+
+
+def test_missing_assembled_dims_are_filled_before_copy_skip(monkeypatch):
+    product = _Product(attributes={}, specs={}, description="")
+
+    def _fill(attributes, sku):
+        attributes.update(CLEAR_DIMS)
+        return True
+
+    result, calls = _run_analyze(
+        monkeypatch,
+        product,
+        intel={"pricing_basis": "SAFE_15_NO_MARKET", "price_stats": {}, "total_listings": 0},
+        fill_dims=_fill,
+    )
+    assert calls["optimize"] == 1
+    assert calls["fact_sheet"] == 0
+    assert product.status == "READY"
+    assert product.attributes["Assembled Length (in.)"] == "40"
+    assert result["success"] == 1
+    assert result["skipped"] == 0
 
 
 def test_safe_15_no_market_and_near_market_still_generate_copy(monkeypatch):

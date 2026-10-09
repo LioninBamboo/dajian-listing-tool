@@ -11,12 +11,13 @@ Reason codes (stored on the product log and ``cost_breakdown``):
 - ``cargo_cost_over_200`` — supplier product + cargo (shipping) > USD 200
 - ``unclear_dims`` — item L/W/H missing, placeholder, or not source-grounded
 - ``far_above_market`` — a real market median exists and the SAFE_15 price
-  still sits above the near-market band (median × 1.15)
+  (landed supplier cost, not an observed eBay listing price) still sits
+  above the near-market band (median × 1.15)
 - ``factsheet_material_conflict`` — source-grounded material clash that
   FactSheet already fails without an LLM invent
 
-``SAFE_15_NO_MARKET`` (no median) stays publishable. Do not skip copy for
-missing market data alone.
+``SAFE_15_NO_MARKET`` (no median, or no supplier cost to price from) stays
+publishable. Do not skip copy for missing market data alone.
 """
 
 from __future__ import annotations
@@ -179,6 +180,77 @@ def apply_live_supplier_quote(product: Any, quote: Mapping[str, Any] | None) -> 
         changed = True
     if shipping is not None and shipping >= 0 and _as_float(getattr(product, "shipping", None)) != shipping:
         product.shipping = shipping
+        changed = True
+    return changed
+
+
+# Assembled item axes only. Package / carton measurements must not be copied
+# onto these keys — the copy gate treats package size as missing item dims.
+_SUPPLIER_ITEM_DIM_ATTRS: tuple[tuple[str, str], ...] = (
+    ("assembledLength", "Assembled Length (in.)"),
+    ("assembledWidth", "Assembled Width (in.)"),
+    ("assembledHeight", "Assembled Height (in.)"),
+)
+
+
+def lookup_supplier_assembled_dims(sku: str) -> dict[str, str]:
+    """DaJian assembled L/W/H as listing attribute keys. Never raises.
+
+    Package size is omitted. Missing credentials or a missing detail return {}.
+    """
+    key = os.getenv("DAJIAN_API_KEY")
+    secret = os.getenv("DAJIAN_API_SECRET")
+    if not key or not secret or not str(sku or "").strip():
+        return {}
+    try:
+        from src.clients.dajian_client import DaJianClient
+        from src.utils.dimension_helpers import extract_dajian_measurements
+
+        detail = DaJianClient(key, secret).get_product_detail_by_sku(sku)
+        if not detail:
+            return {}
+        measurements = extract_dajian_measurements(detail) or {}
+    except Exception:
+        return {}
+    found: dict[str, str] = {}
+    for source_key, attr_key in _SUPPLIER_ITEM_DIM_ATTRS:
+        raw = measurements.get(source_key)
+        if raw in (None, ""):
+            continue
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if number <= 0:
+            continue
+        found[attr_key] = str(raw)
+    return found
+
+
+def fill_missing_assembled_dims(attributes: dict[str, Any], sku: str) -> bool:
+    """Copy DaJian assembled L/W/H onto axes that are absent.
+
+    Mutates ``attributes``. Placeholders already stored on an axis are left
+    alone, and package measurements are never written here. Returns True
+    when at least one axis was added. Analyze entry points that gate with
+    ``dims_mode="require"`` must call this before ``evaluate_copy_skip``.
+    """
+    missing = [
+        attr_key
+        for _, attr_key in _SUPPLIER_ITEM_DIM_ATTRS
+        if attr_key not in attributes or attributes.get(attr_key) in (None, "")
+    ]
+    if not missing:
+        return False
+    fetched = lookup_supplier_assembled_dims(sku)
+    if not fetched:
+        return False
+    changed = False
+    for attr_key in missing:
+        value = fetched.get(attr_key)
+        if not value or attributes.get(attr_key) not in (None, ""):
+            continue
+        attributes[attr_key] = value
         changed = True
     return changed
 
@@ -414,6 +486,9 @@ def evaluate_copy_skip(
     that still do not resolve skip. Empty dims wait for supplier enrichment
     inside analyze. ``include_market=False`` skips the far-above check so
     callers can avoid a Browse/Terapeak fetch for items already blocked.
+    ``apply_cargo=False`` means ``product_price`` is an observed eBay listing
+    price, not supplier cargo. Both the cargo cap and far-above stay off so
+    the draft remains ``SAFE_15_NO_MARKET``.
     """
     reasons: list[str] = []
     detail: dict[str, Any] = {"sku": str(sku or "")}
@@ -452,7 +527,10 @@ def evaluate_copy_skip(
         detail["material_conflicts"] = conflicts
 
     median = _as_float(market_median)
-    if include_market and median is not None and median > 0:
+    # SAFE_15 inflates landed supplier cost. An eBay listing price is not
+    # that cost until a live quote sets apply_cargo. Comparing it with the
+    # Browse median skips copy for drafts that should stay publishable.
+    if include_market and apply_cargo and median is not None and median > 0:
         detail["market_median"] = median
         safe_price = safe_15_price(product_price, shipping, is_oversize=is_oversize)
         ceiling = median * NEAR_MARKET_BAND

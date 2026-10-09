@@ -224,12 +224,19 @@ def analyze_collected_products(
                     apply_live_supplier_quote,
                     cargo_gate_applies,
                     evaluate_copy_skip,
+                    fill_missing_assembled_dims,
                     lookup_live_supplier_quote,
                     market_median_from_intel,
                 )
 
                 specs = product.specs or {}
-                attributes = product.attributes or {}
+                attributes = dict(product.attributes or {})
+                # Empty item L/W/H wait for DaJian assembled measurements.
+                # Package size must not stand in. Fill before the require-dims gate.
+                if fill_missing_assembled_dims(attributes, product.sku):
+                    product.attributes = attributes
+                    _flag_modified(product, "attributes")
+                    logger.info(f"  Supplier assembled L/W/H filled for {product.sku}")
                 is_oversize = 'Dimensions' in specs or 'Dimensions' in attributes
 
                 live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(product.sku))
