@@ -266,7 +266,7 @@ extension/content.js -> POST /api/collect -> server.py -> ebay_collection.db
 要求：
 
 - 区分 `价格不匹配`、`历史遗留不同步`、`促销改价`、`人工改价`。
-- 不要把 ghost delist 与 Inventory API 的暂时状态误判成真实下架。
+- 不要把 ghost delist 与 Inventory API 的暂时状态误判成真实下架。Trading/Motors 没有 Inventory Offer 时 `NOT_FOUND` 不是下架；售完 Completed 且供应商有货走 Relist（SiteID 100），不要只因 Offer/Trading `NOT_FOUND` 写成 `DELISTED`。
 - 自动修复必须保留利润底线。
 
 ### 5.9 上线后标题优化
