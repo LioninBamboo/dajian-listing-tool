@@ -1,0 +1,12 @@
+你是 semantic_rewrite / repair 工具作者，执行三个小尾巴修复。工作目录 C:\Users\poonx\Dajian_Listing_Tool。任务定义在 docs/HANDOFF_TAIL_FIXES_20260716.md（交接#11，半小时级）。
+
+三件事按序：
+1. 修 scripts/semantic_rewrite.py 的 --from-daily-audit 报告选择器：在 total_published>500 的全库报告里取 mtime 最新（今日 12:48 它取了 0714 旧报告，疑似排序取反）。加单测。
+2. 修空队列退出码：--from-daily-audit 推导 0 条时打印 nothing-to-do 并 exit 0（现在 exit 2 造成调度器假告警）；无参数裸跑仍报用法错误。加单测。
+3. footer 漏网收尾：**扫 live**（不是 DB）全库 PUBLISHED 的 offer listingDescription，含旧串(Ships from California, USA / Dedicated Support / Easy Returns / Secure Checkout)的入 logs/footer_stragglers.txt（预计个位数~十几条，含 W5368P497697），逐条走 scripts/repair_broken_listings.py 单 SKU 协议(backup+三层验证+live复查+失败回滚)，verify 不过的跳过留清单不硬推。产出 footer_stragglers_summary.md。
+
+收尾 commit（只 commit 不 push）：只 stage scripts/semantic_rewrite.py + 对应测试 +（若动）repair_broken_listings.py。message: `fix(semantic-rewrite): pick latest audit report, exit 0 on empty queue; footer straggler repush`。产出 logs/tail_fixes_summary.md。
+
+铁律：红线只能停不能重新解释(回滚失败留坏态/单批回滚>2/缩水失效/listing_id变化→全停)；禁push；禁git add -A；禁改.env；禁碰守护进程；live只碰straggler清单SKU；避开10:50-12:15与12:30。
+
+验收方将查：两bug单测全绿、W5368P497697 live为新footer(✦ Ships from US Warehouse ✦ / Trusted Seller)、straggler skip有原因、git show --stat HEAD只含点名文件、未push。按此自我要求。

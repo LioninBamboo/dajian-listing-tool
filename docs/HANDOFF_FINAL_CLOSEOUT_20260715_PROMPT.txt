@@ -1,0 +1,16 @@
+你是 semantic_rewrite 工具的作者，执行最终收口。工作目录 C:\Users\poonx\Dajian_Listing_Tool。
+
+任务定义在 docs/HANDOFF_FINAL_CLOSEOUT_20260715.md（交接任务书 #9）。用户已授权把复合材质审定(阶段B')和人工件可安全自动化子集(C'/F')交给你决策执行；genuinely 需人判断的仍留清单。
+
+🔒 最重要——红线条款：四条红线只能触发"停止"，你**无权重新解释、弱化、或改成 batch fence 续跑**。上一轮有 AI 私自把"单批回滚>2→全停"改成"只结束本批继续"——**禁止再犯**。触发任一红线：立即停、写清现场、等用户指令，不得自行续跑。四红线=①postfix不收敛且回滚也失败 ②单批回滚>2 ③缩水拦截失效被推 ④listing_id变化。
+
+按顺序：
+1. 读任务书#9全文+红线条款，按自检清单逐项确认输出。
+2. **阶段B'**：config/semantic_rewrite_maps.yaml 的31条 policy:human 复合材质，逐条判定——**只把"主材唯一且源可溯"的改 apply**(结构主材如PU,Solid Wood→Solid Wood;或次级源字段Wood Type佐证)，两成分对等(Metal,Wood/Fabric,Foam+Spring)或不确定→保持human。记 logs/residual_compound_decisions.md。改完对apply项走单SKU协议(phase=RESIDUAL_B)，**无需再硬停**(用户已授权，前提严格遵守判定规则+零臆造+三层验证兜底)。
+3. **阶段C'**：residual_human_review.md 三桶只做确定安全的——claim_residual(源明确不支持则删声明,源可溯地删)、dimension_count(仅source_dims_trustworthy且源尺寸明确才用源值修,波动噪声留human)、title_category(全留human)。处理走phase=RESIDUAL_C。
+4. **阶段F'**：5件不再自动修，只整理 held_back_5_review.md 成运营可照做的一页，live不动。
+5. 写 logs/final_closeout_summary.md(计数+B'判定统计+红线记录+声明未commit/.env/守护)。
+
+铁律：零臆造(材质/声明必须源可溯或eBay官方中性值);禁git commit/改.env/碰守护进程与每日调度;live只碰点名SKU;republish原offer原listing_id;双闸已开;每SKU plan→apply留backup→连续两次postfix dry 0 CRITICAL→不收敛即回滚→仍不行留human;每批末抽2条独立复核;避开10:50-12:15与12:30。
+
+验收方将查B'判定无臆造(每条primary源可溯)、对RESIDUAL_B/C的DONE抽10-15条独立双引擎复核、核对progress无私自续跑(红线是停不是绕)、pytest无新增失败、无commit。按此自我要求。

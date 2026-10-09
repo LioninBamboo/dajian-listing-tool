@@ -1,3 +1,0 @@
-﻿[>] Token expired or expiring soon, refreshing...
-[!] Not authorized. Please run OAuth flow first.
-Authorization URL: https://auth.sandbox.ebay.com/oauth2/authorize?client_id=xiaoting-AquaVerv-PRD-947e7b8cc-97e0e078&response_type=code&redirect_uri=https%3A//nonlugubrious-yasmine-redressible.ngrok-free.dev/ebay/callback&scope=https%3A//api.ebay.com/oauth/api_scope/sell.inventory%20https%3A//api.ebay.com/oauth/api_scope/sell.account%20https%3A//api.ebay.com/oauth/api_scope/sell.fulfillment

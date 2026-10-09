@@ -50,11 +50,47 @@
             color: #999;
             cursor: pointer;
         }
+        .store-box {
+            background: #fff;
+            border: 2px solid #0060df;
+            border-radius: 6px;
+            padding: 10px;
+            margin-bottom: 15px;
+        }
+        .store-box label {
+            font-weight: bold;
+            color: #333;
+            font-size: 12px;
+            margin-bottom: 6px;
+        }
+        .store-box select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: bold;
+            box-sizing: border-box;
+            cursor: pointer;
+        }
+        .store-hint {
+            font-size: 11px;
+            color: #666;
+            margin-top: 6px;
+            line-height: 1.4;
+        }
     </style>
 </head>
 <body>
-    <h2>💰 AquaVerve Calculator</h2>
-    
+    <h2>💰 Dajian Collector</h2>
+
+    <!-- 采集目标店铺:按批次采集,选一次会一直保持 -->
+    <div class="store-box" id="storeBox">
+        <label>📦 本批采集到哪个店</label>
+        <select id="storeSelect"></select>
+        <div class="store-hint" id="storeHint"></div>
+    </div>
+
     <div class="input-group">
         <label>Cost Cost (USD)</label>
         <input type="number" id="cost" placeholder="e.g. 50.00" step="0.01">
@@ -82,6 +118,7 @@
     
     <div id="status" style="margin-top:10px; font-size:12px; color:green; text-align:center;"></div>
 
+    <script src="stores.js"></script>
     <script src="popup.js"></script>
 </body>
 </html>

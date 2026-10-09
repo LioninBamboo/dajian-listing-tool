@@ -1,0 +1,86 @@
+你是接手 Dajian_Listing_Tool（eBay 家具刊登系统）的执行方。
+
+仓库：C:\Users\poonx\Dajian_Listing_Tool
+分支：codex/live-audit-semantic-guard（已在此分支，不要切换、不要新建）
+
+【第一件事】
+完整读完 docs/HANDOFF_CRITICAL_BACKLOG_20260726.md，然后严格按它执行。
+本提示词不重复任务书内容，只强调最容易出事的几点。
+
+【任务】
+把存量 CRITICAL 幻觉批量清完。不是每天 40 条的增量，是一次性把存量过一遍。
+
+【最重要的一条：不要相信"143 个 SKU"这个数字】
+用户口头说的是 143 个 CRITICAL SKU。这个数字已过期。
+7/26 修了审计噪声（提交 4674f02），其中 64 行 CRITICAL 是审计自己的误报——
+eBay 的 aspects 是类目必填枚举（Features: With Cushions / Style: Modern），
+过去被当成"我们编的文案声明"，条条误报。
+
+真实基线是 98 个 SKU / 133 行。
+
+所以：**必须先重跑审计拿新基线，再动任何 listing。**
+如果你拿旧报告去"修"那 64 行，你会把正确的 eBay 属性改坏——
+这比不修严重得多。这是红线 R1。
+
+docs 里给的 logs/crit_batch_*.txt 清单只供你预估工作量和交叉核对，
+**不是执行输入**。唯一合法的执行输入是你自己重跑审计后 --derive-queue 派生的队列。
+
+【预期：约 55% 可自动化，不是 100%】
+我方在 20 条存量上实跑过：11 条可推 / 9 条转人工。
+存量本来就是难啃的剩饭，比每日增量的 70% 低。
+
+**不要试图把这个数字提上去。** 被拒的都有正当理由：
+- title_category_conflict → 转人工，不要绕过类目预检
+- 源尺寸可疑（供应商把包装尺寸填进整装字段）→ 转人工，不要用可疑尺寸覆盖 live
+- 复合材质（Acacia Wood,Rope,Waterproof Fabric）→ 转人工仲裁
+
+【红线：只能触发停止，你无权重新解释】
+历史教训：曾有执行方在正确触发"批量回滚>2条则停止"后，
+自行把它重新解释成"批次栅栏——结束本批、继续下一批"。这是不允许的。
+红线的唯一合法反应是：停下来，报告，等人工指示。
+
+硬红线：
+- 未重跑审计就用旧清单写入 → 禁止
+- 转人工的 SKU 被绕过校验推送 → 立即停止
+- 单批回滚 > 2 条 → 立即停止
+- 任何 end-listing / relist（必须原位更新 listing_id/offer_id）→ 立即停止
+- 修改或删除既有测试断言 → 禁止（只能新增）
+- git add -A 或 git add .  → 禁止。工作区有并行 session 的改动
+  （batch_publish.py、cro_title_rewrite.py、fix_measurement_quality_issues.py 等），
+  只能 git add <具体路径>
+- 修改 .env → 禁止
+- 杀掉/重启调度守护进程 → 禁止
+- git push → 禁止（只提交，不推送）
+- 绕过 PricingEngine / RepricingGuard / EbayPublisher → 禁止
+
+【验证描述时的坑】
+必须在 offer 的 listingDescription 上验证模板完整性，不是 inventory 那份。
+inventory 描述会被截断到 4000 字符，验证那份会误判。
+模板要件：banner（AquaVerve）+ footer（✦ Ships from US Warehouse ✦ /
+Quality Guaranteed • Fast US Shipping • Trusted Seller）。
+材质大小写要对：MDF 不是 Mdf，PU 不是 Pu。
+
+【已知抖动，不要去"修"】
+LLM 提取有 run-to-run 抖动，同一 SKU 两次跑出的 violation 数可能不同
+（实测有从 8 条变 3 条、pushable 从 True 变 False）。
+规则：只对连续两次都被标记的问题动手。不要为了消除抖动去改提取器。
+
+另：MEDIUM 仍会有上千条，那是营销措辞噪声，本次**不处理 MEDIUM**，只看 CRITICAL。
+不要因为 MEDIUM 多就自行扩大作业范围。
+
+【节奏】
+Step 1 重跑审计 → Step 2 派生队列 → Step 3 全量 dry-run
+→ **停下来把统计报给验收人，等放行** → Step 4 金丝雀 10 条（覆盖不同问题类型）
+→ 逐条抽验 → Step 5 分批推（每批≤30，批间停下核对）
+→ Step 6 类目/组装那 30 条全部转人工、只出建议不写入
+
+【测试】
+$env:PYTHONPATH='C:\Users\poonx\Dajian_Listing_Tool'; .\.venv\Scripts\python.exe -m pytest tests/ -q
+基线 2068 passed。
+
+【交付】
+按任务书第 9 节交付 7 项数据（基线对比、分类统计、金丝雀验收、落地清单、
+人工队列及原因、期末审计前后对比、测试结果）。
+
+**不要自评"任务完成"。** 交付数据后等待验收人确认。
+遇到任何红线或判断不了的情况：停下来问，不要自行放宽。

@@ -9,11 +9,46 @@ import os
 import requests
 import base64
 import sqlite3
-from datetime import datetime, timedelta
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# 使用绝对路径，避免计划任务工作目录不同导致找不到数据库
+_PROJECT_ROOT = Path(__file__).parent.parent.parent
+_TOKEN_DB_PATH = str(_PROJECT_ROOT / "ebay_tokens.db")
+# How early to refresh before the stored expiry. Absorbs clock skew between this
+# machine and eBay's auth servers (see get_valid_token).
+TOKEN_REFRESH_SAFETY_MINUTES = 30
+
+_REDIRECT_PLACEHOLDERS = {
+    "",
+    "NOT SET",
+    "your_registered_redirect_uri",
+    "https://your-app.streamlit.app",
+    "https://your-app.streamlit.app/ebay/callback",
+}
+
+
+def _redirect_uri_needs_attention(value: Optional[str]) -> bool:
+    """Warn only for obvious placeholders.
+
+    eBay production auth often uses a RuName-style identifier rather than a literal URL.
+    """
+    if value is None:
+        return False
+    normalized = value.strip()
+    return normalized in _REDIRECT_PLACEHOLDERS
+
+
+def _create_oauth_session() -> requests.Session:
+    """Create an eBay OAuth session that never inherits desktop proxy settings."""
+    session = requests.Session()
+    session.trust_env = False
+    session.verify = False
+    return session
 
 
 class EbayOAuthService:
@@ -40,12 +75,14 @@ class EbayOAuthService:
             self.auth_base = "https://auth.sandbox.ebay.com/oauth2"
             self.api_base = "https://api.sandbox.ebay.com"
         
-        # Scopes required for selling (simplified for Production)
-        # Only request scopes that are typically pre-approved
+        # Scopes required for selling (including Taxonomy and Media API)
+        # eBay support confirmed we have access to Media API and Taxonomy API
         self.scopes = [
             "https://api.ebay.com/oauth/api_scope/sell.inventory",
             "https://api.ebay.com/oauth/api_scope/sell.account",
             "https://api.ebay.com/oauth/api_scope/sell.fulfillment",
+            "https://api.ebay.com/oauth/api_scope/commerce.taxonomy.readonly",  # Taxonomy API
+            "https://api.ebay.com/oauth/api_scope/sell.marketing",  # For promotions
         ]
         
         # Initialize token storage
@@ -53,13 +90,15 @@ class EbayOAuthService:
         # Basic validation of important env vars to help debugging
         if not self.app_id or not self.cert_id:
             print("[!] EBAY_APP_ID or EBAY_CERT_ID is not set. Check your .env or environment variables.")
-        # Warn if redirect URI looks unexpected (common cause of failures)
-        if self.redirect_uri and not self.redirect_uri.startswith("http://localhost"):
-            print(f"[!] Warning: EBAY_REDIRECT_URI is set to '{self.redirect_uri}'. Ensure this exact URI is registered in your eBay app settings.")
+        if _redirect_uri_needs_attention(self.redirect_uri):
+            print(
+                f"[!] Warning: EBAY_REDIRECT_URI looks like a placeholder ('{self.redirect_uri}'). "
+                "Ensure it matches your registered eBay RuName/callback setting."
+            )
     
     def _init_token_db(self):
         """Initialize SQLite database for token storage"""
-        conn = sqlite3.connect("ebay_tokens.db")
+        conn = sqlite3.connect(_TOKEN_DB_PATH)
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS oauth_tokens (
@@ -142,7 +181,9 @@ class EbayOAuthService:
         print(f"   Redirect URI: {self.redirect_uri}")
         
         try:
-            response = requests.post(url, headers=headers, data=data)
+            response = _create_oauth_session().post(
+                url, headers=headers, data=data, timeout=30
+            )
             
             # Log response for debugging
             print(f"   Response Status: {response.status_code}")
@@ -163,6 +204,12 @@ class EbayOAuthService:
             print(f"[OK] Token exchange successful!")
             print(f"   Token type: {token_data.get('token_type', 'Unknown')}")
             print(f"   Expires in: {token_data.get('expires_in', 'Unknown')} seconds")
+            print(f"   Has refresh_token: {'YES' if token_data.get('refresh_token') else 'NO'}")
+            
+            # Warn if no refresh token (will require re-auth when access token expires)
+            if not token_data.get('refresh_token'):
+                print("[!] WARNING: No refresh_token received! Token will expire in 2 hours and require re-authorization.")
+                print("    This may indicate insufficient OAuth scopes or account type limitations.")
             
             # Save token to database
             self._save_token(token_data)
@@ -209,16 +256,39 @@ class EbayOAuthService:
             "Authorization": f"Basic {encoded_credentials}"
         }
         
+        # Note: Don't send scope parameter during refresh - eBay uses the original scope
+        # Sending a different scope causes "invalid_scope" error
         data = {
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
-            "scope": " ".join(self.scopes)
         }
         
-        response = requests.post(url, headers=headers, data=data)
+        response = _create_oauth_session().post(
+            url, headers=headers, data=data, timeout=30
+        )
+        
+        # Log error details before raising
+        if response.status_code != 200:
+            print(f"[ERROR] Refresh token failed: {response.status_code}")
+            print(f"[ERROR] Response: {response.text}")
+        
         response.raise_for_status()
         
         token_data = response.json()
+        
+        # Validate: eBay may return error JSON even with 200 status
+        if 'error' in token_data:
+            error_desc = token_data.get('error_description', token_data['error'])
+            raise ValueError(f"OAuth error: {error_desc}")
+        
+        if 'access_token' not in token_data:
+            raise ValueError(f"Invalid token response: missing access_token")
+        
+        # IMPORTANT: Preserve the refresh_token if not returned in response
+        # eBay refresh response may not include refresh_token, we must keep the original
+        if not token_data.get("refresh_token"):
+            token_data["refresh_token"] = refresh_token
+            print("[INFO] Preserved original refresh_token")
         
         # Save new token
         self._save_token(token_data)
@@ -239,24 +309,64 @@ class EbayOAuthService:
         
         # Check if token is expired
         expires_at = datetime.fromisoformat(stored_token["expires_at"])
-        now = datetime.utcnow()
-        
-        # Refresh if expired or expiring in next 5 minutes
-        if expires_at <= now + timedelta(minutes=5):
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+        # Refresh if expired or expiring within the safety window.
+        # 2026-07-22: widened 5 -> 30 minutes. A local clock running behind eBay's
+        # made this check say "valid for 4 more minutes" while eBay already
+        # rejected the token ("Invalid access token", errorId 1001), stalling a
+        # publish run. Refresh is cheap and the refresh_token is long-lived, so
+        # erring early costs nothing and absorbs clock skew.
+        if expires_at <= now + timedelta(minutes=TOKEN_REFRESH_SAFETY_MINUTES):
             print("[>] Token expired or expiring soon, refreshing...")
             token_data = self.refresh_access_token()
             return token_data["access_token"]
         
         return stored_token["access_token"]
     
+    def get_application_token(self) -> str:
+        """
+        Get an Application Token (Client Credentials Grant) for public APIs like Taxonomy.
+        This doesn't require user authorization.
+        
+        Returns:
+            Application access token string
+        """
+        if self.environment == "PRODUCTION":
+            url = "https://api.ebay.com/identity/v1/oauth2/token"
+        else:
+            url = "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
+        
+        credentials = f"{self.app_id}:{self.cert_id}"
+        encoded_credentials = base64.b64encode(credentials.encode()).decode()
+        
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {encoded_credentials}"
+        }
+        
+        # Request public scope for Taxonomy API
+        data = {
+            "grant_type": "client_credentials",
+            "scope": "https://api.ebay.com/oauth/api_scope"
+        }
+        
+        response = _create_oauth_session().post(
+            url, headers=headers, data=data, timeout=30
+        )
+        response.raise_for_status()
+        
+        token_data = response.json()
+        return token_data["access_token"]
+    
     def _save_token(self, token_data: Dict):
         """Save token to database"""
-        conn = sqlite3.connect("ebay_tokens.db")
+        conn = sqlite3.connect(_TOKEN_DB_PATH)
         cursor = conn.cursor()
         
         # Calculate expiration time
         expires_in = token_data.get("expires_in", 7200)  # Default 2 hours
-        expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+        expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=expires_in)
         
         # Delete old tokens
         cursor.execute("DELETE FROM oauth_tokens")
@@ -279,7 +389,7 @@ class EbayOAuthService:
     
     def _get_stored_token(self) -> Optional[Dict]:
         """Retrieve stored token from database"""
-        conn = sqlite3.connect("ebay_tokens.db")
+        conn = sqlite3.connect(_TOKEN_DB_PATH)
         cursor = conn.cursor()
         
         cursor.execute("""

@@ -1,0 +1,15 @@
+你是一个严格按任务书执行的开发+运维执行代理，工作目录 C:\Users\poonx\Dajian_Listing_Tool。你是 semantic_rewrite 工具的作者，现在做人工队列批量降解。
+
+唯一任务定义在 docs/HANDOFF_HUMANQUEUE_DRAIN.md（交接任务书 #5），规格母文件 docs/PROJECT_SEMANTIC_REWRITE.md。两者都必须完整读完。现在：
+
+1. 读完任务书 #5 全文 + 立项书，按第 8 节自检清单逐项确认并输出。
+2. 阶段 A（只读）：从 logs/semantic_rewrite_human_queue.txt 的 required_no_source(47) 与 compound_material(12) 两桶提取待决模式，产出 logs/humanqueue_drain_candidates.yaml，每条带 evidence，拿不准标 policy=human。不写 live、不改代码。
+3. 阶段 B（改代码不碰 live）：定 config/semantic_rewrite_maps.yaml schema 并填候选，把两张表接入 _is_simple_material_value 与 protect_and_fill_required_aspects（增强不是依赖：查表命中才增强，未命中/缺表落回原安全行为——复合值默认仍 human、必填缺失仍 human）。新增测试全绿，禁改既有断言。
+4. ★阶段 B 后硬停★：交付 config/semantic_rewrite_maps.yaml + logs/humanqueue_drain_review.md（逐模式 源值→建议target→依据→SKU数），停止一切执行，等用户亲自审表批准。你不得自认表已生效，不得抢跑阶段 C。
+5. 收到用户批准后阶段 C：对 59 个目标 SKU 逐条走单 SKU 协议（plan→apply留backup→连续两次postfix dry 0 CRITICAL→不收敛即回滚→仍不行留human），progress phase=HQ_DRAIN，批末抽 2 条独立复核，写 summary。
+
+铁律：零新增幻觉（策展 target 必须源可溯或 eBay 官方中性值，二选一，否则判 human）；禁 git commit；禁改 .env / 守护进程 / 既有测试断言；live 仅限 59 个目标 SKU；双闸不变；四条红线沿用任务书#4；避开 10:50-12:15 与 12:30 窗口。
+
+事实校准：队列最大桶是 required_no_source（47），不是复合材质（12）。别搞反主次。
+
+验收方将在阶段 B 硬停查你的候选表有无臆造、机制降级是否正确；终验对 DONE 做独立双引擎复核并要求 human_queue 净减少数=DONE数。按这个标准自我要求。

@@ -1,9 +1,13 @@
 """数据库模型定义 - 采集系统专用"""
-from datetime import datetime
+from datetime import UTC, datetime
 from sqlalchemy import Column, Integer, String, Text, Float, DateTime, JSON
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
+
+
+def _utcnow_naive() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class CollectedProduct(Base):
@@ -44,8 +48,8 @@ class CollectedProduct(Base):
     logs = Column(JSON)  # ["Received from extension", "AI optimization complete", ...]
     
     # 时间戳
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow_naive)
+    updated_at = Column(DateTime, default=_utcnow_naive, onupdate=_utcnow_naive)
     published_at = Column(DateTime)  # 上架时间
     
     def to_dict(self) -> dict:

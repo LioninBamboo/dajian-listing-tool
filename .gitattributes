@@ -1,0 +1,29 @@
+# Normalize line endings. Repo canon is LF.
+# NOTE: this file alone does not rewrite anything. The one-time cleanup commit
+# must run `git add --renormalize .` (with `git config core.autocrlf false`)
+# to flatten the existing ~479 CRLF-only working-tree diffs. Until then, stage
+# only the specific files you change; never `git add -A`.
+
+# Default: detect text, check out / commit with LF.
+*           text=auto eol=lf
+
+# Windows-only scripts must keep CRLF to run correctly.
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# Binary assets: never touch.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.webp      binary
+*.ico       binary
+*.pdf       binary
+*.xlsx      binary
+*.xls       binary
+*.zip       binary
+*.gz        binary
+*.db        binary
+*.sqlite    binary
+*.sqlite3   binary
