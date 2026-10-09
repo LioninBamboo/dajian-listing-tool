@@ -112,6 +112,51 @@ def should_mark_delisted(
     return False
 
 
+def choose_sold_relist_target(
+    *,
+    ended_listing_id: Any,
+    current_listing_id: Any = None,
+    current_status: Any = None,
+    current_ending_reason: Any = None,
+    current_quantity_sold: Any = None,
+    current_available: Any = None,
+    current_confirmed: bool = True,
+) -> tuple[str, str]:
+    """Pick the only ItemID that may be relisted, or refuse.
+
+    SoldList keeps the original ended item for the lookback window, and eBay
+    accepts RelistFixedPriceItem on that item more than once. If
+    ``current_listing_id`` already points at a different listing, relisting
+    the SoldList ItemID creates a second live listing.
+
+    Returns ``(action, item_id)``:
+    - ``relist``: ``item_id`` is the current ended listing and may be relisted
+    - ``revise``: ``item_id`` is already the live listing; change quantity only
+    - ``skip``: ``item_id`` is already live and has stock
+    - ``abort``: the current listing differs and could not be confirmed
+    """
+    ended = str(ended_listing_id or "").strip()
+    current = str(current_listing_id or "").strip()
+    if not current or current == ended:
+        return "relist", ended
+    if not current_confirmed:
+        return "abort", current
+
+    status = _norm(current_status)
+    if status in {"", "notfound", "unknown", "error"}:
+        return "abort", current
+    if status in {"active", "outofstock"}:
+        available = _as_int(current_available)
+        if available is None:
+            return "abort", current
+        if available > 0:
+            return "skip", current
+        return "revise", current
+    if completed_because_sold(current_status, current_ending_reason, current_quantity_sold):
+        return "relist", current
+    return "abort", current
+
+
 def classify_zero_qty_listing(
     *,
     inventory_offer_status: Any,

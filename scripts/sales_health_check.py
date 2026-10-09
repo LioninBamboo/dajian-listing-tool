@@ -50,6 +50,7 @@ from src.utils.inventory_audit_contract import (
 )
 from src.utils.inventory_restock_hold import is_restock_held
 from src.utils.sold_through_relist import (
+    choose_sold_relist_target,
     classify_zero_qty_listing,
     completed_because_sold,
     sold_relist_lookback_days,
@@ -641,8 +642,14 @@ class SalesHealthChecker:
             return None
 
     def _fetch_trading_active_quantity_map(self) -> dict:
-        """Load available quantities from Trading ActiveList in batches."""
+        """Load available quantities from Trading ActiveList in batches.
+
+        A missing SKU proves the listing is gone only when every page loaded.
+        ``_trading_active_quantity_map_complete`` stays False after a timeout,
+        Ack failure, or later-page error, even if earlier pages were parsed.
+        """
         result = {}
+        self._trading_active_quantity_map_complete = False
         try:
             import xml.etree.ElementTree as ET
 
@@ -654,6 +661,9 @@ class SalesHealthChecker:
             while page <= total_pages:
                 response = trading.get_active_listings(page=page, limit=200, site_id=site_id)
                 root = ET.fromstring(response)
+                ack = (root.findtext('.//ebay:Ack', default='', namespaces=ns) or '').strip()
+                if ack.lower() == 'failure':
+                    raise RuntimeError(f"ActiveList page {page} Ack=Failure")
                 total_pages_text = root.findtext(
                     './/ebay:PaginationResult/ebay:TotalNumberOfPages',
                     default='1',
@@ -698,6 +708,7 @@ class SalesHealthChecker:
                 if page <= total_pages:
                     time.sleep(0.2)
 
+            self._trading_active_quantity_map_complete = True
             log.info(f"  Trading ActiveList 数量缓存: {len(result)} listings (site {site_id})")
         except Exception as e:
             log.warning(f"加载 Trading ActiveList 数量缓存失败: {e}")
@@ -1215,12 +1226,57 @@ class SalesHealthChecker:
                     sold_state.get('sold'),
                 ):
                     # A live ActiveList row wins. This branch is only the
-                    # completed sell-through that ActiveList can no longer see.
+                    # completed sell-through that a complete ActiveList can no
+                    # longer see. A timeout or partial page is not that proof.
+                    if not getattr(self, '_trading_active_quantity_map_complete', False):
+                        log.warning(
+                            f"  {sku}: ActiveList 未完整加载，缺行不能当成已下架，跳过 Relist"
+                        )
+                        error_count += 1
+                        continue
+
+                    sold_listing_id = str(sold_state.get('listing_id') or listing_id or '').strip()
+                    db_listing_id = str(listing_id or '').strip()
+                    current_snapshot = None
+                    current_confirmed = True
+                    if db_listing_id and sold_listing_id and db_listing_id != sold_listing_id:
+                        current_snapshot = self._fetch_trading_listing_snapshot(db_listing_id)
+                        current_status = str((current_snapshot or {}).get('listing_status') or '')
+                        current_confirmed = bool(
+                            current_snapshot and current_status.upper() != 'NOT_FOUND'
+                        )
+                    action, relist_id = choose_sold_relist_target(
+                        ended_listing_id=sold_listing_id,
+                        current_listing_id=db_listing_id,
+                        current_status=(current_snapshot or {}).get('listing_status') if current_snapshot else None,
+                        current_ending_reason=(current_snapshot or {}).get('ending_reason') if current_snapshot else None,
+                        current_quantity_sold=(current_snapshot or {}).get('quantity_sold') if current_snapshot else None,
+                        current_available=(current_snapshot or {}).get('available') if current_snapshot else None,
+                        current_confirmed=current_confirmed,
+                    )
+                    if action == 'skip':
+                        log.info(
+                            f"  {sku}: DB listing {db_listing_id} 已在线，"
+                            f"跳过 SoldList {sold_listing_id} Relist"
+                        )
+                        continue
+                    if action == 'revise':
+                        log.info(
+                            f"  {sku}: DB listing {db_listing_id} 仍是当前链接，"
+                            f"不 Relist 旧 ItemID {sold_listing_id}"
+                        )
+                        qty_zero.append(sku)
+                        continue
+                    if action != 'relist':
+                        log.warning(
+                            f"  {sku}: DB listing {db_listing_id} 与 SoldList {sold_listing_id} "
+                            f"不同且不能确认可 Relist，跳过"
+                        )
+                        error_count += 1
+                        continue
                     qty_zero.append(sku)
                     sold_through_skus.add(sku)
-                    relist_listing_ids[sku] = str(
-                        sold_state.get('listing_id') or listing_id or ""
-                    )
+                    relist_listing_ids[sku] = str(relist_id or sold_listing_id or listing_id or '')
                     continue
 
                 if trading_available is None:
@@ -1327,12 +1383,18 @@ class SalesHealthChecker:
                     )
                     if recovery == 'relist':
                         sold_through_skus.add(sku)
-                        relist_listing_ids[sku] = str(
+                        db_listing_id = str(listing_ids.get(sku) or '').strip()
+                        candidate = str(
                             snapshot.get('item_id')
                             or sold_state.get('listing_id')
                             or listing_id
-                            or ""
-                        )
+                            or ''
+                        ).strip()
+                        # SoldList can still name the original ended item after
+                        # listing_id has moved to the replacement.
+                        if db_listing_id and candidate and candidate != db_listing_id:
+                            candidate = db_listing_id
+                        relist_listing_ids[sku] = candidate or db_listing_id
                     elif recovery == 'delist':
                         log.info(f"  {sku}: eBay offer 状态={offer_status}，Trading={trading_status}，同步为 DELISTED")
                         try:

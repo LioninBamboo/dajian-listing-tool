@@ -31,6 +31,7 @@ from src.utils.inventory_restock_hold import (
     should_block_positive_quantity,
 )
 from src.utils.sold_through_relist import (
+    choose_sold_relist_target,
     completed_because_sold,
     extract_item_id,
     parse_trading_item_xml,
@@ -619,6 +620,51 @@ class InventorySyncService:
             return True
 
         if quantity > 0 and completed_because_sold(status, ending_reason, quantity_sold):
+            # GetItem on the original sold item stays Completed after a successful
+            # relist, and eBay will RelistFixedPriceItem that same ItemID again.
+            # Follow collected_products.listing_id when it already moved on.
+            current_listing_id = (self._lookup_listing_id(sku) or "").strip()
+            if current_listing_id and current_listing_id != str(listing_id).strip():
+                try:
+                    current_snapshot = self._get_trading_snapshot(current_listing_id)
+                except Exception as exc:
+                    self.logger.warning(
+                        f"{sku}: 当前 listing {current_listing_id} GetItem 失败，"
+                        f"不 Relist 旧 ItemID {listing_id}: {exc}"
+                    )
+                    return False
+                current_status = str((current_snapshot or {}).get("listing_status") or "")
+                current_confirmed = bool(
+                    current_snapshot and current_status.upper() != "NOT_FOUND"
+                )
+                action, target_id = choose_sold_relist_target(
+                    ended_listing_id=listing_id,
+                    current_listing_id=current_listing_id,
+                    current_status=current_status if current_snapshot else None,
+                    current_ending_reason=(current_snapshot or {}).get("ending_reason"),
+                    current_quantity_sold=(current_snapshot or {}).get("quantity_sold"),
+                    current_available=(current_snapshot or {}).get("available"),
+                    current_confirmed=current_confirmed,
+                )
+                if action == "skip":
+                    self.logger.info(
+                        f"{sku}: DB listing {current_listing_id} 已在线，"
+                        f"不 Relist 已结束的 {listing_id}"
+                    )
+                    return True
+                if action == "revise":
+                    self.logger.info(
+                        f"{sku}: DB listing {current_listing_id} 仍是当前链接，"
+                        f"改为 Revise，不 Relist {listing_id}"
+                    )
+                    return self._revise_trading_quantity(sku, target_id, quantity, site_id)
+                if action != "relist":
+                    self.logger.warning(
+                        f"{sku}: DB listing {current_listing_id} 与待 Relist {listing_id} "
+                        f"不同且无法确认，不创建第二链接"
+                    )
+                    return False
+                listing_id = target_id
             return self._relist_fixed_price_item(sku, listing_id, quantity, site_id)
 
         if str(status or "").lower() in {"active", "outofstock"}:
