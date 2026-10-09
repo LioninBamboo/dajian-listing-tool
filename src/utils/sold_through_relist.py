@@ -92,6 +92,32 @@ def completed_because_sold(
     return sold_qty > 0
 
 
+def completed_by_zero_quantity_end(
+    listing_status: Any,
+    ending_reason: Any = None,
+    quantity_sold: Any = None,
+) -> bool:
+    """True when a zero-quantity revise ended a listing that did not sell.
+
+    Motors parts are published without OutOfStockControl, so
+    ReviseInventoryStatus quantity 0 Completes the item. EndingReason is
+    blank or NotAvailable and QuantitySold stays 0. Those listings should
+    come back when stock returns. Incorrect / LostOrBroken /
+    OtherListingError stay down.
+    """
+    if _norm(listing_status) != "completed":
+        return False
+    reason = _norm(ending_reason)
+    if reason in (SELLER_END_REASONS - {"notavailable"}):
+        return False
+    if reason in SOLD_ENDING_REASONS:
+        return False
+    if completed_because_sold(listing_status, ending_reason, quantity_sold):
+        return False
+    sold_qty = _as_int(quantity_sold)
+    return sold_qty is not None and sold_qty <= 0
+
+
 def should_mark_delisted(
     *,
     inventory_offer_status: Any,
@@ -188,6 +214,7 @@ def parse_trading_item_xml(xml_text: str) -> Optional[dict]:
         "quantity": quantity,
         "quantity_sold": sold if sold is not None else 0,
         "available": available,
+        "out_of_stock_control": _norm(_child_text(item, "OutOfStockControl")) in {"true", "1", "yes"},
     }
 
 

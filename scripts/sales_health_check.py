@@ -1216,11 +1216,38 @@ class SalesHealthChecker:
                 ):
                     # A live ActiveList row wins. This branch is only the
                     # completed sell-through that ActiveList can no longer see.
+                    sold_item_id = str(sold_state.get('listing_id') or '').strip()
+                    db_item_id = str(listing_id or '').strip()
+                    # SoldList keeps the original sale for the lookback window.
+                    # Relisting that ended ItemID after the DB already points at
+                    # a replacement creates a second live listing.
+                    if db_item_id and sold_item_id and db_item_id != sold_item_id:
+                        current = self._fetch_trading_listing_snapshot(db_item_id) or {}
+                        current_status = str(current.get('listing_status') or '')
+                        if completed_because_sold(
+                            current_status,
+                            current.get('ending_reason'),
+                            current.get('quantity_sold'),
+                        ):
+                            qty_zero.append(sku)
+                            sold_through_skus.add(sku)
+                            relist_listing_ids[sku] = db_item_id
+                            continue
+                        current_available = current.get('available')
+                        if str(current_status).lower() in {'active', 'outofstock'}:
+                            if current_available is None or int(current_available) > 0:
+                                continue
+                            qty_zero.append(sku)
+                            continue
+                        log.info(
+                            f"  {sku}: SoldList ItemID {sold_item_id} 已结束，"
+                            f"当前 DB listing {db_item_id} 状态={current_status or 'UNKNOWN'}，"
+                            f"不重复 Relist"
+                        )
+                        continue
                     qty_zero.append(sku)
                     sold_through_skus.add(sku)
-                    relist_listing_ids[sku] = str(
-                        sold_state.get('listing_id') or listing_id or ""
-                    )
+                    relist_listing_ids[sku] = str(sold_item_id or db_item_id or "")
                     continue
 
                 if trading_available is None:
@@ -1327,12 +1354,17 @@ class SalesHealthChecker:
                     )
                     if recovery == 'relist':
                         sold_through_skus.add(sku)
-                        relist_listing_ids[sku] = str(
+                        db_item_id = str(listing_ids.get(sku) or '').strip()
+                        sold_item_id = str(sold_state.get('listing_id') or '').strip()
+                        chosen = str(
                             snapshot.get('item_id')
-                            or sold_state.get('listing_id')
+                            or sold_item_id
                             or listing_id
                             or ""
-                        )
+                        ).strip()
+                        if db_item_id and sold_item_id and db_item_id != sold_item_id:
+                            chosen = db_item_id
+                        relist_listing_ids[sku] = chosen
                     elif recovery == 'delist':
                         log.info(f"  {sku}: eBay offer 状态={offer_status}，Trading={trading_status}，同步为 DELISTED")
                         try:

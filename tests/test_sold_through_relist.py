@@ -455,3 +455,349 @@ def test_sold_list_scan_keeps_completed_sold_on_site_100(monkeypatch):
     assert "SELLER-ENDED" not in by_sku
     assert OLD_ITEM in by_item
     assert "111" not in by_item
+
+
+def _completed_unsold_xml(item_id: str, sku: str, ending_reason: str = "NotAvailable") -> str:
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+    <GetItemResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+      <Ack>Success</Ack>
+      <Item>
+        <ItemID>{item_id}</ItemID>
+        <SKU>{sku}</SKU>
+        <Quantity>1</Quantity>
+        <QuantityAvailable>0</QuantityAvailable>
+        <ListingDetails><EndingReason>{ending_reason}</EndingReason></ListingDetails>
+        <SellingStatus>
+          <QuantitySold>0</QuantitySold>
+          <ListingStatus>Completed</ListingStatus>
+        </SellingStatus>
+      </Item>
+    </GetItemResponse>
+    """
+
+
+def test_sold_list_does_not_relist_replacement_already_active(monkeypatch, tmp_path):
+    db_path = tmp_path / "ebay.db"
+    _init_db(db_path, listing_id=NEW_ITEM)
+    _patch_oauth_and_http(monkeypatch)
+    _patch_supplier_gate(monkeypatch)
+    monkeypatch.setattr("scripts.sales_health_check.uses_trading_channel", lambda: True)
+
+    calls = []
+
+    def trading_call(call_name, xml_body, site_id):
+        calls.append((call_name, xml_body, site_id))
+        if NEW_ITEM in xml_body:
+            return _active_item_xml(NEW_ITEM, SKU, 2)
+        return _completed_item_xml()
+
+    _patch_trading(monkeypatch, trading_call)
+
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    monkeypatch.setattr(
+        InventorySyncService,
+        "check_dajian_stock",
+        lambda self, sku: (True, 40.0, 5.0, 99),
+    )
+
+    checker = _checker(db_path)
+    monkeypatch.setattr(checker, "_fetch_trading_active_quantity_map", lambda: {})
+    monkeypatch.setattr(
+        checker,
+        "_fetch_trading_recent_sold_map",
+        lambda: ({
+            SKU: {
+                "listing_id": OLD_ITEM,
+                "available": 0,
+                "quantity": 1,
+                "sold": 1,
+                "listing_status": "Completed",
+                "ending_reason": "Sold",
+            }
+        }, {}),
+    )
+
+    def snapshot(listing_id):
+        if str(listing_id) == NEW_ITEM:
+            return {
+                "item_id": NEW_ITEM,
+                "sku": SKU,
+                "listing_status": "Active",
+                "quantity_sold": 0,
+                "available": 2,
+            }
+        return {
+            "item_id": OLD_ITEM,
+            "sku": SKU,
+            "listing_status": "Completed",
+            "ending_reason": "Sold",
+            "quantity_sold": 1,
+            "available": 0,
+        }
+
+    monkeypatch.setattr(checker, "_fetch_trading_listing_snapshot", snapshot)
+
+    audit = checker._check_quantity_integrity(auto_fix=True)
+
+    assert not any(call[0] == "RelistFixedPriceItem" for call in calls)
+    conn = sqlite3.connect(db_path)
+    listing_id, status = conn.execute(
+        "SELECT listing_id, status FROM collected_products WHERE sku = ?",
+        (SKU,),
+    ).fetchone()
+    conn.close()
+    assert listing_id == NEW_ITEM
+    assert status == "PUBLISHED"
+    assert audit["restocked_count"] == 0
+
+
+def test_sold_list_relists_current_db_item_not_historical_id(monkeypatch, tmp_path):
+    db_path = tmp_path / "ebay.db"
+    current_item = "189050000001"
+    fresh_item = "189050000002"
+    _init_db(db_path, listing_id=current_item)
+    monkeypatch.setenv("EBAY_LISTING_QUANTITY_CAP", "2")
+    _patch_oauth_and_http(monkeypatch)
+    _patch_supplier_gate(monkeypatch)
+    monkeypatch.setattr("scripts.sales_health_check.uses_trading_channel", lambda: True)
+
+    calls = []
+
+    def trading_call(call_name, xml_body, site_id):
+        calls.append((call_name, xml_body, site_id))
+        if call_name == "RelistFixedPriceItem":
+            return (
+                "<RelistFixedPriceItemResponse><Ack>Success</Ack>"
+                f"<ItemID>{fresh_item}</ItemID></RelistFixedPriceItemResponse>"
+            )
+        if call_name == "GetItem" and fresh_item in xml_body:
+            return _active_item_xml(fresh_item, SKU, 2)
+        if current_item in xml_body:
+            return _completed_item_xml(current_item, SKU)
+        return _completed_item_xml()
+
+    _patch_trading(monkeypatch, trading_call)
+
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    monkeypatch.setattr(
+        InventorySyncService,
+        "check_dajian_stock",
+        lambda self, sku: (True, 40.0, 5.0, 99),
+    )
+
+    checker = _checker(db_path)
+    monkeypatch.setattr(checker, "_fetch_trading_active_quantity_map", lambda: {})
+    monkeypatch.setattr(
+        checker,
+        "_fetch_trading_recent_sold_map",
+        lambda: ({
+            SKU: {
+                "listing_id": OLD_ITEM,
+                "available": 0,
+                "sold": 1,
+                "listing_status": "Completed",
+                "ending_reason": "Sold",
+            }
+        }, {}),
+    )
+
+    def snapshot(listing_id):
+        item_id = str(listing_id or "")
+        if item_id == current_item:
+            return {
+                "item_id": current_item,
+                "sku": SKU,
+                "listing_status": "Completed",
+                "ending_reason": "Sold",
+                "quantity_sold": 1,
+                "available": 0,
+            }
+        return {
+            "item_id": OLD_ITEM,
+            "sku": SKU,
+            "listing_status": "Completed",
+            "ending_reason": "Sold",
+            "quantity_sold": 1,
+            "available": 0,
+        }
+
+    monkeypatch.setattr(checker, "_fetch_trading_listing_snapshot", snapshot)
+
+    audit = checker._check_quantity_integrity(auto_fix=True)
+
+    relist_calls = [call for call in calls if call[0] == "RelistFixedPriceItem"]
+    assert len(relist_calls) == 1
+    assert f"<ItemID>{current_item}</ItemID>" in relist_calls[0][1]
+    assert f"<ItemID>{OLD_ITEM}</ItemID>" not in relist_calls[0][1]
+    conn = sqlite3.connect(db_path)
+    listing_id = conn.execute(
+        "SELECT listing_id FROM collected_products WHERE sku = ?",
+        (SKU,),
+    ).fetchone()[0]
+    conn.close()
+    assert listing_id == fresh_item
+    assert audit["restocked_count"] == 1
+
+
+def test_stale_known_listing_id_does_not_relist_live_db_item(monkeypatch, tmp_path):
+    db_path = tmp_path / "ebay.db"
+    _init_db(db_path, sku=SKU, listing_id=NEW_ITEM)
+    _patch_oauth_and_http(monkeypatch)
+
+    calls = []
+
+    def trading_call(call_name, xml_body, site_id):
+        calls.append((call_name, xml_body, site_id))
+        if call_name == "RelistFixedPriceItem":
+            raise AssertionError("must not relist the ended SoldList item")
+        if call_name == "ReviseInventoryStatus":
+            return "<Ack>Success</Ack>"
+        if NEW_ITEM in str(xml_body):
+            return _active_item_xml(NEW_ITEM, SKU, 2)
+        return _completed_item_xml()
+
+    _patch_trading(monkeypatch, trading_call)
+
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    service = InventorySyncService(db_path=str(db_path))
+    service.logger = logging.getLogger(__name__)
+
+    assert service.update_ebay_quantity(SKU, 2, known_listing_id=OLD_ITEM) is True
+    assert not any(call[0] == "RelistFixedPriceItem" for call in calls)
+    assert all(OLD_ITEM not in call[1] for call in calls)
+    revise_calls = [call for call in calls if call[0] == "ReviseInventoryStatus"]
+    assert len(revise_calls) == 1
+    assert f"<ItemID>{NEW_ITEM}</ItemID>" in revise_calls[0][1]
+
+
+def test_zero_quantity_enables_out_of_stock_control_before_revise(monkeypatch, tmp_path):
+    db_path = tmp_path / "ebay.db"
+    _init_db(db_path, sku="SKU-ACTIVE", listing_id="LISTING-ACTIVE")
+    _patch_oauth_and_http(monkeypatch)
+
+    calls = []
+    state = {"revised": False}
+
+    def trading_call(call_name, xml_body, site_id):
+        calls.append((call_name, xml_body, site_id))
+        if call_name == "ReviseFixedPriceItem":
+            assert "<OutOfStockControl>true</OutOfStockControl>" in xml_body
+            assert "<ItemID>LISTING-ACTIVE</ItemID>" in xml_body
+            return "<ReviseFixedPriceItemResponse><Ack>Success</Ack></ReviseFixedPriceItemResponse>"
+        if call_name == "ReviseInventoryStatus":
+            assert any(call[0] == "ReviseFixedPriceItem" for call in calls)
+            assert "<Quantity>0</Quantity>" in xml_body
+            state["revised"] = True
+            return "<Ack>Success</Ack>"
+        available = 0 if state["revised"] else 2
+        return _active_item_xml("LISTING-ACTIVE", "SKU-ACTIVE", available)
+
+    _patch_trading(monkeypatch, trading_call)
+
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    service = InventorySyncService(db_path=str(db_path))
+    service.logger = logging.getLogger(__name__)
+
+    assert service.update_ebay_quantity("SKU-ACTIVE", 0) is True
+    assert state["revised"] is True
+    assert not any(call[0] == "RelistFixedPriceItem" for call in calls)
+    assert not any(str(call[0]).startswith("End") for call in calls)
+    conn = sqlite3.connect(db_path)
+    status = conn.execute(
+        "SELECT status FROM collected_products WHERE sku = ?",
+        ("SKU-ACTIVE",),
+    ).fetchone()[0]
+    conn.close()
+    assert status == "PUBLISHED"
+
+
+def test_failed_out_of_stock_control_does_not_revise_quantity_to_zero(monkeypatch, tmp_path):
+    db_path = tmp_path / "ebay.db"
+    _init_db(db_path, sku="SKU-ACTIVE", listing_id="LISTING-ACTIVE")
+    _patch_oauth_and_http(monkeypatch)
+
+    calls = []
+
+    def trading_call(call_name, xml_body, site_id):
+        calls.append((call_name, xml_body, site_id))
+        if call_name == "ReviseFixedPriceItem":
+            return "<ReviseFixedPriceItemResponse><Ack>Failure</Ack></ReviseFixedPriceItemResponse>"
+        if call_name == "ReviseInventoryStatus":
+            raise AssertionError("quantity 0 must not be sent without OutOfStockControl")
+        return _active_item_xml("LISTING-ACTIVE", "SKU-ACTIVE", 2)
+
+    _patch_trading(monkeypatch, trading_call)
+
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    service = InventorySyncService(db_path=str(db_path))
+    service.logger = logging.getLogger(__name__)
+
+    assert service.update_ebay_quantity("SKU-ACTIVE", 0) is False
+    assert any(call[0] == "ReviseFixedPriceItem" for call in calls)
+    assert not any(call[0] == "ReviseInventoryStatus" for call in calls)
+
+
+def test_unsold_zero_end_relists_when_stock_returns(monkeypatch, tmp_path):
+    db_path = tmp_path / "ebay.db"
+    _init_db(db_path, sku="SKU-OOS", listing_id=OLD_ITEM)
+    _patch_oauth_and_http(monkeypatch)
+
+    calls = []
+
+    def trading_call(call_name, xml_body, site_id):
+        calls.append((call_name, xml_body, site_id))
+        if call_name == "RelistFixedPriceItem":
+            return (
+                "<RelistFixedPriceItemResponse><Ack>Success</Ack>"
+                f"<ItemID>{NEW_ITEM}</ItemID></RelistFixedPriceItemResponse>"
+            )
+        if call_name == "GetItem" and NEW_ITEM in xml_body:
+            return _active_item_xml(NEW_ITEM, "SKU-OOS", 2)
+        return _completed_unsold_xml(OLD_ITEM, "SKU-OOS")
+
+    _patch_trading(monkeypatch, trading_call)
+
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    service = InventorySyncService(db_path=str(db_path))
+    service.logger = logging.getLogger(__name__)
+
+    assert service.update_ebay_quantity("SKU-OOS", 2, known_listing_id=OLD_ITEM) is True
+    relist_calls = [call for call in calls if call[0] == "RelistFixedPriceItem"]
+    assert len(relist_calls) == 1
+    assert f"<ItemID>{OLD_ITEM}</ItemID>" in relist_calls[0][1]
+    assert "<Quantity>2</Quantity>" in relist_calls[0][1]
+    conn = sqlite3.connect(db_path)
+    listing_id = conn.execute(
+        "SELECT listing_id FROM collected_products WHERE sku = ?",
+        ("SKU-OOS",),
+    ).fetchone()[0]
+    conn.close()
+    assert listing_id == NEW_ITEM
+
+
+def test_seller_error_end_is_not_relisted(monkeypatch, tmp_path):
+    db_path = tmp_path / "ebay.db"
+    _init_db(db_path, sku="SKU-ENDED", listing_id=OLD_ITEM)
+    _patch_oauth_and_http(monkeypatch)
+
+    calls = []
+
+    def trading_call(call_name, xml_body, site_id):
+        calls.append((call_name, xml_body, site_id))
+        return _completed_unsold_xml(OLD_ITEM, "SKU-ENDED", ending_reason="Incorrect")
+
+    _patch_trading(monkeypatch, trading_call)
+
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    service = InventorySyncService(db_path=str(db_path))
+    service.logger = logging.getLogger(__name__)
+
+    assert service.update_ebay_quantity("SKU-ENDED", 2) is False
+    assert not any(call[0] == "RelistFixedPriceItem" for call in calls)

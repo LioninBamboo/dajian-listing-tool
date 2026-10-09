@@ -32,6 +32,7 @@ from src.utils.inventory_restock_hold import (
 )
 from src.utils.sold_through_relist import (
     completed_because_sold,
+    completed_by_zero_quantity_end,
     extract_item_id,
     parse_trading_item_xml,
     trading_ack_ok,
@@ -570,11 +571,12 @@ class InventorySyncService:
                 available = live.get("available")
                 live_sku = str(live.get("sku") or "").strip()
                 sku_ok = (not live_sku) or live_sku == sku
-                if (
-                    sku_ok
-                    and available == expected_quantity
-                    and status.lower() == "active"
-                ):
+                status_name = status.lower()
+                if expected_quantity <= 0:
+                    status_ok = status_name in {"active", "outofstock"}
+                else:
+                    status_ok = status_name == "active"
+                if sku_ok and available == expected_quantity and status_ok:
                     return True
             if attempt < 3:
                 time.sleep(1)
@@ -591,7 +593,19 @@ class InventorySyncService:
         RelistFixedPriceItem sends only ItemID, Quantity, and SKU. Fitment,
         item specifics, and package dimensions stay on the ended listing.
         """
-        listing_id = str(known_listing_id or "").strip() or self._lookup_listing_id(sku)
+        requested_id = str(known_listing_id or "").strip()
+        db_listing_id = str(self._lookup_listing_id(sku) or "").strip()
+        # SoldList keeps the ended ItemID for the lookback window. Once the
+        # DB points at a replacement, RelistFixedPriceItem on the old ID
+        # opens a second live listing.
+        if requested_id and db_listing_id and requested_id != db_listing_id:
+            self.logger.info(
+                f"{sku}: 请求的 ItemID {requested_id} 不是当前 DB listing {db_listing_id}，"
+                f"不 Relist 已结束的旧链接"
+            )
+            listing_id = db_listing_id
+        else:
+            listing_id = requested_id or db_listing_id
         if not listing_id:
             self.logger.error(f"No Trading listing ID for {sku}")
             return False
@@ -618,16 +632,47 @@ class InventorySyncService:
             self.logger.info(f"{sku}: 链接已结束且目标数量为 0，不 Relist")
             return True
 
-        if quantity > 0 and completed_because_sold(status, ending_reason, quantity_sold):
+        if quantity > 0 and (
+            completed_because_sold(status, ending_reason, quantity_sold)
+            or completed_by_zero_quantity_end(status, ending_reason, quantity_sold)
+        ):
             return self._relist_fixed_price_item(sku, listing_id, quantity, site_id)
 
         if str(status or "").lower() in {"active", "outofstock"}:
+            if quantity <= 0 and not snapshot.get("out_of_stock_control"):
+                if not self._enable_trading_out_of_stock_control(sku, listing_id, site_id):
+                    self.logger.warning(
+                        f"{sku}: 未开启 OutOfStockControl，拒绝将数量改为 0，避免 eBay 结束刊登"
+                    )
+                    return False
             return self._revise_trading_quantity(sku, listing_id, quantity, site_id)
 
         self.logger.warning(
             f"{sku}: Trading 状态 {status} / EndingReason {ending_reason or '-'}，不 Relist"
         )
         return False
+
+    def _enable_trading_out_of_stock_control(self, sku: str, listing_id: str, site_id: str) -> bool:
+        """Keep a GTC fixed-price item Active at quantity 0.
+
+        Without this flag, ReviseInventoryStatus quantity 0 Completes the listing.
+        """
+        trading, _site = self._trading_client()
+        xml_body = f"""
+        <Item>
+            <ItemID>{xml_escape(str(listing_id))}</ItemID>
+            <OutOfStockControl>true</OutOfStockControl>
+        </Item>
+        """
+        try:
+            response = trading.call("ReviseFixedPriceItem", xml_body, site_id=site_id)
+        except Exception as exc:
+            self.logger.warning(f"{sku}: 开启 OutOfStockControl 失败: {exc}")
+            return False
+        if not trading_ack_ok(response):
+            self.logger.warning(f"{sku}: OutOfStockControl Ack 失败: {response[:300]}")
+            return False
+        return True
 
     def _revise_trading_quantity(self, sku: str, listing_id: str, quantity: int, site_id: str) -> bool:
         trading, _site = self._trading_client()
