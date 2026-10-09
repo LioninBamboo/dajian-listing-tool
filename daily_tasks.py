@@ -208,28 +208,72 @@ def analyze_collected_products(
         
         success = 0
         failed = 0
+        skipped = 0
+        skip_reasons: dict[str, list[str]] = {}
         prepared_skus: list[str] = []
         
         for i, product in enumerate(products, 1):
             logger.info(f"[{i}/{len(products)}] 处理 {product.sku}...")
             
             try:
-                # 1. 计算价格
+                # 1. 计算价格 — live cargo recheck when the supplier API is up,
+                #    then cheap publishability gates BEFORE any title/desc LLM.
+                from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+                from src.utils.copy_skip_gate import (
+                    apply_copy_skip,
+                    apply_live_supplier_quote,
+                    cargo_gate_applies,
+                    evaluate_copy_skip,
+                    lookup_live_supplier_quote,
+                    market_median_from_intel,
+                )
+
                 specs = product.specs or {}
                 attributes = product.attributes or {}
                 is_oversize = 'Dimensions' in specs or 'Dimensions' in attributes
-                
+
+                live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(product.sku))
+                if live_applied:
+                    logger.info(
+                        f"  💲 Live supplier quote: price=${product.price} ship=${product.shipping}"
+                    )
+                apply_cargo = cargo_gate_applies(specs, live_quote_applied=live_applied)
+
                 dajian_costs = PricingEngine.calculate_dajian_cost(
                     product_price=product.price,
                     shipping_cost=product.shipping,
                     is_oversize=is_oversize
                 )
-                
+
                 safe_price = PricingEngine.calculate_selling_price(
                     dajian_costs["total_dajian_cost"], 0.15
                 )
-                
-                # 2. AI 优化 (with market intelligence)
+
+                local_skip = evaluate_copy_skip(
+                    sku=product.sku,
+                    product_price=product.price,
+                    shipping=product.shipping,
+                    is_oversize=is_oversize,
+                    attributes=attributes,
+                    specs=specs,
+                    description=product.description or "",
+                    title=product.title or "",
+                    include_market=False,
+                    dims_mode="require",
+                    apply_cargo=apply_cargo,
+                )
+                if local_skip.skip:
+                    apply_copy_skip(product, local_skip, cost_breakdown=dajian_costs)
+                    _flag_modified(product, "logs")
+                    _flag_modified(product, "cost_breakdown")
+                    db.commit()
+                    logger.info(f"  ⏭ copy_skip {','.join(local_skip.reasons)} (no LLM)")
+                    skipped += 1
+                    skip_reasons[product.sku] = list(local_skip.reasons)
+                    continue
+
+                # 2. Market median (Browse cache / Terapeak) then far-above.
+                #    No median → SAFE_15_NO_MARKET, still publishable, still copy.
                 market_intel = None
                 try:
                     market_intel = qwen.fetch_market_intelligence(product.title)
@@ -237,6 +281,32 @@ def analyze_collected_products(
                         logger.info(f"  📊 Market intel: {market_intel.get('total_listings', 0)} listings")
                 except Exception as mi_err:
                     logger.warning(f"  ⚠️ Market intel failed: {mi_err}")
+
+                market_skip = evaluate_copy_skip(
+                    sku=product.sku,
+                    product_price=product.price,
+                    shipping=product.shipping,
+                    is_oversize=is_oversize,
+                    attributes=attributes,
+                    specs=specs,
+                    description=product.description or "",
+                    title=product.title or "",
+                    market_median=market_median_from_intel(market_intel),
+                    include_market=True,
+                    dims_mode="require",
+                    apply_cargo=apply_cargo,
+                )
+                if market_skip.skip:
+                    apply_copy_skip(product, market_skip, cost_breakdown=dajian_costs)
+                    _flag_modified(product, "logs")
+                    _flag_modified(product, "cost_breakdown")
+                    db.commit()
+                    logger.info(f"  ⏭ copy_skip {','.join(market_skip.reasons)} (no LLM)")
+                    skipped += 1
+                    skip_reasons[product.sku] = list(market_skip.reasons)
+                    continue
+
+                # 3. AI 优化 — only SKUs that can still near-or-SAFE publish.
                 
                 max_retries = 2
                 previous_errors = None
@@ -340,10 +410,12 @@ def analyze_collected_products(
                 flag_modified(product, 'logs')
                 db.commit()
         
-        logger.info(f"\n分析完成: 成功 {success}, 失败 {failed}")
+        logger.info(f"\n分析完成: 成功 {success}, 跳过文案 {skipped}, 失败 {failed}")
         return {
             'success': success,
             'failed': failed,
+            'skipped': skipped,
+            'skip_reasons': skip_reasons,
             'requested': len(normalized_skus) if normalized_skus else len(products),
             'matched': len(products),
             'prepared_skus': prepared_skus,

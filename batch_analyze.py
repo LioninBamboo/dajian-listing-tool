@@ -14,6 +14,14 @@ from src.services.ebay_category_matcher import create_category_matcher
 from src.services.pricing_engine import PricingEngine
 from sqlalchemy.orm.attributes import flag_modified
 from qwen_optimizer import QwenOptimizer, optimize_product_full_with_timeout
+from src.utils.copy_skip_gate import (
+    apply_copy_skip,
+    apply_live_supplier_quote,
+    cargo_gate_applies,
+    evaluate_copy_skip,
+    lookup_live_supplier_quote,
+    market_median_from_intel,
+)
 from src.utils.listing_quality_gate import (
     blocking_issue_messages,
     normalize_generated_listing,
@@ -57,6 +65,11 @@ def main():
             attributes = product.attributes or {}
             is_oversize = 'Dimensions' in specs or 'Dimensions' in attributes
             
+            live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(product.sku))
+            apply_cargo = cargo_gate_applies(specs, live_quote_applied=live_applied)
+            if live_applied:
+                print(f"  💲 Live supplier quote: price=${product.price} ship=${product.shipping}")
+
             dajian_costs = PricingEngine.calculate_dajian_cost(
                 product_price=product.price,
                 shipping_cost=product.shipping,
@@ -64,8 +77,56 @@ def main():
             )
             
             safe_price = PricingEngine.calculate_selling_price(dajian_costs["total_dajian_cost"], 0.15)
-            
-            # 2. AI 优化
+
+            local_skip = evaluate_copy_skip(
+                sku=product.sku,
+                product_price=product.price,
+                shipping=product.shipping,
+                is_oversize=is_oversize,
+                attributes=attributes,
+                specs=specs,
+                description=product.description or "",
+                title=product.title or "",
+                include_market=False,
+                dims_mode="require",
+                apply_cargo=apply_cargo,
+            )
+            if local_skip.skip:
+                apply_copy_skip(product, local_skip, cost_breakdown=dajian_costs)
+                flag_modified(product, "logs")
+                flag_modified(product, "cost_breakdown")
+                db.commit()
+                print(f"  ⏭ copy_skip {','.join(local_skip.reasons)} (no LLM)\n")
+                continue
+
+            market_intel = None
+            try:
+                market_intel = qwen.fetch_market_intelligence(product.title)
+            except Exception as mi_err:
+                print(f"  ⚠️ Market intel failed: {mi_err}")
+            market_skip = evaluate_copy_skip(
+                sku=product.sku,
+                product_price=product.price,
+                shipping=product.shipping,
+                is_oversize=is_oversize,
+                attributes=attributes,
+                specs=specs,
+                description=product.description or "",
+                title=product.title or "",
+                market_median=market_median_from_intel(market_intel),
+                include_market=True,
+                dims_mode="require",
+                apply_cargo=apply_cargo,
+            )
+            if market_skip.skip:
+                apply_copy_skip(product, market_skip, cost_breakdown=dajian_costs)
+                flag_modified(product, "logs")
+                flag_modified(product, "cost_breakdown")
+                db.commit()
+                print(f"  ⏭ copy_skip {','.join(market_skip.reasons)} (no LLM)\n")
+                continue
+
+            # 2. AI 优化 — survivors that can still near-or-SAFE publish
             opt_data = None
             previous_errors = []
             for attempt in range(3):
@@ -77,6 +138,7 @@ def main():
                         attributes=attributes,
                         specs=specs,
                         images=product.images or [],
+                        market_intel=market_intel,
                         previous_errors=previous_errors if previous_errors else None
                     )
                     opt_data = normalize_generated_listing(

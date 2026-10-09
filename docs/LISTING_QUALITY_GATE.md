@@ -47,6 +47,20 @@
 - 新草稿在进入 `READY` 前会先规范化并过 quality gate；
 - 即使历史 READY 草稿绕过了生成入口，发布前也会再次被 `scripts/audit_fix_ready_drafts.py` 和 `batch_publish.py` 拦截。
 
+## 文案生成前的刊登闸门
+
+不能刊登的 SKU 不得先烧标题 / 描述 / FactSheet 抽取 / 图片说明的 LLM token。`src/utils/copy_skip_gate.py` 在 `POST /api/collect`、`server.analyze_product_task`、`daily_tasks.analyze_collected_products` 和 `batch_analyze.py` 里，于 `optimize_product_full_with_timeout` 之前做便宜判断。命中后状态写成 `SKIPPED`，日志带 `copy_skip:<reason>`，`cost_breakdown.copy_skip_reasons` 记下原因码。不写标题和描述。
+
+| 原因码 | 何时跳过文案 |
+|--------|----------------|
+| `blacklist_seller` | SKU 前缀命中 N735* 或已知跳过卖家 |
+| `cargo_cost_over_200` | 供应商货价 + 运费 > USD 200（有大建实时报价时先用报价） |
+| `unclear_dims` | 源数据里没有可信的物品长宽高（占位值、缺失都不许编造；包装/箱规尺寸不能填成组装尺寸） |
+| `far_above_market` | 已有市场中位价，且 SAFE_15 仍高于近市价带（中位 × 1.15，与 dry-run 的超价带一致） |
+| `factsheet_material_conflict` | 源字段与标题之间已有确定性材质冲突，不需要 LLM 发明事实表 |
+
+没有市场中位价时仍按 `SAFE_15_NO_MARKET` 生成文案并允许刊登。已经生成过文案的 READY 草稿不在这里删除；下架 / End 行为不变。
+
 ## Source Preflight
 
 采集时不再只看图片/描述长度，还会额外提取 `source_facts`：

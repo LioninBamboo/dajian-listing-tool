@@ -544,19 +544,9 @@ def analyze_product_task(sku: str):
             wt = dajian_dims.get('productWeight')
             if wt and 'Product Weight (lbs.)' not in attrs:
                 attrs['Product Weight (lbs.)'] = str(wt)
-            # Tools / kits often have assembled L/W/H = "Not Applicable". Fall
-            # back to package dims so Item Length/Width/Height can be filled.
-            for a_key, p_key in (
-                ("Assembled Length (in.)", "Package Length (in.)"),
-                ("Assembled Width (in.)", "Package Width (in.)"),
-                ("Assembled Height (in.)", "Package Height (in.)"),
-            ):
-                if a_key not in attrs and specs.get(p_key):
-                    try:
-                        float(specs[p_key])
-                        attrs[a_key] = str(specs[p_key])
-                    except (TypeError, ValueError):
-                        pass
+            # Package L/W/H must not be copied onto Assembled/Item axes.
+            # Missing item dims skip listing copy; inventing them would hide
+            # unclear_dims and spend LLM tokens on unlistable SKUs.
             if "Product Weight (lbs.)" not in attrs and specs.get("Package Weight (lbs.)"):
                 attrs["Product Weight (lbs.)"] = str(specs["Package Weight (lbs.)"])
             product.specs = specs
@@ -626,7 +616,20 @@ def analyze_product_task(sku: str):
             db.commit()
 
         from src.services.pricing_engine import PricingEngine
+        from src.utils.copy_skip_gate import (
+            apply_copy_skip,
+            apply_live_supplier_quote,
+            cargo_gate_applies,
+            evaluate_copy_skip,
+            lookup_live_supplier_quote,
+        )
         specs = product.specs or {}
+        live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(sku))
+        apply_cargo = cargo_gate_applies(specs, live_quote_applied=live_applied)
+        if live_applied:
+            logging.info(
+                f"[PRICE] {sku} live supplier quote: price=${product.price} ship=${product.shipping}"
+            )
         is_oversize = bool(
             dajian_dims.get('overSizeFlag')
             or 'Dimensions' in specs
@@ -643,7 +646,29 @@ def analyze_product_task(sku: str):
             is_oversize=is_oversize,
         )
         total_cost = dajian_costs["total_dajian_cost"]
-        
+
+        # Cheap gates before Browse/Terapeak and before any listing-copy LLM.
+        local_skip = evaluate_copy_skip(
+            sku=sku,
+            product_price=product.price,
+            shipping=product.shipping,
+            is_oversize=is_oversize,
+            attributes=attrs,
+            specs=specs,
+            description=product.description or "",
+            title=product.title or "",
+            include_market=False,
+            dims_mode="require",
+            apply_cargo=apply_cargo,
+        )
+        if local_skip.skip:
+            apply_copy_skip(product, local_skip, cost_breakdown=dajian_costs)
+            flag_modified(product, "logs")
+            flag_modified(product, "cost_breakdown")
+            db.commit()
+            logging.info(f"[COPY_SKIP] {sku} {','.join(local_skip.reasons)} (no LLM)")
+            return
+
         market_price = None  # Default: no market data
         market_avg = None
         market_source = None
@@ -692,9 +717,32 @@ def analyze_product_task(sku: str):
         product.cost_breakdown = dajian_costs
         flag_modified(product, 'cost_breakdown')  # FIX: Notify SQLAlchemy of JSON change
         product.suggested_price = decision["final_price"]
-        
-        # 2. AI Optimization (Switched to Qwen)
+
+        priced_skip = evaluate_copy_skip(
+            sku=sku,
+            product_price=product.price,
+            shipping=product.shipping,
+            is_oversize=is_oversize,
+            attributes=attrs,
+            specs=specs,
+            description=product.description or "",
+            title=product.title or "",
+            market_median=market_price,
+            include_market=True,
+            dims_mode="require",
+            apply_cargo=apply_cargo,
+        )
+        if priced_skip.skip:
+            apply_copy_skip(product, priced_skip, cost_breakdown=dajian_costs)
+            flag_modified(product, "logs")
+            flag_modified(product, "cost_breakdown")
+            db.commit()
+            logging.info(f"[COPY_SKIP] {sku} {','.join(priced_skip.reasons)} (no LLM)")
+            return
+
+        # 2. AI Optimization (Switched to Qwen) — only near-market or SAFE_15 survivors.
         from qwen_optimizer import QwenOptimizer, optimize_product_full_with_timeout
+        from src.utils.copy_skip_gate import market_median_from_intel
         import os
         QWEN_KEY = os.getenv("QWEN_API_KEY")
         
@@ -720,7 +768,32 @@ def analyze_product_task(sku: str):
             except Exception as mi_err:
                 logging.warning(f"Market intelligence fetch failed (non-critical): {mi_err}")
                 # Continue without market intelligence — optimization still works fine
-            
+
+            # First lookup can miss a cached Browse/Terapeak median that this
+            # fetch still has. Re-check far-above before paying for copy.
+            if not market_price:
+                intel_skip = evaluate_copy_skip(
+                    sku=sku,
+                    product_price=product.price,
+                    shipping=product.shipping,
+                    is_oversize=is_oversize,
+                    attributes=attrs,
+                    specs=specs,
+                    description=product.description or "",
+                    title=product.title or "",
+                    market_median=market_median_from_intel(market_intel),
+                    include_market=True,
+                    dims_mode="require",
+                    apply_cargo=apply_cargo,
+                )
+                if intel_skip.skip:
+                    apply_copy_skip(product, intel_skip, cost_breakdown=dajian_costs)
+                    flag_modified(product, "logs")
+                    flag_modified(product, "cost_breakdown")
+                    db.commit()
+                    logging.info(f"[COPY_SKIP] {sku} {','.join(intel_skip.reasons)} (no LLM)")
+                    return
+
             opt_data = optimize_product_full_with_timeout(
                 api_key=QWEN_KEY,
                 original_title=product.title,
@@ -967,7 +1040,28 @@ async def collect_product(
             f"({len(normalized_images)} imgs, "
             f"{len(normalized_videos)} vids, {len(payload.specs or {})} specs, Shipping: ${payload.shipping})"
         )
-        
+
+        from src.utils.copy_skip_gate import (
+            apply_copy_skip,
+            evaluate_copy_skip,
+        )
+
+        # Intake gates that the payload can already answer. Missing dims stay
+        # deferred so analyze can still read supplier assembled measurements.
+        # Placeholder dims and N735* / cargo>200 never schedule copy generation.
+        intake_skip = evaluate_copy_skip(
+            sku=payload.sku,
+            product_price=payload.price,
+            shipping=payload.shipping,
+            is_oversize="Dimensions" in specs or "Dimensions" in attributes,
+            attributes=attributes,
+            specs=specs,
+            description=description,
+            title=title,
+            include_market=False,
+            dims_mode="defer_missing",
+        )
+
         # Check if product already exists
         existing = db.query(CollectedProduct).filter_by(sku=payload.sku).first()
         
@@ -992,6 +1086,10 @@ async def collect_product(
             flag_modified(existing, 'attributes')
             flag_modified(existing, 'specs')
             flag_modified(existing, 'logs')
+            if intake_skip.skip:
+                apply_copy_skip(existing, intake_skip)
+                flag_modified(existing, "logs")
+                flag_modified(existing, "cost_breakdown")
             db.commit()
             print(f" Updated existing product: {payload.sku}")
         else:
@@ -1013,10 +1111,25 @@ async def collect_product(
             )
             if issue_flags:
                 new_product.logs.append(f"Collection quality flags: {', '.join(issue_flags)}")
+            if intake_skip.skip:
+                apply_copy_skip(new_product, intake_skip)
             db.add(new_product)
             db.commit()
             print(f"?Created new product: {payload.sku}")
-        
+
+        if intake_skip.skip:
+            logging.info(
+                "[COPY_SKIP] %s %s at intake (no LLM)",
+                payload.sku,
+                ",".join(intake_skip.reasons),
+            )
+            return {
+                "status": "success",
+                "message": "Product collected; listing copy skipped",
+                "sku": payload.sku,
+                "copy_skip_reasons": list(intake_skip.reasons),
+            }
+
         # Schedule background optimization
         print(f"?Scheduling background optimization for {payload.sku}...")
         background_tasks.add_task(analyze_product_task, payload.sku)
@@ -1102,11 +1215,13 @@ async def collect_from_ebay_link(
             existing.description = description
             existing.images = images
             existing.attributes = attributes
+            existing.specs = {**(existing.specs or {}), "_price_basis": "ebay_listing"}
             existing.url = fields.get("url") or payload.url
             existing.status = "COLLECTED"
             existing.logs = (existing.logs or []) + logs
             flag_modified(existing, "images")
             flag_modified(existing, "attributes")
+            flag_modified(existing, "specs")
             flag_modified(existing, "logs")
             db.commit()
         else:
@@ -1120,12 +1235,47 @@ async def collect_from_ebay_link(
                 images=images,
                 videos=[],
                 attributes=attributes,
-                specs={},
+                specs={"_price_basis": "ebay_listing"},
                 url=fields.get("url") or payload.url,
                 status="COLLECTED",
                 logs=logs,
             ))
             db.commit()
+
+        from src.utils.copy_skip_gate import evaluate_copy_skip as _intake_copy_skip
+
+        # eBay-link `price` is an observed listing price, not GIGA supplier
+        # cargo. Cargo cap waits until a real supplier quote exists.
+        ebay_intake_skip = _intake_copy_skip(
+            sku=sku,
+            product_price=None,
+            shipping=None,
+            attributes=attributes,
+            specs={},
+            description=description,
+            title=title,
+            include_market=False,
+            dims_mode="defer_missing",
+        )
+        if ebay_intake_skip.skip:
+            from src.utils.copy_skip_gate import apply_copy_skip as _apply_intake_skip
+
+            row = existing or db.query(CollectedProduct).filter_by(sku=sku).first()
+            if row is not None:
+                _apply_intake_skip(row, ebay_intake_skip)
+                flag_modified(row, "logs")
+                flag_modified(row, "cost_breakdown")
+                db.commit()
+            return {
+                "status": "success",
+                "sku": sku,
+                "title": title,
+                "images": len(images),
+                "item_specifics": len(attributes),
+                "banned_terms_in_source": banned_summary,
+                "compliance": "collected images/copy are draft-only; replace before publish",
+                "copy_skip_reasons": list(ebay_intake_skip.reasons),
+            }
 
         background_tasks.add_task(analyze_product_task, sku)
 
