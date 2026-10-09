@@ -971,3 +971,45 @@ class TestFoamMdfLinenEngineeredDemotion:
             v["claim_type"] == "semantic_material" and "engineered wood" in v["claim_text"]
             for v in violations
         )
+
+class TestAluminumAluminiumSpelling:
+    """UK/US metal spelling: aluminium vs aluminum must not CRITICAL-block."""
+
+    def test_aluminum_supported_by_aluminium_synonym(self):
+        source = dict(SOURCE_SHEET, materials=["aluminium", "tempered glass"])
+        live = dict(SOURCE_SHEET, materials=["aluminum", "tempered glass"])
+        violations = compare_fact_sheets(source, live)
+        assert not any(
+            v["claim_type"] == "semantic_material" and v["claim_text"] == "aluminum"
+            for v in violations
+        )
+
+    def test_aluminium_supported_by_aluminum_synonym(self):
+        source = dict(SOURCE_SHEET, materials=["aluminum", "steel"])
+        live = dict(SOURCE_SHEET, materials=["aluminium", "steel"])
+        violations = compare_fact_sheets(source, live)
+        assert not any(
+            v["claim_type"] == "semantic_material" and v["claim_text"] == "aluminium"
+            for v in violations
+        )
+
+    def test_aluminum_alloy_supported_by_aluminium(self):
+        source = dict(SOURCE_SHEET, materials=["aluminium"])
+        live = dict(SOURCE_SHEET, materials=["aluminum alloy"])
+        violations = compare_fact_sheets(source, live)
+        assert not any(v["claim_type"] == "semantic_material" for v in violations)
+
+    def test_claim_in_text_cross_spelling(self):
+        assert lfs._claim_in_text("aluminum", "frame material: aluminium alloy") is True
+        assert lfs._claim_in_text("aluminium", "Aluminum Frame Double Sliding") is True
+
+    def test_aluminum_not_supported_by_unrelated_metal(self):
+        # Spelling synonym only — iron must not back aluminum.
+        source = dict(SOURCE_SHEET, materials=["iron", "glass"])
+        live = dict(SOURCE_SHEET, materials=["aluminum"])
+        violations = compare_fact_sheets(source, live)
+        assert any(
+            v["claim_type"] == "semantic_material" and "aluminum" in v["claim_text"]
+            for v in violations
+        )
+

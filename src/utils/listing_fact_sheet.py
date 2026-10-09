@@ -116,6 +116,14 @@ _SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
         "medium density fibreboard",
         "medium-density fibreboard",
     }),
+    # UK/US metal spelling (W1675*): source aluminium vs live aluminum -- same metal.
+    # Mirror microfibre/microfiber and fibreboard/fiberboard pairs already above.
+    frozenset({
+        "aluminum",
+        "aluminium",
+        "aluminum alloy",
+        "aluminium alloy",
+    }),
 )
 
 # Generalization is safe, specialization is the hallucination direction:
