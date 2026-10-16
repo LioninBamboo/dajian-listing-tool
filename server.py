@@ -359,8 +359,8 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         publisher = EbayPublisher(
             client=ebay_client,
             validator=CategoryValidator(
+                session=ebay_client.session,
                 api_base=ebay_client.base_url,
-                token_provider=ebay_client.oauth.get_valid_token,
             ),
             matcher=EbayCategoryMatcher(),
             tree_id="0",
