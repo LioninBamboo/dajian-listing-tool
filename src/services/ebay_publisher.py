@@ -107,9 +107,10 @@ def apply_category_publish_gate(
     Confirm category_id is a current leaf before any inventory or offer write.
 
     A non-leaf, retired id, or network `unknown` is remapped once to the first
-    plausible valid leaf. Item specifics already on `aspects` are not replaced
-    or invented. If nothing qualifies, return a human-gate PublishResult and
-    do not call create/update/publish.
+    plausible valid leaf. `force_remap` does the same after eBay rejects an id
+    Taxonomy still calls a leaf, and will not select that rejected id again.
+    Item specifics already on `aspects` are not replaced or invented. If nothing
+    qualifies, return a human-gate PublishResult and do not call create/update/publish.
     """
     from src.services.ebay_category_matcher import EbayCategoryMatcher
 
@@ -135,6 +136,8 @@ def apply_category_publish_gate(
     )
     for cid, name in suggestions:
         if not cid:
+            continue
+        if force_remap and str(cid).strip() == current_id:
             continue
         if not checker.is_category_plausible_for_text(title, cid, name):
             continue
@@ -1341,9 +1344,11 @@ class EbayPublisher:
         new_id, new_name, new_aspects = gated
         if offer_id and hasattr(self.ebay_client, "update_offer_category"):
             try:
-                self.ebay_client.update_offer_category(offer_id, new_id)
+                updated = self.ebay_client.update_offer_category(offer_id, new_id)
             except Exception as exc:
                 self.logger.warning("[CAT_REMAP] offer update failed: %s", exc)
+                updated = False
+            if not updated:
                 return PublishResult(
                     status=PublishStatus.ERROR,
                     message=HUMAN_GATE_ERROR,

@@ -20,10 +20,60 @@ from src.utils.store_profile import get_store_profile
 class EbayCategoryMatcher:
     """Automatic category and item specifics matching"""
     
-    def __init__(self, oauth_service: EbayOAuthService):
+    # Retired historical IDs -> current tree-0 leaves.
+    _DIRECT_LEAF_REPLACEMENTS = {
+        "116363": ("100411", "Litter Boxes"),
+        "20751": ("20744", "Beds"),
+        "20743": ("20744", "Beds"),
+        "116365": ("20748", "Fences & Exercise Pens"),
+        "121856": ("20748", "Fences & Exercise Pens"),
+        "116366": ("108884", "Dog Houses"),
+        "116403": ("116389", "Ramps & Stairs"),
+        "38205": ("38204", "Tables"),
+        "42428": ("20487", "Cabinets & Cupboards"),
+        "45331": ("20689", "Wine Racks & Bottle Holders"),
+        "66756": ("66743", "Play Table & Chair Sets"),
+        "175761": ("20490", "Ottomans, Footstools & Poufs"),
+        # eBay tree 0 retired these historical IDs. Keep old drafts
+        # publishable by canonicalizing them to the current leaves.
+        "20877": ("66690", "Rockers, Gliders"),
+        "43527": ("43517", "Laundry Carts & Hampers"),
+        # Retired tree-0 coat-rack leaf. Current leaf is Coat & Hat Racks.
+        "32880": ("22656", "Coat & Hat Racks"),
+    }
+    # 42430 Outdoor Storage is retired. 139956 Sheds is an alternate only.
+    _OUTDOOR_STORAGE_LEAVES = (
+        ("161059", "Trash Can Storage"),
+        ("184533", "Storage Deck Boxes"),
+    )
+
+    def __init__(self, oauth_service: Optional[EbayOAuthService] = None):
         self.oauth = oauth_service
         self.base_url = "https://api.ebay.com"
         self._aspects_cache: Dict[str, List[Dict]] = {}  # Cache category aspects
+
+    def hardcoded_categories(self) -> List[Tuple[str, str, str]]:
+        """Current leaves this matcher hardcodes, as (category_id, name, tree_id).
+
+        Read-only. Does not need OAuth. Retired source IDs are omitted so the
+        leaf check covers the replacements publish will actually send.
+        """
+        seen = set()
+        rows: List[Tuple[str, str, str]] = []
+
+        def add(category_id: str, name: str, tree_id: str = "0") -> None:
+            cid = str(category_id or "").strip()
+            key = (cid, str(tree_id))
+            if not cid or key in seen:
+                return
+            seen.add(key)
+            rows.append((cid, name, str(tree_id)))
+
+        for category_id, name in self._DIRECT_LEAF_REPLACEMENTS.values():
+            add(category_id, name)
+        for category_id, name in self._OUTDOOR_STORAGE_LEAVES:
+            add(category_id, name)
+        return rows
 
     def canonicalize_category(
         self,
@@ -469,36 +519,17 @@ class EbayCategoryMatcher:
         if has_outdoor_rocker and cid != "79684":
             return "79684", "Outdoor Chairs"
 
-        direct_replacements = {
-            "116363": ("100411", "Litter Boxes"),
-            "20751": ("20744", "Beds"),
-            "20743": ("20744", "Beds"),
-            "116365": ("20748", "Fences & Exercise Pens"),
-            "121856": ("20748", "Fences & Exercise Pens"),
-            "116366": ("108884", "Dog Houses"),
-            "116403": ("116389", "Ramps & Stairs"),
-            "38205": ("38204", "Tables"),
-            "42428": ("20487", "Cabinets & Cupboards"),
-            "45331": ("20689", "Wine Racks & Bottle Holders"),
-            "66756": ("66743", "Play Table & Chair Sets"),
-            "175761": ("20490", "Ottomans, Footstools & Poufs"),
-            # eBay tree 0 retired these historical IDs. Keep old drafts
-            # publishable by canonicalizing them to the current leaves.
-            "20877": ("66690", "Rockers, Gliders"),
-            "43527": ("43517", "Laundry Carts & Hampers"),
-            # Retired tree-0 coat-rack leaf. Current leaf is Coat & Hat Racks.
-            "32880": ("22656", "Coat & Hat Racks"),
-        }
-        if cid in direct_replacements:
-            return direct_replacements[cid]
+        if cid in self._DIRECT_LEAF_REPLACEMENTS:
+            return self._DIRECT_LEAF_REPLACEMENTS[cid]
 
         # 42430 Outdoor Storage is retired. Pick the leaf from the product text.
         # 139956 Sheds is an alternate for bin sheds and is not chosen here.
         if cid == "42430":
+            trash_can_storage, deck_box = self._OUTDOOR_STORAGE_LEAVES
             if any(kw in product_text_lower for kw in ("garbage bin shed", "trash can storage", "bin shed")):
-                return "161059", "Trash Can Storage"
+                return trash_can_storage
             if "deck box" in product_text_lower:
-                return "184533", "Storage Deck Boxes"
+                return deck_box
             return None, None
 
         if has_bunk_bed and cid != "175758":

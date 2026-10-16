@@ -360,6 +360,125 @@ def test_client_fallback_never_returns_3197():
     assert "32880" not in ids
 
 
+class _AlwaysPlausible:
+    def is_category_plausible_for_text(self, title, category_id, name=None):
+        return True
+
+    def _is_api_category_plausible(self, title, category_id, name=None):
+        return True
+
+
+class _LeafValidator:
+    def validate(self, category_id, tree_id):
+        return {"valid": True, "leaf": True, "name": f"Leaf {category_id}", "reason": "leaf"}
+
+
+def test_force_remap_skips_rejected_leaf_even_when_taxonomy_suggests_it():
+    product = _product("22656", "Coat Rack walnut hanger")
+    client = SimpleNamespace(
+        get_category_suggestions=lambda title: [
+            {"category": {"categoryId": "22656", "categoryName": "Coat & Hat Racks"}},
+            {"category": {"categoryId": "261263", "categoryName": "Hall Trees & Stands"}},
+        ]
+    )
+    result = apply_category_publish_gate(
+        category_id="22656",
+        category_name="Coat & Hat Racks",
+        title=product["title"],
+        product=product,
+        aspects={"Brand": ["FromSource"]},
+        ebay_client=client,
+        oauth=None,
+        validator=_LeafValidator(),
+        matcher=_AlwaysPlausible(),
+        force_remap=True,
+    )
+    assert result[0] == "261263"
+    assert product["optimization"]["categoryId"] == "261263"
+
+
+def test_force_remap_human_gate_when_suggestions_are_only_the_rejected_id():
+    product = _product("22656", "Coat Rack walnut hanger")
+    client = SimpleNamespace(
+        get_category_suggestions=lambda title: [
+            {"category": {"categoryId": "22656", "categoryName": "Coat & Hat Racks"}},
+        ]
+    )
+    result = apply_category_publish_gate(
+        category_id="22656",
+        category_name="Coat & Hat Racks",
+        title=product["title"],
+        product=product,
+        aspects={},
+        ebay_client=client,
+        oauth=None,
+        validator=_LeafValidator(),
+        matcher=_AlwaysPlausible(),
+        force_remap=True,
+    )
+    assert isinstance(result, PublishResult)
+    assert result.errors == [HUMAN_GATE_ERROR]
+
+
+def test_failed_offer_category_update_does_not_publish():
+    from src.services.ebay_publisher import EbayPublisher
+
+    published = []
+    pub = EbayPublisher.__new__(EbayPublisher)
+    pub.logger = logging.getLogger("remap-offer-update")
+    pub._category_error_remapped = False
+    pub.ebay_client = SimpleNamespace(update_offer_category=lambda *args, **kwargs: False)
+    pub._apply_category_gate = lambda *args, **kwargs: ("261263", "Hall Trees & Stands", {})
+    pub._do_publish = lambda *args, **kwargs: published.append(args)
+
+    result = pub._remap_once_or_human_gate(
+        "invalid category id",
+        product=_product("22656", "Coat Rack walnut hanger"),
+        category_id="22656",
+        category_name="Coat & Hat Racks",
+        title="Coat Rack walnut hanger",
+        aspects={},
+        offer_id="OFFER1",
+    )
+    assert published == []
+    assert isinstance(result, PublishResult)
+    assert result.status == PublishStatus.ERROR
+    assert result.errors == [HUMAN_GATE_ERROR]
+    assert result.offer_id == "OFFER1"
+    assert result.category_id == "261263"
+
+
+def test_leaf_check_entry_point_lists_remapped_ids_without_oauth():
+    import importlib.util
+    from pathlib import Path
+
+    rows = list(EbayCategoryMatcher().hardcoded_categories())
+    by_id = {category_id: (name, tree_id) for category_id, name, tree_id in rows}
+    assert by_id["22656"] == ("Coat & Hat Racks", "0")
+    assert by_id["161059"] == ("Trash Can Storage", "0")
+    assert by_id["184533"] == ("Storage Deck Boxes", "0")
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "check_hardcoded_category_leaves.py"
+    spec = importlib.util.spec_from_file_location("check_hardcoded_category_leaves", script_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    seen = []
+
+    class Validator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def validate(self, category_id, tree_id="0"):
+            seen.append((str(category_id), str(tree_id)))
+            return {"valid": True, "leaf": True, "name": "Leaf", "reason": "leaf"}
+
+    module.CategoryValidator = Validator
+    assert module.main() == 0
+    assert ("22656", "0") in seen
+    assert ("161059", "0") in seen
+    assert ("184533", "0") in seen
+
+
 def test_publisher_does_not_invent_aspects():
     product = _product("3197", "Coat Rack walnut hanger")
     aspects = {}
