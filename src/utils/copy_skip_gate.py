@@ -11,7 +11,10 @@ Reason codes (stored on the product log and ``cost_breakdown``):
 - ``cargo_cost_over_200`` — supplier product + cargo (shipping) > USD 200
 - ``unclear_dims`` — item L/W/H missing, placeholder, or not source-grounded
 - ``far_above_market`` — a real market median exists and the SAFE_15 price
-  still sits above the near-market band (median × 1.15)
+  still sits above the near-market band (median × 1.15). When
+  ``MARKET_GATE_ENABLED`` is false (the default if the key is missing),
+  this reason is not appended; ``detail["far_above_market_advisory"]``
+  is set instead so pricing and reports still see the market numbers.
 - ``factsheet_material_conflict`` — source-grounded material clash that
   FactSheet already fails without an LLM invent
 
@@ -55,6 +58,34 @@ REASON_CARGO_COST = "cargo_cost_over_200"
 REASON_UNCLEAR_DIMS = "unclear_dims"
 REASON_FAR_ABOVE = "far_above_market"
 REASON_MATERIAL_CONFLICT = "factsheet_material_conflict"
+
+_TRUTHY_ENV = {"1", "true", "yes", "on"}
+
+
+def market_gate_enabled() -> bool:
+    """Read ``MARKET_GATE_ENABLED`` on every call.
+
+    Missing, empty, or any value outside 1/true/yes/on (case-insensitive)
+    is false, matching Sergey's 2026-10-16 default. ``true`` restores the
+    old far-above-market skip.
+    """
+    raw = os.getenv("MARKET_GATE_ENABLED")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in _TRUTHY_ENV
+
+
+def market_advisory_log_line(detail: Mapping[str, Any] | None) -> str | None:
+    """Exact ops log when far-above is advisory because the gate is off."""
+    if not isinstance(detail, Mapping) or not detail.get("far_above_market_advisory"):
+        return None
+    ratio = detail.get("market_ratio")
+    try:
+        shown = f"{float(ratio):.2f}"
+    except (TypeError, ValueError):
+        shown = "?"
+    return f"market advisory ratio={shown} (gate off)"
+
 
 COPY_SKIP_STATUS = "SKIPPED"
 
@@ -456,11 +487,17 @@ def evaluate_copy_skip(
         detail["market_median"] = median
         safe_price = safe_15_price(product_price, shipping, is_oversize=is_oversize)
         ceiling = median * NEAR_MARKET_BAND
+        detail["ceiling"] = round(ceiling, 2)
         detail["near_market_ceiling"] = round(ceiling, 2)
         if safe_price is not None:
             detail["safe_15_price"] = safe_price
+            ratio = safe_price / median
+            detail["market_ratio"] = round(ratio, 4)
             if safe_price > ceiling:
-                reasons.append(REASON_FAR_ABOVE)
+                if market_gate_enabled():
+                    reasons.append(REASON_FAR_ABOVE)
+                else:
+                    detail["far_above_market_advisory"] = True
     elif include_market:
         detail["pricing_basis"] = "SAFE_15_NO_MARKET"
 

@@ -20,6 +20,7 @@ from src.utils.copy_skip_gate import (
     cargo_gate_applies,
     evaluate_copy_skip,
     lookup_live_supplier_quote,
+    market_advisory_log_line,
     market_median_from_intel,
 )
 from src.utils.listing_quality_gate import (
@@ -118,6 +119,9 @@ def main():
                 dims_mode="require",
                 apply_cargo=apply_cargo,
             )
+            advisory_line = market_advisory_log_line(market_skip.detail)
+            if advisory_line:
+                print(f"  {advisory_line}")
             if market_skip.skip:
                 apply_copy_skip(product, market_skip, cost_breakdown=dajian_costs)
                 flag_modified(product, "logs")
