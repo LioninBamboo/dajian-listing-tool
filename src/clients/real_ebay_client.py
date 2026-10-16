@@ -175,33 +175,32 @@ class RealEbayClient:
             {"offerId": "...", "status": "..."}
         """
         url = f"{self.base_url}/sell/inventory/v1/offer"
-        
+        headers, payload = self._build_offer_payload(sku, price, category_id)
+        return self._post_offer(url, headers, payload)
+
+    def _build_offer_payload(self, sku: str, price: float, category_id: Optional[str] = None) -> Dict:
+        """Shared offer body for create and category update. Does not invent aspects."""
         token = self.oauth.get_valid_token()
-        
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Content-Language": "en-US"
         }
-        
-        # Try to get policy IDs (optional)
         try:
             fulfillment_policy_id = self.policy_manager.get_default_fulfillment_policy_id()
             return_policy_id = self.policy_manager.get_default_return_policy_id()
             payment_policy_id = self.policy_manager.get_default_payment_policy_id()
-        except:
-            # If policies not available, set to None
-            # eBay will use account default policies
+        except Exception:
             fulfillment_policy_id = None
             return_policy_id = None
             payment_policy_id = None
             print("[WARN] No cached policies found, eBay will use account defaults")
-        
+
         payload = {
             "sku": sku,
             "marketplaceId": self.marketplace_id,
             "format": "FIXED_PRICE",
-            "merchantLocationKey": "DAJIAN_LA_WAREHOUSE",  # Los Angeles, CA
+            "merchantLocationKey": "DAJIAN_LA_WAREHOUSE",
             "pricingSummary": {
                 "price": {
                     "value": str(price),
@@ -209,28 +208,43 @@ class RealEbayClient:
                 }
             }
         }
-        
-        # Add policies if available
         if all([fulfillment_policy_id, return_policy_id, payment_policy_id]):
             payload["listingPolicies"] = {
                 "fulfillmentPolicyId": fulfillment_policy_id,
                 "returnPolicyId": return_policy_id,
                 "paymentPolicyId": payment_policy_id
             }
-            print(f"[OK] Using cached policies")
+            print("[OK] Using cached policies")
         else:
-            # Use hardcoded user's policies as fallback
             payload["listingPolicies"] = {
                 "fulfillmentPolicyId": "321897899021",
                 "returnPolicyId": "321896608021",
                 "paymentPolicyId": "321896606021"
             }
-            print(f"[INFO] Using user's configured policies")
-        
-        # Add category if provided
+            print("[INFO] Using user's configured policies")
         if category_id:
-            payload["categoryId"] = category_id
-        
+            payload["categoryId"] = str(category_id)
+        return headers, payload
+
+    def update_offer_category(self, offer_id: str, sku: str, price: float, category_id: str) -> Dict:
+        """
+        PUT /sell/inventory/v1/offer/{offerId} with a corrected leaf category.
+
+        Used when an unpublished offer already exists and its category must change
+        before publishOffer.
+        """
+        url = f"{self.base_url}/sell/inventory/v1/offer/{offer_id}"
+        headers, payload = self._build_offer_payload(sku, price, category_id)
+        response = self.session.put(url, headers=headers, json=payload)
+        if response.status_code not in (200, 204):
+            logging.error(f"[ERROR] Update offer category failed: {response.status_code}")
+            logging.error(f"[ERROR] Response: {response.text}")
+            response.raise_for_status()
+        if response.status_code == 204 or not response.content:
+            return {"offerId": offer_id, "categoryId": str(category_id), "status": "UPDATED"}
+        return response.json()
+
+    def _post_offer(self, url: str, headers: Dict, payload: Dict) -> Dict:
         try:
             response = self.session.post(url, headers=headers, json=payload)
             response.raise_for_status()
@@ -418,7 +432,13 @@ class RealEbayClient:
         Return fallback category based on keywords in title
         """
         title_lower = title.lower()
-        
+
+        # Retired-ID keyword rules live in the matcher (22656 / 161059 / 184533).
+        from src.services.ebay_category_matcher import EbayCategoryMatcher
+        matched = EbayCategoryMatcher()._fallback_category(title_lower)
+        if matched:
+            return [{"category": matched}]
+
         # Common product -> category mappings
         category_map = {
             # Pet supplies
@@ -451,15 +471,10 @@ class RealEbayClient:
         for keyword, category in category_map.items():
             if keyword in title_lower:
                 return [{"category": category}]
-        
-        # Default to Home & Garden -> Furniture
-        return [{"category": {"categoryId": "3197", "categoryName": "Furniture"}}]
-        response.raise_for_status()
-        
-        result = response.json()
-        suggestions = result.get("categorySuggestions", [])
-        
-        return suggestions[:limit]
+
+        # 3197 Furniture is a non-leaf. Returning it lets publishOffer fail and retry.
+        # An empty list sends the publish human gate instead of a fake category.
+        return []
 
 
 # Factory function for easy initialization

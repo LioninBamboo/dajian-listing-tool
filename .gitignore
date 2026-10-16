@@ -47,10 +47,11 @@ env/
 *.log
 debug_*.log
 
-# Test files (keep but don't deploy)
-test_*.py
-debug_*.py
-*_test.py
+# Test files at repo root (keep but don't deploy)
+/test_*.py
+/debug_*.py
+/*_test.py
+!tests/test_*.py
 
 # Temp files
 *.tmp

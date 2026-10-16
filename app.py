@@ -303,37 +303,55 @@ def publish_to_ebay(product: dict) -> dict:
             return {"status": "error", "message": "价格未计算"}
         
         sku = product['sku']
-        
-        # 1. Create Inventory Item
-        ebay_client.create_or_replace_inventory_item(
-            sku=sku,
-            product={
-                "title": opt_data.get("title", product.get('title', ''))[:80],
-                "description": opt_data.get("description", product.get('description', '')),
-                "image_urls": product.get('images', [])[:12],
-                "price": final_price,
-                "quantity": product.get('stock', 1) or 1,
-                "condition": "NEW",
-                "aspects": opt_data.get("aspects", {"Brand": ["AquaVerve"]})
-            }
+        from src.services.ebay_category_validator import CategoryValidator
+        from src.services.ebay_category_matcher import EbayCategoryMatcher
+        from src.services.ebay_publisher import EbayPublisher, HUMAN_GATE_ERROR
+
+        opt_data = dict(opt_data)
+        product_view = {
+            "sku": sku,
+            "title": opt_data.get("title") or product.get("title") or "",
+            "description": opt_data.get("description") or product.get("description") or "",
+            "image_urls": (product.get("images") or [])[:12],
+            "price": final_price,
+            "quantity": product.get("stock", 1) or 1,
+            "condition": "NEW",
+            "optimization": opt_data,
+            "logs": list(product.get("logs") or []),
+            "status": product.get("status") or "READY",
+        }
+        if opt_data.get("aspects") is not None:
+            product_view["aspects"] = opt_data.get("aspects")
+
+        publisher = EbayPublisher(
+            client=ebay_client,
+            validator=CategoryValidator(
+                api_base=ebay_client.base_url,
+                token_provider=ebay_client.oauth.get_valid_token,
+            ),
+            matcher=EbayCategoryMatcher(),
+            tree_id="0",
         )
-        
-        # 2. Create Offer
-        category_id = opt_data.get("categoryId")
-        offer = ebay_client.create_offer(
-            sku=sku,
-            price=final_price,
-            category_id=category_id
-        )
-        
-        if offer and offer.get("offerId"):
+        # Streamlit path creates the offer only. Category gate still runs first.
+        result = publisher.publish(product_view, publish_offer=False)
+        product["optimization"] = product_view["optimization"]
+        product["logs"] = product_view["logs"]
+        if result.status == "ERROR" and HUMAN_GATE_ERROR in result.errors:
+            product["status"] = "READY"
+        import copy
+        save_product(copy.deepcopy(product))
+        if result.status == "ERROR":
             return {
-                "status": "success",
-                "message": "产品已保存为草稿 (Offer 已创建)",
-                "offer_id": offer["offerId"]
+                "status": "error",
+                "message": HUMAN_GATE_ERROR if HUMAN_GATE_ERROR in result.errors else "; ".join(result.errors) or "创建 Offer 失败",
+                "errors": result.errors,
             }
-        else:
-            return {"status": "error", "message": "创建 Offer 失败"}
+        return {
+            "status": "success",
+            "message": "产品已保存为草稿 (Offer 已创建)",
+            "offer_id": result.extra.get("offer_id"),
+            "listing_id": result.extra.get("listing_id"),
+        }
             
     except Exception as e:
         return {"status": "error", "message": str(e)}

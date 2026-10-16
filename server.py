@@ -38,6 +38,12 @@ async def startup_event():
     
     logging.info("Server starting up (handler forced)...")
     init_db()
+    if os.getenv("EBAY_CATEGORY_SELF_CHECK") == "1":
+        try:
+            from src.services.ebay_category_matcher import run_startup_category_self_check
+            run_startup_category_self_check()
+        except Exception:
+            logging.exception("category self-check failed")
 
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -328,32 +334,60 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
     # Proceed to List
     try:
         final_price = product.suggested_price
-        opt_data = product.optimization
-        
-        # Get category suggestions if not already set
-        category_id = opt_data.get("categoryId")
-        if not category_id:
-            suggestions = ebay_client.get_category_suggestions(opt_data.get("title", product.title))
-            if suggestions:
-                category_id = suggestions[0].get("category", {}).get("categoryId")
-                print(f" Using suggested category: {category_id}")
-        
-        # 1. Create Inventory Item
-        print(f" Creating inventory item for {sku}...")
-        ebay_client.create_or_replace_inventory_item(
-            sku=product.sku,
-            product={
-                "title": opt_data.get("title", product.title),
-                "description": opt_data.get("description", product.description),
-                "image_urls": product.images or [],
-                "price": final_price,
-                "quantity": product.stock if product.stock > 0 else 1,
-                "condition": "NEW",
-                "aspects": opt_data.get("aspects", {"Brand": [BRAND_NAME]})
-            }
+        opt_data = dict(product.optimization or {})
+        from sqlalchemy.orm.attributes import flag_modified
+        from src.services.ebay_category_validator import CategoryValidator
+        from src.services.ebay_category_matcher import EbayCategoryMatcher
+        from src.services.ebay_publisher import EbayPublisher, HUMAN_GATE_ERROR
+
+        product_view = {
+            "sku": product.sku,
+            "title": opt_data.get("title") or product.title,
+            "description": opt_data.get("description") or product.description or "",
+            "image_urls": product.images or [],
+            "price": final_price,
+            "quantity": product.stock if product.stock and product.stock > 0 else 1,
+            "condition": "NEW",
+            "optimization": opt_data,
+            "logs": list(product.logs or []),
+            "status": product.status or "READY",
+        }
+        # Aspects already on the product are forwarded. Nothing new is invented.
+        if opt_data.get("aspects") is not None:
+            product_view["aspects"] = opt_data.get("aspects")
+
+        publisher = EbayPublisher(
+            client=ebay_client,
+            validator=CategoryValidator(
+                api_base=ebay_client.base_url,
+                token_provider=ebay_client.oauth.get_valid_token,
+            ),
+            matcher=EbayCategoryMatcher(),
+            tree_id="0",
         )
-        
-        # 2. Handle video upload (async)
+        result = publisher.publish(product_view)
+        product.optimization = product_view["optimization"]
+        product.logs = product_view["logs"]
+        flag_modified(product, "optimization")
+        flag_modified(product, "logs")
+        category_id = (product.optimization or {}).get("categoryId")
+
+        if result.status == "ERROR" and HUMAN_GATE_ERROR in result.errors:
+            product.status = "READY"
+            db.commit()
+            return {
+                "status": "error",
+                "message": HUMAN_GATE_ERROR,
+                "errors": result.errors,
+            }
+
+        if result.status != "SUCCESS":
+            raise Exception("; ".join(result.errors) or "publish failed")
+
+        offer = {"offerId": result.extra.get("offer_id")}
+        listing_id = result.extra.get("listing_id")
+
+        # Inventory, offer, and publishOffer already ran inside the category gate.
         if product.videos and len(product.videos) > 0:
             video_url = product.videos[0]
             video_title = opt_data.get("title", product.title)[:80]
@@ -371,23 +405,10 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             if not product.optimization:
                 product.optimization = {}
             product.optimization["video_status"] = "PROCESSING"
+            flag_modified(product, "optimization")
             db.commit()
-        
-        # 3. Create Offer
-        print(f" Creating offer for {sku}...")
-        offer = ebay_client.create_offer(
-            sku=product.sku,
-            price=final_price,
-            category_id=category_id
-        )
-        
-        # 4. Publish Offer to eBay
+
         if offer and offer.get("offerId"):
-            print(f" Publishing offer {offer['offerId']}...")
-            listing = ebay_client.publish_offer(offer["offerId"])
-            
-            listing_id = listing.get("listingId") if listing else None
-            
             if listing_id:
                 product.listing_id = listing_id
                 product.status = "PUBLISHED"
@@ -408,7 +429,9 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             
             if product.videos:
                 product.logs.append("Video upload in progress...")
-            
+
+            flag_modified(product, "optimization")
+            flag_modified(product, "logs")
             db.commit()
             
             print(f"✅ Product {sku} published! Listing ID: {listing_id}")
