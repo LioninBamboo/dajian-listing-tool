@@ -10,6 +10,19 @@ def _utcnow_naive() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+class CategoryValidityCache(Base):
+    """Taxonomy leaf checks. 7-day TTL; rows die when categoryTreeVersion changes."""
+    __tablename__ = "category_validity_cache"
+
+    tree_id = Column(String(16), primary_key=True)
+    category_id = Column(String(32), primary_key=True)
+    valid = Column(Integer, nullable=False)
+    leaf = Column(Integer, nullable=False)
+    name = Column(String(255))
+    tree_version = Column(String(64))
+    checked_at = Column(DateTime, nullable=False)
+
+
 class CollectedProduct(Base):
     """采集产品表 - 用于浏览器扩展采集的产品"""
     __tablename__ = 'collected_products'

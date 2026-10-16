@@ -75,6 +75,141 @@ class PublishResult:
         }
 
 
+HUMAN_GATE_ERROR = "category_invalid_needs_human"
+
+
+def _is_publish_invalid_category(error_msg: str) -> bool:
+    from src.utils.publish_autofix import is_invalid_category_error
+    text = error_msg or ""
+    return is_invalid_category_error(text) or "25005" in text
+
+
+def invalid_category_retry_action(already_remapped: bool) -> str:
+    """Invalid category is remapped once, then the human gate. Never a 3x retry."""
+    return "human_gate" if already_remapped else "remap_once"
+
+
+def apply_category_publish_gate(
+    *,
+    category_id,
+    category_name,
+    title,
+    product,
+    aspects,
+    ebay_client,
+    oauth,
+    validator,
+    tree_id: str = "0",
+    matcher=None,
+    force_remap: bool = False,
+):
+    """
+    Confirm category_id is a current leaf before any inventory or offer write.
+
+    A non-leaf, retired id, or network `unknown` is remapped once to the first
+    plausible valid leaf. Item specifics already on `aspects` are not replaced
+    or invented. If nothing qualifies, return a human-gate PublishResult and
+    do not call create/update/publish.
+    """
+    from src.services.ebay_category_matcher import EbayCategoryMatcher
+
+    logger = logging.getLogger(__name__)
+    checker = matcher or EbayCategoryMatcher(oauth)
+    current_id = str(category_id or "").strip()
+    current_name = category_name or ""
+    reason = "missing"
+
+    def _usable(check: dict) -> bool:
+        return bool(check.get("valid") and check.get("leaf") and check.get("reason") != "unknown")
+
+    if current_id:
+        check = validator.validate(current_id, tree_id)
+        reason = check.get("reason") or "unknown"
+        if _usable(check) and not force_remap:
+            if check.get("name") and not current_name:
+                current_name = check["name"]
+            return current_id, current_name, aspects
+
+    suggestions = _normalize_category_suggestions(
+        ebay_client.get_category_suggestions(title) if ebay_client is not None else []
+    )
+    for cid, name in suggestions:
+        if not cid:
+            continue
+        if not checker.is_category_plausible_for_text(title, cid, name):
+            continue
+        if not checker._is_api_category_plausible(title, cid, name):
+            continue
+        check = validator.validate(cid, tree_id)
+        if not _usable(check):
+            continue
+        resolved_name = check.get("name") or name
+        log_line = f"[CAT_REMAP] {current_id or '(none)'}→{cid} ({reason})"
+        _store_remapped_category(product, cid, resolved_name, log_line)
+        logger.info(log_line)
+        return cid, resolved_name, aspects
+
+    shown = ", ".join(f"{cid}:{name}" for cid, name in suggestions[:3]) or "(no suggestions)"
+    log_line = f"category_invalid_needs_human old={current_id or '(none)'} suggestions={shown}"
+    _append_product_log(product, log_line)
+    logger.warning(log_line)
+    return PublishResult(
+        status=PublishStatus.ERROR,
+        message=HUMAN_GATE_ERROR,
+        errors=[HUMAN_GATE_ERROR],
+        category_id=current_id or None,
+    )
+
+
+def _normalize_category_suggestions(raw) -> list:
+    normalized = []
+    for item in raw or []:
+        if isinstance(item, dict) and isinstance(item.get("category"), dict):
+            cat = item["category"]
+            normalized.append((str(cat.get("categoryId") or ""), cat.get("categoryName") or ""))
+        elif isinstance(item, dict):
+            normalized.append((str(item.get("categoryId") or ""), item.get("categoryName") or ""))
+    return normalized
+
+
+def _append_product_log(product, line: str) -> None:
+    if product is None:
+        return
+    if isinstance(product, dict):
+        logs = list(product.get("logs") or [])
+        logs.append(line)
+        product["logs"] = logs
+        return
+    logs = list(getattr(product, "logs", None) or [])
+    logs.append(line)
+    product.logs = logs
+
+
+def _store_remapped_category(product, category_id: str, category_name: str, log_line: str) -> None:
+    if product is None:
+        return
+    if isinstance(product, dict):
+        opt = product.get("optimization")
+        if not isinstance(opt, dict):
+            opt = {}
+            product["optimization"] = opt
+        opt["categoryId"] = str(category_id)
+        if category_name:
+            opt["categoryName"] = category_name
+        _append_product_log(product, log_line)
+        return
+    opt = getattr(product, "optimization", None)
+    if not isinstance(opt, dict):
+        opt = {}
+    else:
+        opt = dict(opt)
+    opt["categoryId"] = str(category_id)
+    if category_name:
+        opt["categoryName"] = category_name
+    product.optimization = opt
+    _append_product_log(product, log_line)
+
+
 class EbayPublisher:
     """
     统一的 eBay 发布服务
@@ -1090,7 +1225,8 @@ class EbayPublisher:
         "180997": ["shade sail", "sun shade sail", "sunshade sail"],
         "180995": ["gazebo"],
         "180994": ["pergola", "canopy"],
-        "42430": ["outdoor storage", "deck box"],
+        "184533": ["deck box"],
+        "161059": ["trash can storage", "bin shed", "garbage bin shed"],
         "180998": ["patio umbrella", "umbrella base"],
         "181000": ["fire pit", "outdoor fireplace"],
         "85916": ["fire pit", "outdoor fireplace"],
@@ -1104,7 +1240,7 @@ class EbayPublisher:
         "261263": ["hall tree"],
         "262980": ["storage bench", "entryway bench", "shoe bench"],
         "38221": ["shoe rack", "shoe cabinet", "shoe bench", "shoe storage", "cabinet"],
-        "32880": ["coat rack", "coat stand"],
+        "22656": ["coat rack", "coat stand"],
         "108044": ["umbrella stand"],
         "20584": ["safe", "gun safe", "security safe", "safe box", "lockbox"],
         "175764": ["room divider", "partition", "screen"],
@@ -1156,6 +1292,73 @@ class EbayPublisher:
         self.policy_manager = EbayPolicyManager(oauth_service)
         self.ebay_client = RealEbayClient(oauth_service, self.policy_manager)
         self.logger = logging.getLogger(__name__)
+        self._category_error_remapped = False
+
+    def _apply_category_gate(self, category_id, category_name, title, product, aspects):
+        from src.services.ebay_category_validator import CategoryValidator
+
+        validator = getattr(self, "_category_validator", None)
+        if validator is None:
+            def token():
+                try:
+                    return self.oauth.get_application_token()
+                except Exception:
+                    return self.oauth.get_valid_token()
+
+            api_base = getattr(self.oauth, "api_base", None) or getattr(self.ebay_client, "base_url", "https://api.ebay.com")
+            validator = CategoryValidator(api_base=api_base, token_provider=token)
+        return apply_category_publish_gate(
+            category_id=category_id,
+            category_name=category_name,
+            title=title,
+            product=product,
+            aspects=aspects,
+            ebay_client=self.ebay_client,
+            oauth=self.oauth,
+            validator=validator,
+            tree_id=str(get_store_profile().category_tree_id or "0"),
+            force_remap=bool(getattr(self, "_force_category_remap", False)),
+        )
+
+    def _remap_once_or_human_gate(self, error_msg, *, product, category_id, category_name, title, aspects, offer_id):
+        if self._category_error_remapped:
+            _append_product_log(product, f"category_invalid_needs_human old={category_id} after remap")
+            return PublishResult(
+                status=PublishStatus.ERROR,
+                message=HUMAN_GATE_ERROR,
+                errors=[HUMAN_GATE_ERROR],
+                offer_id=offer_id,
+                category_id=str(category_id or "") or None,
+            )
+        self._category_error_remapped = True
+        self._force_category_remap = True
+        try:
+            gated = self._apply_category_gate(category_id, category_name, title or "", product, aspects or {})
+        finally:
+            self._force_category_remap = False
+        if isinstance(gated, PublishResult):
+            return gated
+        new_id, new_name, new_aspects = gated
+        if offer_id and hasattr(self.ebay_client, "update_offer_category"):
+            try:
+                self.ebay_client.update_offer_category(offer_id, new_id)
+            except Exception as exc:
+                self.logger.warning("[CAT_REMAP] offer update failed: %s", exc)
+                return PublishResult(
+                    status=PublishStatus.ERROR,
+                    message=HUMAN_GATE_ERROR,
+                    errors=[HUMAN_GATE_ERROR],
+                    offer_id=offer_id,
+                    category_id=new_id,
+                )
+            return self._do_publish(offer_id, new_id, new_name, new_aspects)
+        return PublishResult(
+            status=PublishStatus.ERROR,
+            message=f"[CAT_REMAP] stored {new_id}; not publishing again in this attempt",
+            errors=["category_remapped"],
+            category_id=new_id,
+            category_name=new_name,
+        )
         
     def publish(self, product: Dict) -> PublishResult:
         """
@@ -1212,6 +1415,16 @@ class EbayPublisher:
                         product,
                         suggested_category_id
                     )
+                    gated = self._apply_category_gate(
+                        category_id,
+                        category_name,
+                        publish_data["title"],
+                        product,
+                        completed_aspects,
+                    )
+                    if isinstance(gated, PublishResult):
+                        return gated
+                    category_id, category_name, completed_aspects = gated
                     publish_data["aspects"] = completed_aspects
                     compatibility = self._prepare_motors_compatibility(
                         category_id,
@@ -1241,6 +1454,8 @@ class EbayPublisher:
                     )
                     
                     # 发布 offer
+                    self._publish_title = publish_data["title"]
+                    self._publish_product = product
                     return self._do_publish(offer_id, category_id, category_name, completed_aspects)
             
             # 3. 准备发布数据（新产品）
@@ -1263,7 +1478,17 @@ class EbayPublisher:
                 product,
                 suggested_category_id
             )
-            
+            gated = self._apply_category_gate(
+                category_id,
+                category_name,
+                publish_data["title"],
+                product,
+                completed_aspects,
+            )
+            if isinstance(gated, PublishResult):
+                return gated
+            category_id, category_name, completed_aspects = gated
+
             publish_data["category_id"] = category_id
             publish_data["category_name"] = category_name
             publish_data["aspects"] = completed_aspects
@@ -1300,44 +1525,25 @@ class EbayPublisher:
                 )
             
             # 7. 发布 Offer
+            self._publish_title = publish_data["title"]
+            self._publish_product = product
             return self._do_publish(offer_id, category_id, category_name, completed_aspects)
                 
         except Exception as e:
             error_msg = str(e)
             self.logger.error(f"[PUBLISH ERROR] {error_msg}")
             
-            # --- 自动恢复策略: Invalid Category ---
-            normalized_error = error_msg.lower()
-            if (
-                "invalid category" in normalized_error
-                or "invalid category id" in normalized_error
-                or "not a leaf category" in normalized_error
-                or "25005" in error_msg
-                or "20400" in error_msg
-            ):
-                self.logger.warning(f"⚠️ Category Issue Detected. Attempting global auto-fix.")
-                try:
-                    # 尝试获取 offer_id
-                    target_offer_id = None
-                    if 'offer_id' in locals() and offer_id:
-                        target_offer_id = offer_id
-                    else:
-                        # 尝试通过 SKU 查找
-                        existing = self._get_existing_offer(sku)
-                        if existing:
-                            target_offer_id = existing.get("offerId")
-                    
-                    if target_offer_id:
-                        self.logger.info(f"[AUTO-FIX] Deleting Offer {target_offer_id} to clear invalid category state...")
-                        self.ebay_client.delete_offer(target_offer_id)
-                        
-                        return PublishResult(
-                            status=PublishStatus.ERROR,
-                            message=f"已自动清理无效类目 Offer。请 **立即重试**，下次将成功发布。",
-                            errors=["Auto-fixed: Old offer deleted."]
-                        )
-                except Exception as fix_e:
-                    self.logger.error(f"Auto-fix failed: {fix_e}")
+            # Invalid category is not a 3x retry. One remap, then the human gate.
+            if _is_publish_invalid_category(error_msg):
+                return self._remap_once_or_human_gate(
+                    error_msg,
+                    product=locals().get("product"),
+                    category_id=locals().get("category_id"),
+                    category_name=locals().get("category_name"),
+                    title=(locals().get("publish_data") or {}).get("title") if isinstance(locals().get("publish_data"), dict) else None,
+                    aspects=locals().get("completed_aspects"),
+                    offer_id=locals().get("offer_id"),
+                )
             
             # 解析错误信息，提供更友好的提示
             friendly_msg = self._parse_error_message(error_msg)
@@ -1407,29 +1613,17 @@ class EbayPublisher:
         except Exception as e:
             error_msg = str(e)
             
-            # CRITICAL RETRY LOGIC for Invalid Category
-            normalized_error = error_msg.lower()
-            if (
-                "invalid category" in normalized_error
-                or "invalid category id" in normalized_error
-                or "not a leaf category" in normalized_error
-                or "25005" in error_msg
-                or "20400" in error_msg
-            ):
-                self.logger.warning(f"[AUTO-FIX] Invalid Category {category_id} detected. Deleting and Recreating Offer {offer_id}...")
-                try:
-                    # 1. Delete broken offer
-                    self.ebay_client.delete_offer(offer_id)
-                    time.sleep(1)
-                    
-                    return PublishResult(
-                        status=PublishStatus.ERROR,
-                        message=f"检测到旧Offer类目错误，已自动清理。请 **立即重试**，下次将成功发布。",
-                        offer_id=offer_id,
-                        errors=["Old offer deleted due to category error. Please retry."]
-                    )
-                except Exception as del_e:
-                    self.logger.error(f"Failed to auto-delete offer: {del_e}")
+            if _is_publish_invalid_category(error_msg):
+                self.logger.warning("[CAT] invalid category on publishOffer for %s; one remap then human gate", category_id)
+                return self._remap_once_or_human_gate(
+                    error_msg,
+                    product=getattr(self, "_publish_product", None),
+                    category_id=category_id,
+                    category_name=category_name,
+                    title=getattr(self, "_publish_title", "") or "",
+                    aspects=aspects,
+                    offer_id=offer_id,
+                )
 
             return PublishResult(
                 status=PublishStatus.ERROR,

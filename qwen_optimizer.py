@@ -2246,8 +2246,12 @@ class QwenOptimizer:
             (["gazebo"], "180995"),                 # Gazebos
             (["pergola"], "180994"),                # Pergolas
             (["canopy"], "180994"),                 # Canopies
-            (["outdoor", "storage"], "42430"),      # Outdoor Storage
-            (["deck", "box"], "42430"),             # Deck Boxes
+            # Bare outdoor+storage is not a leaf. Bin sheds use 161059;
+            # 139956 Sheds is an alternate only. Deck boxes use 184533.
+            (["garbage", "bin", "shed"], "161059"),  # Trash Can Storage
+            (["trash", "can", "storage"], "161059"), # Trash Can Storage
+            (["bin", "shed"], "161059"),             # Trash Can Storage
+            (["deck", "box"], "184533"),             # Storage Deck Boxes
             (["patio", "umbrella"], "180998"),      # Patio Umbrellas
             (["umbrella", "base"], "180998"),       # Umbrella Bases
             (["fire", "pit"], "85916"),             # Fire Pits
@@ -2275,8 +2279,8 @@ class QwenOptimizer:
             (["shoe", "cabinet"], "38221"),         # Shoe Cabinets
             (["shoe", "bench"], "38221"),           # Shoe Benches
             (["shoe", "storage"], "38221"),         # Shoe Storage
-            (["coat", "rack"], "32880"),            # Coat Racks
-            (["coat", "stand"], "32880"),           # Coat Stands
+            (["coat", "rack"], "22656"),            # Coat & Hat Racks
+            (["coat", "stand"], "22656"),           # Coat & Hat Racks
             (["umbrella", "stand"], "108044"),      # Umbrella Stands
             (["key", "cabinet"], "175763"),         # Key Cabinets
             (["jewelry", "cabinet"], "262017"),     # Jewelry Boxes & Organizers

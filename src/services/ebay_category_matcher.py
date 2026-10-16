@@ -486,9 +486,20 @@ class EbayCategoryMatcher:
             # publishable by canonicalizing them to the current leaves.
             "20877": ("66690", "Rockers, Gliders"),
             "43527": ("43517", "Laundry Carts & Hampers"),
+            # Retired tree-0 coat-rack leaf. Current leaf is Coat & Hat Racks.
+            "32880": ("22656", "Coat & Hat Racks"),
         }
         if cid in direct_replacements:
             return direct_replacements[cid]
+
+        # 42430 Outdoor Storage is retired. Pick the leaf from the product text.
+        # 139956 Sheds is an alternate for bin sheds and is not chosen here.
+        if cid == "42430":
+            if any(kw in product_text_lower for kw in ("garbage bin shed", "trash can storage", "bin shed")):
+                return "161059", "Trash Can Storage"
+            if "deck box" in product_text_lower:
+                return "184533", "Storage Deck Boxes"
+            return None, None
 
         if has_bunk_bed and cid != "175758":
             return "175758", "Beds & Bed Frames"
@@ -827,6 +838,20 @@ class EbayCategoryMatcher:
     ) -> bool:
         """Check whether a category is semantically plausible for a product title."""
         title_lower = self._normalize_keyword_text(title)
+        name_lower = self._normalize_keyword_text(category_name or "")
+        # Trash-can sheds are not the bin. 20608 is the can; 161059 is the shed.
+        # 139956 Sheds stays plausible as a documented alternate.
+        if any(kw in title_lower for kw in ("garbage bin shed", "trash can storage", "bin shed")):
+            if str(category_id) == "20608" or "wastebasket" in name_lower:
+                return False
+            if str(category_id) in {"161059", "139956"} or "trash can storage" in name_lower or "shed" in name_lower:
+                return True
+            return False
+        if "deck box" in title_lower:
+            return str(category_id) == "184533" or "deck box" in name_lower or "storage deck" in name_lower
+        if any(kw in title_lower for kw in ("coat rack", "coat stand")) and "bench" not in title_lower:
+            if str(category_id) in {"22656"} or "coat" in name_lower or "hat rack" in name_lower:
+                return True
         cid, category_name = self.canonicalize_category(title, category_id, category_name)
         cid = str(cid or "").strip()
         if not cid:
@@ -1761,7 +1786,11 @@ class EbayCategoryMatcher:
             (["shade sail", "sun shade sail", "sunshade sail"], "180997", "Shade Sails"),
             (["gazebo"], "180995", "Gazebos"),
             (["pergola", "canopy"], "180994", "Pergolas"),
-            (["outdoor storage", "deck box"], "42430", "Outdoor Storage"),
+            # Retired 42430 is not a current leaf. Bare "outdoor storage" is
+            # intentionally absent so it falls through to the Taxonomy API.
+            # 139956 Sheds is an alternate only; bin sheds use 161059.
+            (["garbage bin shed", "trash can storage", "bin shed"], "161059", "Trash Can Storage"),
+            (["deck box"], "184533", "Storage Deck Boxes"),
             (["patio umbrella", "umbrella base"], "180998", "Patio Umbrellas"),
             (["fire pit", "outdoor fireplace"], "85916", "Fire Pits"),
             (["plant stand", "pedestal", "roman column", "pillar"], "29514", "Plant Stands"),
@@ -1801,7 +1830,7 @@ class EbayCategoryMatcher:
             (["dining bench", "long bench", "upholstered bench", "mid century bench", "bench with", "end of bed", "footrest stool"], "262980", "Benches"),
             (["storage bench", "entryway bench", "shoe bench"], "262980", "Benches"),
             (["shoe rack", "shoe cabinet", "shoe bench", "shoe storage"], "38221", "Shoe Racks"),
-            (["coat rack", "coat stand"], "32880", "Coat Racks"),
+            (["coat rack", "coat stand"], "22656", "Coat & Hat Racks"),
             (["umbrella stand"], "108044", "Umbrella Stands"),
             (["room divider", "partition", "screen"], "175764", "Room Dividers"),
             

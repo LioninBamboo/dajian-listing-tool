@@ -153,6 +153,26 @@ async def startup_event():
     
     logging.info("Server starting up (handler forced)...")
     init_db()
+    if os.getenv("EBAY_CATEGORY_SELF_CHECK") == "1":
+        try:
+            from src.services.ebay_category_validator import CategoryValidator
+
+            validator = CategoryValidator(write_cache=False)
+            for category_id, label in (
+                ("22656", "Coat & Hat Racks"),
+                ("184533", "Storage Deck Boxes"),
+                ("161059", "Trash Can Storage"),
+            ):
+                result = validator.validate(category_id, "0")
+                if not (result.get("valid") and result.get("leaf")):
+                    logging.warning(
+                        "[CAT_SELF_CHECK] WARN %s %s reason=%s",
+                        category_id,
+                        label,
+                        result.get("reason"),
+                    )
+        except Exception:
+            logging.exception("category self-check failed")
     
     # Start background video linker task
     video_task = asyncio.create_task(periodic_video_linker())
@@ -1716,7 +1736,52 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                 status_code=400,
                 detail="; ".join(publish_blockers),
             )
-        
+
+        from src.services.ebay_category_validator import CategoryValidator
+        from src.services.ebay_publisher import (
+            HUMAN_GATE_ERROR,
+            apply_category_publish_gate,
+            invalid_category_retry_action,
+        )
+
+        def _taxonomy_token():
+            try:
+                return ebay_client.oauth.get_application_token()
+            except Exception:
+                return ebay_client.oauth.get_valid_token()
+
+        gated = apply_category_publish_gate(
+            category_id=category_id,
+            category_name=category_name,
+            title=title_context or listing_title,
+            product=product,
+            aspects=completed_aspects,
+            ebay_client=ebay_client,
+            oauth=ebay_client.oauth,
+            validator=CategoryValidator(
+                api_base=getattr(ebay_client, "base_url", "https://api.ebay.com"),
+                token_provider=_taxonomy_token,
+            ),
+            tree_id=str(get_store_profile().category_tree_id or "0"),
+            matcher=category_matcher,
+        )
+        if not isinstance(gated, tuple):
+            product.status = "READY"
+            flag_modified(product, "optimization")
+            flag_modified(product, "logs")
+            db.commit()
+            return {
+                "status": "error",
+                "message": HUMAN_GATE_ERROR,
+                "errors": [HUMAN_GATE_ERROR],
+            }
+        category_id, category_name, completed_aspects = gated
+        opt_data["categoryId"] = category_id
+        if category_name:
+            opt_data["categoryName"] = category_name
+        product.optimization = opt_data
+        flag_modified(product, "optimization")
+
         # Upload images to eBay EPS (permanent hosting)
         raw_images = product.images or []
         eps_images = None  # cache across retries
@@ -1725,6 +1790,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         last_error = None
         offer_result = None
         listing_id = None
+        category_remap_used = False
         
         for attempt in range(MAX_PUBLISH_RETRIES):
             try:
@@ -1849,19 +1915,57 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                         eps_images = None  # force re-upload
                         fixed = True
                     
-                    # Auto-fix: invalid category
+                    # Invalid category: one remap, then the human gate. Do not burn 3 attempts.
                     if not fixed and is_invalid_category_error(last_error):
+                        action = invalid_category_retry_action(category_remap_used)
+                        if action == "human_gate":
+                            print("[CAT] invalid category after one remap; human gate")
+                            last_error = HUMAN_GATE_ERROR
+                            product.status = "READY"
+                            product.logs = (product.logs or []) + [
+                                f"category_invalid_needs_human old={category_id}"
+                            ]
+                            flag_modified(product, "logs")
+                            break
+                        category_remap_used = True
                         try:
-                            new_id, new_name, new_aspects = category_matcher.get_category_and_aspects(
-                                listing_title, completed_aspects, description
+                            remapped = apply_category_publish_gate(
+                                category_id=category_id,
+                                category_name=category_name,
+                                title=title_context or listing_title,
+                                product=product,
+                                aspects=completed_aspects,
+                                ebay_client=ebay_client,
+                                oauth=ebay_client.oauth,
+                                validator=CategoryValidator(
+                                    api_base=getattr(ebay_client, "base_url", "https://api.ebay.com"),
+                                    token_provider=_taxonomy_token,
+                                ),
+                                tree_id=str(get_store_profile().category_tree_id or "0"),
+                                matcher=category_matcher,
                             )
-                            if new_id and new_id != category_id:
-                                category_id, category_name = new_id, new_name
-                                completed_aspects.update(new_aspects)
-                                print(f"[AUTO-FIX] New category: {category_id}")
-                                fixed = True
-                        except Exception:
-                            pass
+                        except Exception as remap_err:
+                            print(f"[CAT] remap failed: {remap_err}")
+                            remapped = None
+                        if not isinstance(remapped, tuple):
+                            last_error = HUMAN_GATE_ERROR
+                            product.status = "READY"
+                            flag_modified(product, "logs")
+                            flag_modified(product, "optimization")
+                            break
+                        new_id, new_name, _kept_aspects = remapped
+                        if new_id and str(new_id) != str(category_id):
+                            category_id, category_name = new_id, new_name
+                            opt_data["categoryId"] = category_id
+                            opt_data["categoryName"] = category_name
+                            product.optimization = opt_data
+                            flag_modified(product, "optimization")
+                            print(f"[CAT_REMAP] retry category: {category_id}")
+                            fixed = True
+                        else:
+                            last_error = HUMAN_GATE_ERROR
+                            product.status = "READY"
+                            break
                     
                     if fixed:
                         print(f"[AUTO-FIX] Retrying (attempt {attempt+2})...")
@@ -1948,8 +2052,21 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                 "video_id": video_id
             }
         else:
-            # All retries exhausted
+            # All retries exhausted. Invalid category stops after one remap.
             error_msg = last_error or "Unknown error"
+            if error_msg == HUMAN_GATE_ERROR or category_remap_used and is_invalid_category_error(error_msg):
+                product.status = "READY"
+                product.logs = (product.logs or []) + [
+                    f"category_invalid_needs_human old={category_id}"
+                ]
+                flag_modified(product, "logs")
+                flag_modified(product, "optimization")
+                db.commit()
+                return {
+                    "status": "error",
+                    "message": HUMAN_GATE_ERROR,
+                    "errors": [HUMAN_GATE_ERROR],
+                }
             product.logs = (product.logs or []) + [f"Publish failed after {MAX_PUBLISH_RETRIES} attempts: {error_msg}"]
             flag_modified(product, 'logs')
             db.commit()

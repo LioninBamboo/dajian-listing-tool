@@ -1753,7 +1753,21 @@ class RealEbayClient:
         Return fallback category based on keywords in title
         """
         title_lower = title.lower()
-        
+
+        # Retired leaves must not be reintroduced here. Longer phrases first.
+        # 139956 Sheds is an alternate for bin sheds and is not selected.
+        corrected = (
+            ("garbage bin shed", {"categoryId": "161059", "categoryName": "Trash Can Storage"}),
+            ("trash can storage", {"categoryId": "161059", "categoryName": "Trash Can Storage"}),
+            ("bin shed", {"categoryId": "161059", "categoryName": "Trash Can Storage"}),
+            ("deck box", {"categoryId": "184533", "categoryName": "Storage Deck Boxes"}),
+            ("coat rack", {"categoryId": "22656", "categoryName": "Coat & Hat Racks"}),
+            ("coat stand", {"categoryId": "22656", "categoryName": "Coat & Hat Racks"}),
+        )
+        for keyword, category in corrected:
+            if keyword in title_lower:
+                return [{"category": category}]
+
         # Common product -> category mappings
         category_map = {
             # Pet supplies
@@ -1805,15 +1819,10 @@ class RealEbayClient:
         for keyword, category in category_map.items():
             if keyword in title_lower:
                 return [{"category": category}]
-        
-        # Default to Home & Garden -> Furniture
-        return [{"category": {"categoryId": "3197", "categoryName": "Furniture"}}]
-        response.raise_for_status()
-        
-        result = response.json()
-        suggestions = result.get("categorySuggestions", [])
-        
-        return suggestions[:limit]
+
+        # 3197 Furniture is a non-leaf. An empty list lets the publish human
+        # gate fire instead of sending a category eBay will reject.
+        return []
 
 
     def upload_picture(self, image_url: str) -> Optional[str]:
