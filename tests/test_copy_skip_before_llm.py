@@ -151,7 +151,8 @@ def test_safe_15_no_market_is_not_a_copy_skip():
     assert market_median_from_intel({"pricing_basis": "SAFE_15_NO_MARKET", "price_stats": {}}) is None
 
 
-def test_far_above_when_safe_price_exceeds_near_market_band():
+def test_far_above_when_safe_price_exceeds_near_market_band(monkeypatch):
+    monkeypatch.setenv("MARKET_GATE_ENABLED", "true")
     price, shipping = 80, 10
     safe = safe_15_price(price, shipping)
     assert safe is not None and safe > 0
@@ -224,6 +225,15 @@ def test_analyze_callers_gate_before_llm_copy():
     )
     assert analyze_src
     assert "attrs[a_key] = str(specs[p_key])" not in analyze_src
+
+    for relative, func_name in targets:
+        source = ast.get_source_segment(
+            (ROOT / relative).read_text(encoding="utf-8-sig"),
+            _function(ROOT / relative, func_name),
+        )
+        assert source
+        assert "market_advisory_log_line" in source
+        assert "if market_skip.skip" in source or "if priced_skip.skip" in source or "if intel_skip.skip" in source
 
     collect = _function(ROOT / "server.py", "collect_product")
     gate_lines = _call_lines(collect, "evaluate_copy_skip")
@@ -394,6 +404,7 @@ def test_live_cargo_recheck_skips_before_llm(monkeypatch):
 
 
 def test_far_above_skips_after_market_fetch_and_before_copy(monkeypatch):
+    monkeypatch.setenv("MARKET_GATE_ENABLED", "true")
     product = _Product(price=80, shipping=10)
     safe = safe_15_price(80, 10)
     median = safe / NEAR_MARKET_BAND - 1

@@ -622,6 +622,7 @@ def analyze_product_task(sku: str):
             cargo_gate_applies,
             evaluate_copy_skip,
             lookup_live_supplier_quote,
+            market_advisory_log_line,
         )
         specs = product.specs or {}
         live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(sku))
@@ -732,6 +733,9 @@ def analyze_product_task(sku: str):
             dims_mode="require",
             apply_cargo=apply_cargo,
         )
+        advisory_line = market_advisory_log_line(priced_skip.detail)
+        if advisory_line:
+            logging.info(advisory_line)
         if priced_skip.skip:
             apply_copy_skip(product, priced_skip, cost_breakdown=dajian_costs)
             flag_modified(product, "logs")
@@ -786,6 +790,9 @@ def analyze_product_task(sku: str):
                     dims_mode="require",
                     apply_cargo=apply_cargo,
                 )
+                advisory_line = market_advisory_log_line(intel_skip.detail)
+                if advisory_line:
+                    logging.info(advisory_line)
                 if intel_skip.skip:
                     apply_copy_skip(product, intel_skip, cost_breakdown=dajian_costs)
                     flag_modified(product, "logs")
