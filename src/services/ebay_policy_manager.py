@@ -6,9 +6,13 @@ Manages and caches eBay business policies (Fulfillment, Return, Payment)
 
 import sqlite3
 import requests
+from pathlib import Path
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import UTC, datetime
 from src.services.ebay_auth import EbayOAuthService
+
+# 锚定项目根,避免从其他工作目录运行脚本时在错误位置建库(与 ebay_auth 同策略)
+_POLICY_DB_PATH = str(Path(__file__).resolve().parent.parent.parent / "ebay_collection.db")
 
 
 class EbayPolicyManager:
@@ -27,7 +31,7 @@ class EbayPolicyManager:
     
     def _init_policy_db(self):
         """Initialize SQLite database for policy caching"""
-        conn = sqlite3.connect("ebay_collection.db")
+        conn = sqlite3.connect(_POLICY_DB_PATH)
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -102,7 +106,7 @@ class EbayPolicyManager:
     
     def _cache_policies(self, policy_type: str, policies: List[Dict]):
         """Cache policies to database"""
-        conn = sqlite3.connect("ebay_collection.db")
+        conn = sqlite3.connect(_POLICY_DB_PATH)
         cursor = conn.cursor()
         
         for policy in policies:
@@ -122,7 +126,7 @@ class EbayPolicyManager:
                 policy_name,
                 is_default,
                 str(policy),  # Store full policy data as string
-                datetime.utcnow().isoformat()
+                datetime.now(UTC).replace(tzinfo=None).isoformat()
             ))
         
         conn.commit()
@@ -142,7 +146,7 @@ class EbayPolicyManager:
     
     def _get_default_policy_id(self, policy_type: str) -> Optional[str]:
         """Get default policy ID for a given type"""
-        conn = sqlite3.connect("ebay_collection.db")
+        conn = sqlite3.connect(_POLICY_DB_PATH)
         cursor = conn.cursor()
         
         # Try to get default policy
@@ -179,7 +183,7 @@ class EbayPolicyManager:
         Returns:
             List of policy dicts
         """
-        conn = sqlite3.connect("ebay_collection.db")
+        conn = sqlite3.connect(_POLICY_DB_PATH)
         cursor = conn.cursor()
         
         if policy_type:
@@ -218,7 +222,7 @@ class EbayPolicyManager:
             return_id: Return policy ID
             payment_id: Payment policy ID
         """
-        conn = sqlite3.connect("ebay_collection.db")
+        conn = sqlite3.connect(_POLICY_DB_PATH)
         cursor = conn.cursor()
         
         # Clear all defaults first

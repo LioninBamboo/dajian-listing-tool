@@ -1,0 +1,11 @@
+你是 repair 工具作者，执行旧 footer 批量重推 + 精确 commit。工作目录 C:\Users\poonx\Dajian_Listing_Tool。
+
+任务定义在 docs/HANDOFF_FOOTER_REPUSH_COMMIT_20260715.md（交接#10）。两阶段：
+
+阶段1 旧footer重推：扫全库PUBLISHED，live描述含旧串(`Ships from California, USA`/`Dedicated Support`/`Easy Returns`/`Secure Checkout`)的入队 logs/footer_repush_queue.txt(~490+)，逐条走 scripts/repair_broken_listings.py 的 build_repair(现生成新footer `✦ Ships from US Warehouse ✦` + `Quality Guaranteed • Fast US Shipping • Trusted Seller`)→三层验证→backup→推送→live复查含新footer无旧串。改不干净的跳过留清单，类目不碰。每25一批批末抽2条复查，phase=FOOTER_REPUSH，产出 footer_repush_summary.md。
+
+阶段2 精确commit：**只stage任务书白名单里的文件**(逐个git add，对修改文件先git diff确认是listing-quality相关)。新增文件(listing_fact_sheet/semantic_rewrite/source_refresh/repair_broken_listings/order_source_recheck/source_content_refresh/config/新测试/所有HANDOFF文档等)直接add；修改文件(audit_fix_active_listings/claim_diff_engine/listing_quality_gate/dimension_helpers/ebay_category_matcher/ebay_video_uploader/scheduler_daemon/qwen_optimizer/LISTING_QUALITY_GATE.md/4个测试)diff确认后add。**绝不stage** batch_publish/cro_title_rewrite/fix_measurement_quality_issues及cro相关测试(并行会话的)。提交前跑指定测试切片全绿。commit message见任务书。**只commit不push。**产出 logs/commit_summary.md(staged文件+hash+测试)。
+
+铁律：禁push；禁git add -A/git add .(工作树有并行会话改动，混提就毁了)；禁改.env；live只碰有旧footer的SKU；republish原offer原listing_id；每SKU backup+三层验证+失败回滚；红线只能停不能绕；避开10:50-12:15与12:30。
+
+验收方将查:重推DONE抽样live含新footer无旧串listing_id未变、git show --stat HEAD只含白名单文件无并行文件、未push、测试全绿。按此自我要求。

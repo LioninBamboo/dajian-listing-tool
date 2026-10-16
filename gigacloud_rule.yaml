@@ -1,17 +1,26 @@
 # 将此规则添加到你的Clash配置文件的rules部分
 
-# 方案1: 让gigacloud.com走代理（推荐先试这个）
+# 正确的大建 API 域名是 openapi.gigab2b.com (注意是 gigab2b 带 'b')
+# gigacloud.com 和 giga2b.com 是旧域名或错误域名
+
+# 方案1: 让 gigab2b.com 走代理（推荐）
 # 在rules列表最前面添加：
+- DOMAIN-SUFFIX,gigab2b.com,PROXY
+- DOMAIN,openapi.gigab2b.com,PROXY
+- DOMAIN,openapi-sandbox.gigab2b.com,PROXY
+
+# 旧域名（可能仍被使用）
 - DOMAIN-SUFFIX,gigacloud.com,PROXY
 
 # 方案2: 如果方案1不行，尝试直连
-# - DOMAIN-SUFFIX,gigacloud.com,DIRECT
+# - DOMAIN-SUFFIX,gigab2b.com,DIRECT
 
 # 方案3: 指定具体节点（需要替换成你实际的节点名）
-# - DOMAIN-SUFFIX,gigacloud.com,🇺🇸 美国节点
+# - DOMAIN-SUFFIX,gigab2b.com,🇺🇸 美国节点
 
 # 完整示例（添加到你的config.yaml的rules部分）:
 # rules:
-#   - DOMAIN-SUFFIX,gigacloud.com,PROXY  # 添加这一行
+#   - DOMAIN-SUFFIX,gigab2b.com,PROXY   # 生产API域名
+#   - DOMAIN-SUFFIX,gigacloud.com,PROXY # 旧域名/网站
 #   - GEOIP,CN,DIRECT
 #   - MATCH,PROXY

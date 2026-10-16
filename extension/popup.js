@@ -1,6 +1,43 @@
 // popup.js
 
 document.addEventListener('DOMContentLoaded', () => {
+    // --- Target store (sticky across collections) ---------------------------
+    // Collecting happens in category batches: pick the store once, keep going.
+    const storeSelect = document.getElementById('storeSelect');
+    const storeHint = document.getElementById('storeHint');
+    const storeBox = document.getElementById('storeBox');
+
+    DAJIAN_STORES.forEach((s) => {
+        const opt = document.createElement('option');
+        opt.value = s.id;
+        opt.textContent = s.name;
+        storeSelect.appendChild(opt);
+    });
+
+    function paintStore(id) {
+        const s = dajianStoreById(id);
+        storeBox.style.borderColor = s.color;
+        storeSelect.style.color = s.color;
+        storeHint.textContent = `采集将发送到 localhost:${s.port}（${s.short}）。切换前采集的都会进当前店。`;
+    }
+
+    chrome.storage.local.get([DAJIAN_STORE_KEY], (result) => {
+        const raw = result[DAJIAN_STORE_KEY] || DAJIAN_DEFAULT_STORE;
+        const store = dajianStoreById(raw);
+        // Migrate legacy ids (e.g. blindbox → outdoor) so the <select> matches.
+        if (raw !== store.id) {
+            chrome.storage.local.set({ [DAJIAN_STORE_KEY]: store.id });
+        }
+        storeSelect.value = store.id;
+        paintStore(store.id);
+    });
+
+    storeSelect.addEventListener('change', () => {
+        const id = storeSelect.value;
+        chrome.storage.local.set({ [DAJIAN_STORE_KEY]: id }, () => paintStore(id));
+    });
+
+    // --- Profit calculator ---------------------------------------------------
     const costInput = document.getElementById('cost');
     const shippingInput = document.getElementById('shipping');
     const marginInput = document.getElementById('margin');
