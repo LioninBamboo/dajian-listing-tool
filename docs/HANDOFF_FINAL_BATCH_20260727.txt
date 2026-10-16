@@ -1,0 +1,161 @@
+你是接手 Dajian_Listing_Tool 存量 CRITICAL 清理任务的执行方。这是**收尾指令**。
+
+仓库：C:\Users\poonx\Dajian_Listing_Tool
+分支：codex/live-audit-semantic-guard（不要切换、不要新建）
+原任务书：docs/HANDOFF_CRITICAL_BACKLOG_20260726.md —— 红线部分仍然全部有效
+
+═══════════════════════════════════════════
+【一、金丝雀已验收通过】
+═══════════════════════════════════════════
+
+你推的 10 条我逐条查了 live eBay，全部合格：
+- 描述 banner/footer 齐全，**编造的"提供实用座椅"确实消失**，无中文
+- **listing_id 10/10 与推送前完全一致，零 end+relist**
+- 标题无截断、无 Mdf/Pu 大小写问题
+
+一处提醒（不是错，但会误导你自己）：你写的 `verify_live.py` 里
+`EbayOAuthService()` 用了默认值，而默认是 **SANDBOX**，所以报 401。
+本仓库所有生产脚本都显式传 `os.getenv('EBAY_ENVIRONMENT','PRODUCTION')`。
+
+═══════════════════════════════════════════
+【二、验收时又发现三个缺陷，都已修（你不用改代码）】
+═══════════════════════════════════════════
+
+1. **供应商内部编号泄漏到买家标题**（`4ea02a5`）
+   `Full Size Murphy Bed with Large Drawers,Gray (OLD SKU:N708P336203E)`
+   全库 24 条源标题带此标记。已在 sanitize_listing_title 里清除。
+
+2. **MEDIUM 噪声在暗中改标题**（同上提交，这是上面那条的成因）
+   MEDIUM 的 "with cabinet" 命中标题里的 "Storage Cabinet"，触发整条标题
+   按源重建，SEO 关键词被换成裸的供应商品名。已改为只有 CRITICAL/HIGH 且
+   确实出现在标题里的声明才允许重建标题。
+
+3. **源标题过短会连坐放弃描述修复**（`c8bcf11`）
+   鸡舍 W3166P455683 的源品名就是 "chicken coop"（12 字符 < 15 字符下限），
+   `build_repair` 因此整体放弃，连本来完好的描述重建也丢掉。已改为
+   保留现标题、照常修描述。实跑从 SKIP 变 DRY_OK。
+
+修复效果（在同一批 57 条 SKU 上重跑 dry-run 对比）：
+
+| | 修复前 v2 | 修复后 v3 |
+|---|---|---|
+| 标题被改写 | 15 条 | **1 条** |
+| after 标题含 OLD SKU | 3 条 | **0 条** |
+| PERFECT FOR 冗余 | 46 条 | **2 条** |
+| 阻断级缺陷 | — | **0** |
+
+唯一还会改的标题是 W3636P456623，删掉未经源证实的 "Luxury"，关键词完整保留。
+
+═══════════════════════════════════════════
+【三、调度器抢跑了一部分，这不是问题但你要知道】
+═══════════════════════════════════════════
+
+12:30 的定时任务 `semantic_rewrite --from-daily-audit --limit 40 --apply`
+自主推了 29 条，其中 22 条本来就在待推清单里。
+
+我实测了这 29 条的 live 标题：**全部干净，零 OLD SKU 污染**。
+（修复赶在它逐条处理到那些 SKU 之前生效了。）
+
+所以**真正还没推的只剩 36 条**，已写入 `logs/_still_pending.txt`。
+
+> ⚠️ 注意：定时任务会**用推送后的状态覆盖回滚快照**。
+> 已有 2 条的推送前标题因此丢失（我从预览报告里才找回）。
+> 你分批推的时候，如果发现某条的 backup 时间戳晚于你的推送时间，
+> 说明定时任务动过它，**不要用 rollback 脚本回滚那一条**——
+> 会把推送后的状态当成"原状"写回去。停下来报告。
+
+═══════════════════════════════════════════
+【四、这一轮做什么】
+═══════════════════════════════════════════
+
+### Step 1 — 还原 3 条被误改的标题（先做这个）
+
+这 3 条是被上面第 2 条缺陷（MEDIUM 误触发）改坏的，本不该动。
+脚本已写好并 dry-run 验证过：`scripts/restore_medium_false_trigger_titles.py`
+
+它只改标题，从 live 读回当前描述与属性原样带回——**描述是修好的，不能碰**。
+
+```
+PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/restore_medium_false_trigger_titles.py
+```
+先看 dry-run 输出确认三条的 now/want 正确，再加 `--apply`。
+
+> 🔴 注意：`LP000677AAE-1`(Gray) 与 `LP000677AAF-1`(Green) 还原后标题**完全相同**。
+> 这是推送前就存在的状况，不是新问题，照原样还原即可。
+> **不要自作主张给它们加颜色词或改写**——标题改写需要人工定稿。
+> 还原完把这个重复现象记进报告，由验收人决定要不要单独处理。
+
+### Step 2 — 校验后推余下 36 条
+
+```
+PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/verify_rewrite_preview.py reports/crit_backlog_preview_v3
+```
+
+只看退出码和 RESULT 行：
+- **退出码 1 = BLOCK** → 停下报告，不许推
+- **退出码 0** → 可推（v3 现在是 `OK WITH WARNINGS`，2 条 warn 是源 HTML
+  缺句号造成的粘连，属供应商数据瑕疵，不阻断）
+
+**不要自己另写 grep 判断。** 上一轮我给的 grep 扫全文件，把 `### Before`
+段（当前 live 内容，本来就带旧文案）也算进去，造成假警报——那是我的错，
+不是你的。这个脚本只读 `### After` 段。
+
+通过后分批推，**每批 ≤ 30，批间停下核对上一批 live 正常**：
+
+```
+PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/semantic_rewrite.py --sku-file logs/_still_pending.txt --apply
+```
+
+### Step 3 — 鸡舍 W3166P455683 描述修复（本次授权写入）
+
+修复已让它可执行（dry-run 现在是 DRY_OK, title_len=12, claim=0, tpl=True）：
+
+```
+PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/repair_broken_listings.py --sku W3166P455683 --apply
+```
+
+> 🔴 标题 `chicken coop` 仍然只许出建议，不许自动改。
+> 提 2–3 个候选给验收人选。已核实存在于源的事实：
+> 123"L x 26"W x 44.5"H、容量 4–8 只鸡、含产蛋箱 / 坡道 / 架高主体。
+> 每个词都要有源依据；不许加源里没有的材质，不许加 "waterproof /
+> all-weather" 这类未经证实的形容词。
+
+### Step 4 — 期末重跑审计
+
+```
+PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/audit_fix_active_listings.py --live --ignore-clean-freeze
+```
+
+给出 CRITICAL 的**前后对比**。参考基线：7/26 修噪声后是 142 行 / 115 SKU。
+
+═══════════════════════════════════════════
+【五、红线（只能触发停止，你无权重新解释）】
+═══════════════════════════════════════════
+
+历史教训：曾有执行方在正确触发"批量回滚>2条则停止"后，自行把它重新解释成
+"批次栅栏——结束本批、继续下一批"。**红线的唯一合法反应是：停下来，报告，等指示。**
+
+- 校验脚本退出码 1（BLOCK）→ 停止
+- 单批回滚 > 2 条 → 停止
+- 任何 end-listing / relist（必须原位更新 listing_id/offer_id）→ 停止
+- backup 时间戳晚于你的推送时间的那一条被 rollback → 停止（快照已被定时任务污染）
+- W3166P455683 或那 3 条还原标题被自动改写 → 停止
+- 转人工的 19 条被绕过校验推送 → 停止
+- 修改或删除既有测试断言 → 禁止（只能新增）
+- `git add -A` / `git add .` → 禁止。工作区有并行 session 的改动，只能 git add <具体路径>
+- 修改 .env / 杀重启调度守护进程 / git push → 禁止
+- 绕过 PricingEngine / RepricingGuard / EbayPublisher → 禁止
+
+═══════════════════════════════════════════
+【六、其他】
+═══════════════════════════════════════════
+
+- 测试基线 **2128 passed**
+  `$env:PYTHONPATH='C:\Users\poonx\Dajian_Listing_Tool'; .\.venv\Scripts\python.exe -m pytest tests/ -q`
+- 仍**只处理 CRITICAL**，不碰 MEDIUM。
+- 已知未处理项（不要顺手改）：提取器把颜色和表面处理当成材质
+  （`semantic_material: "glossy"`、`"green"`），留待材质词表单独校准。
+- 验证描述一律看 **offer 的 `listingDescription`**，不是 inventory 那份
+  （后者截断到 4000 字符，验它会误判）。
+
+**不要自评"任务完成"。** 每个 Step 报完数据等放行；遇到红线或判断不了的，停下来问。

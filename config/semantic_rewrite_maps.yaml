@@ -1,0 +1,346 @@
+# Curated semantic-rewrite maps (human-queue drain).
+# Schema version for loaders. THIS FILE IS NOT LIVE-APPROVED until user signs off
+# via logs/humanqueue_drain_review.md. Engine treats missing/invalid file as no-op
+# (safe fallback: compound → human, required missing → human).
+#
+# Zero-hallucination rule: every non-human target is either
+#   (1) source-traceable field value, or
+#   (2) eBay-legal neutral (e.g. Unbranded).
+
+version: 1
+# User release signal 2026-07-14: approve maps as proposed → set true → Phase C.
+# When false/missing, loader behaves as empty maps (safe fallback; table not "live").
+enabled: true
+description: >
+  Table A resolves compound Main Material strings to a single primary token.
+  Table B fills category-required aspects when missing after 3.3 fixes.
+  enabled=true only after user release; agent must not flip without approval.
+
+# ---------------------------------------------------------------------------
+# Table A: compound_material_map
+# key: exact or case-insensitive normalized source Main Material string
+# policy: apply | human
+# primary: required when policy=apply; ignored when human
+# ---------------------------------------------------------------------------
+compound_material_map:
+  "Polyester,Rubber Wood":
+    primary: "Rubberwood"
+    policy: apply
+    evidence: "Source Wood Type=Rubberwood (N759P307029L/F); cat 54235 Material."
+    skus: [N759P307029L, N759P307029F]
+
+  "Fabric,Foam,Rubber Wood":
+    primary: "Rubberwood"
+    policy: apply
+    evidence: "Source Wood Type=Rubberwood (W3244P487860); cat 54235 Material."
+    skus: [W3244P487860]
+
+  "Acacia Wood,Rope,Waterproof Fabric":
+    primary: "Acacia Wood"
+    policy: apply
+    evidence: "Acacia Wood is structural first token in Main Material; cat 79682 Material."
+    skus: [N767P363998C_N767P369236T]
+
+  "PU,Solid Wood":
+    primary: "Solid Wood"
+    policy: apply
+    evidence: "Solid Wood structural token in Main Material (W1151P455536/537)."
+    skus: [W1151P455536, W1151P455537]
+
+  "Metal,Wood":
+    primary: null
+    policy: human
+    evidence: "No secondary source field to disambiguate Metal vs Wood (W244P459660)."
+    skus: [W244P459660]
+
+  "Fabric,Foam+Spring":
+    primary: null
+    policy: human
+    evidence: "Generic Fabric only; no fiber/upholstery source for cat 38208 (W3975S00049)."
+    skus: [W3975S00049]
+
+  "Iron,Polypropylene":
+    primary: "Iron"
+    policy: apply
+    evidence: "Iron is explicit source substring of Main Material (W5108P421389)."
+    skus: [W5108P421389]
+
+  # --- Residual B candidates (2026-07-15): NEW entries default policy=human until user approval ---
+  "Solid Wood+MDF":
+    primary: "MDF"
+    policy: apply
+    evidence: "Secondary Material often MDF+Pinewood+Plywood (LP000138AAN family)."
+    skus: [LP000138AAN, LP000139AAN, N710P438977P, N760P404168N, W1801109588, W1801P369066, W1801P369067, W282S00036]
+
+  "Particle Board+MDF":
+    primary: "Particle Board"
+    policy: apply
+    evidence: "Filler/Top Particle Board on residual desk/cabinet SKUs."
+    skus: [N707S170347B, N707S349811W, N721S000044B-1, W1820P505528, W1820P505529, W1820P505530, W331S00190]
+
+  "Wood+Fabric":
+    primary: "Wood"
+    policy: apply
+    evidence: "Frame Material=Wood; Upholstery Material=Polyester (W5568 residual)."
+    skus: [W5568P478817, W5568P478823, W5568P486919, W5568P486921, W5568P486923, W5568S00044]
+
+  "Foam,Polyester":
+    primary: "Polyester"
+    policy: apply
+    evidence: "Main Material only; Polyester as surface (N767 residual)."
+    skus: [N767P263923G, N767P346281G, N767P384981A, N767P384981R]
+
+  "Acacia Wood,Waterproof Fabric":
+    primary: "Acacia Wood"
+    policy: apply
+    evidence: "Acacia structural first token."
+    skus: [N767P365575A, N767P389773L, N767P389773T]
+
+  "MDF+LVL,Plywood":
+    primary: "Plywood"
+    policy: apply
+    evidence: "Material field Plywood+MDF+LVL (LP000678*)."
+    skus: [LP000678AAF-1, LP000678AAK-1]
+
+  "Acacia Wood,Polyester":
+    primary: "Acacia Wood"
+    policy: apply
+    evidence: "Material Acacia Wood+Polyester (N704P417249*)."
+    skus: [N704P417249A, N704P417249L]
+
+  "MDF+Iron":
+    primary: "MDF"
+    policy: apply
+    evidence: "Filler=MDF; Iron hardware."
+    skus: []
+
+  "Fabric,Rubber":
+    primary: "Rubberwood"
+    policy: apply
+    evidence: "Wood Type=Rubberwood when present."
+    skus: []
+
+  "Fabric,Solid Wood":
+    primary: "Solid Wood"
+    policy: apply
+    evidence: "Main Material Fabric,Solid Wood."
+    skus: []
+
+  "Polyester,Solid Wood":
+    primary: "Solid Wood"
+    policy: apply
+    evidence: "Main Material Polyester,Solid Wood."
+    skus: []
+
+  "Flannelette,MDF":
+    primary: "MDF"
+    policy: apply
+    evidence: "Material MDF+Flannel."
+    skus: []
+
+  "MDF,Rubber Wood":
+    primary: "Rubberwood"
+    policy: apply
+    evidence: "Wood Type=Rubberwood."
+    skus: []
+
+  "Faux Leather,MDF,Rubber Wood":
+    primary: "Rubberwood"
+    policy: apply
+    evidence: "Frame fields RUBBERWOOD."
+    skus: []
+
+  "PU Leather,Solid Wood":
+    primary: "Solid Wood"
+    policy: apply
+    evidence: "Main Material only."
+    skus: []
+
+  "Acacia Wood,Paper Rope,Waterproof Fabric":
+    primary: "Acacia Wood"
+    policy: apply
+    evidence: "Acacia structural first."
+    skus: []
+
+  "Acacia Wood,Rope":
+    primary: "Acacia Wood"
+    policy: apply
+    evidence: "Acacia first."
+    skus: []
+
+  "MDF,Rattan,Rubber Wood":
+    primary: null
+    policy: human
+    evidence: "Three-way compound; no clean primary."
+    skus: []
+
+  "Linen,MDF+Metal":
+    primary: null
+    policy: human
+    evidence: "Ambiguous fabric vs structure."
+    skus: []
+
+  "PE Rattan+Iron+Waterproof Fabric":
+    primary: null
+    policy: human
+    evidence: "Complex outdoor mix; Material PE/PP."
+    skus: []
+
+  "MDF,Pine,Plywood":
+    primary: "Pine"
+    policy: apply
+    evidence: "Material Pine Wood+Plywood+MDF."
+    skus: []
+
+  "MDF,Metal":
+    primary: "Metal"
+    policy: human
+    evidence: "Material Metal+MDF."
+    skus: []
+
+  "Steel,Wood":
+    primary: null
+    policy: human
+    evidence: "No secondary disambiguation."
+    skus: []
+
+  "MDF+Metal,PU Leather,Tempered Glass":
+    primary: null
+    policy: human
+    evidence: "Too compound."
+    skus: []
+
+  "Fabric,Rubber Wood":
+    primary: "Rubberwood"
+    policy: apply
+    evidence: "Wood Type=Rubberwood."
+    skus: []
+
+  "Fabric,Linen Blend,Wood":
+    primary: null
+    policy: human
+    evidence: "Upholstery Polyester / Frame Metal / Wood Type Poplar — ambiguous."
+    skus: []
+
+  "MDF,Pine":
+    primary: "Pine"
+    policy: apply
+    evidence: "Material Solid Wood & MDF."
+    skus: []
+
+  "Glass,Particle Board+MDF":
+    primary: "Particle Board"
+    policy: apply
+    evidence: "Material MDF+PB+Steel+Glass."
+    skus: []
+
+# ---------------------------------------------------------------------------
+# Table B: required_aspect_map
+# key form in loader: "{category_id}|{aspect}" case-insensitive aspect
+# policy: source | neutral | human
+# source_fields: tried in order when policy=source
+# suggested_value: used when policy=neutral
+# fabric_like_only: when true, source value must look fabric-like (upholstery safety)
+# ---------------------------------------------------------------------------
+required_aspect_map:
+  - category_id: "38208"
+    aspect: "Upholstery Fabric"
+    policy: source
+    source_fields: ["Upholstery Material", "Main Material"]
+    suggested_value: null
+    fabric_like_only: true
+    evidence: "38208 requires Upholstery Fabric; fill from Upholstery Material or fabric-like Main Material."
+    skus:
+      [W1885S00335, W1885S00337, W2564S00135, W714P364693, W714P364703,
+       W714S01469, W1885S00328, W1885S00330, W1885S00332, W5532P458418,
+       W5532P458419, B355P428579, W2519P486547, W2941P393993, W5568P478805]
+
+  - category_id: "38204"
+    aspect: "Material"
+    policy: source
+    source_fields: ["Main Material", "Material"]
+    suggested_value: null
+    fabric_like_only: false
+    evidence: "38204 requires Material; source Main Material present."
+    skus: [W465P386389, W2519P486098]
+
+  - category_id: "54235"
+    aspect: "Material"
+    policy: source
+    source_fields: ["Main Material", "Material", "Wood Type"]
+    suggested_value: null
+    fabric_like_only: false
+    evidence: "54235 requires Material."
+    skus: [W2105P210239, W5797P481894]
+
+  - category_id: "179010"
+    aspect: "Material"
+    policy: source
+    source_fields: ["Main Material", "Material"]
+    suggested_value: null
+    fabric_like_only: false
+    evidence: "179010 tents require Material."
+    skus: [W3636P456623, W3636P456625, W3636P456646, W3636P456648, W640P483724]
+
+  - category_id: "63108"
+    aspect: "Material"
+    policy: source
+    source_fields: ["Main Material", "Material"]
+    suggested_value: null
+    fabric_like_only: false
+    evidence: "Source Main Material=Wood."
+    skus: [W2326P477430, W2326P486267, W2326P500591]
+
+  - category_id: "175758"
+    aspect: "Material"
+    policy: source
+    source_fields: ["Main Material", "Material"]
+    suggested_value: null
+    fabric_like_only: false
+    evidence: "Bed frames require Material."
+    skus: [N7090000667B, W504S00303]
+
+  - category_id: "261263"
+    aspect: "Material"
+    policy: source
+    source_fields: ["Main Material", "Top Material", "Bench Material"]
+    suggested_value: null
+    fabric_like_only: false
+    evidence: "Particle Board(+MDF) from source Main/Top Material."
+    skus: [N721S000044B-1]
+
+  - category_id: "103431"
+    aspect: "Material"
+    policy: source
+    source_fields: ["Main Material", "Material"]
+    suggested_value: null
+    fabric_like_only: false
+    evidence: "Main Material=Linen."
+    skus: [W1143P494949]
+
+  - category_id: "79684"
+    aspect: "Material"
+    policy: source
+    source_fields: ["Main Material", "Material"]
+    suggested_value: null
+    fabric_like_only: false
+    evidence: "Main Material=Polyester."
+    skus: [W311P284681]
+
+  - category_id: "260921"
+    aspect: "Material"
+    policy: human
+    source_fields: []
+    suggested_value: null
+    fabric_like_only: false
+    evidence: "Also missing Cutting Width/Power Source — refuse partial invent."
+    skus: [W465P369979, W465P369984]
+
+  - category_id: "38208"
+    aspect: "Brand"
+    policy: neutral
+    source_fields: []
+    suggested_value: "Unbranded"
+    fabric_like_only: false
+    evidence: "eBay-legal neutral Brand already used in publisher defaults."
+    skus: []

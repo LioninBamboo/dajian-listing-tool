@@ -1,0 +1,44 @@
+# 本实例的店铺画像(主账号:家具 / AquaVerve)。
+# 子账号实例各自维护一份本文件;缺省值 = 主账号现值,缺文件/缺键均回退默认。
+# 加载器:src/utils/store_profile.py(可用 STORE_PROFILE_PATH 环境变量覆盖路径)
+
+store:
+  brand_name: "AquaVerve"
+  brand_tagline: "PREMIUM HOME FURNISHINGS"
+  description_footer_line1: "✦ Ships from US Warehouse ✦"
+  description_footer_line2: "Quality Guaranteed • Fast US Shipping • Trusted Seller"
+  promotion_prefix: "AquaVerve Auto Sale"
+
+ebay:
+  # 账号私有:business policy ID 与库存位置 key,子账号必须改为自己的值
+  merchant_location_key: "DAJIAN_LA_WAREHOUSE"
+  fallback_fulfillment_policy_id: "321897899021"
+  fallback_return_policy_id: "321896608021"
+  fallback_payment_policy_id: "321896606021"
+
+quality_gate:
+  # 语义改写质量门在描述中检查的小写标记子串
+  banner_marker: "aquaverve"
+  # 2026-07-22: 原为 "california"。7/15 footer 改成 "✦ Ships from US Warehouse ✦"
+  # 后此标记未同步,导致每条重建都过不了 has_footer、改写管线 100% 拒推
+  # (7/17-7/22 零推送)。改用 footer 里稳定不变的片段。
+  footer_marker: "ships from"
+
+# v2:描述模板与禁词(家具实例用默认即可,这里显式写出仅为文档)
+listing:
+  template_style: "furniture_classic"   # furniture_classic | arttoy_hype(盲盒)
+  footer_html: ""                        # 整块 footer;空则用上面的 footer_line1/2
+  banned_terms: []                       # 禁词硬校验表;家具为空=守卫不触发
+  force_house_brand: true                # 通用货把店铺品牌盖为 Brand;潮玩设 false(各件保留自有 IP)
+
+# v2:定价策略。cost_plus = 现有 PricingEngine 成本+毛利模型(家具/汽配)
+pricing:
+  pricing_strategy: "cost_plus"          # cost_plus | undercut(盲盒:采集价略降)
+  undercut_pct: 0.03                     # undercut 按【总到手价=卖价+运费】计
+  undercut_min_abs: 0.0
+  price_ends_99: false
+  shipping_model: "free"                 # free=免邮 | fixed=固定运费(仅 undercut 用)
+  fixed_shipping_amount: 8.99
+
+server:
+  port: 8000

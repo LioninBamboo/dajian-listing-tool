@@ -1,0 +1,35 @@
+你是 semantic_rewrite 工具的作者，继续执行交接任务书 #5（docs/HANDOFF_HUMANQUEUE_DRAIN.md）的【阶段 C：应用】。工作目录 C:\Users\poonx\Dajian_Listing_Tool。用户已完成阶段 B 硬停后的映射表审定与放行。现在按"先验证放行条件 → 再执行"的顺序做，任何一步不满足即停。
+
+═══ 第一步：放行条件验证（只读，不得 apply）═══
+1. 读 config/semantic_rewrite_maps.yaml，确认顶层 enabled: true。
+   → 若仍为 false 或缺失：立即停止，输出"总闸未开（enabled≠true），阶段 C 不启动"，不做任何 apply。
+2. 确认两张映射表非空（compound_material_map / required_aspect_map 有条目），版本号在。
+3. 只读预检：对 51 个 unique 目标 SKU（口径见 review.md §1；从 human_queue latest 取，排除 §5 残余清单）逐条跑 plan_rewrite（不 apply），统计：
+   - pushable 数、needs_human 数、SkipResult 数
+   - 打印各 pushable SKU 将应用的 Material/Upholstery 取值（供最后一眼核对）
+   把预检结果写 logs/humanqueue_drain_stagec_preflight.md。
+4. 环境自检：venv 解释器 + PYTHONPATH；apply 阶段将设 SEMANTIC_REWRITE_APPLY_ENABLED=1；postfix 审计设 AUDIT_SEMANTIC_FACT_SHEET=1；确认不在 10:50–12:15 与 12:30 窗口；无其他 audit/rewrite 进程在跑。
+
+═══ 第二步：执行阶段 C（收到上面全部通过后自动继续）═══
+按任务书 #5 §5 逐 SKU 协议，串行：
+1. plan_rewrite → pushable 才 apply_rewrite（自动留 backup 到 logs/semantic_rewrite_backups/）
+2. apply 后连续两次 dry 审计（--live --sku <SKU>，AUDIT_SEMANTIC_FACT_SHEET=1），两次均 0 语义 CRITICAL 才判 DONE
+3. 不收敛 → 立即 scripts/semantic_rewrite_rollback.py --sku <SKU> 回滚 → 回滚后 dry 验证恢复 → 记 human_queue（原因 postfix_failed）
+4. plan 返回 needs_human / SkipResult → 记 human_queue（带原因），跳过
+5. 每 SKU 落 logs/semantic_rewrite_run_progress.jsonl，phase="HQ_DRAIN"
+6. 从 human_queue 文件移除已 DONE 的行，保留未解析行
+7. 批末抽 2 条 DONE 用事实表引擎独立复核，结果写入 summary
+
+═══ 铁律（违反任一即失败）═══
+- 四条红线沿用任务书 #4 §1：回滚失败留坏状态 / 单批回滚>2 / 缩水拦截失效 / listing_id 变化 → 全停并记录。
+- live 写操作仅限这 51 个目标 SKU；republish 必须原 offer 原 listing_id，禁 end+relist。
+- 禁 git commit/stage/push；禁改 .env（#6 才动）；禁碰守护进程；禁改代码（阶段 C 只执行不开发，若发现工具 bug → 记录+跳过该 SKU，不改代码）。
+- 禁碰 §5 残余清单（title_category_conflict / postfix_unconverged / skip_unavailable）与非目标 SKU。
+
+═══ 产出物（终验依据，缺失即失败）═══
+- logs/humanqueue_drain_stagec_preflight.md（第一步预检）
+- logs/semantic_rewrite_run_progress.jsonl（phase=HQ_DRAIN 每 SKU 一行）
+- logs/humanqueue_drain_summary.md（51 中 DONE/human 分解、残余 23 清单、表覆盖率、批末复核结果、明确声明未 commit/未改代码/未动 .env 与守护进程）
+- 更新后的 logs/semantic_rewrite_human_queue.txt（已移除 DONE 行）
+
+全部完成后停止，输出 summary 路径。验收方将独立双引擎复核 DONE 条目，并核对 human_queue 净减少数 = DONE 数。

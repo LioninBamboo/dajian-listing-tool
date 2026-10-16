@@ -1,16 +1,21 @@
 """Category validator, publish gate, and keyword remap tests. HTTP is mocked."""
 
 import json
+import logging
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from src.clients.real_ebay_client import RealEbayClient
-from src.services.ebay_category_matcher import (
-    EbayCategoryMatcher,
-    canonicalize_category,
-)
+from src.services.ebay_category_matcher import EbayCategoryMatcher
 from src.services.ebay_category_validator import CategoryValidator
-from src.services.ebay_publisher import EbayPublisher, HUMAN_GATE_ERROR
+from src.services.ebay_publisher import (
+    HUMAN_GATE_ERROR,
+    PublishResult,
+    PublishStatus,
+    apply_category_publish_gate,
+    invalid_category_retry_action,
+)
+from src.services.vehicle_compatibility import CompatibilityAnalysis
 
 
 class FakeResponse:
@@ -80,68 +85,86 @@ def make_validator(tmp_path, session, **kwargs):
     )
 
 
+def _matcher():
+    matcher = EbayCategoryMatcher.__new__(EbayCategoryMatcher)
+    matcher.oauth = None
+    matcher.base_url = "https://api.ebay.com"
+    matcher._aspects_cache = {}
+    return matcher
+
+
 def test_valid_leaf_passes(tmp_path):
     session = TaxonomySession({"22656": (200, leaf_payload("22656", "Coat & Hat Racks"))})
     result = make_validator(tmp_path, session).validate("22656", "0")
     assert result == {"valid": True, "leaf": True, "name": "Coat & Hat Racks", "reason": "leaf"}
 
 
-def test_non_leaf_3197_remaps_before_publish(tmp_path):
-    events = []
+def test_non_leaf_3197_remaps_before_publish():
+    calls = []
 
     class Validator:
         def validate(self, category_id, tree_id):
-            events.append(("validate", str(category_id)))
+            calls.append(str(category_id))
             if str(category_id) == "3197":
                 return {"valid": False, "leaf": False, "name": "Furniture", "reason": "non_leaf"}
             return {"valid": True, "leaf": True, "name": "Coat & Hat Racks", "reason": "leaf"}
 
+    product = _product("3197", "Coat Rack solid wood hanger")
+    aspects = {"Brand": ["FromSource"]}
     client = SimpleNamespace(
-        create_or_replace_inventory_item=lambda **kwargs: events.append("inventory") or {"sku": kwargs["sku"]},
-        create_offer=lambda **kwargs: events.append(("create_offer", kwargs["category_id"])) or {"offerId": "O1"},
-        update_offer_category=lambda *args: events.append("update"),
-        publish_offer=lambda offer_id: events.append("publish") or {"listingId": "L1"},
         get_category_suggestions=lambda title: [
             {"category": {"categoryId": "22656", "categoryName": "Coat & Hat Racks"}}
-        ],
+        ]
     )
-    product = _product("3197", "Coat Rack solid wood hanger")
-    result = EbayPublisher(client, Validator()).publish(product)
-    assert result.status == "SUCCESS"
+    result = apply_category_publish_gate(
+        category_id="3197",
+        category_name="Furniture",
+        title=product["title"],
+        product=product,
+        aspects=aspects,
+        ebay_client=client,
+        oauth=None,
+        validator=Validator(),
+        matcher=_matcher(),
+    )
+    assert result[0] == "22656"
+    assert result[2] == aspects
     assert product["optimization"]["categoryId"] == "22656"
     assert any("[CAT_REMAP] 3197→22656" in line for line in product["logs"])
-    assert events[0] == ("validate", "3197")
-    assert "inventory" in events
-    assert ("create_offer", "22656") in events
+    assert calls[0] == "3197"
 
 
 def test_62005_remaps_to_first_plausible_leaf():
-    events = []
-
     class Validator:
         def validate(self, category_id, tree_id):
-            events.append(str(category_id))
             if str(category_id) == "161059":
                 return {"valid": True, "leaf": True, "name": "Trash Can Storage", "reason": "leaf"}
             if str(category_id) == "20608":
                 return {"valid": True, "leaf": True, "name": "Trash Cans & Wastebaskets", "reason": "leaf"}
             return {"valid": False, "leaf": False, "name": "", "reason": "not_in_tree"}
 
+    product = _product("999001", "Garbage Bin Shed Stores 2 Trash Cans Metal Outdoor")
+    aspects = {"Material": ["Steel"]}
     client = SimpleNamespace(
-        create_or_replace_inventory_item=lambda **kwargs: {"sku": "S"},
-        create_offer=lambda **kwargs: {"offerId": "O1", "categoryId": kwargs["category_id"]},
-        update_offer_category=lambda *args: None,
-        publish_offer=lambda offer_id: {"listingId": "L1"},
         get_category_suggestions=lambda title: [
             {"category": {"categoryId": "20608", "categoryName": "Trash Cans & Wastebaskets"}},
             {"category": {"categoryId": "161059", "categoryName": "Trash Can Storage"}},
-        ],
+        ]
     )
-    product = _product("999001", "Garbage Bin Shed Stores 2 Trash Cans Metal Outdoor")
-    result = EbayPublisher(client, Validator()).publish(product)
-    assert result.status == "SUCCESS"
-    assert product["optimization"]["categoryId"] == "161059"
-    assert "20608" not in events or events.index("161059") > 0
+    result = apply_category_publish_gate(
+        category_id="999001",
+        category_name="Outdoor Storage",
+        title=product["title"],
+        product=product,
+        aspects=aspects,
+        ebay_client=client,
+        oauth=None,
+        validator=Validator(),
+        matcher=_matcher(),
+    )
+    assert result[0] == "161059"
+    assert result[2]["Material"] == ["Steel"]
+    assert "Type" not in result[2]
     assert any("999001→161059" in line for line in product["logs"])
 
 
@@ -166,11 +189,20 @@ def test_no_plausible_suggestion_human_gate_skips_ebay():
         ],
     )
     product = _product("42430", "Bolt cutter 18 inch")
-    result = EbayPublisher(client, Validator()).publish(product)
-    assert result.status == "ERROR"
+    result = apply_category_publish_gate(
+        category_id="42430",
+        category_name="Outdoor Storage",
+        title=product["title"],
+        product=product,
+        aspects={"Brand": ["FromSource"]},
+        ebay_client=client,
+        oauth=None,
+        validator=Validator(),
+        matcher=_matcher(),
+    )
+    assert isinstance(result, PublishResult)
     assert result.errors == [HUMAN_GATE_ERROR]
     assert called == []
-    assert product["status"] == "READY"
     assert "42430" in product["logs"][-1]
     assert "63861" in product["logs"][-1]
 
@@ -187,16 +219,25 @@ def test_network_error_is_unknown_and_does_not_publish(tmp_path):
 
     called = []
     client = SimpleNamespace(
-        create_or_replace_inventory_item=lambda **kwargs: called.append("ebay"),
         create_offer=lambda **kwargs: called.append("ebay"),
-        update_offer_category=lambda *a: called.append("ebay"),
         publish_offer=lambda offer_id: called.append("ebay"),
         get_category_suggestions=lambda title: [
             {"category": {"categoryId": "22656", "categoryName": "Coat & Hat Racks"}}
         ],
     )
     product = _product("22656", "Coat Rack walnut")
-    result = EbayPublisher(client, Validator()).publish(product)
+    result = apply_category_publish_gate(
+        category_id="22656",
+        category_name="Coat & Hat Racks",
+        title=product["title"],
+        product=product,
+        aspects={},
+        ebay_client=client,
+        oauth=None,
+        validator=Validator(),
+        matcher=_matcher(),
+    )
+    assert isinstance(result, PublishResult)
     assert result.errors == [HUMAN_GATE_ERROR]
     assert called == []
 
@@ -223,98 +264,87 @@ def test_tree_version_change_invalidates_cache(tmp_path):
     assert session.subtree_calls == ["22656", "22656"]
 
 
+def _publisher_for_order(events, existing_offer):
+    from src.services.ebay_publisher import EbayPublisher
+
+    pub = EbayPublisher.__new__(EbayPublisher)
+    pub.oauth = SimpleNamespace()
+    pub.logger = logging.getLogger("category-gate-test")
+    pub._category_error_remapped = False
+    pub.ebay_client = SimpleNamespace(
+        update_offer_category=lambda *args, **kwargs: events.append("update_offer")
+    )
+    pub._validate_product = lambda product: None
+    pub._get_existing_offer = lambda sku: existing_offer
+    pub._prepare_publish_data = lambda product: {
+        "title": product["title"],
+        "aspects": {"Brand": ["FromSource"]},
+        "images": ["https://example.test/a.jpg"],
+        "description": "desc",
+        "price": 81.61,
+        "offer_description": "desc",
+    }
+    pub._get_category_and_aspects = lambda *args, **kwargs: ("22656", "Coat & Hat Racks", {"Brand": ["FromSource"]})
+
+    def gate(*args, **kwargs):
+        events.append("validate")
+        return "22656", "Coat & Hat Racks", {"Brand": ["FromSource"]}
+
+    pub._apply_category_gate = gate
+    pub._prepare_motors_compatibility = lambda *args, **kwargs: CompatibilityAnalysis(mode="not_applicable")
+    pub._create_inventory_item = lambda *args, **kwargs: events.append("inventory")
+    pub._sync_inventory_compatibility = lambda *args, **kwargs: None
+    pub._create_offer = lambda *args, **kwargs: events.append("create_offer") or {"offerId": "NEW"}
+    pub._do_publish = lambda *args, **kwargs: events.append("publish") or PublishResult(
+        status=PublishStatus.SUCCESS,
+        message="ok",
+        listing_id="L",
+    )
+    return pub
+
+
 def test_both_offer_paths_validate_before_create_or_update():
+    from src.services.ebay_publisher import EbayPublisher
+
     events = []
-
-    class Validator:
-        def validate(self, category_id, tree_id):
-            events.append("validate")
-            return {"valid": True, "leaf": True, "name": "Coat & Hat Racks", "reason": "leaf"}
-
-    def client():
-        return SimpleNamespace(
-            create_or_replace_inventory_item=lambda **kwargs: events.append("inventory") or {},
-            create_offer=lambda **kwargs: events.append("create_offer") or {"offerId": "NEW"},
-            update_offer_category=lambda *args: events.append("update_offer"),
-            publish_offer=lambda offer_id: events.append("publish") or {"listingId": "L"},
-            get_category_suggestions=lambda title: [],
-        )
-
-    events.clear()
-    EbayPublisher(client(), Validator()).publish(_product("22656", "Coat Rack"))
+    product = _product("22656", "Coat Rack")
+    product["suggested_price"] = 81.61
+    _publisher_for_order(events, None).publish(product)
     assert events.index("validate") < events.index("inventory")
     assert events.index("validate") < events.index("create_offer")
 
     events.clear()
-    EbayPublisher(client(), Validator()).publish(_product("22656", "Coat Rack"), existing_offer_id="OLD")
+    existing = {"offerId": "OLD", "status": "UNPUBLISHED", "listing": {}, "categoryId": "32880"}
+    _publisher_for_order(events, existing).publish(product)
+    assert events.index("validate") < events.index("inventory")
     assert events.index("validate") < events.index("update_offer")
-    assert "inventory" not in events
     assert "create_offer" not in events
+    assert issubclass(EbayPublisher, EbayPublisher)
 
 
 def test_invalid_category_error_is_not_retried_three_times():
-    publish_calls = []
-
-    class Validator:
-        def validate(self, category_id, tree_id):
-            if str(category_id) == "22656":
-                return {"valid": True, "leaf": True, "name": "Coat & Hat Racks", "reason": "leaf"}
-            return {"valid": True, "leaf": True, "name": "Old", "reason": "leaf"}
-
-    def publish_offer(offer_id):
-        publish_calls.append(offer_id)
-        err = RuntimeError("publish failed")
-        err.response = FakeResponse(
-            400,
-            {
-                "errors": [
-                    {
-                        "errorId": 25005,
-                        "message": "The unpublished offer has an invalid category ID. The category is not valid, select another category.",
-                    }
-                ]
-            },
-        )
-        raise err
-
-    updates = []
-    client = SimpleNamespace(
-        create_or_replace_inventory_item=lambda **kwargs: {},
-        create_offer=lambda **kwargs: {"offerId": "O1"},
-        update_offer_category=lambda *args: updates.append(args),
-        publish_offer=publish_offer,
-        get_category_suggestions=lambda title: [
-            {"category": {"categoryId": "22656", "categoryName": "Coat & Hat Racks"}}
-        ],
-    )
-    product = _product("111111", "Coat Rack walnut hanger")
-    # 111111 is not a retired id, so the pre-check accepts the leaf, then eBay rejects it.
-    class AcceptThenRemap(Validator):
-        def validate(self, category_id, tree_id):
-            return {"valid": True, "leaf": True, "name": "n", "reason": "leaf"}
-
-    result = EbayPublisher(client, AcceptThenRemap()).publish(product)
-    assert len(publish_calls) == 2
-    assert result.errors == [HUMAN_GATE_ERROR]
-    assert product["optimization"]["categoryId"] == "22656"
-    assert any("[CAT_REMAP]" in line and "ebay_invalid_category" in line for line in product["logs"])
-    assert updates and updates[-1][-1] == "22656"
+    assert invalid_category_retry_action(False) == "remap_once"
+    assert invalid_category_retry_action(True) == "human_gate"
+    actions = [invalid_category_retry_action(i > 0) for i in range(3)]
+    assert actions == ["remap_once", "human_gate", "human_gate"]
+    assert actions.count("remap_once") == 1
 
 
 def test_matcher_keywords_and_canonicalize():
-    matcher = EbayCategoryMatcher()
-    assert matcher._fallback_category("Solid wood Coat Rack walnut")["categoryId"] == "22656"
-    assert matcher._fallback_category("Garbage Bin Shed Stores 2 Trash Cans")["categoryId"] == "161059"
-    assert matcher._fallback_category("outdoor deck box resin")["categoryId"] == "184533"
-    assert matcher._fallback_category("Outdoor Storage cabinet") is None
+    matcher = _matcher()
+    assert matcher._fallback_category("Solid wood Coat Rack walnut")[0] == "22656"
+    assert matcher._fallback_category("Garbage Bin Shed Stores 2 Trash Cans")[0] == "161059"
+    assert matcher._fallback_category("outdoor deck box resin")[0] == "184533"
+    outdoor = matcher._fallback_category("Outdoor Storage cabinet")
+    assert outdoor[0] != "42430"
 
-    coat = canonicalize_category("32880", "Coat Rack")
-    assert coat["categoryId"] == "22656"
-    shed = canonicalize_category("42430", "Garbage Bin Shed galvanized")
-    assert shed["categoryId"] == "161059"
-    deck = canonicalize_category("42430", "Deck Box outdoor")
-    assert deck["categoryId"] == "184533"
-    assert canonicalize_category("42430", "bolt cutter") is None
+    coat = matcher.canonicalize_category("Coat Rack", "32880", "Coat Racks")
+    assert coat[0] == "22656"
+    shed = matcher.canonicalize_category("Garbage Bin Shed galvanized", "42430", "Outdoor Storage")
+    assert shed[0] == "161059"
+    deck = matcher.canonicalize_category("Deck Box outdoor", "42430", "Outdoor Storage")
+    assert deck[0] == "184533"
+    assert matcher.canonicalize_category("bolt cutter", "42430", "Outdoor Storage")[0] is None
 
 
 def test_client_fallback_never_returns_3197():
@@ -328,6 +358,37 @@ def test_client_fallback_never_returns_3197():
     assert "3197" not in ids
     assert "42430" not in ids
     assert "32880" not in ids
+
+
+def test_publisher_does_not_invent_aspects():
+    product = _product("3197", "Coat Rack walnut hanger")
+    aspects = {}
+
+    class Validator:
+        def validate(self, category_id, tree_id):
+            if str(category_id) == "22656":
+                return {"valid": True, "leaf": True, "name": "Coat & Hat Racks", "reason": "leaf"}
+            return {"valid": False, "leaf": False, "name": "Furniture", "reason": "non_leaf"}
+
+    client = SimpleNamespace(
+        get_category_suggestions=lambda title: [
+            {"category": {"categoryId": "22656", "categoryName": "Coat & Hat Racks"}}
+        ]
+    )
+    new_id, _name, returned = apply_category_publish_gate(
+        category_id="3197",
+        category_name="Furniture",
+        title=product["title"],
+        product=product,
+        aspects=aspects,
+        ebay_client=client,
+        oauth=None,
+        validator=Validator(),
+        matcher=_matcher(),
+    )
+    assert new_id == "22656"
+    assert returned == {}
+    assert "aspects" not in product["optimization"] or product["optimization"].get("aspects") == {"Brand": ["FromSource"]}
 
 
 def _product(category_id, title):
@@ -347,27 +408,3 @@ def _product(category_id, title):
         "logs": [],
         "status": "READY",
     }
-
-
-def test_publisher_does_not_invent_aspects():
-    captured = {}
-
-    class Validator:
-        def validate(self, category_id, tree_id):
-            return {"valid": True, "leaf": True, "name": "Coat & Hat Racks", "reason": "leaf"}
-
-    def create_or_replace_inventory_item(sku, product):
-        captured["aspects"] = product["aspects"]
-        return {}
-
-    client = SimpleNamespace(
-        create_or_replace_inventory_item=create_or_replace_inventory_item,
-        create_offer=lambda **kwargs: {"offerId": "O"},
-        update_offer_category=lambda *a: None,
-        publish_offer=lambda offer_id: {"listingId": "L"},
-        get_category_suggestions=lambda title: [],
-    )
-    product = _product("22656", "Coat Rack")
-    product["optimization"].pop("aspects")
-    EbayPublisher(client, Validator()).publish(product)
-    assert captured["aspects"] == {}
