@@ -1943,6 +1943,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                                 ),
                                 tree_id=str(get_store_profile().category_tree_id or "0"),
                                 matcher=category_matcher,
+                                force_remap=True,
                             )
                         except Exception as remap_err:
                             print(f"[CAT] remap failed: {remap_err}")

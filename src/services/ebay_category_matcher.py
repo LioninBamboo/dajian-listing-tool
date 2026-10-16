@@ -25,6 +25,36 @@ class EbayCategoryMatcher:
         self.base_url = "https://api.ebay.com"
         self._aspects_cache: Dict[str, List[Dict]] = {}  # Cache category aspects
 
+    @classmethod
+    def hardcoded_categories(cls):
+        """(category_id, name, tree_id) leaves the keyword fallbacks will publish.
+
+        No OAuth and no Taxonomy call. The read-only leaf probe uses this so a
+        retired id put back into the matcher or client fallback is what gets checked.
+        """
+        from src.clients.real_ebay_client import RealEbayClient
+
+        matcher = cls.__new__(cls)
+        client = RealEbayClient.__new__(RealEbayClient)
+        rows = []
+        seen = set()
+
+        def add(category_id, name, tree_id="0"):
+            cid = str(category_id or "").strip()
+            tid = str(tree_id or "0")
+            if not cid or (cid, tid) in seen:
+                return
+            seen.add((cid, tid))
+            rows.append((cid, name or "", tid))
+
+        for title in ("coat rack", "deck box", "trash can storage"):
+            cid, name = matcher._fallback_category(title)
+            add(cid, name)
+            for item in client._get_fallback_category(title) or []:
+                category = item.get("category") or {}
+                add(category.get("categoryId"), category.get("categoryName"))
+        return rows
+
     def canonicalize_category(
         self,
         title: str,

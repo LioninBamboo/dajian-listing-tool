@@ -134,7 +134,9 @@ def apply_category_publish_gate(
         ebay_client.get_category_suggestions(title) if ebay_client is not None else []
     )
     for cid, name in suggestions:
-        if not cid:
+        # A rejected id can still be a Taxonomy leaf (Motors privilege, tree
+        # mismatch, or a stale cache). force_remap must not select it again.
+        if not cid or (force_remap and str(cid).strip() == current_id):
             continue
         if not checker.is_category_plausible_for_text(title, cid, name):
             continue
@@ -1341,13 +1343,20 @@ class EbayPublisher:
         new_id, new_name, new_aspects = gated
         if offer_id and hasattr(self.ebay_client, "update_offer_category"):
             try:
-                self.ebay_client.update_offer_category(offer_id, new_id)
+                updated = self.ebay_client.update_offer_category(offer_id, new_id)
             except Exception as exc:
                 self.logger.warning("[CAT_REMAP] offer update failed: %s", exc)
+                updated = False
+            # False means the live offer still has the old category. Publishing
+            # now fails 25005, and the remap flag already set would human-gate
+            # a change that never reached eBay.
+            if updated is False:
+                self._category_error_remapped = False
+                self.logger.warning("[CAT_REMAP] offer update failed; not publishing")
                 return PublishResult(
                     status=PublishStatus.ERROR,
-                    message=HUMAN_GATE_ERROR,
-                    errors=[HUMAN_GATE_ERROR],
+                    message=f"[CAT_REMAP] offer update failed for {new_id}; not publishing",
+                    errors=["offer_category_update_failed"],
                     offer_id=offer_id,
                     category_id=new_id,
                 )

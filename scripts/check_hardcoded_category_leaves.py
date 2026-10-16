@@ -21,7 +21,7 @@ def main() -> int:
     api_base = "https://api.sandbox.ebay.com" if environment == "SANDBOX" else "https://api.ebay.com"
     validator = CategoryValidator(api_base=api_base, write_cache=False)
     failed = 0
-    for category_id, name, tree_id in EbayCategoryMatcher().hardcoded_categories():
+    for category_id, name, tree_id in EbayCategoryMatcher.hardcoded_categories():
         result = validator.validate(category_id, tree_id)
         ok = result.get("valid") and result.get("leaf")
         flag = "OK" if ok else "WARN"
