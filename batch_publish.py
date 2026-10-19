@@ -717,7 +717,8 @@ def validate_product(product: dict) -> list:
         errors.append("missing title")
 
     price = product.get('suggested_price', 0) or product.get('price', 0)
-    cb = product.get('cost_breakdown', {})
+    # SQL NULL arrives as None; dict.get default only applies when the key is missing.
+    cb = product.get('cost_breakdown', {}) or {}
     total_cost = cb.get('total_dajian_cost', 0)
     
     # 确保有成本数据或价格可以计算最终价格
