@@ -1845,6 +1845,66 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
     return ListingProfile(kind="unknown")
 
 
+def quality_gate_expected_aspects(
+    *,
+    title: str = "",
+    description: str = "",
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    category_id: str = "",
+    current_aspects: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Aspect values the quality gate requires or derives.
+
+    The publish source-guard must defer to these instead of stripping or
+    rewriting them. Keys match Item Specific names (Type, Assembly Required, …).
+    """
+    expected: dict[str, str] = {}
+    title_for_profile = " ".join(part for part in (source_title, title) if part)
+    profile = classify_listing_profile(title_for_profile, description, category_id)
+    if profile.type_value:
+        expected["Type"] = profile.type_value
+    if profile.set_includes:
+        expected["Set Includes"] = profile.set_includes
+    if profile.room:
+        expected["Room"] = profile.room
+    if profile.indoor_outdoor:
+        expected["Indoor/Outdoor"] = profile.indoor_outdoor
+
+    title_text = _text_context(title_for_profile)
+    if profile.kind == "dining_chair":
+        match = re.search(r"set\s+of\s+(\d+)", title_text)
+        if match:
+            expected["Number of Items in Set"] = match.group(1)
+    if profile.kind == "dining_set":
+        item_count = infer_number_of_items_in_set(
+            title_for_profile,
+            category_id=category_id or profile.category_id or "",
+        )
+        if item_count:
+            expected["Number of Items in Set"] = item_count
+            expected["Number of Pieces"] = item_count
+
+    current_assembly = first_aspect_text(current_aspects or {}, "Assembly Required")
+    assembly_decision = infer_assembly_decision(
+        source_title=source_title or title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+        current_assembly=current_assembly,
+    )
+    expected_assembly = assembly_decision.get("required")
+    if not expected_assembly and assembly_decision.get("status") == "unknown":
+        expected_assembly = _normalize_yes_no(
+            infer_source_assembly_required(attributes, specs, source_description)
+        )
+    if expected_assembly:
+        expected["Assembly Required"] = expected_assembly
+    return expected
+
+
 def _apply_profile_rules(opt: dict[str, Any], profile: ListingProfile) -> None:
     aspects = opt.setdefault("aspects", {})
     if profile.category_id:
