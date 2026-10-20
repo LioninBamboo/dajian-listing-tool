@@ -1,8 +1,10 @@
 """Source-grounded item-specific guard used at publish time.
 
 After template fill + placeholder sanitization, every final aspect except
-dimensions/weight and Brand is checked against the GIGA source blob
-(title, description, attributes, specs). Unsourced optional aspects are
+dimensions/weight, Brand, and MPN is checked against the GIGA source blob
+(title, description, attributes, specs). eBay sentinel values and any
+aspect the listing quality gate already requires or derives are kept.
+Unsourced optional claims (materials, voltage/power, warranty, …) are
 stripped; unsourced required aspects are replaced with a source-matching
 value when one exists, otherwise they block publish.
 """
@@ -24,6 +26,24 @@ SKIP_ASPECT_NAMES = {key.lower() for key in MEASUREMENT_ASPECT_KEYS} | {
     "package width",
     "package height",
     "brand",
+    "mpn",
+    "manufacturer part number",
+}
+
+EBAY_SENTINEL_VALUES = {
+    "does not apply",
+    "doesnotapply",
+    "unbranded",
+    "n/a",
+    "n.a",
+    "n.a.",
+    "na",
+    "n a",
+    "none",
+    "not applicable",
+    "not available",
+    "unspecified",
+    "unknown",
 }
 
 POWER_ASPECT_MARKERS = (
@@ -173,6 +193,31 @@ def is_skipped_aspect(name: str) -> bool:
     return str(name or "").strip().lower() in SKIP_ASPECT_NAMES
 
 
+def is_ebay_sentinel_value(value: str) -> bool:
+    return _normalize_text(value) in EBAY_SENTINEL_VALUES
+
+
+def _expected_value_for(
+    name: str,
+    expected_values_by_name: Optional[Mapping[str, Any]] = None,
+) -> str:
+    if not expected_values_by_name:
+        return ""
+    want = str(name or "").strip().lower()
+    for key, raw in expected_values_by_name.items():
+        if str(key or "").strip().lower() != want:
+            continue
+        values = _aspect_values(raw)
+        if values:
+            return values[0]
+    return ""
+
+
+def _values_match_expected(values: Iterable[str], expected: str) -> bool:
+    want = _normalize_text(expected)
+    return bool(want) and any(_normalize_text(value) == want for value in values)
+
+
 def is_power_aspect(name: str) -> bool:
     normalized = _normalize_text(name)
     return any(marker in normalized for marker in POWER_ASPECT_MARKERS)
@@ -217,7 +262,11 @@ def restore_sourced_aspects(
     """Re-apply original optimization.aspects that are source-supported."""
     for name, raw in (original or {}).items():
         if is_skipped_aspect(name):
-            if str(name or "").strip().lower() == "brand" and _aspect_values(raw):
+            if str(name or "").strip().lower() in {
+                "brand",
+                "mpn",
+                "manufacturer part number",
+            } and _aspect_values(raw):
                 completed[name] = list(_aspect_values(raw))
             continue
         values = [value for value in _aspect_values(raw) if value_supported_by_source(value, source_text)]
@@ -232,6 +281,7 @@ def guard_unsourced_aspects(
     source_text: str,
     required_names: Optional[Iterable[str]] = None,
     allowed_values_by_name: Optional[Mapping[str, Iterable[str]]] = None,
+    expected_values_by_name: Optional[Mapping[str, Any]] = None,
     sku: str = "",
     log: Optional[LogFn] = None,
 ) -> list[str]:
@@ -248,6 +298,17 @@ def guard_unsourced_aspects(
             continue
 
         values = _aspect_values(aspects.get(name))
+        if values and all(is_ebay_sentinel_value(value) for value in values):
+            continue
+
+        expected = _expected_value_for(name, expected_values_by_name)
+        if expected:
+            if _values_match_expected(values, expected):
+                continue
+            aspects[name] = [expected]
+            _emit(log, f"[ASPECT_GATE] {sku} {name}={expected}".strip())
+            continue
+
         kept = [value for value in values if value_supported_by_source(value, source_text)]
         power_unsupported = is_power_aspect(name) and not any(
             value_supported_by_source(marker, source_text) for marker in POWER_ASPECT_MARKERS
@@ -287,6 +348,11 @@ def guard_unsourced_aspects(
             continue
         if first_aspect_text(aspects, name):
             continue
+        expected = _expected_value_for(name, expected_values_by_name)
+        if expected:
+            aspects[name] = [expected]
+            _emit(log, f"[ASPECT_GATE] {sku} {name}={expected}".strip())
+            continue
         if is_power_aspect(name) and not any(
             value_supported_by_source(marker, source_text) for marker in POWER_ASPECT_MARKERS
         ):
@@ -300,5 +366,11 @@ def guard_unsourced_aspects(
         reason = f"unsourced_required_aspect:{name}"
         if reason not in blockers:
             blockers.append(reason)
+
+    for name in (expected_values_by_name or {}):
+        expected = _expected_value_for(name, expected_values_by_name)
+        if expected and not first_aspect_text(aspects, name):
+            aspects[name] = [expected]
+            _emit(log, f"[ASPECT_GATE] {sku} {name}={expected}".strip())
 
     return blockers

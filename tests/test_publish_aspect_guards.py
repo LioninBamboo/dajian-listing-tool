@@ -121,7 +121,7 @@ def test_required_unsourced_color_uses_source_matching_value():
 
 
 def test_unsourced_voltage_aspect_is_always_dropped():
-    aspects = {"Voltage": ["Does Not Apply"], "Type": ["Kitchen Island"]}
+    aspects = {"Voltage": ["110V"], "Type": ["Kitchen Island"]}
     blockers = guard_unsourced_aspects(
         aspects,
         source_text="Kitchen island with wood top and storage drawers",
@@ -130,6 +130,69 @@ def test_unsourced_voltage_aspect_is_always_dropped():
     assert blockers == []
     assert "Voltage" not in aspects
     assert aspects["Type"] == ["Kitchen Island"]
+
+
+def test_mpn_does_not_apply_is_kept():
+    aspects = {"MPN": ["Does Not Apply"], "Brand": ["Unbranded"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Upholstered storage ottoman with lid",
+        required_names=[],
+    )
+    assert blockers == []
+    assert aspects["MPN"] == ["Does Not Apply"]
+    assert aspects["Brand"] == ["Unbranded"]
+
+
+def test_assembly_required_kept_when_gate_expects_it():
+    aspects = {"Assembly Required": ["Yes"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Upholstered storage ottoman with lid",
+        expected_values_by_name={"Assembly Required": "Yes"},
+    )
+    assert blockers == []
+    assert aspects["Assembly Required"] == ["Yes"]
+
+
+def test_type_kept_when_it_matches_gate_expectation():
+    aspects = {"Type": ["Storage Ottoman"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Upholstered ottoman for the living room",
+        required_names=["Type"],
+        allowed_values_by_name={"Type": ["Ottoman", "Storage Ottoman"]},
+        expected_values_by_name={"Type": "Storage Ottoman"},
+    )
+    assert blockers == []
+    assert aspects["Type"] == ["Storage Ottoman"]
+
+
+def test_material_marble_still_stripped_when_source_lacks_it():
+    aspects = {"Material": ["Marble"], "Type": ["Storage Ottoman"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Upholstered storage ottoman with lid",
+        expected_values_by_name={"Type": "Storage Ottoman"},
+    )
+    assert blockers == []
+    assert "Material" not in aspects
+    assert aspects["Type"] == ["Storage Ottoman"]
+
+
+def test_quality_gate_expected_aspects_for_storage_ottoman():
+    from src.utils.listing_quality_gate import quality_gate_expected_aspects
+
+    expected = quality_gate_expected_aspects(
+        title="Storage Ottoman with Lid",
+        source_title="Storage Ottoman with Lid",
+        source_description="Upholstered storage ottoman. Assembly Required: Yes.",
+        attributes={"Assembly Required": "Yes"},
+        category_id="20490",
+        current_aspects={"Type": ["Storage Ottoman"], "Assembly Required": ["Yes"]},
+    )
+    assert expected["Type"] == "Storage Ottoman"
+    assert expected["Assembly Required"] == "Yes"
 
 
 def test_wood_does_not_match_hollywood():

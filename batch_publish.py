@@ -53,6 +53,7 @@ from src.utils.publish_validation import (
 from src.utils.listing_quality_gate import (
     enforce_store_brand_aspect,
     normalize_generated_listing as _normalize_generated_listing,
+    quality_gate_expected_aspects,
 )
 from src.services.listing_qc import run_listing_qc
 from src.utils.publish_autofix import (
@@ -1134,6 +1135,16 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         source_text=source_text,
         required_names=required_aspect_names_for_guard,
         allowed_values_by_name=allowed_values_by_name,
+        expected_values_by_name=quality_gate_expected_aspects(
+            title=title,
+            description=description,
+            source_title=source_title or product.get("title", ""),
+            source_description=product.get("description", ""),
+            attributes=product.get("attributes", {}) or {},
+            specs=product.get("specs", {}) or {},
+            category_id=category_id,
+            current_aspects=completed_aspects,
+        ),
         sku=sku,
         log=lambda message: logger.info(f"  {message}"),
     )
