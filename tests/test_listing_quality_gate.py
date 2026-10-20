@@ -2567,6 +2567,34 @@ def test_seating_ignores_dimension_numbers():
     assert "48" in blocked.message
 
 
+def test_set_of_n_in_color_is_piece_count_not_inches():
+    from src.utils.listing_quality_gate import (
+        _source_kit_size_evidence,
+        find_invented_kit_size,
+    )
+    from src.utils.publish_aspect_completion import (
+        infer_number_of_items_in_set,
+        seating_item_counts,
+        seating_plus_table_item_count,
+    )
+
+    assert infer_number_of_items_in_set("Set of 4 in Beige") == "4"
+    assert infer_number_of_items_in_set("set of 4 in grey") == "4"
+    assert seating_item_counts("Dining Set with 4 in grey chairs") == {4}
+    assert seating_plus_table_item_count(
+        "Dining Table Set with 4 in beige chairs"
+    ) == "5"
+    assert 4 in _source_kit_size_evidence(source_title="Set of 4 in Beige")
+    assert 60 not in _source_kit_size_evidence(source_title="60 in Dining Bench")
+
+    issue = find_invented_kit_size(
+        "4-Piece Dining Chair Set",
+        "",
+        source_title="Set of 4 in Beige",
+    )
+    assert issue is None
+
+
 def test_kit_evidence_ignores_size_and_model_numbers():
     from src.utils.listing_quality_gate import (
         _first_int,

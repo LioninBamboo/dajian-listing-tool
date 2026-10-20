@@ -30,8 +30,16 @@ _SET_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 # Units/size words that must not be read as a seat or piece count.
+# Bare "in" is inches ("60 in", "60 in Dining Bench"). It is not the
+# preposition before a color ("set of 4 in grey", "with 4 in beige chairs").
+_COLOR_AFTER_IN = (
+    r"beige|black|blue|bronze|brown|burgundy|camel|charcoal|chrome|clear|"
+    r"cream|gold|gray|green|grey|ivory|khaki|natural|navy|oak|orange|pink|"
+    r"purple|red|silver|tan|teal|walnut|white|yellow"
+)
 _DIMENSION_AFTER_NUMBER = (
-    r"inch(?:es)?\b|in\b|\"|''|ft\b|feet\b|foot\b|cm\b|mm\b|"
+    rf"inch(?:es)?\b|in\b(?!\s+(?:{_COLOR_AFTER_IN})\b)|\"|''|"
+    r"ft\b|feet\b|foot\b|cm\b|mm\b|"
     r"lbs?\b|pounds?\b|kg\b|oz\b|seat\s+height\b|tiers?\b|drawers?\b"
 )
 NOT_DIMENSION_AFTER = rf"(?!\s*[-–—]?\s*(?:{_DIMENSION_AFTER_NUMBER}))"
