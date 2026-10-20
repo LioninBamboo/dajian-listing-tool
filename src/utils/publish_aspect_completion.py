@@ -29,10 +29,23 @@ _SET_CONTEXT_RE = re.compile(
     r"table and chair|table\s*&\s*chair",
     re.IGNORECASE,
 )
+# "in" is inches only when dimension-like, not the preposition in "set of 4 in grey".
+_IN_AS_INCHES = (
+    r"in\."
+    r"|in(?=\s*[x×])"
+    r"|in(?=\s*\d)"
+    r"|in(?=\s*$)"
+    r"|in(?=\s*[,;:)\]}/])"
+    r"|in(?=\s+(?:wide|long|tall|high|deep|dia(?:meter)?|width|height|length|thick(?:ness)?)\b)"
+)
 # Units/size words that must not be read as a seat or piece count.
 _DIMENSION_AFTER_NUMBER = (
-    r"inch(?:es)?\b|in\b|\"|''|ft\b|feet\b|foot\b|cm\b|mm\b|"
+    rf"inch(?:es)?\b|{_IN_AS_INCHES}|\"|''|ft\b|feet\b|foot\b|cm\b|mm\b|"
     r"lbs?\b|pounds?\b|kg\b|oz\b|seat\s+height\b|tiers?\b|drawers?\b"
+)
+_REAL_TABLE_RE = re.compile(
+    r"\btable\b|\b(?:dining|bistro|pub|patio)\s+(?:table|set)\b|桌",
+    re.IGNORECASE,
 )
 NOT_DIMENSION_AFTER = rf"(?!\s*[-–—]?\s*(?:{_DIMENSION_AFTER_NUMBER}))"
 _NOT_DIMENSION_AFTER = NOT_DIMENSION_AFTER
@@ -83,6 +96,11 @@ FABRIC_KEYWORDS = {
 
 def has_table_set_domain(title: str) -> bool:
     return bool(_TABLE_SET_DOMAIN_RE.search(title or ""))
+
+
+def has_real_table(text: str) -> bool:
+    """True only for a table / dining|bistro|pub|patio table|set / 桌."""
+    return bool(_REAL_TABLE_RE.search(text or ""))
 
 
 def number_is_dimension_bound(text: str, match: re.Match[str], group: int = 1) -> bool:
@@ -175,12 +193,22 @@ def infer_set_includes(title: str) -> Optional[str]:
     if any(keyword in title_lower for keyword in TABLE_TENNIS_KEYWORDS):
         return "Table"
     set_context = bool(_SET_CONTEXT_RE.search(title_lower))
-    if re.search(r"\bchairs?\b", title_lower) and set_context and has_table_set_domain(title_lower):
-        if "table and chair" not in title_lower and "table & chair" not in title_lower:
-            return "Chairs"
-        return "Dining Table & Chairs" if "dining" in title_lower else "Table & Chairs"
-    if re.search(r"\bstools?\b", title_lower) and set_context and has_table_set_domain(title_lower):
-        return "Dining Table & Stools" if "dining" in title_lower else "Table & Stools"
+    has_chairs = bool(re.search(r"\bchairs?\b", title_lower))
+    has_stools = bool(re.search(r"\bstools?\b", title_lower))
+    table_and_chairs = (
+        "table and chair" in title_lower or "table & chair" in title_lower
+    )
+    if has_chairs and set_context and has_table_set_domain(title_lower):
+        if table_and_chairs or (has_real_table(title_lower) and seating_item_counts(title_lower)):
+            return "Dining Table & Chairs" if "dining" in title_lower else "Table & Chairs"
+        return "Chairs"
+    if has_stools and set_context and has_table_set_domain(title_lower):
+        if has_real_table(title_lower) and (
+            seating_item_counts(title_lower) or table_and_chairs
+        ):
+            return "Dining Table & Stools" if "dining" in title_lower else "Table & Stools"
+        if has_real_table(title_lower):
+            return "Dining Table & Stools" if "dining" in title_lower else "Table & Stools"
     if "sofa" in title_lower or "couch" in title_lower or "sectional" in title_lower:
         return "Sofa Set"
     if set_context:

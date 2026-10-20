@@ -15,7 +15,7 @@ ASPECTS = {"Type": ["Wrench Set"], "Number of Pieces": ["7"], "Set Includes": ["
 def test_infer_set_includes_never_table_set_for_tools():
     assert infer_set_includes(WRENCH_TITLE) is None
     assert infer_set_includes("4-Piece Heavy Duty Straight Pipe Wrench Set") is None
-    assert infer_set_includes("5 Piece Dining Table Set with 4 Chairs") in ("Chairs", "Dining Table & Chairs")
+    assert infer_set_includes("5 Piece Dining Table Set with 4 Chairs") == "Dining Table & Chairs"
     assert infer_set_includes("3-Piece Bistro Patio Table Set") == "Table Set"
 
 
@@ -28,6 +28,7 @@ def test_infer_set_includes_table_set_only_for_table_domain():
     assert infer_set_includes("3-Piece Stable Storage Set") is None
     assert infer_set_includes("Marble Masterpiece Dining Table") == "Table"
     assert infer_set_includes("W465P451141 7-Piece Wrench Set") is None
+    assert infer_set_includes("Round Dining Table Set with 4 Chairs") == "Dining Table & Chairs"
 
 
 def test_w465p451141_regression_all_three_blocked():

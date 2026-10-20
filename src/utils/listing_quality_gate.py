@@ -25,6 +25,7 @@ from src.utils.product_context_signals import (
 )
 from src.utils.publish_aspect_completion import (
     NOT_DIMENSION_AFTER,
+    has_real_table,
     infer_number_of_items_in_set,
     number_is_dimension_bound,
     plausible_seat_count,
@@ -2687,12 +2688,6 @@ _TABLE_OR_DINING_RE = re.compile(
     r"\b(?:table|dining|bistro|patio)\b|桌|餐桌",
     re.IGNORECASE,
 )
-_REAL_TABLE_RE = re.compile(
-    r"\btable\b|\b(?:dining|bistro|pub|patio)\s+(?:table|set)\b|桌",
-    re.IGNORECASE,
-)
-
-
 def _add_kit_count(dest: set[int], raw: Any) -> None:
     try:
         value = int(raw)
@@ -2748,7 +2743,7 @@ def _piece_counts_from_mapping(mapping: Mapping[str, Any] | None) -> set[int]:
 
 def _has_real_table(text: str) -> bool:
     """True only for a table / dining|bistro|pub|patio table|set / 桌."""
-    return bool(_REAL_TABLE_RE.search(text or ""))
+    return has_real_table(text)
 
 
 def _source_kit_size_evidence(
