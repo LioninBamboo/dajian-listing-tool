@@ -2476,3 +2476,53 @@ def test_invented_kit_size_still_blocks_unsupported_count():
     assert issue is not None
     assert issue.code == "invented_kit_size"
     assert "10" in issue.message
+
+
+def test_kit_table_regex_does_not_match_stable_vegetable_tablet():
+    from src.utils.listing_quality_gate import (
+        _TABLE_OR_DINING_RE,
+        _has_real_table,
+        _source_kit_size_evidence,
+    )
+
+    for text in ("stable 4 chairs", "vegetable 4 chairs", "tablet 4 chairs"):
+        assert _TABLE_OR_DINING_RE.search(text) is None
+        assert not _has_real_table(text)
+        evidence = _source_kit_size_evidence(source_title=text)
+        assert 4 in evidence
+        assert 5 not in evidence
+
+
+def test_invented_kit_size_allows_dining_chairs_without_table_plus_one():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "Set of 4 Dining Chairs",
+        "",
+        source_title="4 dining chairs",
+    )
+    assert issue is None
+
+
+def test_invented_kit_size_blocks_five_piece_when_source_is_four_chairs():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Chair Set",
+        "",
+        source_title="4 chairs",
+    )
+    assert issue is not None
+    assert issue.code == "invented_kit_size"
+    assert "5" in issue.message
+
+
+def test_invented_kit_size_allows_cn_table_plus_can_yi():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Dining Set",
+        "",
+        source_title="餐桌+4把餐椅",
+    )
+    assert issue is None

@@ -24,6 +24,8 @@ def test_infer_set_includes_table_set_only_for_table_domain():
     assert infer_set_includes("3-Piece Ottoman Set") is None
     assert infer_set_includes("Set of 2 Chairs") is None
     assert infer_set_includes("5-Piece Dining Set") == "Table Set"
+    assert infer_set_includes("3-Piece Tablet Stand Set") is None
+    assert infer_set_includes("3-Piece Stable Storage Set") is None
 
 
 def test_w465p451141_regression_all_three_blocked():

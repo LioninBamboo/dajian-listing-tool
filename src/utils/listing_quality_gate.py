@@ -25,6 +25,7 @@ from src.utils.product_context_signals import (
 )
 from src.utils.publish_aspect_completion import (
     infer_number_of_items_in_set,
+    seating_item_counts,
     seating_plus_table_item_count,
 )
 from src.utils.publish_autofix import sanitize_placeholder_aspects, sanitize_single_value_aspects
@@ -2672,12 +2673,20 @@ _KIT_SIZE_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 _SOURCE_KIT_CN_RE = re.compile(r"(\d{1,3})\s*(?:件套|件|套)")
-_SOURCE_KIT_CN_CHAIRS_RE = re.compile(r"(\d{1,3})\s*把椅")
+_SOURCE_KIT_CN_CHAIRS_RE = re.compile(r"(\d{1,3})\s*把\S{0,3}?椅")
 _PIECE_COUNT_KEY_RE = re.compile(
-    r"number of pieces|pieces included|number of items in set|items in set|piece count",
+    r"\b(?:number of pieces|pieces included|number of items in set|"
+    r"items in set|piece count)\b",
     re.IGNORECASE,
 )
-_TABLE_OR_DINING_RE = re.compile(r"table|dining|bistro|patio|桌|餐桌", re.IGNORECASE)
+_TABLE_OR_DINING_RE = re.compile(
+    r"\b(?:table|dining|bistro|patio)\b|桌|餐桌",
+    re.IGNORECASE,
+)
+_REAL_TABLE_RE = re.compile(
+    r"\btable\b|\b(?:dining|bistro|pub|patio)\s+(?:table|set)\b|桌",
+    re.IGNORECASE,
+)
 
 
 def _add_kit_count(dest: set[int], raw: Any) -> None:
@@ -2729,6 +2738,11 @@ def _piece_counts_from_mapping(mapping: Mapping[str, Any] | None) -> set[int]:
     return counts
 
 
+def _has_real_table(text: str) -> bool:
+    """True only for a table / dining|bistro|pub|patio table|set / 桌."""
+    return bool(_REAL_TABLE_RE.search(text or ""))
+
+
 def _source_kit_size_evidence(
     source_title: str = "",
     source_description: str = "",
@@ -2749,18 +2763,22 @@ def _source_kit_size_evidence(
         dining_count = expected_dining_set_item_count(text)
         if dining_count:
             _add_kit_count(evidence, dining_count)
-        if _TABLE_OR_DINING_RE.search(text or ""):
-            seating_count = seating_plus_table_item_count(text)
-            if seating_count:
-                _add_kit_count(evidence, seating_count)
 
-    has_table = bool(_TABLE_OR_DINING_RE.search(blob))
+    seating = seating_item_counts(blob)
+    evidence.update(seating)
+    if _has_real_table(blob):
+        for n in seating:
+            _add_kit_count(evidence, n + 1)
+        seating_plus = seating_plus_table_item_count(blob)
+        if seating_plus:
+            _add_kit_count(evidence, seating_plus)
+
     for match in _SOURCE_KIT_CN_CHAIRS_RE.finditer(blob):
         chairs = _first_int(match.group(1))
         if chairs is None:
             continue
         _add_kit_count(evidence, chairs)
-        if has_table:
+        if _has_real_table(blob):
             _add_kit_count(evidence, chairs + 1)
     return evidence
 

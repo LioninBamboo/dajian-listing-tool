@@ -18,20 +18,18 @@ SET_INCLUDES_SKIP_CATEGORIES = {"48319"}
 MEASUREMENT_DEFAULT_SKIP = set(MEASUREMENT_ASPECT_KEYS) | {"Item Weight"}
 SET_INCLUDE_KEYWORDS = ("dining set", "table set", "piece", "set for", "set of")
 TABLE_TENNIS_KEYWORDS = ("table tennis", "ping pong")
-TABLE_SET_DOMAIN_MARKERS = (
-    "table",
-    "dining",
-    "patio",
-    "bistro",
-    "pub set",
-    "conversation set",
+_TABLE_SET_DOMAIN_RE = re.compile(
+    r"\b(?:table|dining|patio|bistro)\b|\bpub set\b|\bconversation set\b",
+    re.IGNORECASE,
 )
-_SEATING_PLUS_ONE_PATTERNS = (
-    r"\bwith\s+(\d+)\s+(?:[a-z]+\s+){0,3}?chairs?\b",
-    r"\bwith\s+(\d+)\s+(?:[a-z]+\s+){0,3}?stools?\b",
-    r"\b(\d+)\s+(?:barrel\s+)?chairs?\b",
-    r"\b(\d+)\s+stools?\b",
-    r"\bseats?\s+(\d+)\b",
+_SEATING_COUNT_PATTERNS = (
+    r"\bwith\s+(\d{1,3})\s+(?:[a-z]+\s+){0,3}?chairs?\b",
+    r"\bwith\s+(\d{1,3})\s+(?:[a-z]+\s+){0,3}?stools?\b",
+    r"\b(\d{1,3})\s+(?:[a-z]+\s+){0,3}?chairs?\b",
+    r"\b(\d{1,3})\s+(?:[a-z]+\s+){0,3}?stools?\b",
+)
+_SEATING_PLUS_ONE_PATTERNS = _SEATING_COUNT_PATTERNS + (
+    r"\bseats?\s+(\d{1,3})\b",
 )
 BED_SIZE_MAP = {
     "twin xl": "Twin XL",
@@ -62,8 +60,22 @@ FABRIC_KEYWORDS = {
 
 
 def has_table_set_domain(title: str) -> bool:
-    text = (title or "").lower()
-    return any(marker in text for marker in TABLE_SET_DOMAIN_MARKERS)
+    return bool(_TABLE_SET_DOMAIN_RE.search(title or ""))
+
+
+def seating_item_counts(text: str) -> set[int]:
+    """N from 'N chairs/stools' phrases. Does not add the table."""
+    lowered = (text or "").lower()
+    counts: set[int] = set()
+    for seating_pattern in _SEATING_COUNT_PATTERNS:
+        for match in re.finditer(seating_pattern, lowered):
+            try:
+                value = int(match.group(1))
+            except ValueError:
+                continue
+            if 2 <= value <= 999:
+                counts.add(value)
+    return counts
 
 
 def seating_plus_table_item_count(text: str) -> Optional[str]:
