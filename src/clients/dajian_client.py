@@ -854,20 +854,41 @@ class DaJianClient:
         # 使用官方价格 API 获取价格和是否可购买
         price_info = self.get_product_price(sku)
         if not price_info:
-            return {"in_stock": False, "quantity": 0, "price": 0, "error": "Product not found in price API"}
+            return {
+                "in_stock": False,
+                "quantity": 0,
+                "price": 0,
+                "error": "Product not found in price API",
+                "stock_confirmed": False,
+            }
         
-        available = price_info.get("skuAvailable", False)
+        sku_available = price_info.get("skuAvailable")
+        available = bool(price_info.get("skuAvailable", False))
         price = float(price_info.get("price", 0) or 0)
         shipping = float(price_info.get("shippingFee", 0) or 0)
         
         # 使用官方库存 API 获取数量
         qty = 0
+        inventory_known = False
         try:
             inv_info = self.get_inventory_by_sku(sku)
             if inv_info:
                 qty = extract_available_inventory_quantity(inv_info)
+                inventory_known = True
         except Exception as e:
             logger.warning(f"Failed to get inventory for {sku}: {e}")
+
+        # 库存 API 空/异常，且价格 API 没有明确 skuAvailable=False：
+        # quantity=0 / in_stock=False 只是哨兵，不是确认缺货。
+        if not inventory_known and sku_available is not False:
+            return {
+                "in_stock": False,
+                "quantity": 0,
+                "price": price,
+                "shipping_fee": shipping,
+                "total_cost": price + shipping,
+                "stock_confirmed": False,
+            }
         
         in_stock = available and qty > 0
         
@@ -876,5 +897,6 @@ class DaJianClient:
             "quantity": qty,
             "price": price,
             "shipping_fee": shipping,
-            "total_cost": price + shipping
+            "total_cost": price + shipping,
+            "stock_confirmed": True,
         }

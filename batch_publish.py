@@ -604,6 +604,50 @@ def fetch_market_price(title: str) -> float | None:
     return None
 
 
+def _optional_float(value):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _confirmed_supplier_stock(info: dict) -> bool:
+    """True only when get_stock_info proved stock, not a lookup miss.
+
+    Price-API misses set ``error`` and still return quantity 0 / in_stock False.
+    Inventory-API misses keep those sentinels but set ``stock_confirmed`` False.
+    """
+    if not isinstance(info, dict) or info.get("error"):
+        return False
+    if info.get("stock_confirmed") is False:
+        return False
+    return "quantity" in info or "in_stock" in info
+
+
+def _live_supplier_quote_applied(info: dict, prior_price, prior_shipping) -> bool:
+    """Whether this payload replaced stored cost with a usable GIGA quote.
+
+    Matches ``lookup_live_supplier_quote`` + ``apply_live_supplier_quote``:
+    error payloads and non-positive prices are not quotes, and an unchanged
+    price/shipping was not applied.
+    """
+    if not isinstance(info, dict) or info.get("error"):
+        return False
+    price = _optional_float(info.get("price"))
+    shipping = _optional_float(info.get("shipping_fee"))
+    if price is None or price <= 0:
+        return False
+    price_changed = _optional_float(prior_price) != price
+    ship_changed = (
+        shipping is not None
+        and shipping >= 0
+        and _optional_float(prior_shipping) != shipping
+    )
+    return price_changed or ship_changed
+
+
 def calculate_smart_final_price(product: dict, market_price: float | None = None) -> float:
     """Calculate final price using smart pricing with Terapeak data.
     
@@ -629,19 +673,30 @@ def calculate_smart_final_price(product: dict, market_price: float | None = None
         key = os.getenv("DAJIAN_API_KEY")
         secret = os.getenv("DAJIAN_API_SECRET")
         if key and secret:
-            info = DaJianClient(key, secret).get_stock_info(product.get("sku") or "")
+            prior_price = product.get("price")
+            prior_shipping = product.get("shipping")
+            info = DaJianClient(key, secret).get_stock_info(product.get("sku") or "") or {}
             live_price = info.get("price")
             live_ship = info.get("shipping_fee")
-            if "quantity" in info:
-                product["live_quantity"] = int(info.get("quantity") or 0)
-            if "in_stock" in info:
-                product["live_in_stock"] = bool(info.get("in_stock"))
+            # Lookup misses use the same 0 / False sentinels as real OOS.
+            # Only a confirmed reading may block publish.
+            if _confirmed_supplier_stock(info):
+                if "quantity" in info:
+                    product["live_quantity"] = int(info.get("quantity") or 0)
+                if "in_stock" in info:
+                    product["live_in_stock"] = bool(info.get("in_stock"))
+            else:
+                product.pop("live_quantity", None)
+                product.pop("live_in_stock", None)
             if live_price is not None:
                 product_price = float(live_price)
                 product["price"] = product_price
             if live_ship is not None:
                 shipping = float(live_ship)
                 product["shipping"] = shipping
+            product["live_supplier_quote_applied"] = _live_supplier_quote_applied(
+                info, prior_price, prior_shipping
+            )
             logger.info(
                 f"  [PRICE] Live supplier cost: price=${product_price:.2f} "
                 f"ship=${shipping:.2f}"
@@ -883,6 +938,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     # Same gates apply to --dry-run so the preview matches real publish outcome.
     from src.utils.copy_skip_gate import (
         MAX_SUPPLIER_CARGO_COST_USD,
+        cargo_gate_applies,
         supplier_cargo_cost,
     )
     live_qty = product.get("live_quantity")
@@ -901,8 +957,19 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 "copy_skip_reasons": ["out_of_stock"],
             }
 
+    # eBay-link drafts store an observed listing price. Same rule as analyze:
+    # the cargo cap applies only after a live GIGA quote replaces that price.
+    raw_specs = product.get("specs") or {}
+    specs = raw_specs if isinstance(raw_specs, dict) else {}
     cargo = supplier_cargo_cost(product.get("price"), product.get("shipping"))
-    if cargo is not None and cargo > MAX_SUPPLIER_CARGO_COST_USD:
+    if (
+        cargo_gate_applies(
+            specs,
+            live_quote_applied=bool(product.get("live_supplier_quote_applied")),
+        )
+        and cargo is not None
+        and cargo > MAX_SUPPLIER_CARGO_COST_USD
+    ):
         msg = (
             f"Blocked cargo_cost_over_cap: supplier cargo "
             f"${cargo:.2f} > ${MAX_SUPPLIER_CARGO_COST_USD:g}"
