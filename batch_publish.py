@@ -823,6 +823,13 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     environment = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION")
     publish_image_limit = _publish_image_limit(sku)
 
+    # Publish gate: never live-list blacklisted GIGA sellers (N735*/W1706*/ZL*).
+    from src.utils.copy_skip_gate import seller_is_blacklisted
+    if seller_is_blacklisted(sku):
+        msg = f"Blocked seller prefix (blacklist_seller): {sku}"
+        record_error(sku, msg)
+        return {"status": "error", "message": msg, "copy_skip_reasons": ["blacklist_seller"]}
+
     # ── Step 0: Enrich missing dimensions from Dajian API ──
     enrich_product_dimensions(product)
 

@@ -1075,7 +1075,7 @@ async def collect_product(
 
         # Intake gates that the payload can already answer. Missing dims stay
         # deferred so analyze can still read supplier assembled measurements.
-        # Placeholder dims and N735* / cargo>200 never schedule copy generation.
+        # Placeholder dims and N735*/W1706*/ZL* / cargo>200 never schedule copy generation.
         intake_skip = evaluate_copy_skip(
             sku=payload.sku,
             product_price=payload.price,

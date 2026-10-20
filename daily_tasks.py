@@ -1366,7 +1366,11 @@ def send_ops_summary_email(results: dict):
         f"全量审核{full_oos_audit.get('checked_count', 0)}个 "
         f"恢复{full_oos_audit.get('restocked_count', 0)}个"
     )
-    return send_email(subject, html)
+    from src.utils.email_policy import should_smtp
+    # 2026-10: ops summary folded into daily_ops_digest unless issues
+    inv = results.get('inventory', {}) or {}
+    has_issues = bool(inv.get('error') or inv.get('ghost_restock_error'))
+    return send_email(subject, html, send_smtp=should_smtp(has_issues=has_issues))
 
 
 def send_daily_summary_email(results: dict):
@@ -1722,7 +1726,14 @@ def send_daily_summary_email(results: dict):
                f"调价{smart_reprice_count} "
                f"{health_icon}健康{health_problems}问题 "
                f"🎯CRO {cro_summary.get('avg_cro_score', 0):.0f}分/P1队{cro.get('p1_queued', 0)}")
-    return send_email(subject, html)
+    from src.utils.email_policy import should_smtp
+    has_issues = bool(
+        (results.get('inventory') or {}).get('error')
+        or (results.get('health_check') or {}).get('error')
+        or (results.get('finance') or {}).get('error')
+        or str((results.get('smart_reprice') or {}).get('status') or '').lower() in {'failed', 'error'}
+    )
+    return send_email(subject, html, send_smtp=should_smtp(has_issues=has_issues))
 
 
 def run_cro_diagnose(enqueue_p1: bool = True) -> dict:
@@ -2417,7 +2428,9 @@ def _send_mi_daily_digest(opportunities: list, kpi: dict, snap_name: str,
                 digest_path.name,
             )
             return True
-        return send_email(subject, html)
+        from src.utils.email_policy import should_smtp
+        # 2026-10: MI digest folded into daily_ops_digest; F18 alerts still SMTP
+        return send_email(subject, html, send_smtp=should_smtp(has_issues=False))  # MI digest SMTP silenced
     except Exception as e:
         logger.error(f"MI 日报邮件发送失败: {e}")
         return False
@@ -2628,17 +2641,19 @@ def main():
     
     logger.info(f"日志已保存到: {log_file}")
     
-    # 发送汇总邮件（全量任务模式下）— --mi-only / --ops-only 各自发专用邮件
+    # 2026-10: routine summaries archive locally; combined digest @11:45 sends SMTP.
+    # send_* helpers still write reports/; SMTP only when email_policy says issues
+    # or EMAIL_FORCE_ROUTINE=1.
     if args.ops_only:
         try:
             send_ops_summary_email(results)
         except Exception as e:
-            logger.error(f"ops 汇总邮件发送失败: {e}")
+            logger.error(f"ops summary email failed: {e}")
     elif not (args.analyze_only or args.sync_only or args.mi_only):
         try:
             send_daily_summary_email(results)
         except Exception as e:
-            logger.error(f"汇总邮件发送失败: {e}")
+            logger.error(f"daily summary email failed: {e}")
     
     return results
 

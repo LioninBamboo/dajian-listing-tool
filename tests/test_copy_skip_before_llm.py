@@ -19,6 +19,7 @@ from src.utils.copy_skip_gate import (
     REASON_MATERIAL_CONFLICT,
     REASON_UNCLEAR_DIMS,
     evaluate_copy_skip,
+    seller_is_blacklisted,
     market_median_from_intel,
     safe_15_price,
     supplier_cargo_cost,
@@ -26,6 +27,17 @@ from src.utils.copy_skip_gate import (
 from src.utils.listing_fact_sheet import extract_fact_sheet
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_seller_is_blacklisted_prefixes():
+    assert seller_is_blacklisted("N735P1")
+    assert seller_is_blacklisted("W1706P1")
+    assert seller_is_blacklisted("ZL999")
+    assert seller_is_blacklisted("zlABC")
+    assert not seller_is_blacklisted("N710P1")
+    assert not seller_is_blacklisted("W1705P1")
+    assert not seller_is_blacklisted("W17")
+    assert not seller_is_blacklisted("")
 
 CLEAR_DIMS = {
     "Assembled Length (in.)": "40",
@@ -51,18 +63,23 @@ def _decision(**overrides):
 
 
 def test_near_market_band_matches_dryrun_overpriced_band():
-    assert NEAR_MARKET_BAND == FLOOR_OVER_MARKET_LOCK == PRICE_OVERPRICED == 1.15
+    assert NEAR_MARKET_BAND == FLOOR_OVER_MARKET_LOCK == 1.30
+    assert PRICE_OVERPRICED == 1.15  # CRO overpriced alert stays tighter
     assert float(PricingEngine.MIN_NET_MARGIN_ON_COST) == 0.10
-    assert MAX_SUPPLIER_CARGO_COST_USD == 200
+    assert MAX_SUPPLIER_CARGO_COST_USD == 250
 
 
 def test_blacklist_cargo_dims_and_material_reasons():
-    black = _decision(sku="n735P999", include_market=False)
-    assert black.reasons == [REASON_BLACKLIST_SELLER]
+    for blocked_sku in ("n735P999", "W1706P100001", "ZL12345", "zl9P1"):
+        black = _decision(sku=blocked_sku, include_market=False)
+        assert black.reasons == [REASON_BLACKLIST_SELLER], blocked_sku
+    # Nearby prefixes must not false-positive
+    ok = _decision(sku="N710P100001", include_market=False)
+    assert REASON_BLACKLIST_SELLER not in ok.reasons
 
-    cargo = _decision(product_price=180, shipping=25, include_market=False)
+    cargo = _decision(product_price=230, shipping=25, include_market=False)
     assert REASON_CARGO_COST in cargo.reasons
-    assert supplier_cargo_cost(180, 25) == 205
+    assert supplier_cargo_cost(230, 25) == 255
 
     missing = _decision(attributes={}, specs={}, description="", include_market=False)
     assert missing.reasons == [REASON_UNCLEAR_DIMS]
@@ -233,7 +250,11 @@ def test_analyze_callers_gate_before_llm_copy():
         )
         assert source
         assert "market_advisory_log_line" in source
-        assert "if market_skip.skip" in source or "if priced_skip.skip" in source or "if intel_skip.skip" in source
+        assert (
+            "if market_skip.skip" in source
+            or "if priced_skip.skip" in source
+            or "if intel_skip.skip" in source
+        )
 
     collect = _function(ROOT / "server.py", "collect_product")
     gate_lines = _call_lines(collect, "evaluate_copy_skip")
@@ -354,7 +375,9 @@ def _run_analyze(monkeypatch, product, *, intel, live_quote=None):
     ("sku", "price", "shipping", "title", "attributes", "intel", "live", "reason", "market_called"),
     [
         ("N735P000111", 40, 10, "Oak Side Table", CLEAR_DIMS, None, None, REASON_BLACKLIST_SELLER, False),
-        ("N710P100001", 180, 30, "Oak Side Table", CLEAR_DIMS, None, None, REASON_CARGO_COST, False),
+        ("W1706P000222", 40, 10, "Oak Side Table", CLEAR_DIMS, None, None, REASON_BLACKLIST_SELLER, False),
+        ("ZL000333", 40, 10, "Oak Side Table", CLEAR_DIMS, None, None, REASON_BLACKLIST_SELLER, False),
+        ("N710P100001", 230, 30, "Oak Side Table", CLEAR_DIMS, None, None, REASON_CARGO_COST, False),
         ("N710P100001", 40, 10, "Oak Side Table", {}, None, None, REASON_UNCLEAR_DIMS, False),
         (
             "N710P100001",
@@ -392,13 +415,13 @@ def test_live_cargo_recheck_skips_before_llm(monkeypatch):
         monkeypatch,
         product,
         intel=None,
-        live_quote={"price": 190, "shipping": 20},
+        live_quote={"price": 240, "shipping": 20},
     )
     assert calls["optimize"] == 0
     assert calls["fact_sheet"] == 0
     assert calls["live"] == 1
     assert calls["market"] == 0
-    assert product.price == 190
+    assert product.price == 240
     assert product.shipping == 20
     assert REASON_CARGO_COST in result["skip_reasons"][product.sku]
 
@@ -448,3 +471,14 @@ def test_safe_15_no_market_and_near_market_still_generate_copy(monkeypatch):
     assert calls["optimize"] == 1
     assert near.status == "READY"
     assert result["skipped"] == 0
+
+
+def test_cargo_cap_250_boundary():
+    passes = _decision(product_price=190, shipping=30, include_market=False)  # $220
+    assert REASON_CARGO_COST not in passes.reasons
+    skipped = _decision(product_price=224.76, shipping=30, include_market=False)  # $254.76
+    assert REASON_CARGO_COST in skipped.reasons
+    from src.utils import copy_skip_gate as _g
+    assert _g.REASON_CARGO_COST == "cargo_cost_over_cap"
+    assert _g.REASON_CARGO_COST_LEGACY == "cargo_cost_over_200"
+    assert "cargo_cost_over_200" in _g.CARGO_COST_REASONS
