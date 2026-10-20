@@ -144,6 +144,35 @@ def test_wood_matches_solid_wood():
     assert value_supported_by_source("Wood", "solid wood frame") is True
 
 
+def test_placeholder_values_are_not_treated_as_sourced():
+    source = "Please see the product description for included hardware and assembly."
+    assert value_supported_by_source("See Description", source) is False
+    assert value_supported_by_source("Refer to description", source) is False
+
+    completed = {"Type": ["Coffee Table"]}
+    restore_sourced_aspects(
+        completed,
+        {
+            "Type": ["Coffee Table"],
+            "Color": ["See Description"],
+            "Features": ["Refer to description"],
+        },
+        source,
+    )
+    assert completed["Type"] == ["Coffee Table"]
+    assert "Color" not in completed
+    assert "Features" not in completed
+
+    completed["Color"] = ["See Description"]
+    blockers = guard_unsourced_aspects(
+        completed,
+        source_text=source,
+        required_names=[],
+    )
+    assert blockers == []
+    assert "Color" not in completed
+
+
 def test_insertion_fee_real_shape_zero_is_allowed():
     reason = evaluate_insertion_fee_preview(
         listing_fees={
@@ -853,3 +882,146 @@ def test_resolve_path_uses_blacklist_categories_path_when_cache_missing(monkeypa
         blacklist_path=str(blacklist),
     )
     assert path == "eBay Motors > Other Vehicles & Trailers > Trailers"
+
+
+def _install_retry_ebay_client(monkeypatch, *, publish_offer):
+    class _FakeEbayClient:
+        def __init__(self, oauth, policy_manager):
+            pass
+
+        def _prepare_inventory_image_urls(self, sku, raw_images, max_images=24):
+            return ["https://i.ebayimg.com/images/g/AAA/s-l1600.jpg"]
+
+        def create_or_replace_inventory_item(self, sku, product):
+            _FakeEbayClient.inventory_aspects.append(dict(product.get("aspects") or {}))
+            return {"status": "success"}
+
+        def create_offer(self, sku, price, category_id=None, listing_description=None, marketplace_id=None):
+            return {"offerId": "offer-1"}
+
+        def get_offer(self, offer_id):
+            return {"status": "DRAFT"}
+
+        def get_offers_by_sku(self, sku):
+            return []
+
+        def get_listing_fees(self, offer_id):
+            return {
+                "feeSummaries": [{
+                    "fees": [{
+                        "feeType": "InsertionFee",
+                        "amount": {"value": "0.00", "currency": "USD"},
+                    }]
+                }]
+            }
+
+        def delete_offer(self, offer_id):
+            return True
+
+        def publish_offer(self, offer_id):
+            return publish_offer(offer_id)
+
+        def get_inventory_item(self, sku):
+            return {}
+
+    _FakeEbayClient.inventory_aspects = []
+    monkeypatch.setattr(batch_publish, "_persist_prepared_listing", lambda **kwargs: None)
+    monkeypatch.setattr(batch_publish, "_try_upload_video", lambda *args, **kwargs: (None, "ok"))
+    monkeypatch.setattr(batch_publish, "_sync_motors_compatibility", lambda *args, **kwargs: None)
+    monkeypatch.setattr(batch_publish, "resolve_publish_quantity", lambda sku, logger=None: 1)
+    monkeypatch.setattr(batch_publish, "update_product_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(batch_publish.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr("src.clients.real_ebay_client.RealEbayClient", _FakeEbayClient)
+    return _FakeEbayClient
+
+
+def test_invalid_category_retry_rechecks_source_and_fee_guards(monkeypatch):
+    class _Matcher(_FakeCategoryMatcher):
+        def __init__(self, oauth):
+            super().__init__(oauth)
+            self.calls = 0
+
+        def get_category_and_aspects(self, title, aspects, description):
+            self.calls += 1
+            if self.calls == 1:
+                return "38204", "Coffee Tables", dict(aspects)
+            invented = dict(aspects)
+            invented["Finish"] = ["Apothecary Cabinet"]
+            return "6038", "Trailers", invented
+
+        def _get_category_aspects(self, category_id):
+            if str(category_id) == "6038":
+                return (
+                    [{"name": "Finish", "required": True, "allowed_values": ["Apothecary Cabinet"]}],
+                    [],
+                )
+            return [], []
+
+        def get_category_path(self, category_id, category_name="", title=""):
+            if str(category_id) == "6038":
+                return "eBay Motors > Other Vehicles & Trailers > Trailers"
+            return "Home & Garden > Furniture > Tables > Coffee Tables"
+
+    def _publish(offer_id):
+        raise RuntimeError('{"errorId":25005,"message":"invalid category"}')
+
+    _install_retry_ebay_client(monkeypatch, publish_offer=_publish)
+    _stub_publish_common(monkeypatch, matcher_factory=lambda oauth: _Matcher(oauth))
+    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", "/nonexistent-high-fee-blacklist.json")
+
+    result = batch_publish.publish_single_product(_product(), dry_run=False)
+
+    assert result["status"] == "error"
+    assert "unsourced_required_aspect:Finish" in result["message"]
+    assert "high_insertion_fee" in result["copy_skip_reasons"]
+    assert "unsourced_required_aspect:Finish" in result["copy_skip_reasons"]
+
+
+def test_invalid_category_retry_strips_template_defaults_before_republish(monkeypatch):
+    published = []
+
+    class _Matcher(_FakeCategoryMatcher):
+        def __init__(self, oauth):
+            super().__init__(oauth)
+            self.calls = 0
+
+        def get_category_and_aspects(self, title, aspects, description):
+            self.calls += 1
+            if self.calls == 1:
+                return "38204", "Coffee Tables", dict(aspects)
+            invented = dict(aspects)
+            invented["Style"] = ["Modern"]
+            invented["Color"] = ["See Description"]
+            return "99901", "Side Tables", invented
+
+        def _get_category_aspects(self, category_id):
+            return [], []
+
+        def get_category_path(self, category_id, category_name="", title=""):
+            return "Home & Garden > Furniture > Tables > Side Tables"
+
+    def _publish(offer_id):
+        if not published:
+            published.append("fail")
+            raise RuntimeError("invalid category id")
+        published.append(offer_id)
+        return {"listingId": "listing-2"}
+
+    client = _install_retry_ebay_client(monkeypatch, publish_offer=_publish)
+    monkeypatch.setattr(
+        batch_publish,
+        "verify_publish_readback",
+        lambda *args, **kwargs: {"status": "verified", "passed": True, "issues": []},
+    )
+    monkeypatch.setattr(batch_publish, "build_publish_readback_expectation", lambda **kwargs: {})
+    _stub_publish_common(monkeypatch, matcher_factory=lambda oauth: _Matcher(oauth))
+    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", "/nonexistent-high-fee-blacklist.json")
+
+    result = batch_publish.publish_single_product(_product(), dry_run=False)
+
+    assert result["status"] == "success"
+    assert published == ["fail", "offer-1"]
+    assert len(client.inventory_aspects) == 2
+    assert "Style" not in client.inventory_aspects[1]
+    assert "Color" not in client.inventory_aspects[1]
+    assert client.inventory_aspects[1]["Type"] == ["Coffee Table"]

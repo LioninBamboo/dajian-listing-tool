@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Iterable, Mapping, MutableMapping, Optional
 
+from src.utils.publish_autofix import is_placeholder_aspect_value
 from src.utils.publish_validation import MEASUREMENT_ASPECT_KEYS, first_aspect_text
 
 
@@ -164,7 +165,9 @@ def _phrase_in_source(phrase: str, source_text: str) -> bool:
 
 def value_supported_by_source(value: str, source_text: str) -> bool:
     text = str(value or "").strip()
-    if not text:
+    # Token overlap is not evidence for placeholders such as "See Description":
+    # ordinary copy contains those words, and sanitize already removed them.
+    if not text or is_placeholder_aspect_value(text):
         return False
     return _phrase_in_source(text, source_text)
 

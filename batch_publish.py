@@ -1615,6 +1615,31 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                             completed_aspects.update(new_aspects)
                             marketplace_id = _target_marketplace(category_id)
                             category_reselected = True
+                            category_path, required_aspect_names, retry_blockers = (
+                                _recheck_publish_guards_for_category(
+                                    category_matcher,
+                                    completed_aspects,
+                                    original_aspects=original_opt_aspects,
+                                    source_text=source_text,
+                                    category_id=category_id,
+                                    category_name=category_name,
+                                    title=title_context,
+                                    sku=sku,
+                                )
+                            )
+                            if retry_blockers:
+                                msg = "; ".join(retry_blockers)
+                                record_error(sku, msg)
+                                result = {"status": "error", "message": msg}
+                                skip_reasons = [
+                                    blocker
+                                    for blocker in retry_blockers
+                                    if blocker.startswith("unsourced_required_aspect:")
+                                    or blocker in {"high_insertion_fee", "fee_preview_unavailable"}
+                                ]
+                                if skip_reasons:
+                                    result["copy_skip_reasons"] = skip_reasons
+                                return result
                     continue
                 except Exception:
                     pass
@@ -1626,6 +1651,61 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     msg = f"Failed after {MAX_RETRIES} attempts: {last_error}"
     record_error(sku, msg)
     return {"status": "error", "message": msg}
+
+
+def _recheck_publish_guards_for_category(
+    category_matcher,
+    completed_aspects,
+    *,
+    original_aspects,
+    source_text,
+    category_id,
+    category_name,
+    title,
+    sku,
+):
+    """Re-apply source-aspect and path fee guards after a category change.
+
+    Invalid-category retries fill missing requireds from allowed-value defaults
+    and must not publish those values, or a stale tree path, unchecked.
+    """
+    category_path = resolve_publish_category_path(
+        category_matcher,
+        category_id,
+        category_name=category_name,
+        title=title,
+        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+    )
+    restore_sourced_aspects(completed_aspects, original_aspects, source_text)
+    required_meta, recommended_meta = category_matcher._get_category_aspects(category_id)
+    required_names = [
+        aspect.get("name")
+        for aspect in required_meta
+        if aspect.get("name")
+    ]
+    allowed_values_by_name = {}
+    for aspect in list(required_meta) + list(recommended_meta):
+        aspect_name = aspect.get("name")
+        if aspect_name and aspect.get("allowed_values"):
+            allowed_values_by_name[aspect_name] = aspect["allowed_values"]
+    blockers = guard_unsourced_aspects(
+        completed_aspects,
+        source_text=source_text,
+        required_names=required_names,
+        allowed_values_by_name=allowed_values_by_name,
+        sku=sku,
+        log=lambda message: logger.info(f"  {message}"),
+    )
+    fee_reason = evaluate_insertion_fee_preview(
+        category_id=category_id,
+        category_path=category_path,
+        category_name=category_name or "",
+        lookup_attempted=False,
+        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+    )
+    if fee_reason and fee_reason not in blockers:
+        blockers.append(fee_reason)
+    return category_path, required_names, blockers
 
 
 def resolve_publish_category_path(
