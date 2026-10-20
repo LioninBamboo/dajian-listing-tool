@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -201,3 +203,225 @@ def test_genuine_outdoor_daybeds_still_classified():
     ):
         category_id, _ = matcher.canonicalize_category(title, "38204", "Benches", description)
         assert category_id == "138996", title
+
+
+MOTORS_TRAILER_TREE = {
+    "categoryTreeId": "100",
+    "categoryTreeVersion": "1",
+    "rootCategoryNode": {
+        "category": {"categoryId": "6000", "categoryName": "eBay Motors"},
+        "childCategoryTreeNodes": [
+            {
+                "category": {
+                    "categoryId": "66468",
+                    "categoryName": "Other Vehicles & Trailers",
+                },
+                "childCategoryTreeNodes": [
+                    {
+                        "category": {"categoryId": "6038", "categoryName": "Trailers"},
+                    }
+                ],
+            }
+        ],
+    },
+}
+
+
+def _install_tree_cache(monkeypatch, tmp_path, trees=None):
+    from src.utils import category_tree_cache
+
+    cache_dir = tmp_path / "data" / "cache"
+    cache_dir.mkdir(parents=True)
+    category_tree_cache.reset_category_tree_cache()
+    monkeypatch.setattr(category_tree_cache, "DEFAULT_CACHE_DIR", cache_dir)
+    for tree_id, payload in (trees or {"100": MOTORS_TRAILER_TREE}).items():
+        category_tree_cache.write_category_tree_cache(tree_id, payload, cache_dir)
+    return cache_dir
+
+
+def test_get_category_path_builds_from_cached_tree(monkeypatch, tmp_path):
+    http_calls = []
+
+    def _forbid_http(*args, **kwargs):
+        http_calls.append((args, kwargs))
+        raise AssertionError("publish path must not fetch taxonomy trees")
+
+    _install_tree_cache(monkeypatch, tmp_path)
+    monkeypatch.setattr("src.services.ebay_category_matcher.requests.get", _forbid_http)
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    path = matcher.get_category_path(
+        "6038",
+        category_name="Trailers",
+        title="Bathroom Vanity with Sink",
+    )
+    assert path == "eBay Motors > Other Vehicles & Trailers > Trailers"
+    assert http_calls == []
+
+
+def test_get_category_path_stale_cache_returns_empty(monkeypatch, tmp_path):
+    import time
+
+    from src.utils import category_tree_cache
+
+    cache_dir = _install_tree_cache(monkeypatch, tmp_path)
+    cache_file = cache_dir / "category_tree_100.json"
+    stale = time.time() - (8 * 24 * 60 * 60)
+    os.utime(cache_file, (stale, stale))
+    category_tree_cache.reset_category_tree_cache()
+
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    assert matcher.get_category_path("6038") == ""
+    assert "6038" not in matcher._path_cache
+
+
+def test_refresh_writes_get_category_tree_not_subtree(tmp_path):
+    from src.utils.category_tree_cache import fetch_category_tree, refresh_category_tree_cache
+
+    class _Session:
+        def __init__(self):
+            self.urls = []
+
+        def get(self, url, headers=None, timeout=None):
+            self.urls.append(url)
+
+            class _Resp:
+                status_code = 200
+
+                def json(self):
+                    return {
+                        "categoryTreeId": "0",
+                        "rootCategoryNode": {
+                            "category": {"categoryId": "0", "categoryName": "Root"}
+                        },
+                    }
+
+            return _Resp()
+
+    session = _Session()
+    payload = fetch_category_tree(
+        "0",
+        session=session,
+        token="app-token",
+        api_base="https://api.ebay.com",
+    )
+    assert session.urls == ["https://api.ebay.com/commerce/taxonomy/v1/category_tree/0"]
+    assert "subtree" not in session.urls[0]
+
+    fetched = []
+
+    def _fetch(tree_id):
+        fetched.append(tree_id)
+        return payload
+
+    written = refresh_category_tree_cache(("0", "100"), fetch=_fetch, cache_dir=tmp_path)
+    assert fetched == ["0", "100"]
+    assert [path.name for path in written] == ["category_tree_0.json", "category_tree_100.json"]
+    snapshot = json.loads(written[0].read_text(encoding="utf-8"))
+    assert snapshot["source_host"] == "https://api.ebay.com"
+
+
+def test_refresh_script_uses_production_when_env_is_production(monkeypatch, tmp_path):
+    import scripts.refresh_category_tree_cache as refresh
+
+    monkeypatch.setenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    constructed = []
+
+    class _Oauth:
+        def __init__(self, environment="SANDBOX"):
+            constructed.append(environment)
+            self.api_base = "https://api.ebay.com"
+
+        def get_application_token(self):
+            return "app-token"
+
+    class _Session:
+        def get(self, url, headers=None, timeout=None):
+            class _Resp:
+                status_code = 200
+
+                def json(self):
+                    return {
+                        "categoryTreeId": "0",
+                        "rootCategoryNode": {
+                            "category": {"categoryId": "0", "categoryName": "Root"},
+                        },
+                    }
+
+            return _Resp()
+
+    monkeypatch.setattr("src.services.ebay_auth.EbayOAuthService", _Oauth)
+    monkeypatch.setattr("requests.Session", lambda: _Session())
+
+    assert refresh.refresh_oauth_environment() == "PRODUCTION"
+    rc = refresh.main(["--cache-dir", str(tmp_path), "--trees", "0"])
+    assert rc == 0
+    assert constructed == ["PRODUCTION"]
+    snapshot = json.loads((tmp_path / "category_tree_0.json").read_text(encoding="utf-8"))
+    assert snapshot["source_host"] == "https://api.ebay.com"
+
+
+def test_refresh_script_refuses_sandbox_host_without_flag(monkeypatch, tmp_path):
+    import scripts.refresh_category_tree_cache as refresh
+    from src.utils.category_tree_cache import require_production_api_base
+
+    monkeypatch.setenv("EBAY_ENVIRONMENT", "SANDBOX")
+
+    class _Oauth:
+        def __init__(self, environment="SANDBOX"):
+            self.environment = environment
+            self.api_base = "https://api.sandbox.ebay.com"
+
+        def get_application_token(self):
+            raise AssertionError("must not fetch taxonomy after refusing sandbox host")
+
+    monkeypatch.setattr("src.services.ebay_auth.EbayOAuthService", _Oauth)
+
+    try:
+        require_production_api_base("https://api.sandbox.ebay.com")
+        raise AssertionError("sandbox host should be refused")
+    except ValueError as exc:
+        assert "non-production" in str(exc)
+
+    rc = refresh.main(["--cache-dir", str(tmp_path), "--trees", "0"])
+    assert rc == 2
+    assert list(tmp_path.glob("category_tree_*.json")) == []
+
+
+def test_loader_rejects_sandbox_snapshot(monkeypatch, tmp_path):
+    from src.utils import category_tree_cache
+
+    cache_dir = tmp_path / "data" / "cache"
+    cache_dir.mkdir(parents=True)
+    category_tree_cache.reset_category_tree_cache()
+    monkeypatch.setattr(category_tree_cache, "DEFAULT_CACHE_DIR", cache_dir)
+    category_tree_cache.write_category_tree_cache(
+        "100",
+        MOTORS_TRAILER_TREE,
+        cache_dir,
+        source_host="https://api.sandbox.ebay.com",
+        allow_sandbox=True,
+    )
+
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    assert matcher.get_category_path("6038") == ""
+    assert "6038" not in matcher._path_cache
+
+
+def test_get_category_path_missing_cache_returns_empty(monkeypatch, tmp_path):
+    from src.utils import category_tree_cache
+
+    cache_dir = tmp_path / "data" / "cache"
+    cache_dir.mkdir(parents=True)
+    category_tree_cache.reset_category_tree_cache()
+    monkeypatch.setattr(category_tree_cache, "DEFAULT_CACHE_DIR", cache_dir)
+
+    http_calls = []
+    monkeypatch.setattr(
+        "src.services.ebay_category_matcher.requests.get",
+        lambda *args, **kwargs: http_calls.append((args, kwargs)) or (_ for _ in ()).throw(AssertionError("no HTTP")),
+    )
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    path = matcher.get_category_path("6038", category_name="Trailers", title="Hollywood vanity")
+    assert path == ""
+    assert "6038" not in matcher._path_cache
+    assert http_calls == []

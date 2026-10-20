@@ -680,10 +680,12 @@ def test_coolers_are_not_published_as_tables():
     assert matcher.is_category_plausible_for_text(title, "79691", "Ice Chests & Coolers")
 
 
-def test_existing_offer_update_does_not_preserve_zero_quantity():
-    assert RealEbayClient._positive_offer_quantity(0) == 1
-    assert RealEbayClient._positive_offer_quantity("0") == 1
+def test_existing_offer_update_respects_resolved_quantity():
+    assert RealEbayClient._positive_offer_quantity(0, default=2) == 0
+    assert RealEbayClient._positive_offer_quantity("0", default=2) == 0
+    assert RealEbayClient._positive_offer_quantity(1, default=2) == 1
     assert RealEbayClient._positive_offer_quantity(5) == 5
+    assert RealEbayClient._positive_offer_quantity(None, default=2) == 2
 
 
 def test_existing_offer_update_completes_missing_business_policies():

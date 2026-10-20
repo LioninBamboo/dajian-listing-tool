@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Any, Tuple
 
 from src.utils.product_context_signals import mentions_cooler_product, outdoor_context
 from src.services.ebay_auth import EbayOAuthService
+from src.utils.category_tree_cache import build_category_path
 from src.utils.store_profile import get_store_profile
 
 
@@ -24,6 +25,30 @@ class EbayCategoryMatcher:
         self.oauth = oauth_service
         self.base_url = "https://api.ebay.com"
         self._aspects_cache: Dict[str, List[Dict]] = {}  # Cache category aspects
+        self._path_cache: Dict[str, str] = {}
+
+    def get_category_path(
+        self,
+        category_id: str,
+        category_name: str = "",
+        title: str = "",
+    ) -> str:
+        """Return the full taxonomy path (ancestors + leaf) for a category id.
+
+        Built from the on-disk cached tree (data/cache/category_tree_<id>.json).
+        Never calls get_category_subtree or get_category_tree. A missing or
+        stale cache returns "" so callers can fail safe and rely on
+        blacklist-by-id instead of treating the leaf name as a complete path.
+        """
+        cid = str(category_id or "").strip()
+        if cid and cid in self._path_cache:
+            return self._path_cache[cid]
+        if not cid:
+            return ""
+        path = build_category_path(cid)
+        if path:
+            self._path_cache[cid] = path
+        return path
 
     def canonicalize_category(
         self,

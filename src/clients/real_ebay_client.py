@@ -525,6 +525,27 @@ class RealEbayClient:
         except Exception as e:
             logging.error(f"get_offer({offer_id}): {e}")
             return None
+
+    def get_listing_fees(self, offer_id: str) -> Dict:
+        """Look up listing fees for an existing offer.
+
+        POST /sell/inventory/v1/offer/get_listing_fees
+        """
+        url = f"{self.base_url}/sell/inventory/v1/offer/get_listing_fees"
+        token = self.oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Content-Language": "en-US",
+        }
+        payload = {"offers": [{"offerId": str(offer_id)}]}
+        response = self.session.post(url, headers=headers, json=payload, timeout=60)
+        if response.status_code != 200:
+            raise Exception(
+                f"getListingFees failed: HTTP {response.status_code} {response.text[:300]}"
+            )
+        return response.json()
     
     def create_or_replace_inventory_item(self, sku: str, product: Dict) -> Dict:
         """
@@ -869,10 +890,13 @@ class RealEbayClient:
         
         target_marketplace = marketplace_id or self.marketplace_id
 
+        available_quantity = self._resolved_publish_quantity(sku)
+
         payload = {
             "sku": sku,
             "marketplaceId": target_marketplace,
             "format": "FIXED_PRICE",
+            "availableQuantity": int(available_quantity),
             "merchantLocationKey": get_store_profile().merchant_location_key,
             "pricingSummary": {
                 "price": {
@@ -954,6 +978,9 @@ class RealEbayClient:
                                             listing_description=listing_description,
                                         )
                                     except Exception as update_e:
+                                        from src.utils.ebay_quantity import SupplierOutOfStockError
+                                        if isinstance(update_e, SupplierOutOfStockError):
+                                            raise
                                         print(f"[WARN] Failed to update existing offer category: {update_e}")
                                         # Continue to return offerId so we can handle it downstream (e.g. delete it)
 
@@ -1329,11 +1356,31 @@ class RealEbayClient:
     
     @staticmethod
     def _positive_offer_quantity(value, default: int = 1) -> int:
+        """Coerce an offer quantity without raising it to the default floor."""
         try:
+            if value is None or value == "":
+                raise TypeError("missing quantity")
             quantity = int(value)
         except (TypeError, ValueError):
-            quantity = default
-        return max(default, quantity)
+            try:
+                return max(0, int(default))
+            except (TypeError, ValueError):
+                return 1
+        return max(0, quantity)
+
+    def _resolved_publish_quantity(self, sku: str) -> int:
+        from src.utils.ebay_quantity import (
+            SupplierOutOfStockError,
+            default_ebay_listing_quantity,
+            resolve_publish_quantity,
+        )
+
+        try:
+            return int(resolve_publish_quantity(sku))
+        except SupplierOutOfStockError:
+            raise
+        except Exception:
+            return int(default_ebay_listing_quantity())
 
     def update_offer_category(self, offer_id: str, category_id: str, price: float = None, listing_description: str = None) -> bool:
         """
@@ -1408,7 +1455,16 @@ class RealEbayClient:
                     }
                 return payload
 
-            quantity = self._positive_offer_quantity(offer_data.get("availableQuantity", 1))
+            from src.utils.ebay_quantity import default_ebay_listing_quantity
+
+            sku = str(offer_data.get("sku") or "").strip()
+            if sku:
+                quantity = self._resolved_publish_quantity(sku)
+            else:
+                quantity = self._positive_offer_quantity(
+                    offer_data.get("availableQuantity"),
+                    default=default_ebay_listing_quantity(),
+                )
             response = self.session.put(
                 get_url,
                 headers=put_headers,
@@ -1465,6 +1521,9 @@ class RealEbayClient:
             return False
         
         except Exception as e:
+            from src.utils.ebay_quantity import SupplierOutOfStockError
+            if isinstance(e, SupplierOutOfStockError):
+                raise
             logging.error(f"Error updating offer: {e}")
             return False
             

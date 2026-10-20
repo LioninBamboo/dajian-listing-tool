@@ -88,6 +88,16 @@ def test_publish_uploads_source_video_before_inventory_put(monkeypatch):
         def create_offer(self, sku, price, category_id=None, listing_description=None, marketplace_id=None):
             return {"offerId": "offer-1"}
 
+        def get_listing_fees(self, offer_id):
+            return {
+                "feeSummaries": [{
+                    "fees": [{
+                        "feeType": "INSERTION_FEE",
+                        "amount": {"value": "0.35", "currency": "USD"},
+                    }]
+                }]
+            }
+
         def get_offer(self, offer_id):
             if not self.published:
                 return {"status": "DRAFT"}
@@ -183,6 +193,7 @@ def test_publish_blocks_when_publishable_video_upload_fails(monkeypatch):
     )
     monkeypatch.setattr(batch_publish, "_persist_video_status", lambda *args, **kwargs: None)
     monkeypatch.setattr(batch_publish, "update_product_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(batch_publish, "record_error", lambda *args, **kwargs: None)
     monkeypatch.setattr(batch_publish, "resolve_publish_quantity", lambda sku, logger=None: 1)
     monkeypatch.setattr(
         batch_publish,

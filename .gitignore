@@ -67,6 +67,9 @@ reports/*.csv
 backups/
 .pytest_cache/
 
+# Refreshed eBay taxonomy snapshots (large; regenerate via scripts/refresh_category_tree_cache.py)
+/data/cache/category_tree_*.json
+
 # Root-level ad hoc test/debug files (do not ignore tests/ suite)
 /test_*.py
 /debug_*.py
