@@ -1366,11 +1366,9 @@ def send_ops_summary_email(results: dict):
         f"全量审核{full_oos_audit.get('checked_count', 0)}个 "
         f"恢复{full_oos_audit.get('restocked_count', 0)}个"
     )
-    from src.utils.email_policy import should_smtp
-    # 2026-10: ops summary folded into daily_ops_digest unless issues
-    inv = results.get('inventory', {}) or {}
-    has_issues = bool(inv.get('error') or inv.get('ghost_restock_error'))
-    return send_email(subject, html, send_smtp=should_smtp(has_issues=has_issues))
+    # 11:45 没有合并摘要任务（watchdog 的 11:45 是 listing_audit）。
+    # ops 邮件本身就是 SMTP，不能按过窄的 has_issues 静音。
+    return send_email(subject, html)
 
 
 def send_daily_summary_email(results: dict):
@@ -1726,14 +1724,9 @@ def send_daily_summary_email(results: dict):
                f"调价{smart_reprice_count} "
                f"{health_icon}健康{health_problems}问题 "
                f"🎯CRO {cro_summary.get('avg_cro_score', 0):.0f}分/P1队{cro.get('p1_queued', 0)}")
-    from src.utils.email_policy import should_smtp
-    has_issues = bool(
-        (results.get('inventory') or {}).get('error')
-        or (results.get('health_check') or {}).get('error')
-        or (results.get('finance') or {}).get('error')
-        or str((results.get('smart_reprice') or {}).get('status') or '').lower() in {'failed', 'error'}
-    )
-    return send_email(subject, html, send_smtp=should_smtp(has_issues=has_issues))
+    # 09:30 日报直接 SMTP。不存在 11:45 合并摘要来接替；
+    # analyze/CRO/刊登审计/幽灵恢复/健康问题数也不会写进旧的 has_issues。
+    return send_email(subject, html)
 
 
 def run_cro_diagnose(enqueue_p1: bool = True) -> dict:
@@ -2428,9 +2421,8 @@ def _send_mi_daily_digest(opportunities: list, kpi: dict, snap_name: str,
                 digest_path.name,
             )
             return True
-        from src.utils.email_policy import should_smtp
-        # 2026-10: MI digest folded into daily_ops_digest; F18 alerts still SMTP
-        return send_email(subject, html, send_smtp=should_smtp(has_issues=False))  # MI digest SMTP silenced
+        # MI 日报就是这份摘要的 SMTP。没有 daily_ops_digest 任务可折叠进去。
+        return send_email(subject, html)
     except Exception as e:
         logger.error(f"MI 日报邮件发送失败: {e}")
         return False
@@ -2641,9 +2633,8 @@ def main():
     
     logger.info(f"日志已保存到: {log_file}")
     
-    # 2026-10: routine summaries archive locally; combined digest @11:45 sends SMTP.
-    # send_* helpers still write reports/; SMTP only when email_policy says issues
-    # or EMAIL_FORCE_ROUTINE=1.
+    # 发送汇总邮件。11:45 没有合并摘要（该时刻只巡检 listing_audit），
+    # 日报 / ops / MI 仍直接 SMTP。
     if args.ops_only:
         try:
             send_ops_summary_email(results)

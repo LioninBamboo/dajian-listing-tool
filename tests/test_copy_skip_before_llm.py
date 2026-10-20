@@ -63,8 +63,8 @@ def _decision(**overrides):
 
 
 def test_near_market_band_matches_dryrun_overpriced_band():
-    assert NEAR_MARKET_BAND == FLOOR_OVER_MARKET_LOCK == 1.30
-    assert PRICE_OVERPRICED == 1.15  # CRO overpriced alert stays tighter
+    assert NEAR_MARKET_BAND == 1.30
+    assert FLOOR_OVER_MARKET_LOCK == PRICE_OVERPRICED == 1.15
     assert float(PricingEngine.MIN_NET_MARGIN_ON_COST) == 0.10
     assert MAX_SUPPLIER_CARGO_COST_USD == 250
 

@@ -4,8 +4,8 @@ Runs BEFORE wishlist heart and detail collect so far-above SKUs never burn
 heart/collect/FactSheet/LLM effort. Complements ``copy_skip_gate`` which still
 blocks LLM copy at analyze when a live median arrives later.
 
-Drop rule (same band as conversion_diagnoser.FLOOR_OVER_MARKET_LOCK /
-copy_skip_gate.NEAR_MARKET_BAND = 1.30):
+Drop rule (listing band copy_skip_gate.NEAR_MARKET_BAND = 1.30;
+CRO conversion_diagnoser.FLOOR_OVER_MARKET_LOCK stays at PRICE_OVERPRICED 1.15):
 
     SAFE_15(list_price, list_shipping) > market_median * 1.30
         → drop with reason FLOOR_OVER_MARKET_LOCK when MARKET_GATE_ENABLED

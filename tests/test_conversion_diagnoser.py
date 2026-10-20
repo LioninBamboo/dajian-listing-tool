@@ -88,6 +88,23 @@ def test_low_cvr_overpriced_floor_locked_skips_price_drop():
     assert any(a.detail.get('floor_locked') for a in d.actions)
 
 
+def test_floor_between_overpriced_and_listing_band_stays_locked():
+    # 地板在 115%–130% 市中位、现价贴地板: 仍超价, 但不能破 10% 净利率地板
+    low_cvr = _p(imp=2000, views=100, tx=1, sold=1, price=120)
+    low_cvr['floor_price'] = 120
+    cvr = diagnose_sku(low_cvr, market_median=100)
+    assert cvr.funnel_stage == 'low_cvr'
+    assert not any(a.type == 'price_drop' for a in cvr.actions)
+    assert any(a.detail.get('floor_locked') for a in cvr.actions)
+
+    low_ctr = _p(imp=1000, views=5, tx=0, sold=0, price=120)
+    low_ctr['floor_price'] = 120
+    ctr = diagnose_sku(low_ctr, market_median=100)
+    assert ctr.funnel_stage == 'low_ctr'
+    assert not any(a.type == 'price_drop' for a in ctr.actions)
+    assert any(a.detail.get('floor_locked') for a in ctr.actions)
+
+
 def test_healthy_funnel_no_actions_or_only_minor():
     # CTR=2%, CVR=3%, STR healthy
     d = diagnose_sku(_p(imp=1000, views=20, tx=1, sold=1, price=100), market_median=100)

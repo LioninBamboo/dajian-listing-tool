@@ -70,8 +70,7 @@ def _load_cargo_cap(default: float = 250.0) -> float:
 MAX_SUPPLIER_CARGO_COST_USD = _load_cargo_cap()
 
 # Near-market band ceiling used when dry-run would still publish at SAFE_15.
-# 30% over median (listing gate). CRO PRICE_OVERPRICED stays 1.15.
-# Synced with conversion_diagnoser.FLOOR_OVER_MARKET_LOCK.
+# 30% over median (listing gate only). CRO floor lock stays at PRICE_OVERPRICED (1.15).
 NEAR_MARKET_BAND = 1.30
 
 REASON_BLACKLIST_SELLER = "blacklist_seller"
