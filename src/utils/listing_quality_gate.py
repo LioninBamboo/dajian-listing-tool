@@ -24,7 +24,10 @@ from src.utils.product_context_signals import (
     outdoor_context as strict_outdoor_context,
 )
 from src.utils.publish_aspect_completion import (
+    NOT_DIMENSION_AFTER,
     infer_number_of_items_in_set,
+    number_is_dimension_bound,
+    plausible_seat_count,
     seating_item_counts,
     seating_plus_table_item_count,
 )
@@ -2669,7 +2672,8 @@ def find_package_includes_set_qty_mismatch(
 
 
 _KIT_SIZE_CLAIM_RE = re.compile(
-    r"\b(\d{1,3})\s*[- ]?\s*(?:pieces?|pcs?|packs?|pk)\b|\bset\s+of\s+(\d{1,3})\b",
+    rf"\b(\d{{1,3}}){NOT_DIMENSION_AFTER}\s*[- ]?\s*(?:pieces?|pcs?|packs?|pk)\b|"
+    rf"\bset\s+of\s+(\d{{1,3}}){NOT_DIMENSION_AFTER}\b",
     re.IGNORECASE,
 )
 _SOURCE_KIT_CN_RE = re.compile(r"(\d{1,3})\s*(?:件套|件|套)")
@@ -2703,11 +2707,12 @@ def _first_int(value: Any) -> int | None:
         return None
     if isinstance(value, (int, float)):
         return int(value)
-    match = re.search(r"\d{1,3}", str(value or ""))
-    if not match:
+    text = str(value or "")
+    match = re.search(r"(?<![A-Za-z0-9])(\d{1,3})(?![A-Za-z0-9])", text)
+    if not match or number_is_dimension_bound(text, match):
         return None
     try:
-        return int(match.group(0))
+        return int(match.group(1))
     except ValueError:
         return None
 
@@ -2717,10 +2722,13 @@ def _extract_kit_size_claims(text: str) -> set[int]:
     claims: set[int] = set()
     plain = html_lib.unescape(re.sub(r"<[^>]+>", " ", text or ""))
     for match in _KIT_SIZE_CLAIM_RE.finditer(plain):
-        for group in match.groups():
-            if group:
-                _add_kit_count(claims, group)
+        for idx, group in enumerate(match.groups(), start=1):
+            if not group or number_is_dimension_bound(plain, match, idx):
+                continue
+            _add_kit_count(claims, group)
     for match in _SOURCE_KIT_CN_RE.finditer(plain):
+        if number_is_dimension_bound(plain, match):
+            continue
         _add_kit_count(claims, match.group(1))
     return claims
 
@@ -2768,17 +2776,20 @@ def _source_kit_size_evidence(
     evidence.update(seating)
     if _has_real_table(blob):
         for n in seating:
-            _add_kit_count(evidence, n + 1)
+            if plausible_seat_count(n):
+                _add_kit_count(evidence, n + 1)
         seating_plus = seating_plus_table_item_count(blob)
         if seating_plus:
             _add_kit_count(evidence, seating_plus)
 
     for match in _SOURCE_KIT_CN_CHAIRS_RE.finditer(blob):
+        if number_is_dimension_bound(blob, match):
+            continue
         chairs = _first_int(match.group(1))
         if chairs is None:
             continue
         _add_kit_count(evidence, chairs)
-        if _has_real_table(blob):
+        if _has_real_table(blob) and plausible_seat_count(chairs):
             _add_kit_count(evidence, chairs + 1)
     return evidence
 

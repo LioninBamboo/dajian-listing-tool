@@ -2526,3 +2526,72 @@ def test_invented_kit_size_allows_cn_table_plus_can_yi():
         source_title="餐桌+4把餐椅",
     )
     assert issue is None
+
+
+def test_seating_ignores_dimension_numbers():
+    from src.utils.listing_quality_gate import (
+        _source_kit_size_evidence,
+        find_invented_kit_size,
+    )
+    from src.utils.publish_aspect_completion import (
+        infer_number_of_items_in_set,
+        seating_item_counts,
+        seating_plus_table_item_count,
+    )
+
+    inch_chairs = "47 Inch Wood Dining Chairs"
+    assert seating_item_counts(inch_chairs) == set()
+    assert seating_plus_table_item_count(inch_chairs) is None
+    assert infer_number_of_items_in_set(inch_chairs, category_id="107578") is None
+
+    mixed = "5 Piece Dining Set 48 inch upholstered chairs"
+    assert 48 not in seating_item_counts(mixed)
+    assert seating_plus_table_item_count(mixed) != "49"
+    assert 48 not in _source_kit_size_evidence(source_title=mixed)
+    assert 49 not in _source_kit_size_evidence(source_title=mixed)
+
+    assert seating_plus_table_item_count(
+        "Dining Table Set with 4 Upholstered Chairs"
+    ) == "5"
+    assert infer_number_of_items_in_set("Set of 2 Barrel Chairs") == "2"
+    assert seating_item_counts("Set of 2 Barrel Chairs") == {2}
+    assert seating_item_counts("4 dining chairs") == {4}
+
+    blocked = find_invented_kit_size(
+        "48-Piece Dining Chair Set",
+        "",
+        source_title="48 inch chairs",
+    )
+    assert blocked is not None
+    assert blocked.code == "invented_kit_size"
+    assert "48" in blocked.message
+
+
+def test_kit_evidence_ignores_size_and_model_numbers():
+    from src.utils.listing_quality_gate import (
+        _first_int,
+        _source_kit_size_evidence,
+        find_invented_kit_size,
+    )
+
+    for text in ("60 in Dining Bench", "W465P451141 Wrench Set", "3-Tier Shelf", "2-Drawer Nightstand"):
+        evidence = _source_kit_size_evidence(source_title=text)
+        assert 60 not in evidence
+        assert 465 not in evidence
+        assert 3 not in evidence
+        assert 2 not in evidence
+
+    assert _first_int("48 inch") is None
+    assert _first_int("3-Tier") is None
+    assert _first_int("2-Drawer") is None
+    assert _first_int("W465") is None
+    assert _first_int("5") == 5
+
+    issue = find_invented_kit_size(
+        "3-Piece Storage Cabinet",
+        "",
+        source_title="3-Tier 2-Drawer Storage Cabinet 60 in",
+        attributes={"Model": "W465"},
+    )
+    assert issue is not None
+    assert issue.code == "invented_kit_size"
