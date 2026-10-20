@@ -180,8 +180,12 @@ class QwenOptimizer:
             self._BROWSE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
             path = self._browse_cache_path(search_words, category_id)
             tmp = path.with_suffix(".tmp")
+            payload = dict(data or {})
+            payload.setdefault("search_words", search_words)
+            if category_id:
+                payload.setdefault("category_id", category_id)
             tmp.write_text(
-                json.dumps({"cached_at": time.time(), "data": data}, ensure_ascii=False),
+                json.dumps({"cached_at": time.time(), "data": payload}, ensure_ascii=False),
                 encoding="utf-8",
             )
             tmp.replace(path)
@@ -399,24 +403,9 @@ class QwenOptimizer:
         return result
     
     def _extract_search_keywords(self, title: str) -> str:
-        """从标题提取搜索关键词（去掉尺寸、颜色等修饰词）"""
-        if not title:
-            return ""
-        
-        # 去掉常见修饰词/噪音
-        noise_words = {
-            'with', 'and', 'for', 'the', 'set', 'of', 'in', 'to', 'a', 'an',
-            'new', 'brand', 'hot', 'sale', 'free', 'shipping', 'fast',
-            'black', 'white', 'gray', 'grey', 'brown', 'beige', 'blue', 'red',
-            'green', 'pink', 'gold', 'silver', 'natural', 'walnut', 'oak',
-            'small', 'medium', 'large', 'xl', 'xxl',
-        }
-        
-        words = re.findall(r'[a-zA-Z]+', title)
-        keywords = [w for w in words if w.lower() not in noise_words and len(w) > 2]
-        
-        # Take first 4-5 meaningful words
-        return ' '.join(keywords[:5])
+        """Delegate to shared product-noun cleaner (pre_heart / cache warm)."""
+        from src.utils.pre_heart_price_gate import extract_search_keywords
+        return extract_search_keywords(title)
     
     def _extract_keyword_frequencies(self, titles: list) -> list:
         """从竞品标题提取高频关键词"""

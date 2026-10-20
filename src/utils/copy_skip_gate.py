@@ -7,11 +7,12 @@ dimensions, materials, or Year/Make/Model.
 
 Reason codes (stored on the product log and ``cost_breakdown``):
 
-- ``blacklist_seller`` — SKU matches the N735* / known skip-seller prefixes
-- ``cargo_cost_over_200`` — supplier product + cargo (shipping) > USD 200
+- ``blacklist_seller`` — SKU matches N735* / W1706* / ZL* / known skip-seller prefixes
+- ``cargo_cost_over_cap`` — supplier product + cargo (shipping) > MAX_SUPPLIER_CARGO_COST_USD
+  (env, default USD 250; legacy alias ``cargo_cost_over_200``)
 - ``unclear_dims`` — item L/W/H missing, placeholder, or not source-grounded
 - ``far_above_market`` — a real market median exists and the SAFE_15 price
-  still sits above the near-market band (median × 1.15). When
+  still sits above the near-market band (median × 1.30). When
   ``MARKET_GATE_ENABLED`` is false (the default if the key is missing),
   this reason is not appended; ``detail["far_above_market_advisory"]``
   is set instead so pricing and reports still see the market numbers.
@@ -40,21 +41,43 @@ from src.utils.listing_fact_sheet import (
     lexical_materials,
 )
 
-# N735* is the standing seller blacklist. Extend this tuple for other
-# known skip-seller prefixes (matched at the start of the SKU).
-SKIP_SELLER_PREFIXES: tuple[str, ...] = ("N735",)
+# Standing GIGA seller blacklist. Extend this tuple for other known
+# skip-seller prefixes (matched at the start of the SKU).
+SKIP_SELLER_PREFIXES: tuple[str, ...] = ("N735", "W1706", "ZL")
 
 # Supplier product price + cargo/shipping. Insurance and payment fees are
 # not part of this cap.
-MAX_SUPPLIER_CARGO_COST_USD = 200.0
+def _load_cargo_cap(default: float = 250.0) -> float:
+    """Read MAX_SUPPLIER_CARGO_COST_USD from env, falling back to the repo .env."""
+    raw = os.getenv("MAX_SUPPLIER_CARGO_COST_USD")
+    if raw is None:
+        try:
+            env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
+            with open(env_path, encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("MAX_SUPPLIER_CARGO_COST_USD="):
+                        raw = line.split("=", 1)[1].split("#", 1)[0].strip().strip('"\'')
+        except OSError:
+            raw = None
+    try:
+        value = float(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        value = default
+    return value if value > 0 else default
+
+
+MAX_SUPPLIER_CARGO_COST_USD = _load_cargo_cap()
 
 # Near-market band ceiling used when dry-run would still publish at SAFE_15.
-# Same 15% over median as conversion_diagnoser.FLOOR_OVER_MARKET_LOCK /
-# PRICE_OVERPRICED and sales-health OVERPRICED_THRESHOLD.
-NEAR_MARKET_BAND = 1.15
+# 30% over median (listing gate). CRO PRICE_OVERPRICED stays 1.15.
+# Synced with conversion_diagnoser.FLOOR_OVER_MARKET_LOCK.
+NEAR_MARKET_BAND = 1.30
 
 REASON_BLACKLIST_SELLER = "blacklist_seller"
-REASON_CARGO_COST = "cargo_cost_over_200"
+REASON_CARGO_COST = "cargo_cost_over_cap"
+REASON_CARGO_COST_LEGACY = "cargo_cost_over_200"  # legacy alias
+CARGO_COST_REASONS: frozenset[str] = frozenset({REASON_CARGO_COST, REASON_CARGO_COST_LEGACY})
 REASON_UNCLEAR_DIMS = "unclear_dims"
 REASON_FAR_ABOVE = "far_above_market"
 REASON_MATERIAL_CONFLICT = "factsheet_material_conflict"
