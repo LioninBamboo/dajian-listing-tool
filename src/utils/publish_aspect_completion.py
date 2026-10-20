@@ -18,6 +18,21 @@ SET_INCLUDES_SKIP_CATEGORIES = {"48319"}
 MEASUREMENT_DEFAULT_SKIP = set(MEASUREMENT_ASPECT_KEYS) | {"Item Weight"}
 SET_INCLUDE_KEYWORDS = ("dining set", "table set", "piece", "set for", "set of")
 TABLE_TENNIS_KEYWORDS = ("table tennis", "ping pong")
+TABLE_SET_DOMAIN_MARKERS = (
+    "table",
+    "dining",
+    "patio",
+    "bistro",
+    "pub set",
+    "conversation set",
+)
+_SEATING_PLUS_ONE_PATTERNS = (
+    r"\bwith\s+(\d+)\s+(?:[a-z]+\s+){0,3}?chairs?\b",
+    r"\bwith\s+(\d+)\s+(?:[a-z]+\s+){0,3}?stools?\b",
+    r"\b(\d+)\s+(?:barrel\s+)?chairs?\b",
+    r"\b(\d+)\s+stools?\b",
+    r"\bseats?\s+(\d+)\b",
+)
 BED_SIZE_MAP = {
     "twin xl": "Twin XL",
     "california king": "California King",
@@ -46,6 +61,25 @@ FABRIC_KEYWORDS = {
 }
 
 
+def has_table_set_domain(title: str) -> bool:
+    text = (title or "").lower()
+    return any(marker in text for marker in TABLE_SET_DOMAIN_MARKERS)
+
+
+def seating_plus_table_item_count(text: str) -> Optional[str]:
+    """Table/dining + N chairs/stools => N+1, same seating patterns as dining sets."""
+    lowered = (text or "").lower()
+    for seating_pattern in _SEATING_PLUS_ONE_PATTERNS:
+        match = re.search(seating_pattern, lowered)
+        if not match:
+            continue
+        try:
+            return str(int(match.group(1)) + 1)
+        except ValueError:
+            return None
+    return None
+
+
 def infer_number_of_items_in_set(title: str, *, category_id: str = "") -> Optional[str]:
     text = (title or "").lower()
 
@@ -69,23 +103,7 @@ def infer_number_of_items_in_set(title: str, *, category_id: str = "") -> Option
     )
     if not is_dining_set:
         return None
-
-    for seating_pattern in (
-        r"\bwith\s+(\d+)\s+(?:[a-z]+\s+){0,3}?chairs?\b",
-        r"\bwith\s+(\d+)\s+(?:[a-z]+\s+){0,3}?stools?\b",
-        r"\b(\d+)\s+(?:barrel\s+)?chairs?\b",
-        r"\b(\d+)\s+stools?\b",
-        r"\bseats?\s+(\d+)\b",
-    ):
-        match = re.search(seating_pattern, text)
-        if not match:
-            continue
-        try:
-            return str(int(match.group(1)) + 1)
-        except ValueError:
-            return None
-
-    return None
+    return seating_plus_table_item_count(title)
 
 
 def _emit(log: Optional[Callable[[str], None]], message: str) -> None:
@@ -102,29 +120,16 @@ def infer_set_includes(title: str) -> Optional[str]:
         or "table and chair" in title_lower
         or "table & chair" in title_lower
     )
-    if "chair" in title_lower and set_context:
+    if "chair" in title_lower and set_context and has_table_set_domain(title_lower):
         if "table and chair" not in title_lower and "table & chair" not in title_lower:
             return "Chairs"
         return "Dining Table & Chairs" if "dining" in title_lower else "Table & Chairs"
-    if "stool" in title_lower and set_context:
+    if "stool" in title_lower and set_context and has_table_set_domain(title_lower):
         return "Dining Table & Stools" if "dining" in title_lower else "Table & Stools"
     if "sofa" in title_lower or "couch" in title_lower or "sectional" in title_lower:
         return "Sofa Set"
     if any(keyword in title_lower for keyword in SET_INCLUDE_KEYWORDS):
-        furniture_hint = (
-            "table" in title_lower
-            or "dining" in title_lower
-            or "patio" in title_lower
-            or "bistro" in title_lower
-            or "chair" in title_lower
-            or "stool" in title_lower
-            or "sofa" in title_lower
-            or "couch" in title_lower
-            or "sectional" in title_lower
-            or "ottoman" in title_lower
-            or "loveseat" in title_lower
-        )
-        if not furniture_hint:
+        if not has_table_set_domain(title_lower):
             return None
         return "Table Set"
     if any(keyword in title_lower for keyword in ("coffee table", "side table", "end table", "console table", "bistro table", "patio table", "dining table")):

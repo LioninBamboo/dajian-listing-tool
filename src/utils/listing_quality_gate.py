@@ -23,7 +23,10 @@ from src.utils.product_context_signals import (
     has_outdoor_marker,
     outdoor_context as strict_outdoor_context,
 )
-from src.utils.publish_aspect_completion import infer_number_of_items_in_set
+from src.utils.publish_aspect_completion import (
+    infer_number_of_items_in_set,
+    seating_plus_table_item_count,
+)
 from src.utils.publish_autofix import sanitize_placeholder_aspects, sanitize_single_value_aspects
 from src.utils.publish_validation import (
     REQUIRED_MEASUREMENT_ASPECT_KEYS,
@@ -2668,7 +2671,36 @@ _KIT_SIZE_CLAIM_RE = re.compile(
     r"\b(\d{1,3})\s*[- ]?\s*(?:pieces?|pcs?|packs?|pk)\b|\bset\s+of\s+(\d{1,3})\b",
     re.IGNORECASE,
 )
-_SOURCE_KIT_CN_RE = re.compile(r"(?:套装|件套|组合|共)\D{0,6}(\d{1,3})")
+_SOURCE_KIT_CN_RE = re.compile(r"(\d{1,3})\s*(?:件套|件|套)")
+_SOURCE_KIT_CN_CHAIRS_RE = re.compile(r"(\d{1,3})\s*把椅")
+_PIECE_COUNT_KEY_RE = re.compile(
+    r"number of pieces|pieces included|number of items in set|items in set|piece count",
+    re.IGNORECASE,
+)
+_TABLE_OR_DINING_RE = re.compile(r"table|dining|bistro|patio|桌|餐桌", re.IGNORECASE)
+
+
+def _add_kit_count(dest: set[int], raw: Any) -> None:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return
+    if 2 <= value <= 999:
+        dest.add(value)
+
+
+def _first_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    match = re.search(r"\d{1,3}", str(value or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
 
 
 def _extract_kit_size_claims(text: str) -> set[int]:
@@ -2677,15 +2709,24 @@ def _extract_kit_size_claims(text: str) -> set[int]:
     plain = html_lib.unescape(re.sub(r"<[^>]+>", " ", text or ""))
     for match in _KIT_SIZE_CLAIM_RE.finditer(plain):
         for group in match.groups():
-            if not group:
-                continue
-            try:
-                value = int(group)
-            except ValueError:
-                continue
-            if 2 <= value <= 999:
-                claims.add(value)
+            if group:
+                _add_kit_count(claims, group)
+    for match in _SOURCE_KIT_CN_RE.finditer(plain):
+        _add_kit_count(claims, match.group(1))
     return claims
+
+
+def _piece_counts_from_mapping(mapping: Mapping[str, Any] | None) -> set[int]:
+    counts: set[int] = set()
+    if not isinstance(mapping, Mapping):
+        return counts
+    for key, value in mapping.items():
+        if not _PIECE_COUNT_KEY_RE.search(str(key or "")):
+            continue
+        parsed = _first_int(value)
+        if parsed is not None:
+            _add_kit_count(counts, parsed)
+    return counts
 
 
 def _source_kit_size_evidence(
@@ -2701,13 +2742,26 @@ def _source_kit_size_evidence(
                 parts.append(f"{key}: {value}")
     blob = " ".join(parts)
     evidence = _extract_kit_size_claims(blob)
-    for match in _SOURCE_KIT_CN_RE.finditer(blob):
-        try:
-            value = int(match.group(1))
-        except ValueError:
+    evidence.update(_piece_counts_from_mapping(attributes))
+    evidence.update(_piece_counts_from_mapping(specs))
+
+    for text in (source_title, source_description, blob):
+        dining_count = expected_dining_set_item_count(text)
+        if dining_count:
+            _add_kit_count(evidence, dining_count)
+        if _TABLE_OR_DINING_RE.search(text or ""):
+            seating_count = seating_plus_table_item_count(text)
+            if seating_count:
+                _add_kit_count(evidence, seating_count)
+
+    has_table = bool(_TABLE_OR_DINING_RE.search(blob))
+    for match in _SOURCE_KIT_CN_CHAIRS_RE.finditer(blob):
+        chairs = _first_int(match.group(1))
+        if chairs is None:
             continue
-        if 2 <= value <= 999:
-            evidence.add(value)
+        _add_kit_count(evidence, chairs)
+        if has_table:
+            _add_kit_count(evidence, chairs + 1)
     return evidence
 
 

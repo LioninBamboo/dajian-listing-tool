@@ -2379,3 +2379,100 @@ def test_invented_kit_size_allows_source_backed_piece_count():
         source_description="20 Pcs stainless steel rods kit",
     )
     assert issue is None
+
+
+def test_invented_kit_size_allows_dining_title_and_number_of_pieces():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Dining Table Set with 4 Chairs Natural Wood",
+        "",
+        source_title="5 Piece Dining Table Set with 4 Chairs",
+        attributes={"Number of Pieces": "5"},
+    )
+    assert issue is None
+
+
+def test_invented_kit_size_allows_chinese_jian_tao():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Dining Table Set",
+        "",
+        source_title="北欧实木餐桌椅5件套 简约家用",
+    )
+    assert issue is None
+
+
+def test_invented_kit_size_allows_pieces_included_spec():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Dining Table Set",
+        "",
+        source_title="Dining Table Chair Bundle",
+        specs={"Pieces Included": "5"},
+    )
+    assert issue is None
+
+
+def test_invented_kit_size_allows_number_of_items_in_set_attr():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Dining Table Set",
+        "",
+        source_title="Dining Table Chair Bundle",
+        attributes={"Number of Items in Set": "5"},
+    )
+    assert issue is None
+
+
+def test_invented_kit_size_allows_table_plus_n_chairs_or_stools():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    chairs = find_invented_kit_size(
+        "5-Piece Dining Table Set",
+        "",
+        source_title="Dining Table with 4 Chairs",
+    )
+    stools = find_invented_kit_size(
+        "3-Piece Pub Table Set",
+        "",
+        source_title="Pub Table with 2 Stools",
+    )
+    assert chairs is None
+    assert stools is None
+
+
+def test_invented_kit_size_allows_chinese_ba_yi_chairs():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    four_chairs = find_invented_kit_size(
+        "4-Piece Chair Set",
+        "",
+        source_title="餐椅 4把椅",
+    )
+    table_plus_chairs = find_invented_kit_size(
+        "5-Piece Dining Table Set",
+        "",
+        source_title="实木餐桌 4把椅",
+    )
+    assert four_chairs is None
+    assert table_plus_chairs is None
+
+
+def test_invented_kit_size_still_blocks_unsupported_count():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "10-Piece Dining Table Set",
+        "",
+        source_title="5 Piece Dining Table Set with 4 Chairs",
+        source_description="北欧实木餐桌椅5件套",
+        attributes={"Number of Pieces": "5", "Number of Items in Set": "5"},
+        specs={"Pieces Included": "5"},
+    )
+    assert issue is not None
+    assert issue.code == "invented_kit_size"
+    assert "10" in issue.message
