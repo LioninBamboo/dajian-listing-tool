@@ -190,6 +190,7 @@ def try_fix_publish_error(
     measurement_aspect_keys: Iterable[str],
     *,
     log: LogFn | None = None,
+    allow_template_defaults: bool = True,
 ) -> bool:
     normalized_error = normalize_publish_error_message(error_msg)
     measurement_keys = {str(key).strip() for key in measurement_aspect_keys if str(key).strip()}
@@ -204,7 +205,7 @@ def try_fix_publish_error(
             return False
 
         defaults = category_required_aspects.get(category_id, {}).get('defaults', {})
-        if missing in defaults:
+        if allow_template_defaults and missing in defaults:
             value = defaults[missing]
             aspects[missing] = [value] if isinstance(value, str) else value
             _emit(log, f'[AUTO-FIX] {missing} = {aspects[missing]}')

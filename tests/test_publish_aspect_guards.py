@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+import batch_publish
+from src.utils.publish_fee_preview import evaluate_insertion_fee_preview
+from src.utils.publish_source_aspect_guard import (
+    build_giga_source_text,
+    find_source_matching_value,
+    guard_unsourced_aspects,
+    restore_sourced_aspects,
+)
+
 
 def test_infer_upholstery_fabric_does_not_invent_a_specific_fiber():
     from src.utils.publish_aspect_completion import infer_upholstery_fabric
@@ -15,3 +24,445 @@ def test_specialized_furniture_categories_are_protected_from_generic_remap():
     from src.services.taxonomy_constants import PROTECTED_STORED_CATEGORY_IDS
 
     assert {"20689", "261263"}.issubset(PROTECTED_STORED_CATEGORY_IDS)
+
+
+def test_apothecary_cabinet_template_default_is_dropped_when_optional():
+    logs = []
+    aspects = {"Type": ["Apothecary Cabinet"], "Color": ["White"]}
+    source = build_giga_source_text(
+        title="Bathroom Vanity with Sink",
+        description="A compact bathroom vanity with ceramic basin.",
+    )
+
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=source,
+        required_names=[],
+        sku="SKU-VANITY",
+        log=logs.append,
+    )
+
+    assert blockers == []
+    assert "Type" not in aspects
+    assert any("Apothecary Cabinet" in line and "[ASPECT_STRIP]" in line for line in logs)
+
+
+def test_apothecary_cabinet_required_without_source_match_blocks():
+    aspects = {"Type": ["Apothecary Cabinet"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Generic household widget with no furniture type",
+        required_names=["Type"],
+        allowed_values_by_name={"Type": ["Apothecary Cabinet"]},
+        sku="SKU-WIDGET",
+    )
+
+    assert "unsourced_required_aspect:Type" in blockers
+    assert "Type" not in aspects
+
+
+def test_sourced_aspect_is_kept_and_not_overwritten_by_template():
+    source = build_giga_source_text(
+        title="Bathroom Vanity",
+        description="Silver glass bathroom vanity cabinet.",
+        attributes={"Color": "Silver", "Material": "Glass"},
+    )
+    completed = {"Type": ["Apothecary Cabinet"], "Color": ["Red"], "Material": ["Wood"]}
+    restore_sourced_aspects(
+        completed,
+        {"Type": ["Bathroom Vanity"], "Color": ["Silver"], "Material": ["Glass"]},
+        source,
+    )
+
+    assert completed["Type"] == ["Bathroom Vanity"]
+    assert completed["Color"] == ["Silver"]
+    assert completed["Material"] == ["Glass"]
+
+    blockers = guard_unsourced_aspects(
+        completed,
+        source_text=source,
+        required_names=["Type", "Color", "Material"],
+    )
+    assert blockers == []
+    assert completed["Type"] == ["Bathroom Vanity"]
+    assert completed["Color"] == ["Silver"]
+    assert completed["Material"] == ["Glass"]
+
+
+def test_missing_required_aspect_blocks_when_source_has_no_match():
+    aspects = {"Brand": ["AquaVerve"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Plain household widget",
+        required_names=["Type"],
+    )
+    assert blockers == ["unsourced_required_aspect:Type"]
+
+
+def test_required_unsourced_color_uses_source_matching_value():
+    aspects = {"Color": ["Red"]}
+    source = "Silver glass wall mirror"
+    assert find_source_matching_value("Color", source, ["Red", "Silver", "Black"]) == "Silver"
+
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=source,
+        required_names=["Color"],
+        allowed_values_by_name={"Color": ["Red", "Silver", "Black"]},
+    )
+    assert blockers == []
+    assert aspects["Color"] == ["Silver"]
+
+
+def test_unsourced_voltage_aspect_is_always_dropped():
+    aspects = {"Voltage": ["Does Not Apply"], "Type": ["Kitchen Island"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Kitchen island with wood top and storage drawers",
+        required_names=[],
+    )
+    assert blockers == []
+    assert "Voltage" not in aspects
+    assert aspects["Type"] == ["Kitchen Island"]
+
+
+def test_insertion_fee_at_least_20_blocks():
+    reason = evaluate_insertion_fee_preview(
+        listing_fees={
+            "feeSummaries": [{
+                "fees": [{
+                    "feeType": "INSERTION_FEE",
+                    "amount": {"value": "20.00", "currency": "USD"},
+                }]
+            }]
+        },
+        lookup_attempted=True,
+    )
+    assert reason == "high_insertion_fee"
+
+
+def test_motors_vehicles_trailers_path_blocks_as_high_insertion_fee():
+    reason = evaluate_insertion_fee_preview(
+        category_id="6001",
+        category_path="eBay Motors/Vehicles/Trailers/Cars & Trucks",
+        category_name="Cars & Trucks",
+        lookup_attempted=False,
+    )
+    assert reason == "high_insertion_fee"
+
+
+def test_fee_preview_unavailable_unless_explicitly_allowed(monkeypatch):
+    monkeypatch.delenv("ALLOW_PUBLISH_WITHOUT_FEE_PREVIEW", raising=False)
+    assert evaluate_insertion_fee_preview(
+        lookup_attempted=True,
+        lookup_error=RuntimeError("boom"),
+    ) == "fee_preview_unavailable"
+
+    monkeypatch.setenv("ALLOW_PUBLISH_WITHOUT_FEE_PREVIEW", "1")
+    assert evaluate_insertion_fee_preview(
+        lookup_attempted=True,
+        lookup_error=RuntimeError("boom"),
+    ) is None
+
+
+def test_high_fee_category_blacklist_json(tmp_path):
+    path = tmp_path / "high_fee.json"
+    path.write_text('{"categoryIds": ["99999"]}', encoding="utf-8")
+    reason = evaluate_insertion_fee_preview(
+        category_id="99999",
+        blacklist_path=str(path),
+        lookup_attempted=False,
+    )
+    assert reason == "high_insertion_fee"
+
+
+def _long_description(text: str) -> str:
+    return (
+        f"<div><h3>KEY FEATURES</h3><ul>"
+        f"<li>{text}</li>"
+        f"<li>Sturdy frame supports everyday household use.</li>"
+        f"<li>Compact profile fits apartments and family rooms.</li>"
+        f"</ul></div>"
+    )
+
+
+def _product(**overrides):
+    product = {
+        "sku": "W3204P565677",
+        "title": "Coffee Table",
+        "description": "Coffee table with storage shelf. Assembly Required Yes.",
+        "price": 50.0,
+        "suggested_price": 99.0,
+        "shipping": 0,
+        "images": ["https://example.com/a.jpg"],
+        "attributes": {
+            "Assembled Length (in.)": "40",
+            "Assembled Width (in.)": "20",
+            "Assembled Height (in.)": "18",
+        },
+        "specs": {},
+        "cost_breakdown": {"total_dajian_cost": 40},
+        "optimization": {
+            "title": "Coffee Table",
+            "description": _long_description("Storage shelf keeps living room essentials organized."),
+            "categoryId": "38204",
+            "categoryName": "Coffee Tables",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Type": ["Coffee Table"],
+                "Assembly Required": ["Yes"],
+                "Item Length": ["40 in"],
+                "Item Width": ["20 in"],
+                "Item Height": ["18 in"],
+            },
+        },
+    }
+    product.update(overrides)
+    return product
+
+
+class _FakeOAuth:
+    def __init__(self, environment):
+        self.environment = environment
+
+    def is_authorized(self):
+        return True
+
+    def get_application_token(self):
+        return "app-token"
+
+    def get_valid_token(self):
+        return "token"
+
+
+class _FakeCategoryMatcher:
+    def __init__(
+        self,
+        oauth,
+        *,
+        required=None,
+        returned_aspects=None,
+        category_id="38204",
+        category_name="Coffee Tables",
+    ):
+        self._required = required or []
+        self._returned_aspects = returned_aspects
+        self._category_id = category_id
+        self._category_name = category_name
+
+    def canonicalize_category(self, title_context, category_id, category_name, description=None):
+        return category_id, category_name
+
+    def get_category_and_aspects(self, title, aspects, description):
+        completed = dict(self._returned_aspects) if self._returned_aspects is not None else dict(aspects)
+        return self._category_id, self._category_name, completed
+
+    def is_category_plausible_for_text(self, title, category_id, category_name):
+        return True
+
+    def _get_category_aspects(self, category_id):
+        return list(self._required), []
+
+
+class _FakePolicyManager:
+    def __init__(self, oauth):
+        pass
+
+
+def _stub_publish_common(monkeypatch, *, matcher_factory=None, qc_blockers=None):
+    monkeypatch.setattr(batch_publish, "enrich_product_dimensions", lambda product: None)
+    monkeypatch.setattr(batch_publish, "validate_product", lambda product: [])
+    monkeypatch.setattr(batch_publish, "fetch_market_price", lambda title: None)
+    monkeypatch.setattr(batch_publish, "calculate_smart_final_price", lambda product, market_p: 99.0)
+    monkeypatch.setattr(batch_publish, "record_error", lambda *args, **kwargs: None)
+    monkeypatch.setattr(batch_publish, "_is_sellable_leaf_category", lambda oauth, category_id: True)
+    monkeypatch.setattr(
+        batch_publish,
+        "run_listing_qc",
+        lambda **kwargs: {
+            "status": "pass",
+            "blockers": list(qc_blockers or []),
+            "warnings": [],
+            "source_fingerprint": "source",
+            "candidate_fingerprint": "candidate",
+            "ruleset_version": "listing-qc-v2",
+            "fact_sheet_version": 4,
+        },
+    )
+    monkeypatch.setattr("src.services.ebay_auth.EbayOAuthService", _FakeOAuth)
+    monkeypatch.setattr(
+        "src.services.ebay_category_matcher.EbayCategoryMatcher",
+        matcher_factory or (lambda oauth: _FakeCategoryMatcher(oauth)),
+    )
+    monkeypatch.setattr("src.services.ebay_policy_manager.EbayPolicyManager", _FakePolicyManager)
+
+
+def test_publish_dry_run_does_not_persist_template_aspects(monkeypatch):
+    persisted = []
+    monkeypatch.setattr(
+        batch_publish,
+        "_persist_prepared_listing",
+        lambda **kwargs: persisted.append(kwargs),
+    )
+    _stub_publish_common(
+        monkeypatch,
+        matcher_factory=lambda oauth: _FakeCategoryMatcher(
+            oauth,
+            returned_aspects={
+                "Brand": ["AquaVerve"],
+                "Type": ["Apothecary Cabinet"],
+                "Item Length": ["40 in"],
+                "Item Width": ["20 in"],
+                "Item Height": ["18 in"],
+            },
+        ),
+    )
+
+    result = batch_publish.publish_single_product(_product(), dry_run=True)
+
+    assert result["status"] == "dry_run"
+    assert persisted == []
+
+
+def test_publish_blocks_unsourced_required_aspect(monkeypatch):
+    _stub_publish_common(
+        monkeypatch,
+        matcher_factory=lambda oauth: _FakeCategoryMatcher(
+            oauth,
+            required=[{"name": "Type", "required": True, "allowed_values": ["Apothecary Cabinet"]}],
+            returned_aspects={
+                "Brand": ["AquaVerve"],
+                "Type": ["Apothecary Cabinet"],
+                "Item Length": ["40 in"],
+                "Item Width": ["20 in"],
+                "Item Height": ["18 in"],
+            },
+        ),
+    )
+    product = _product(
+        title="Plain household widget",
+        description="Plain household widget with no furniture type mentioned.",
+        optimization={
+            "title": "Plain household widget",
+            "description": _long_description("Plain household widget with no furniture type mentioned."),
+            "categoryId": "38204",
+            "categoryName": "Coffee Tables",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Type": ["Apothecary Cabinet"],
+                "Item Length": ["40 in"],
+                "Item Width": ["20 in"],
+                "Item Height": ["18 in"],
+            },
+        },
+    )
+
+    result = batch_publish.publish_single_product(product, dry_run=True)
+
+    assert result["status"] == "error"
+    assert "unsourced_required_aspect:Type" in result["message"]
+    assert result["copy_skip_reasons"] == ["unsourced_required_aspect:Type"]
+
+
+def test_publish_keeps_sourced_type_when_template_tries_to_overwrite(monkeypatch):
+    captured = {}
+    real_guard = batch_publish.guard_unsourced_aspects
+
+    def _capture(aspects, **kwargs):
+        captured["aspects"] = dict(aspects)
+        return real_guard(aspects, **kwargs)
+
+    monkeypatch.setattr(batch_publish, "guard_unsourced_aspects", _capture)
+    monkeypatch.setattr(batch_publish, "_persist_prepared_listing", lambda **kwargs: None)
+    _stub_publish_common(
+        monkeypatch,
+        matcher_factory=lambda oauth: _FakeCategoryMatcher(
+            oauth,
+            category_id="32878",
+            category_name="Bathroom Vanities",
+            required=[{"name": "Type", "required": True, "allowed_values": ["Apothecary Cabinet", "Bathroom Vanity"]}],
+            returned_aspects={
+                "Brand": ["AquaVerve"],
+                "Type": ["Apothecary Cabinet"],
+                "Item Length": ["24 in"],
+                "Item Width": ["18 in"],
+                "Item Height": ["32 in"],
+            },
+        ),
+    )
+    product = _product(
+        title="Bathroom Vanity with Sink",
+        description="Bathroom vanity cabinet with silver glass doors.",
+        attributes={
+            "Assembled Length (in.)": "24",
+            "Assembled Width (in.)": "18",
+            "Assembled Height (in.)": "32",
+            "Type": "Bathroom Vanity",
+        },
+        optimization={
+            "title": "Bathroom Vanity with Sink",
+            "description": _long_description("Bathroom vanity cabinet with silver glass doors."),
+            "categoryId": "32878",
+            "categoryName": "Bathroom Vanities",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Type": ["Bathroom Vanity"],
+                "Item Length": ["24 in"],
+                "Item Width": ["18 in"],
+                "Item Height": ["32 in"],
+            },
+        },
+    )
+
+    result = batch_publish.publish_single_product(product, dry_run=True)
+
+    assert result["status"] == "dry_run"
+    assert captured["aspects"]["Type"] == ["Bathroom Vanity"]
+
+
+def test_publish_blocks_when_insertion_fee_is_at_least_20(monkeypatch):
+    published = []
+
+    class _FakeEbayClient:
+        def __init__(self, oauth, policy_manager):
+            self.published = False
+
+        def _prepare_inventory_image_urls(self, sku, raw_images, max_images=24):
+            return ["https://i.ebayimg.com/images/g/AAA/s-l1600.jpg"]
+
+        def create_or_replace_inventory_item(self, sku, product):
+            return {"status": "success"}
+
+        def create_offer(self, sku, price, category_id=None, listing_description=None, marketplace_id=None):
+            return {"offerId": "offer-1"}
+
+        def get_offer(self, offer_id):
+            return {"status": "DRAFT"}
+
+        def get_listing_fees(self, offer_id):
+            return {
+                "feeSummaries": [{
+                    "fees": [{
+                        "feeType": "INSERTION_FEE",
+                        "amount": {"value": "20.00", "currency": "USD"},
+                    }]
+                }]
+            }
+
+        def publish_offer(self, offer_id):
+            published.append(offer_id)
+            self.published = True
+            return {"listingId": "listing-1"}
+
+    monkeypatch.setattr(batch_publish, "_persist_prepared_listing", lambda **kwargs: None)
+    monkeypatch.setattr(batch_publish, "_try_upload_video", lambda *args, **kwargs: (None, "ok"))
+    monkeypatch.setattr(batch_publish, "_sync_motors_compatibility", lambda *args, **kwargs: None)
+    monkeypatch.setattr(batch_publish, "resolve_publish_quantity", lambda sku, logger=None: 1)
+    monkeypatch.setattr("src.clients.real_ebay_client.RealEbayClient", _FakeEbayClient)
+    _stub_publish_common(monkeypatch)
+
+    result = batch_publish.publish_single_product(_product(), dry_run=False)
+
+    assert result["status"] == "error"
+    assert result["copy_skip_reasons"] == ["high_insertion_fee"]
+    assert published == []

@@ -62,6 +62,12 @@ from src.utils.publish_autofix import (
     try_fix_publish_error,
 )
 from src.utils.publish_aspect_completion import complete_publish_aspects
+from src.utils.publish_source_aspect_guard import (
+    build_giga_source_text,
+    guard_unsourced_aspects,
+    restore_sourced_aspects,
+)
+from src.utils.publish_fee_preview import evaluate_insertion_fee_preview
 from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP, PROTECTED_STORED_CATEGORY_IDS
 from src.utils.dimension_helpers import (
     extract_all_dimensions, find_dimension,
@@ -850,6 +856,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         return {"status": "error", "message": "eBay not authorized"}
 
     opt = product.get('optimization', {})
+    original_opt_aspects = dict(opt.get('aspects') or {})
     raw_title = opt.get('title', product.get('title', ''))
     title, title_changed = normalize_listing_title_for_ebay(
         raw_title,
@@ -1104,12 +1111,40 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         log=lambda message: logger.info(f"  {message}"),
     )
 
+    source_text = build_giga_source_text(
+        title=source_title or product.get('title', ''),
+        description=product.get('description', ''),
+        attributes=product.get('attributes', {}) or {},
+        specs=product.get('specs', {}) or {},
+    )
+    restore_sourced_aspects(completed_aspects, original_opt_aspects, source_text)
+    required_aspects_meta, recommended_aspects_meta = category_matcher._get_category_aspects(category_id)
+    required_aspect_names_for_guard = {
+        aspect.get("name")
+        for aspect in required_aspects_meta
+        if aspect.get("name")
+    }
+    allowed_values_by_name = {}
+    for aspect in list(required_aspects_meta) + list(recommended_aspects_meta):
+        aspect_name = aspect.get("name")
+        if aspect_name and aspect.get("allowed_values"):
+            allowed_values_by_name[aspect_name] = aspect["allowed_values"]
+    aspect_blockers = guard_unsourced_aspects(
+        completed_aspects,
+        source_text=source_text,
+        required_names=required_aspect_names_for_guard,
+        allowed_values_by_name=allowed_values_by_name,
+        sku=sku,
+        log=lambda message: logger.info(f"  {message}"),
+    )
+
     if compatibility.mode != "not_applicable":
         logger.info(f"  [COMPAT] {compatibility.summary}")
         for issue in compatibility.issues:
             logger.warning(f"  [COMPAT] {issue}")
 
     publish_blockers = []
+    publish_blockers.extend(aspect_blockers)
     publish_blockers.extend(_measurement_validation_errors(completed_aspects))
     publish_blockers.extend(_category_validation_errors(category_matcher, title_context, category_id, category_name))
     qc_candidate = {
@@ -1144,21 +1179,41 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     source_fingerprint = qc_result["source_fingerprint"]
     candidate_fingerprint = qc_result["candidate_fingerprint"]
 
+    fee_category_reason = evaluate_insertion_fee_preview(
+        category_id=category_id,
+        category_path=category_name or "",
+        category_name=category_name or "",
+        lookup_attempted=False,
+        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+    )
+    if fee_category_reason:
+        publish_blockers.append(fee_category_reason)
+
     publish_blockers = list(dict.fromkeys(publish_blockers))
     if publish_blockers:
         msg = "; ".join(publish_blockers)
         record_error(sku, msg)
-        return {"status": "error", "message": msg}
+        result = {"status": "error", "message": msg}
+        skip_reasons = [
+            blocker
+            for blocker in publish_blockers
+            if blocker.startswith("unsourced_required_aspect:")
+            or blocker in {"high_insertion_fee", "fee_preview_unavailable"}
+        ]
+        if skip_reasons:
+            result["copy_skip_reasons"] = skip_reasons
+        return result
 
-    _persist_prepared_listing(
-        sku=sku,
-        category_id=category_id,
-        category_name=category_name,
-        title=title,
-        description=description,
-        aspects=completed_aspects,
-        compatibility=compatibility if compatibility.mode != "not_applicable" else None,
-    )
+    if not dry_run:
+        _persist_prepared_listing(
+            sku=sku,
+            category_id=category_id,
+            category_name=category_name,
+            title=title,
+            description=description,
+            aspects=completed_aspects,
+            compatibility=compatibility if compatibility.mode != "not_applicable" else None,
+        )
 
     logger.info(f"  Category: {category_id} ({category_name})")
     logger.info(f"  Aspects: {len(completed_aspects)} items")
@@ -1379,6 +1434,19 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                     f" ({listing_status or 'UNKNOWN'}); reusing it."
                 )
             else:
+                fee_reason = preview_offer_listing_fees(
+                    ebay_client,
+                    offer_id,
+                    category_id=category_id,
+                    category_name=category_name,
+                )
+                if fee_reason:
+                    record_error(sku, fee_reason)
+                    return {
+                        "status": "error",
+                        "message": fee_reason,
+                        "copy_skip_reasons": [fee_reason],
+                    }
                 # Publish
                 logger.info(f"  Publishing offer {offer_id}...")
                 publish_result = ebay_client.publish_offer(offer_id)
@@ -1537,6 +1605,29 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     return {"status": "error", "message": msg}
 
 
+def preview_offer_listing_fees(ebay_client, offer_id, *, category_id, category_name=""):
+    """Call Sell Inventory getListingFees and return a block reason, if any."""
+    listing_fees = None
+    lookup_error = None
+    try:
+        getter = getattr(ebay_client, "get_listing_fees", None)
+        if getter is None:
+            raise RuntimeError("get_listing_fees is not available")
+        listing_fees = getter(offer_id)
+    except Exception as exc:
+        lookup_error = exc
+        listing_fees = None
+    return evaluate_insertion_fee_preview(
+        category_id=category_id,
+        category_path=category_name or "",
+        category_name=category_name or "",
+        listing_fees=listing_fees,
+        lookup_error=lookup_error,
+        lookup_attempted=True,
+        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+    )
+
+
 def _create_or_get_offer(ebay_client, sku, price, category_id, listing_description=None, marketplace_id=None) -> str:
     """Create a new offer or retrieve existing one."""
     try:
@@ -1659,6 +1750,7 @@ def _try_fix_missing_aspect(error_msg: str, aspects: dict, category_id: str) -> 
         EbayPublisher.CATEGORY_REQUIRED_ASPECTS,
         MEASUREMENT_ASPECT_KEYS,
         log=lambda message: logger.info(f"  {message}"),
+        allow_template_defaults=False,
     )
 
 

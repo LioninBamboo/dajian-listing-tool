@@ -525,6 +525,27 @@ class RealEbayClient:
         except Exception as e:
             logging.error(f"get_offer({offer_id}): {e}")
             return None
+
+    def get_listing_fees(self, offer_id: str) -> Dict:
+        """Look up listing fees for an existing offer.
+
+        POST /sell/inventory/v1/offer/get_listing_fees
+        """
+        url = f"{self.base_url}/sell/inventory/v1/offer/get_listing_fees"
+        token = self.oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Content-Language": "en-US",
+        }
+        payload = {"offers": [{"offerId": str(offer_id)}]}
+        response = self.session.post(url, headers=headers, json=payload, timeout=60)
+        if response.status_code != 200:
+            raise Exception(
+                f"getListingFees failed: HTTP {response.status_code} {response.text[:300]}"
+            )
+        return response.json()
     
     def create_or_replace_inventory_item(self, sku: str, product: Dict) -> Dict:
         """
