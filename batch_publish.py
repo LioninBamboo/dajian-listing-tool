@@ -632,6 +632,10 @@ def calculate_smart_final_price(product: dict, market_price: float | None = None
             info = DaJianClient(key, secret).get_stock_info(product.get("sku") or "")
             live_price = info.get("price")
             live_ship = info.get("shipping_fee")
+            if "quantity" in info:
+                product["live_quantity"] = int(info.get("quantity") or 0)
+            if "in_stock" in info:
+                product["live_in_stock"] = bool(info.get("in_stock"))
             if live_price is not None:
                 product_price = float(live_price)
                 product["price"] = product_price
@@ -874,6 +878,41 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     # ── Step 0b: Smart pricing with Terapeak market data ──
     market_p = fetch_market_price(title)
     final_price = calculate_smart_final_price(product, market_p)
+
+    # Re-check live stock + supplier cargo after the live supplier refresh.
+    # Same gates apply to --dry-run so the preview matches real publish outcome.
+    from src.utils.copy_skip_gate import (
+        MAX_SUPPLIER_CARGO_COST_USD,
+        supplier_cargo_cost,
+    )
+    live_qty = product.get("live_quantity")
+    live_in_stock = product.get("live_in_stock")
+    if live_qty is not None or live_in_stock is not None:
+        qty_oos = live_qty is not None and int(live_qty) <= 0
+        if qty_oos or live_in_stock is False:
+            msg = (
+                f"Blocked out_of_stock: live quantity={live_qty}, "
+                f"in_stock={live_in_stock}"
+            )
+            record_error(sku, msg)
+            return {
+                "status": "error",
+                "message": msg,
+                "copy_skip_reasons": ["out_of_stock"],
+            }
+
+    cargo = supplier_cargo_cost(product.get("price"), product.get("shipping"))
+    if cargo is not None and cargo > MAX_SUPPLIER_CARGO_COST_USD:
+        msg = (
+            f"Blocked cargo_cost_over_cap: supplier cargo "
+            f"${cargo:.2f} > ${MAX_SUPPLIER_CARGO_COST_USD:g}"
+        )
+        record_error(sku, msg)
+        return {
+            "status": "error",
+            "message": msg,
+            "copy_skip_reasons": ["cargo_cost_over_cap"],
+        }
 
     # Guard: refuse to publish with empty or placeholder description
     if not description or len(description) < 100 or 'Brand new product' in description[:100]:
