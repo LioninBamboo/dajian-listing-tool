@@ -193,6 +193,56 @@ def test_quality_gate_expected_aspects_for_storage_ottoman():
     )
     assert expected["Type"] == "Storage Ottoman"
     assert expected["Assembly Required"] == "Yes"
+    assert expected["Room"] == "Living Room"
+
+
+def test_sourced_room_is_not_overwritten_by_profile_room():
+    from src.utils.listing_quality_gate import quality_gate_expected_aspects
+
+    aspects = {"Type": ["Storage Ottoman"], "Room": ["Bedroom"]}
+    source = "Upholstered storage ottoman for the bedroom"
+    expected = quality_gate_expected_aspects(
+        title="Storage Ottoman with Lid",
+        source_title="Storage Ottoman with Lid",
+        source_description=source,
+        category_id="20490",
+        current_aspects=aspects,
+    )
+
+    assert expected["Type"] == "Storage Ottoman"
+    assert "Room" not in expected
+
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=source,
+        expected_values_by_name=expected,
+    )
+    assert blockers == []
+    assert aspects["Room"] == ["Bedroom"]
+    assert aspects["Type"] == ["Storage Ottoman"]
+
+
+def test_matching_profile_room_is_kept_when_source_does_not_name_it():
+    from src.utils.listing_quality_gate import quality_gate_expected_aspects
+
+    aspects = {"Type": ["Storage Ottoman"], "Room": ["Living Room"]}
+    source = "Upholstered storage ottoman with lid"
+    expected = quality_gate_expected_aspects(
+        title="Storage Ottoman with Lid",
+        source_title="Storage Ottoman with Lid",
+        source_description=source,
+        category_id="20490",
+        current_aspects=aspects,
+    )
+
+    assert expected["Room"] == "Living Room"
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=source,
+        expected_values_by_name=expected,
+    )
+    assert blockers == []
+    assert aspects["Room"] == ["Living Room"]
 
 
 def test_wood_does_not_match_hollywood():

@@ -1868,7 +1868,12 @@ def quality_gate_expected_aspects(
         expected["Type"] = profile.type_value
     if profile.set_includes:
         expected["Set Includes"] = profile.set_includes
-    if profile.room:
+    # Room is only a fallback when the aspect is missing. A value already on
+    # the listing (for example a source-backed Bedroom) must not be replaced.
+    current_room = first_aspect_text(current_aspects or {}, "Room")
+    if profile.room and (
+        not current_room or current_room.lower() == profile.room.lower()
+    ):
         expected["Room"] = profile.room
     if profile.indoor_outdoor:
         expected["Indoor/Outdoor"] = profile.indoor_outdoor
