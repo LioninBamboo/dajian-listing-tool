@@ -466,6 +466,8 @@ def test_motors_one_named_set_in_box_does_not_false_fail(monkeypatch):
     result = listing_qc.run_listing_qc(
         sku="SOCKET-SET",
         candidate=candidate,
+        source_title=candidate["title"],
+        source_description=candidate["description"],
         qc_profile="motors",
         fact_sheet_conn=None,
     )

@@ -72,21 +72,48 @@ def resolve_qc_profile(explicit: str | None = None) -> str:
         return "furniture"
 
 
-def motors_package_includes_issues(candidate: Mapping[str, Any]) -> list[Any]:
-    """Set / Number of Pieces vs PACKAGE INCLUDES. Independent of fitment.
+def motors_package_includes_issues(  # motors_invented_kit
+    candidate: Mapping[str, Any],
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    source_attributes: Mapping[str, Any] | None = None,
+    source_specs: Mapping[str, Any] | None = None,
+) -> list[Any]:
+    """Set / Number of Pieces vs PACKAGE INCLUDES + invented kit size.
 
     Motors QC used to return after the fitment check alone. Universal-fit
     parts therefore never saw the same deterministic mismatch Main already
-    flags as ``package_includes_set_qty_mismatch``. This does not synthesize
-    Year/Make/Model rows.
+    flags as ``package_includes_set_qty_mismatch``. Also blocks LLM-invented
+    N-piece/pack claims with no GIGA/source evidence (``invented_kit_size``).
+    This does not synthesize Year/Make/Model rows.
     """
     aspects = candidate.get("aspects") if isinstance(candidate.get("aspects"), Mapping) else {}
+    issues: list[Any] = []
     issue = _quality_gate.find_package_includes_set_qty_mismatch(
         str(candidate.get("title") or ""),
         str(candidate.get("description") or ""),
         aspects,
     )
-    return [issue] if issue is not None else []
+    if issue is not None:
+        issues.append(issue)
+    issues.extend(_quality_gate.find_soft3_content_issues(
+        str(candidate.get("title") or ""),
+        str(candidate.get("description") or ""),
+        aspects,
+        f"{source_title or ''}\n{source_description or ''}",
+    ))
+    invented = _quality_gate.find_invented_kit_size(
+        str(candidate.get("title") or ""),
+        str(candidate.get("description") or ""),
+        source_title=source_title,
+        source_description=source_description,
+        attributes=source_attributes,
+        specs=source_specs,
+    )
+    if invented is not None:
+        issues.append(invented)
+    return issues
 
 
 def motors_fitment_blockers(candidate: Mapping[str, Any]) -> list[str]:
@@ -386,7 +413,13 @@ def _run_motors_listing_qc(
     run, including when fitment itself is empty or universal.
     """
     result = _base_result(sku=sku)
-    package_issues = motors_package_includes_issues(candidate)
+    package_issues = motors_package_includes_issues(
+        candidate,
+        source_title=source_title,
+        source_description=source_description,
+        source_attributes=source_attributes,
+        source_specs=source_specs,
+    )
     fitment_blockers = motors_fitment_blockers(candidate)
     gate_errors: list[str] = []
     try:

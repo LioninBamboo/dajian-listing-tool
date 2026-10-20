@@ -111,6 +111,21 @@ def infer_set_includes(title: str) -> Optional[str]:
     if "sofa" in title_lower or "couch" in title_lower or "sectional" in title_lower:
         return "Sofa Set"
     if any(keyword in title_lower for keyword in SET_INCLUDE_KEYWORDS):
+        furniture_hint = (
+            "table" in title_lower
+            or "dining" in title_lower
+            or "patio" in title_lower
+            or "bistro" in title_lower
+            or "chair" in title_lower
+            or "stool" in title_lower
+            or "sofa" in title_lower
+            or "couch" in title_lower
+            or "sectional" in title_lower
+            or "ottoman" in title_lower
+            or "loveseat" in title_lower
+        )
+        if not furniture_hint:
+            return None
         return "Table Set"
     if any(keyword in title_lower for keyword in ("coffee table", "side table", "end table", "console table", "bistro table", "patio table", "dining table")):
         return "Table"
