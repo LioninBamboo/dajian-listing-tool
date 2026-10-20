@@ -6,6 +6,7 @@ import batch_publish
 from src.utils.publish_fee_preview import (
     evaluate_insertion_fee_preview,
     insertion_fee_usd,
+    load_high_fee_blacklist_category_paths,
     load_high_fee_category_blacklist,
 )
 from src.utils.publish_source_aspect_guard import (
@@ -240,6 +241,24 @@ def test_high_fee_category_blacklist_json(tmp_path):
         lookup_attempted=False,
     )
     assert reason == "high_insertion_fee"
+
+
+def test_blacklist_reads_categories_path_entries(tmp_path):
+    path = tmp_path / "skip.json"
+    path.write_text(
+        '{"categories": [{"id": "38204", "path": "Home & Garden > Furniture > Coffee Tables"}]}',
+        encoding="utf-8",
+    )
+    assert load_high_fee_category_blacklist(str(path)) == {"38204"}
+    assert load_high_fee_blacklist_category_paths(str(path)) == {
+        "38204": "Home & Garden > Furniture > Coffee Tables",
+    }
+    assert evaluate_insertion_fee_preview(
+        category_id="99999",
+        category_path="Home & Garden > Furniture > Coffee Tables",
+        blacklist_path=str(path),
+        lookup_attempted=False,
+    ) == "high_insertion_fee"
 
 
 def test_blacklist_reads_publish_skip_category_ids(tmp_path):
@@ -620,3 +639,217 @@ def test_publish_blocks_motors_trailers_using_full_category_path(monkeypatch):
 
     assert result["status"] == "error"
     assert result["copy_skip_reasons"] == ["high_insertion_fee"]
+
+
+_MOTORS_TRAILER_TREE = {
+    "categoryTreeId": "100",
+    "categoryTreeVersion": "1",
+    "rootCategoryNode": {
+        "category": {"categoryId": "6000", "categoryName": "eBay Motors"},
+        "childCategoryTreeNodes": [
+            {
+                "category": {
+                    "categoryId": "66468",
+                    "categoryName": "Other Vehicles & Trailers",
+                },
+                "childCategoryTreeNodes": [
+                    {"category": {"categoryId": "6038", "categoryName": "Trailers"}},
+                ],
+            }
+        ],
+    },
+}
+
+
+def _forbid_taxonomy_tree_http(monkeypatch):
+    calls = []
+
+    def _track(url, *args, **kwargs):
+        text = str(url)
+        calls.append(text)
+        if "get_category_subtree" in text or (
+            "/category_tree/" in text
+            and "get_item_aspects_for_category" not in text
+            and "get_category_suggestions" not in text
+        ):
+            raise AssertionError(f"publish/dry-run must not fetch taxonomy trees: {text}")
+
+        class _Resp:
+            status_code = 500
+
+            def json(self):
+                return {}
+
+        return _Resp()
+
+    monkeypatch.setattr("requests.get", _track)
+    monkeypatch.setattr("src.services.ebay_category_matcher.requests.get", _track)
+    monkeypatch.setattr("batch_publish.requests.get", _track)
+    return calls
+
+
+def _cache_backed_matcher(monkeypatch, tmp_path, trees=None):
+    from src.services.ebay_category_matcher import EbayCategoryMatcher
+    from src.utils import category_tree_cache
+
+    cache_dir = tmp_path / "data" / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    category_tree_cache.reset_category_tree_cache()
+    monkeypatch.setattr(category_tree_cache, "DEFAULT_CACHE_DIR", cache_dir)
+    for tree_id, payload in (trees or {"100": _MOTORS_TRAILER_TREE}).items():
+        category_tree_cache.write_category_tree_cache(tree_id, payload, cache_dir)
+
+    class _Matcher(_FakeCategoryMatcher):
+        def __init__(self, oauth, **kwargs):
+            super().__init__(oauth, **kwargs)
+
+        def get_category_path(self, category_id, category_name="", title=""):
+            return EbayCategoryMatcher(_FakeOAuth("PRODUCTION")).get_category_path(
+                category_id,
+                category_name=category_name,
+                title=title,
+            )
+
+    return _Matcher, cache_dir
+
+
+def test_publish_dry_run_builds_path_from_cache_without_tree_http(monkeypatch, tmp_path):
+    matcher_cls, _ = _cache_backed_matcher(monkeypatch, tmp_path)
+    _forbid_taxonomy_tree_http(monkeypatch)
+    monkeypatch.setattr(batch_publish, "_persist_prepared_listing", lambda **kwargs: None)
+    monkeypatch.setattr(
+        batch_publish,
+        "_normalize_generated_listing",
+        lambda listing, **kwargs: listing,
+    )
+    _stub_publish_common(
+        monkeypatch,
+        matcher_factory=lambda oauth: matcher_cls(
+            oauth, category_id="6038", category_name="Trailers"
+        ),
+    )
+    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", "/nonexistent-high-fee-blacklist.json")
+
+    product = _product(
+        title="Utility Trailer 12ft Single Axle",
+        description="Single-axle utility trailer for cargo.",
+        optimization={
+            "title": "Utility Trailer 12ft Single Axle",
+            "description": _long_description("Single-axle utility trailer for cargo."),
+            "categoryId": "6038",
+            "categoryName": "Trailers",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Type": ["Utility Trailer"],
+                "Item Length": ["12 ft"],
+                "Item Width": ["6 ft"],
+                "Item Height": ["3 ft"],
+            },
+        }
+    )
+    path = batch_publish.resolve_publish_category_path(
+        matcher_cls(_FakeOAuth("PRODUCTION")),
+        "6038",
+        category_name="Trailers",
+    )
+    assert path == "eBay Motors > Other Vehicles & Trailers > Trailers"
+
+    result = batch_publish.publish_single_product(product, dry_run=True)
+    assert result["status"] == "error"
+    assert result["copy_skip_reasons"] == ["high_insertion_fee"]
+
+
+def test_missing_cache_returns_empty_and_blacklist_by_id_still_blocks(monkeypatch, tmp_path):
+    from src.utils import category_tree_cache
+
+    cache_dir = tmp_path / "data" / "cache"
+    cache_dir.mkdir(parents=True)
+    category_tree_cache.reset_category_tree_cache()
+    monkeypatch.setattr(category_tree_cache, "DEFAULT_CACHE_DIR", cache_dir)
+    _forbid_taxonomy_tree_http(monkeypatch)
+
+    blacklist = tmp_path / "high_fee.json"
+    blacklist.write_text('{"publish_skip_category_ids": ["88888"]}', encoding="utf-8")
+    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", str(blacklist))
+
+    from src.services.ebay_category_matcher import EbayCategoryMatcher
+
+    class _Matcher(_FakeCategoryMatcher):
+        def __init__(self, oauth):
+            super().__init__(oauth, category_id="88888", category_name="Widget")
+
+        def get_category_path(self, category_id, category_name="", title=""):
+            return EbayCategoryMatcher(_FakeOAuth("PRODUCTION")).get_category_path(
+                category_id,
+                category_name=category_name,
+                title=title,
+            )
+
+    monkeypatch.setattr(batch_publish, "_persist_prepared_listing", lambda **kwargs: None)
+    monkeypatch.setattr(
+        batch_publish,
+        "_normalize_generated_listing",
+        lambda listing, **kwargs: listing,
+    )
+    _stub_publish_common(monkeypatch, matcher_factory=lambda oauth: _Matcher(oauth))
+
+    matcher = _Matcher(_FakeOAuth("PRODUCTION"))
+    assert matcher.get_category_path("88888", category_name="Widget") == ""
+    assert batch_publish.resolve_publish_category_path(
+        matcher,
+        "88888",
+        category_name="Widget",
+        blacklist_path=str(blacklist),
+    ) == ""
+
+    product = _product(
+        title="Household Widget",
+        description="Plain household widget for indoor use.",
+        optimization={
+            "title": "Household Widget",
+            "description": _long_description("Plain household widget for indoor use."),
+            "categoryId": "88888",
+            "categoryName": "Widget",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Type": ["Widget"],
+                "Item Length": ["10 in"],
+                "Item Width": ["8 in"],
+                "Item Height": ["6 in"],
+            },
+        }
+    )
+    result = batch_publish.publish_single_product(product, dry_run=True)
+    assert result["status"] == "error"
+    assert result["copy_skip_reasons"] == ["high_insertion_fee"]
+
+
+def test_resolve_path_uses_blacklist_categories_path_when_cache_missing(monkeypatch, tmp_path):
+    from src.utils import category_tree_cache
+
+    cache_dir = tmp_path / "data" / "cache"
+    cache_dir.mkdir(parents=True)
+    category_tree_cache.reset_category_tree_cache()
+    monkeypatch.setattr(category_tree_cache, "DEFAULT_CACHE_DIR", cache_dir)
+
+    blacklist = tmp_path / "high_fee.json"
+    blacklist.write_text(
+        '{"categories": [{"id": "6038", "path": "eBay Motors > Other Vehicles & Trailers > Trailers"}]}',
+        encoding="utf-8",
+    )
+
+    from src.services.ebay_category_matcher import EbayCategoryMatcher
+
+    class _Matcher(_FakeCategoryMatcher):
+        def get_category_path(self, category_id, category_name="", title=""):
+            return EbayCategoryMatcher(_FakeOAuth("PRODUCTION")).get_category_path(
+                category_id, category_name=category_name, title=title
+            )
+
+    path = batch_publish.resolve_publish_category_path(
+        _Matcher(_FakeOAuth("PRODUCTION")),
+        "6038",
+        category_name="Trailers",
+        blacklist_path=str(blacklist),
+    )
+    assert path == "eBay Motors > Other Vehicles & Trailers > Trailers"

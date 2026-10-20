@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -203,85 +204,134 @@ def test_genuine_outdoor_daybeds_still_classified():
         assert category_id == "138996", title
 
 
-def test_get_category_path_walks_subtree_parents_by_category_id(monkeypatch):
-    class _TokenOauth:
-        def get_application_token(self):
-            return "app-token"
+MOTORS_TRAILER_TREE = {
+    "categoryTreeId": "100",
+    "categoryTreeVersion": "1",
+    "rootCategoryNode": {
+        "category": {"categoryId": "6000", "categoryName": "eBay Motors"},
+        "childCategoryTreeNodes": [
+            {
+                "category": {
+                    "categoryId": "66468",
+                    "categoryName": "Other Vehicles & Trailers",
+                },
+                "childCategoryTreeNodes": [
+                    {
+                        "category": {"categoryId": "6038", "categoryName": "Trailers"},
+                    }
+                ],
+            }
+        ],
+    },
+}
 
-        def get_valid_token(self):
-            return "user-token"
 
-    nodes = {
-        "6038": {
-            "category": {"categoryId": "6038", "categoryName": "Trailers"},
-            "parentCategoryTreeNodeHref": (
-                "https://api.ebay.example/commerce/taxonomy/v1/category_tree/100/"
-                "get_category_subtree?category_id=66468"
-            ),
-        },
-        "66468": {
-            "category": {"categoryId": "66468", "categoryName": "Other Vehicles & Trailers"},
-            "parentCategoryTreeNodeHref": (
-                "https://api.ebay.example/commerce/taxonomy/v1/category_tree/100/"
-                "get_category_subtree?category_id=6000"
-            ),
-        },
-        "6000": {
-            "category": {"categoryId": "6000", "categoryName": "eBay Motors"},
-            "parentCategoryTreeNodeHref": "",
-        },
-    }
+def _install_tree_cache(monkeypatch, tmp_path, trees=None):
+    from src.utils import category_tree_cache
 
-    class _Resp:
-        def __init__(self, payload):
-            self.status_code = 200
-            self._payload = payload
+    cache_dir = tmp_path / "data" / "cache"
+    cache_dir.mkdir(parents=True)
+    category_tree_cache.reset_category_tree_cache()
+    monkeypatch.setattr(category_tree_cache, "DEFAULT_CACHE_DIR", cache_dir)
+    for tree_id, payload in (trees or {"100": MOTORS_TRAILER_TREE}).items():
+        category_tree_cache.write_category_tree_cache(tree_id, payload, cache_dir)
+    return cache_dir
 
-        def json(self):
-            return self._payload
 
-    def _fake_get(url, headers=None, params=None, timeout=None):
-        cid = str((params or {}).get("category_id") or "")
-        node = nodes.get(cid)
-        if node is None:
-            class _Missing:
-                status_code = 400
+def test_get_category_path_builds_from_cached_tree(monkeypatch, tmp_path):
+    http_calls = []
 
-                def json(self):
-                    return {}
+    def _forbid_http(*args, **kwargs):
+        http_calls.append((args, kwargs))
+        raise AssertionError("publish path must not fetch taxonomy trees")
 
-            return _Missing()
-        return _Resp({"categorySubtreeNode": node})
-
-    monkeypatch.setattr("src.services.ebay_category_matcher.requests.get", _fake_get)
-    matcher = EbayCategoryMatcher(_TokenOauth())
+    _install_tree_cache(monkeypatch, tmp_path)
+    monkeypatch.setattr("src.services.ebay_category_matcher.requests.get", _forbid_http)
+    matcher = EbayCategoryMatcher(_DummyOauth())
     path = matcher.get_category_path(
         "6038",
         category_name="Trailers",
         title="Bathroom Vanity with Sink",
     )
-    assert path == "eBay Motors / Other Vehicles & Trailers / Trailers"
+    assert path == "eBay Motors > Other Vehicles & Trailers > Trailers"
+    assert http_calls == []
 
 
-def test_get_category_path_does_not_cache_leaf_when_subtree_fails(monkeypatch):
-    class _TokenOauth:
-        def get_application_token(self):
-            return "app-token"
+def test_get_category_path_stale_cache_returns_empty(monkeypatch, tmp_path):
+    import time
 
-        def get_valid_token(self):
-            return "user-token"
+    from src.utils import category_tree_cache
 
-    class _Resp:
-        status_code = 500
+    cache_dir = _install_tree_cache(monkeypatch, tmp_path)
+    cache_file = cache_dir / "category_tree_100.json"
+    stale = time.time() - (8 * 24 * 60 * 60)
+    os.utime(cache_file, (stale, stale))
+    category_tree_cache.reset_category_tree_cache()
 
-        def json(self):
-            return {}
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    assert matcher.get_category_path("6038") == ""
+    assert "6038" not in matcher._path_cache
 
+
+def test_refresh_writes_get_category_tree_not_subtree(tmp_path):
+    from src.utils.category_tree_cache import fetch_category_tree, refresh_category_tree_cache
+
+    class _Session:
+        def __init__(self):
+            self.urls = []
+
+        def get(self, url, headers=None, timeout=None):
+            self.urls.append(url)
+
+            class _Resp:
+                status_code = 200
+
+                def json(self):
+                    return {
+                        "categoryTreeId": "0",
+                        "rootCategoryNode": {
+                            "category": {"categoryId": "0", "categoryName": "Root"}
+                        },
+                    }
+
+            return _Resp()
+
+    session = _Session()
+    payload = fetch_category_tree(
+        "0",
+        session=session,
+        token="app-token",
+        api_base="https://api.ebay.com",
+    )
+    assert session.urls == ["https://api.ebay.com/commerce/taxonomy/v1/category_tree/0"]
+    assert "subtree" not in session.urls[0]
+
+    fetched = []
+
+    def _fetch(tree_id):
+        fetched.append(tree_id)
+        return payload
+
+    written = refresh_category_tree_cache(("0", "100"), fetch=_fetch, cache_dir=tmp_path)
+    assert fetched == ["0", "100"]
+    assert [path.name for path in written] == ["category_tree_0.json", "category_tree_100.json"]
+
+
+def test_get_category_path_missing_cache_returns_empty(monkeypatch, tmp_path):
+    from src.utils import category_tree_cache
+
+    cache_dir = tmp_path / "data" / "cache"
+    cache_dir.mkdir(parents=True)
+    category_tree_cache.reset_category_tree_cache()
+    monkeypatch.setattr(category_tree_cache, "DEFAULT_CACHE_DIR", cache_dir)
+
+    http_calls = []
     monkeypatch.setattr(
         "src.services.ebay_category_matcher.requests.get",
-        lambda *args, **kwargs: _Resp(),
+        lambda *args, **kwargs: http_calls.append((args, kwargs)) or (_ for _ in ()).throw(AssertionError("no HTTP")),
     )
-    matcher = EbayCategoryMatcher(_TokenOauth())
+    matcher = EbayCategoryMatcher(_DummyOauth())
     path = matcher.get_category_path("6038", category_name="Trailers", title="Hollywood vanity")
     assert path == ""
     assert "6038" not in matcher._path_cache
+    assert http_calls == []

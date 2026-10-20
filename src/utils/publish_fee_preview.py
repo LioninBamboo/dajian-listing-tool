@@ -51,36 +51,97 @@ def resolve_high_fee_blacklist_path(path: Optional[str] = None) -> Path:
     return REPO_ROOT / DEFAULT_HIGH_FEE_BLACKLIST_RELATIVE
 
 
-def _ids_from_blacklist_payload(data: Any) -> set[str]:
-    if isinstance(data, list):
-        values = data
-    elif isinstance(data, Mapping):
-        values = []
-        for key in _BLACKLIST_ID_KEYS:
-            raw = data.get(key)
-            if isinstance(raw, list):
-                values = raw
-                break
-    else:
-        return set()
-    return {str(item).strip() for item in values if str(item).strip()}
-
-
-def load_high_fee_category_blacklist(path: Optional[str] = None) -> set[str]:
+def _read_blacklist_payload(path: Optional[str] = None) -> Any:
     file_path = resolve_high_fee_blacklist_path(path)
     source = str(file_path)
     if not file_path.is_file():
         _warn_empty_blacklist(source)
-        return set()
+        return None
     try:
-        data = json.loads(file_path.read_text(encoding="utf-8"))
+        return json.loads(file_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         _warn_empty_blacklist(source)
+        return None
+
+
+def _ids_from_blacklist_payload(data: Any) -> set[str]:
+    ids: set[str] = set()
+    if isinstance(data, list):
+        return {str(item).strip() for item in data if str(item).strip()}
+    if not isinstance(data, Mapping):
+        return set()
+    for key in _BLACKLIST_ID_KEYS:
+        raw = data.get(key)
+        if isinstance(raw, list):
+            ids.update(str(item).strip() for item in raw if str(item).strip())
+            break
+    categories = data.get("categories")
+    if isinstance(categories, list):
+        for item in categories:
+            if isinstance(item, Mapping):
+                for key in ("id", "categoryId", "category_id"):
+                    value = str(item.get(key) or "").strip()
+                    if value:
+                        ids.add(value)
+                        break
+            else:
+                value = str(item).strip()
+                if value:
+                    ids.add(value)
+    return ids
+
+
+def _paths_from_blacklist_payload(data: Any) -> dict[str, str]:
+    if not isinstance(data, Mapping):
+        return {}
+    categories = data.get("categories")
+    if not isinstance(categories, list):
+        return {}
+    paths: dict[str, str] = {}
+    for item in categories:
+        if not isinstance(item, Mapping):
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        cid = ""
+        for key in ("id", "categoryId", "category_id"):
+            cid = str(item.get(key) or "").strip()
+            if cid:
+                break
+        if cid:
+            paths[cid] = path
+    return paths
+
+
+def _path_entries_from_blacklist_payload(data: Any) -> list[str]:
+    if not isinstance(data, Mapping):
+        return []
+    categories = data.get("categories")
+    if not isinstance(categories, list):
+        return []
+    return [
+        str(item.get("path") or "").strip()
+        for item in categories
+        if isinstance(item, Mapping) and str(item.get("path") or "").strip()
+    ]
+
+
+def load_high_fee_category_blacklist(path: Optional[str] = None) -> set[str]:
+    data = _read_blacklist_payload(path)
+    if data is None:
         return set()
     ids = _ids_from_blacklist_payload(data)
-    if not ids:
-        _warn_empty_blacklist(source)
+    if not ids and not _path_entries_from_blacklist_payload(data):
+        _warn_empty_blacklist(str(resolve_high_fee_blacklist_path(path)))
     return ids
+
+
+def load_high_fee_blacklist_category_paths(path: Optional[str] = None) -> dict[str, str]:
+    data = _read_blacklist_payload(path)
+    if data is None:
+        return {}
+    return _paths_from_blacklist_payload(data)
 
 
 def _warn_empty_blacklist(source: str) -> None:
@@ -110,7 +171,15 @@ def category_is_high_fee(
         return True
 
     segments = _path_segments(category_path, category_name)
-    return any(segment in HIGH_FEE_PATH_SEGMENTS for segment in segments)
+    if any(segment in HIGH_FEE_PATH_SEGMENTS for segment in segments):
+        return True
+
+    incoming = _path_segments(category_path)
+    if incoming:
+        for extra in _path_entries_from_blacklist_payload(_read_blacklist_payload(blacklist_path) or {}):
+            if incoming == _path_segments(extra):
+                return True
+    return False
 
 
 def insertion_fee_usd(listing_fees: Optional[Mapping[str, Any]]) -> Optional[float]:

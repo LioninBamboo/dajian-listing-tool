@@ -1184,6 +1184,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         category_id,
         category_name=category_name,
         title=title_context,
+        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
     )
     fee_category_reason = evaluate_insertion_fee_preview(
         category_id=category_id,
@@ -1627,8 +1628,18 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     return {"status": "error", "message": msg}
 
 
-def resolve_publish_category_path(category_matcher, category_id, category_name="", title=""):
-    """Best-effort full taxonomy path; falls back to the leaf name."""
+def resolve_publish_category_path(
+    category_matcher,
+    category_id,
+    category_name="",
+    title="",
+    blacklist_path=None,
+):
+    """Full taxonomy path from the on-disk tree cache; never fetches inline.
+
+    Missing or stale cache returns "". Optional blacklist ``categories[].path``
+    entries can supply a known path for the same category id.
+    """
     getter = getattr(category_matcher, "get_category_path", None)
     if callable(getter):
         try:
@@ -1637,7 +1648,13 @@ def resolve_publish_category_path(category_matcher, category_id, category_name="
                 return str(path)
         except Exception as exc:
             logger.warning(f"  Failed to resolve category path for {category_id}: {exc}")
-    return category_name or ""
+    from src.utils.publish_fee_preview import load_high_fee_blacklist_category_paths
+
+    extra = load_high_fee_blacklist_category_paths(blacklist_path)
+    known = extra.get(str(category_id or "").strip())
+    if known:
+        return known
+    return ""
 
 
 def _withdraw_unpublished_offer(ebay_client, offer_id) -> None:
