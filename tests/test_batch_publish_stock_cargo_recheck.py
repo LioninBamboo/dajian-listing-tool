@@ -139,3 +139,131 @@ def test_calculate_smart_final_price_stores_live_stock(monkeypatch):
     assert product["shipping"] == 12.0
     assert product["live_quantity"] == 0
     assert product["live_in_stock"] is False
+    assert product["live_quote_applied"] is True
+
+
+def test_publish_ignores_ebay_listing_price_without_live_quote(monkeypatch):
+    """A failed refresh must not treat an observed listing price as GIGA cargo."""
+    over_cap_price = 400.0
+    assert over_cap_price > MAX_SUPPLIER_CARGO_COST_USD
+
+    def _price(product, market_p):
+        return 399.0
+
+    _stub_publish_preamble(monkeypatch, price_side_effect=_price)
+    opt = _product()["optimization"]
+    opt = {**opt, "description": "Too short to publish."}
+    product = _product(
+        price=over_cap_price,
+        shipping=0.0,
+        specs={"_price_basis": "ebay_listing"},
+        optimization=opt,
+    )
+
+    result = batch_publish.publish_single_product(product, dry_run=True)
+
+    assert result["status"] == "error"
+    assert "cargo_cost_over_cap" not in result["message"]
+    assert result.get("copy_skip_reasons") != [REASON_CARGO_COST]
+
+
+def test_publish_blocks_ebay_listing_after_live_quote_over_cap(monkeypatch):
+    over_cap_price = 240.0
+    over_cap_ship = 20.0
+    assert over_cap_price + over_cap_ship > MAX_SUPPLIER_CARGO_COST_USD
+
+    def _price(product, market_p):
+        product["live_quote_applied"] = True
+        product["live_quantity"] = 4
+        product["live_in_stock"] = True
+        product["price"] = over_cap_price
+        product["shipping"] = over_cap_ship
+        return 399.0
+
+    _stub_publish_preamble(monkeypatch, price_side_effect=_price)
+    product = _product(
+        price=400.0,
+        shipping=0.0,
+        specs={"_price_basis": "ebay_listing"},
+    )
+
+    result = batch_publish.publish_single_product(product, dry_run=True)
+
+    assert result["status"] == "error"
+    assert result["copy_skip_reasons"] == [REASON_CARGO_COST]
+
+
+def test_calculate_smart_final_price_skips_quote_flag_without_live_price(monkeypatch):
+    import sys
+    import types
+
+    product = {
+        "sku": "W3204P565677",
+        "price": 400.0,
+        "shipping": 0.0,
+        "suggested_price": 0,
+        "attributes": {},
+        "specs": {"_price_basis": "ebay_listing"},
+        "cost_breakdown": {"total_dajian_cost": 45.0},
+    }
+
+    class _FakeClient:
+        def __init__(self, key, secret):
+            pass
+
+        def get_stock_info(self, sku):
+            return {"in_stock": True, "quantity": 3}
+
+    class _PE:
+        @staticmethod
+        def calculate_selling_price(cost, margin):
+            return {"selling_price": round(float(cost) * (1 + margin), 2)}
+
+        @staticmethod
+        def calculate_dajian_cost(price, shipping, is_oversize=False):
+            return {"total_dajian_cost": float(price) + float(shipping)}
+
+    fake_mod = types.ModuleType("src.clients.dajian_client")
+    fake_mod.DaJianClient = _FakeClient
+    monkeypatch.setitem(sys.modules, "src.clients.dajian_client", fake_mod)
+    monkeypatch.setenv("DAJIAN_API_KEY", "k")
+    monkeypatch.setenv("DAJIAN_API_SECRET", "s")
+    monkeypatch.setattr(batch_publish, "PricingEngine", _PE)
+
+    batch_publish.calculate_smart_final_price(product, market_price=None)
+
+    assert product["price"] == 400.0
+    assert product["shipping"] == 0.0
+    assert product["live_quote_applied"] is False
+    assert product["live_quantity"] == 3
+
+
+def test_calculate_smart_final_price_quote_flag_false_when_refresh_fails(monkeypatch):
+    product = {
+        "sku": "W3204P565677",
+        "price": 400.0,
+        "shipping": 25.0,
+        "suggested_price": 0,
+        "attributes": {},
+        "specs": {"_price_basis": "ebay_listing"},
+        "cost_breakdown": {"total_dajian_cost": 45.0},
+    }
+
+    class _PE:
+        @staticmethod
+        def calculate_selling_price(cost, margin):
+            return {"selling_price": round(float(cost) * (1 + margin), 2)}
+
+        @staticmethod
+        def calculate_dajian_cost(price, shipping, is_oversize=False):
+            return {"total_dajian_cost": float(price) + float(shipping)}
+
+    monkeypatch.delenv("DAJIAN_API_KEY", raising=False)
+    monkeypatch.delenv("DAJIAN_API_SECRET", raising=False)
+    monkeypatch.setattr(batch_publish, "PricingEngine", _PE)
+
+    batch_publish.calculate_smart_final_price(product, market_price=None)
+
+    assert product["price"] == 400.0
+    assert product["shipping"] == 25.0
+    assert product["live_quote_applied"] is False

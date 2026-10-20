@@ -622,6 +622,10 @@ def calculate_smart_final_price(product: dict, market_price: float | None = None
     current_price = product.get('suggested_price', 0) or product.get('price', 0)
     product_price = float(product.get('price', 0) or 0)
     shipping = float(product.get('shipping', 0) or 0)
+    # Set only when this call writes a positive supplier price. Stock-only
+    # payloads, missing credentials, and thrown refreshes leave stored
+    # price/shipping untouched, which may be an observed eBay listing price.
+    product["live_quote_applied"] = False
 
     # Refresh live supplier price + freight before pricing.
     try:
@@ -642,11 +646,14 @@ def calculate_smart_final_price(product: dict, market_price: float | None = None
             if live_ship is not None:
                 shipping = float(live_ship)
                 product["shipping"] = shipping
+            if live_price is not None and product_price > 0:
+                product["live_quote_applied"] = True
             logger.info(
                 f"  [PRICE] Live supplier cost: price=${product_price:.2f} "
                 f"ship=${shipping:.2f}"
             )
     except Exception as exc:
+        product["live_quote_applied"] = False
         logger.warning(f"  [PRICE] Live supplier cost refresh failed: {exc}")
 
     if product_price > 0:
@@ -883,6 +890,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     # Same gates apply to --dry-run so the preview matches real publish outcome.
     from src.utils.copy_skip_gate import (
         MAX_SUPPLIER_CARGO_COST_USD,
+        cargo_gate_applies,
         supplier_cargo_cost,
     )
     live_qty = product.get("live_quantity")
@@ -901,7 +909,13 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 "copy_skip_reasons": ["out_of_stock"],
             }
 
-    cargo = supplier_cargo_cost(product.get("price"), product.get("shipping"))
+    # Stored eBay listing prices are not GIGA cargo until a live quote lands.
+    cargo = None
+    if cargo_gate_applies(
+        product.get("specs") or {},
+        live_quote_applied=bool(product.get("live_quote_applied")),
+    ):
+        cargo = supplier_cargo_cost(product.get("price"), product.get("shipping"))
     if cargo is not None and cargo > MAX_SUPPLIER_CARGO_COST_USD:
         msg = (
             f"Blocked cargo_cost_over_cap: supplier cargo "
