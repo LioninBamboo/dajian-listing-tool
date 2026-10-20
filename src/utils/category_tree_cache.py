@@ -20,6 +20,8 @@ DEFAULT_CACHE_DIR = REPO_ROOT / "data" / "cache"
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_TREE_IDS = ("0", "100")
 PATH_SEPARATOR = " > "
+PRODUCTION_API_BASE = "https://api.ebay.com"
+SOURCE_HOST_FIELD = "source_host"
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,34 @@ logger = logging.getLogger(__name__)
 _INDEX: Optional[dict[str, tuple[str, str]]] = None
 _INDEX_DIR: Optional[Path] = None
 _CACHE_WARNED: set[str] = set()
+
+
+def normalize_api_base(api_base: str) -> str:
+    return str(api_base or "").strip().rstrip("/")
+
+
+def is_production_api_base(api_base: str) -> bool:
+    return normalize_api_base(api_base).lower() == PRODUCTION_API_BASE
+
+
+def require_production_api_base(api_base: str, *, allow_sandbox: bool = False) -> str:
+    host = normalize_api_base(api_base)
+    if is_production_api_base(host) or allow_sandbox:
+        return host
+    raise ValueError(
+        "Refusing to write category tree cache from non-production host "
+        f"{host or '(empty)'}; pass --allow-sandbox to override"
+    )
+
+
+def snapshot_source_host(payload: Mapping[str, Any]) -> str:
+    return normalize_api_base(
+        payload.get(SOURCE_HOST_FIELD) or payload.get("sourceHost") or ""
+    )
+
+
+def is_production_snapshot(payload: Mapping[str, Any]) -> bool:
+    return is_production_api_base(snapshot_source_host(payload))
 
 
 def category_tree_cache_path(tree_id: str, cache_dir: Optional[Path] = None) -> Path:
@@ -103,6 +133,9 @@ def _load_one_tree(tree_id: str, cache_dir: Path) -> dict[str, tuple[str, str]]:
     if not isinstance(payload, Mapping):
         _warn_cache_unavailable(tree_id, path, "unreadable")
         return {}
+    if not is_production_snapshot(payload):
+        _warn_cache_unavailable(tree_id, path, "non-production")
+        return {}
     return flatten_category_tree(payload)
 
 
@@ -156,10 +189,19 @@ def write_category_tree_cache(
     tree_id: str,
     payload: Mapping[str, Any],
     cache_dir: Optional[Path] = None,
+    *,
+    source_host: Optional[str] = None,
+    allow_sandbox: bool = False,
 ) -> Path:
+    host = require_production_api_base(
+        source_host or snapshot_source_host(payload) or PRODUCTION_API_BASE,
+        allow_sandbox=allow_sandbox,
+    )
+    stamped = dict(payload)
+    stamped[SOURCE_HOST_FIELD] = host
     path = category_tree_cache_path(tree_id, cache_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.write_text(json.dumps(stamped), encoding="utf-8")
     reset_category_tree_cache()
     return path
 
@@ -196,9 +238,19 @@ def refresh_category_tree_cache(
     *,
     fetch: Callable[[str], Mapping[str, Any]],
     cache_dir: Optional[Path] = None,
+    source_host: Optional[str] = None,
+    allow_sandbox: bool = False,
 ) -> list[Path]:
     written: list[Path] = []
     for tree_id in tree_ids:
         payload = fetch(str(tree_id))
-        written.append(write_category_tree_cache(str(tree_id), payload, cache_dir))
+        written.append(
+            write_category_tree_cache(
+                str(tree_id),
+                payload,
+                cache_dir,
+                source_host=source_host,
+                allow_sandbox=allow_sandbox,
+            )
+        )
     return written
