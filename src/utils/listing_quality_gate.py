@@ -1873,14 +1873,18 @@ def quality_gate_expected_aspects(
     if profile.indoor_outdoor:
         expected["Indoor/Outdoor"] = profile.indoor_outdoor
 
-    title_text = _text_context(title_for_profile)
+    # Piece counts follow the listing title, same as validate_listing_quality
+    # (source title only when the listing title is empty). The first piece-count
+    # in a concatenated source+listing string can disagree with QC.
+    set_count_title = _clean_text(title or source_title or "")
+    title_text = _text_context(set_count_title)
     if profile.kind == "dining_chair":
         match = re.search(r"set\s+of\s+(\d+)", title_text)
         if match:
             expected["Number of Items in Set"] = match.group(1)
     if profile.kind == "dining_set":
         item_count = infer_number_of_items_in_set(
-            title_for_profile,
+            set_count_title,
             category_id=category_id or profile.category_id or "",
         )
         if item_count:

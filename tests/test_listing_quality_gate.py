@@ -1763,6 +1763,43 @@ def test_quality_gate_sets_dining_set_item_count_from_title():
     assert normalized["aspects"]["Number of Pieces"] == ["5"]
 
 
+def test_expected_aspects_set_count_follows_listing_title():
+    from src.utils.listing_quality_gate import quality_gate_expected_aspects
+
+    source_title = "7-Piece Dining Set"
+    title = "5 Piece Dining Table Set"
+    expected = quality_gate_expected_aspects(
+        title=title,
+        source_title=source_title,
+        category_id="107578",
+    )
+    assert expected["Number of Items in Set"] == "5"
+    assert expected["Number of Pieces"] == "5"
+
+    issues = validate_listing_quality(
+        {
+            "title": title,
+            "description": "<div>KEY FEATURES</div><ul><li>Round table</li></ul>",
+            "categoryId": "107578",
+            "aspects": {
+                "Type": ["Dining Set"],
+                "Set Includes": ["Dining Table & Chairs"],
+                "Number of Items in Set": ["5"],
+                "Brand": ["AquaVerve"],
+            },
+        },
+        source_title=source_title,
+        images=["img1", "img2"],
+    )
+    assert not any(issue.code == "wrong_set_count" for issue in issues)
+
+    chair_expected = quality_gate_expected_aspects(
+        title="Set of 2 Dining Chairs",
+        source_title="Set of 4 Dining Chairs",
+    )
+    assert chair_expected["Number of Items in Set"] == "2"
+
+
 def test_quality_gate_blocks_unsupported_foldable_claim_from_ai_draft():
     normalized = normalize_generated_listing(
         {
