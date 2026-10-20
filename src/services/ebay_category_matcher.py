@@ -24,6 +24,65 @@ class EbayCategoryMatcher:
         self.oauth = oauth_service
         self.base_url = "https://api.ebay.com"
         self._aspects_cache: Dict[str, List[Dict]] = {}  # Cache category aspects
+        self._path_cache: Dict[str, str] = {}
+
+    def get_category_path(
+        self,
+        category_id: str,
+        category_name: str = "",
+        title: str = "",
+    ) -> str:
+        """Return the full taxonomy path (ancestors + leaf) for a category id."""
+        cid = str(category_id or "").strip()
+        if cid and cid in self._path_cache:
+            return self._path_cache[cid]
+
+        query = (title or category_name or cid)[:100]
+        fallback = str(category_name or "").strip()
+        if not query:
+            return fallback
+
+        try:
+            token = None
+            try:
+                token = self.oauth.get_application_token()
+            except Exception:
+                token = self.oauth.get_valid_token()
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+            }
+            tree_id = get_store_profile().category_tree_id
+            url = (
+                f"{self.base_url}/commerce/taxonomy/v1/category_tree/"
+                f"{tree_id}/get_category_suggestions"
+            )
+            resp = requests.get(url, headers=headers, params={"q": query}, timeout=30)
+            if resp.status_code == 200:
+                for suggestion in (resp.json() or {}).get("categorySuggestions") or []:
+                    category = suggestion.get("category") or {}
+                    if cid and str(category.get("categoryId") or "").strip() != cid:
+                        continue
+                    ancestors = list(suggestion.get("categoryTreeNodeAncestors") or [])
+                    ancestors.sort(key=lambda node: node.get("categoryTreeNodeLevel") or 0)
+                    names = [
+                        str(node.get("categoryName") or "").strip()
+                        for node in ancestors
+                        if str(node.get("categoryName") or "").strip()
+                    ]
+                    leaf = str(category.get("categoryName") or fallback).strip()
+                    if leaf:
+                        names.append(leaf)
+                    path = " / ".join(names)
+                    if cid:
+                        self._path_cache[cid] = path
+                    return path
+        except Exception as exc:
+            logging.warning("[WARN] Category path lookup failed for %s: %s", cid or query, exc)
+
+        if cid:
+            self._path_cache[cid] = fallback
+        return fallback
 
     def canonicalize_category(
         self,

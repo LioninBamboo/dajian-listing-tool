@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import batch_publish
-from src.utils.publish_fee_preview import evaluate_insertion_fee_preview
+from src.utils.publish_fee_preview import (
+    evaluate_insertion_fee_preview,
+    insertion_fee_usd,
+    load_high_fee_category_blacklist,
+)
 from src.utils.publish_source_aspect_guard import (
     build_giga_source_text,
     find_source_matching_value,
     guard_unsourced_aspects,
     restore_sourced_aspects,
+    value_supported_by_source,
 )
 
 
@@ -126,6 +131,66 @@ def test_unsourced_voltage_aspect_is_always_dropped():
     assert aspects["Type"] == ["Kitchen Island"]
 
 
+def test_wood_does_not_match_hollywood():
+    assert value_supported_by_source("Wood", "Hollywood vanity mirror") is False
+
+
+def test_red_does_not_match_covered():
+    assert value_supported_by_source("Red", "covered patio set") is False
+
+
+def test_wood_matches_solid_wood():
+    assert value_supported_by_source("Wood", "solid wood frame") is True
+
+
+def test_insertion_fee_real_shape_zero_is_allowed():
+    reason = evaluate_insertion_fee_preview(
+        listing_fees={
+            "feeSummaries": [{
+                "fees": [{
+                    "feeType": "InsertionFee",
+                    "amount": {"value": "0.00", "currency": "USD"},
+                }]
+            }]
+        },
+        lookup_attempted=True,
+        blacklist_path="/nonexistent-high-fee-blacklist.json",
+    )
+    assert reason is None
+
+
+def test_insertion_fee_real_shape_twenty_blocks():
+    reason = evaluate_insertion_fee_preview(
+        listing_fees={
+            "feeSummaries": [{
+                "fees": [{
+                    "feeType": "InsertionFee",
+                    "amount": {"value": "20.00", "currency": "USD"},
+                }]
+            }]
+        },
+        lookup_attempted=True,
+        blacklist_path="/nonexistent-high-fee-blacklist.json",
+    )
+    assert reason == "high_insertion_fee"
+
+
+def test_successful_fee_response_without_insertion_line_counts_as_zero():
+    assert insertion_fee_usd({
+        "feeSummaries": [{
+            "fees": [{
+                "feeType": "FinalValueFee",
+                "amount": {"value": "3.00", "currency": "USD"},
+            }]
+        }]
+    }) == 0.0
+    assert evaluate_insertion_fee_preview(
+        listing_fees={"feeSummaries": [{"fees": []}]},
+        lookup_attempted=True,
+        blacklist_path="/nonexistent-high-fee-blacklist.json",
+    ) is None
+
+
 def test_insertion_fee_at_least_20_blocks():
     reason = evaluate_insertion_fee_preview(
         listing_fees={
@@ -137,6 +202,7 @@ def test_insertion_fee_at_least_20_blocks():
             }]
         },
         lookup_attempted=True,
+        blacklist_path="/nonexistent-high-fee-blacklist.json",
     )
     assert reason == "high_insertion_fee"
 
@@ -174,6 +240,62 @@ def test_high_fee_category_blacklist_json(tmp_path):
         lookup_attempted=False,
     )
     assert reason == "high_insertion_fee"
+
+
+def test_blacklist_reads_publish_skip_category_ids(tmp_path):
+    path = tmp_path / "skip.json"
+    path.write_text('{"publish_skip_category_ids": ["1162", "6001"]}', encoding="utf-8")
+    assert load_high_fee_category_blacklist(str(path)) == {"1162", "6001"}
+    assert evaluate_insertion_fee_preview(
+        category_id="1162",
+        blacklist_path=str(path),
+        lookup_attempted=False,
+    ) == "high_insertion_fee"
+
+
+def test_default_blacklist_path_used_when_env_unset(tmp_path, monkeypatch):
+    from src.utils import publish_fee_preview
+
+    data_dir = tmp_path / "data" / "config"
+    data_dir.mkdir(parents=True)
+    (data_dir / "high_fee_category_blacklist.json").write_text(
+        '{"publish_skip_category_ids": ["77777"]}',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", raising=False)
+    monkeypatch.setattr(publish_fee_preview, "REPO_ROOT", tmp_path)
+    assert "77777" in load_high_fee_category_blacklist()
+
+
+def test_empty_blacklist_logs_warning(tmp_path, monkeypatch, caplog):
+    import logging
+    from src.utils import publish_fee_preview
+
+    monkeypatch.delenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", raising=False)
+    monkeypatch.setattr(publish_fee_preview, "REPO_ROOT", tmp_path)
+    publish_fee_preview._EMPTY_BLACKLIST_WARNED.clear()
+    with caplog.at_level(logging.WARNING):
+        assert load_high_fee_category_blacklist() == set()
+    assert "empty" in caplog.text.lower()
+
+
+def test_leaf_trailer_name_without_path_does_not_block():
+    assert evaluate_insertion_fee_preview(
+        category_id="33653",
+        category_name="Trailers",
+        lookup_attempted=False,
+        blacklist_path="/nonexistent-high-fee-blacklist.json",
+    ) is None
+
+
+def test_full_taxonomy_trailers_path_blocks():
+    assert evaluate_insertion_fee_preview(
+        category_id="6001",
+        category_path="eBay Motors / Vehicles / Trailers / Cars & Trucks",
+        category_name="Cars & Trucks",
+        lookup_attempted=False,
+        blacklist_path="/nonexistent-high-fee-blacklist.json",
+    ) == "high_insertion_fee"
 
 
 def _long_description(text: str) -> str:
@@ -422,6 +544,7 @@ def test_publish_keeps_sourced_type_when_template_tries_to_overwrite(monkeypatch
 
 def test_publish_blocks_when_insertion_fee_is_at_least_20(monkeypatch):
     published = []
+    deleted = []
 
     class _FakeEbayClient:
         def __init__(self, oauth, policy_manager):
@@ -443,11 +566,15 @@ def test_publish_blocks_when_insertion_fee_is_at_least_20(monkeypatch):
             return {
                 "feeSummaries": [{
                     "fees": [{
-                        "feeType": "INSERTION_FEE",
+                        "feeType": "InsertionFee",
                         "amount": {"value": "20.00", "currency": "USD"},
                     }]
                 }]
             }
+
+        def delete_offer(self, offer_id):
+            deleted.append(offer_id)
+            return True
 
         def publish_offer(self, offer_id):
             published.append(offer_id)
@@ -466,3 +593,19 @@ def test_publish_blocks_when_insertion_fee_is_at_least_20(monkeypatch):
     assert result["status"] == "error"
     assert result["copy_skip_reasons"] == ["high_insertion_fee"]
     assert published == []
+    assert deleted == ["offer-1"]
+
+
+def test_publish_blocks_motors_trailers_using_full_category_path(monkeypatch):
+    class _Matcher(_FakeCategoryMatcher):
+        def get_category_path(self, category_id, category_name="", title=""):
+            return "eBay Motors / Vehicles / Trailers / Utility Trailers"
+
+    monkeypatch.setattr(batch_publish, "_persist_prepared_listing", lambda **kwargs: None)
+    _stub_publish_common(monkeypatch, matcher_factory=lambda oauth: _Matcher(oauth))
+    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", "/nonexistent-high-fee-blacklist.json")
+
+    result = batch_publish.publish_single_product(_product(), dry_run=True)
+
+    assert result["status"] == "error"
+    assert result["copy_skip_reasons"] == ["high_insertion_fee"]

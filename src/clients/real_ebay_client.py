@@ -890,10 +890,18 @@ class RealEbayClient:
         
         target_marketplace = marketplace_id or self.marketplace_id
 
+        from src.utils.ebay_quantity import default_ebay_listing_quantity, resolve_publish_quantity
+
+        try:
+            available_quantity = resolve_publish_quantity(sku)
+        except Exception:
+            available_quantity = default_ebay_listing_quantity()
+
         payload = {
             "sku": sku,
             "marketplaceId": target_marketplace,
             "format": "FIXED_PRICE",
+            "availableQuantity": int(available_quantity),
             "merchantLocationKey": get_store_profile().merchant_location_key,
             "pricingSummary": {
                 "price": {
@@ -1429,7 +1437,19 @@ class RealEbayClient:
                     }
                 return payload
 
-            quantity = self._positive_offer_quantity(offer_data.get("availableQuantity", 1))
+            from src.utils.ebay_quantity import default_ebay_listing_quantity, resolve_publish_quantity
+
+            default_qty = default_ebay_listing_quantity()
+            sku = str(offer_data.get("sku") or "").strip()
+            if sku:
+                try:
+                    default_qty = resolve_publish_quantity(sku)
+                except Exception:
+                    default_qty = default_ebay_listing_quantity()
+            quantity = self._positive_offer_quantity(
+                offer_data.get("availableQuantity", default_qty),
+                default=default_qty,
+            )
             response = self.session.put(
                 get_url,
                 headers=put_headers,

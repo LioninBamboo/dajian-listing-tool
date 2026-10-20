@@ -201,3 +201,35 @@ def test_genuine_outdoor_daybeds_still_classified():
     ):
         category_id, _ = matcher.canonicalize_category(title, "38204", "Benches", description)
         assert category_id == "138996", title
+
+
+def test_get_category_path_joins_taxonomy_ancestors(monkeypatch):
+    class _TokenOauth:
+        def get_application_token(self):
+            return "app-token"
+
+        def get_valid_token(self):
+            return "user-token"
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "categorySuggestions": [{
+                    "category": {"categoryId": "6001", "categoryName": "Cars & Trucks"},
+                    "categoryTreeNodeAncestors": [
+                        {"categoryName": "eBay Motors", "categoryTreeNodeLevel": 1},
+                        {"categoryName": "Vehicles", "categoryTreeNodeLevel": 2},
+                        {"categoryName": "Trailers", "categoryTreeNodeLevel": 3},
+                    ],
+                }]
+            }
+
+    monkeypatch.setattr(
+        "src.services.ebay_category_matcher.requests.get",
+        lambda *args, **kwargs: _Resp(),
+    )
+    matcher = EbayCategoryMatcher(_TokenOauth())
+    path = matcher.get_category_path("6001", category_name="Cars & Trucks")
+    assert path == "eBay Motors / Vehicles / Trailers / Cars & Trucks"

@@ -153,8 +153,11 @@ def _phrase_in_source(phrase: str, source_text: str) -> bool:
     if not tokens:
         return False
     source_tokens = set(_tokens(source_norm))
+    source_token_variants = set(source_tokens)
+    for source_token in source_tokens:
+        source_token_variants.update(_plural_variants(source_token))
     return all(
-        any(variant in source_tokens or variant in source_norm for variant in _plural_variants(token))
+        any(variant in source_token_variants for variant in _plural_variants(token))
         for token in tokens
     )
 

@@ -1179,9 +1179,15 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     source_fingerprint = qc_result["source_fingerprint"]
     candidate_fingerprint = qc_result["candidate_fingerprint"]
 
+    category_path = resolve_publish_category_path(
+        category_matcher,
+        category_id,
+        category_name=category_name,
+        title=title_context,
+    )
     fee_category_reason = evaluate_insertion_fee_preview(
         category_id=category_id,
-        category_path=category_name or "",
+        category_path=category_path,
         category_name=category_name or "",
         lookup_attempted=False,
         blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
@@ -1387,6 +1393,20 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                     f"  [TRADING] Motors publish via AddFixedPriceItem "
                     f"(cat {category_id}, {len(trading_product['compatibility'])} fitment)"
                 )
+                motors_fee_reason = evaluate_insertion_fee_preview(
+                    category_id=category_id,
+                    category_path=category_path,
+                    category_name=category_name or "",
+                    lookup_attempted=False,
+                    blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+                )
+                if motors_fee_reason:
+                    record_error(sku, motors_fee_reason)
+                    return {
+                        "status": "error",
+                        "message": motors_fee_reason,
+                        "copy_skip_reasons": [motors_fee_reason],
+                    }
                 trade = ebay_client.add_fixed_price_item_motors(
                     trading_product,
                     category_id=category_id,
@@ -1439,8 +1459,10 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                     offer_id,
                     category_id=category_id,
                     category_name=category_name,
+                    category_path=category_path,
                 )
                 if fee_reason:
+                    _withdraw_unpublished_offer(ebay_client, offer_id)
                     record_error(sku, fee_reason)
                     return {
                         "status": "error",
@@ -1605,7 +1627,39 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     return {"status": "error", "message": msg}
 
 
-def preview_offer_listing_fees(ebay_client, offer_id, *, category_id, category_name=""):
+def resolve_publish_category_path(category_matcher, category_id, category_name="", title=""):
+    """Best-effort full taxonomy path; falls back to the leaf name."""
+    getter = getattr(category_matcher, "get_category_path", None)
+    if callable(getter):
+        try:
+            path = getter(category_id, category_name=category_name or "", title=title or "")
+            if path:
+                return str(path)
+        except Exception as exc:
+            logger.warning(f"  Failed to resolve category path for {category_id}: {exc}")
+    return category_name or ""
+
+
+def _withdraw_unpublished_offer(ebay_client, offer_id) -> None:
+    deleter = getattr(ebay_client, "delete_offer", None)
+    if not callable(deleter):
+        logger.warning(f"  Cannot withdraw unpublished offer {offer_id}: delete_offer missing")
+        return
+    try:
+        deleter(offer_id)
+        logger.info(f"  Withdrew unpublished offer {offer_id} after fee preview block")
+    except Exception as exc:
+        logger.warning(f"  Failed to withdraw unpublished offer {offer_id}: {exc}")
+
+
+def preview_offer_listing_fees(
+    ebay_client,
+    offer_id,
+    *,
+    category_id,
+    category_name="",
+    category_path="",
+):
     """Call Sell Inventory getListingFees and return a block reason, if any."""
     listing_fees = None
     lookup_error = None
@@ -1619,7 +1673,7 @@ def preview_offer_listing_fees(ebay_client, offer_id, *, category_id, category_n
         listing_fees = None
     return evaluate_insertion_fee_preview(
         category_id=category_id,
-        category_path=category_name or "",
+        category_path=category_path or category_name or "",
         category_name=category_name or "",
         listing_fees=listing_fees,
         lookup_error=lookup_error,

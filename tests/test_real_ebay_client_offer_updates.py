@@ -117,3 +117,55 @@ def test_update_offer_category_keeps_failure_when_follow_up_state_is_wrong():
     )
 
     assert ok is False
+
+
+class _PostSession:
+    def __init__(self):
+        self.post_calls = []
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.post_calls.append(json or {})
+        return _Response(201, payload={"offerId": "offer-qty"})
+
+
+def test_create_offer_sends_resolved_available_quantity(monkeypatch):
+    monkeypatch.setattr(
+        "src.utils.ebay_quantity.resolve_publish_quantity",
+        lambda sku, **kwargs: 4,
+    )
+    client = object.__new__(RealEbayClient)
+    client.base_url = "https://api.ebay.example"
+    client.oauth = _DummyOauth()
+    client.session = _PostSession()
+    client.marketplace_id = "EBAY_US"
+    client._complete_listing_policies = lambda policies=None: {}
+
+    result = client.create_offer("SKU-1", 99.0, category_id="38204")
+
+    assert result["offerId"] == "offer-qty"
+    assert client.session.post_calls[0]["availableQuantity"] == 4
+
+
+def test_update_offer_category_defaults_missing_quantity_to_listing_default(monkeypatch):
+    monkeypatch.setattr("src.utils.ebay_quantity.default_ebay_listing_quantity", lambda: 2)
+    monkeypatch.setattr(
+        "src.utils.ebay_quantity.resolve_publish_quantity",
+        lambda sku, **kwargs: 2,
+    )
+    initial = _make_offer()
+    initial.pop("availableQuantity", None)
+    initial["sku"] = "SKU-1"
+    client = _make_client(
+        initial_offer=initial,
+        put_response=_Response(200, payload={}),
+        verified_offer=initial,
+    )
+
+    ok = client.update_offer_category(
+        "offer-1",
+        "183124",
+        listing_description=_long_description("new desc"),
+    )
+
+    assert ok is True
+    assert client.session.put_calls[0]["json"]["availableQuantity"] == 2
