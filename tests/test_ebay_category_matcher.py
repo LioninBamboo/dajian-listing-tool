@@ -203,7 +203,67 @@ def test_genuine_outdoor_daybeds_still_classified():
         assert category_id == "138996", title
 
 
-def test_get_category_path_joins_taxonomy_ancestors(monkeypatch):
+def test_get_category_path_walks_subtree_parents_by_category_id(monkeypatch):
+    class _TokenOauth:
+        def get_application_token(self):
+            return "app-token"
+
+        def get_valid_token(self):
+            return "user-token"
+
+    nodes = {
+        "6038": {
+            "category": {"categoryId": "6038", "categoryName": "Trailers"},
+            "parentCategoryTreeNodeHref": (
+                "https://api.ebay.example/commerce/taxonomy/v1/category_tree/100/"
+                "get_category_subtree?category_id=66468"
+            ),
+        },
+        "66468": {
+            "category": {"categoryId": "66468", "categoryName": "Other Vehicles & Trailers"},
+            "parentCategoryTreeNodeHref": (
+                "https://api.ebay.example/commerce/taxonomy/v1/category_tree/100/"
+                "get_category_subtree?category_id=6000"
+            ),
+        },
+        "6000": {
+            "category": {"categoryId": "6000", "categoryName": "eBay Motors"},
+            "parentCategoryTreeNodeHref": "",
+        },
+    }
+
+    class _Resp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def _fake_get(url, headers=None, params=None, timeout=None):
+        cid = str((params or {}).get("category_id") or "")
+        node = nodes.get(cid)
+        if node is None:
+            class _Missing:
+                status_code = 400
+
+                def json(self):
+                    return {}
+
+            return _Missing()
+        return _Resp({"categorySubtreeNode": node})
+
+    monkeypatch.setattr("src.services.ebay_category_matcher.requests.get", _fake_get)
+    matcher = EbayCategoryMatcher(_TokenOauth())
+    path = matcher.get_category_path(
+        "6038",
+        category_name="Trailers",
+        title="Bathroom Vanity with Sink",
+    )
+    assert path == "eBay Motors / Other Vehicles & Trailers / Trailers"
+
+
+def test_get_category_path_does_not_cache_leaf_when_subtree_fails(monkeypatch):
     class _TokenOauth:
         def get_application_token(self):
             return "app-token"
@@ -212,24 +272,16 @@ def test_get_category_path_joins_taxonomy_ancestors(monkeypatch):
             return "user-token"
 
     class _Resp:
-        status_code = 200
+        status_code = 500
 
         def json(self):
-            return {
-                "categorySuggestions": [{
-                    "category": {"categoryId": "6001", "categoryName": "Cars & Trucks"},
-                    "categoryTreeNodeAncestors": [
-                        {"categoryName": "eBay Motors", "categoryTreeNodeLevel": 1},
-                        {"categoryName": "Vehicles", "categoryTreeNodeLevel": 2},
-                        {"categoryName": "Trailers", "categoryTreeNodeLevel": 3},
-                    ],
-                }]
-            }
+            return {}
 
     monkeypatch.setattr(
         "src.services.ebay_category_matcher.requests.get",
         lambda *args, **kwargs: _Resp(),
     )
     matcher = EbayCategoryMatcher(_TokenOauth())
-    path = matcher.get_category_path("6001", category_name="Cars & Trucks")
-    assert path == "eBay Motors / Vehicles / Trailers / Cars & Trucks"
+    path = matcher.get_category_path("6038", category_name="Trailers", title="Hollywood vanity")
+    assert path == ""
+    assert "6038" not in matcher._path_cache

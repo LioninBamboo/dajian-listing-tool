@@ -11,8 +11,9 @@ from typing import Any, Mapping, Optional
 
 
 HIGH_INSERTION_FEE_USD = 20.0
-HIGH_FEE_PATH_MARKERS = (
-    "vehicles/trailers",
+HIGH_FEE_PATH_SEGMENTS = (
+    "trailers",
+    "other vehicles & trailers",
     "cars & trucks",
     "cars and trucks",
 )
@@ -89,12 +90,13 @@ def _warn_empty_blacklist(source: str) -> None:
     logger.warning("High-fee category blacklist loaded empty from %s", source)
 
 
-def _path_blobs(category_path: str = "", category_name: str = "") -> tuple[str, str]:
-    blob = " / ".join(
-        part for part in (str(category_path or ""), str(category_name or "")) if part
-    ).lower()
-    compact = re.sub(r"\s*/\s*", "/", blob)
-    return blob, compact
+def _path_segments(*parts: str) -> list[str]:
+    text = " > ".join(str(part) for part in parts if str(part or "").strip())
+    return [
+        re.sub(r"\s+", " ", piece).strip().lower()
+        for piece in re.split(r"\s*[/>]\s*", text)
+        if piece.strip()
+    ]
 
 
 def category_is_high_fee(
@@ -107,13 +109,8 @@ def category_is_high_fee(
     if cat_id and cat_id in load_high_fee_category_blacklist(blacklist_path):
         return True
 
-    blob, compact = _path_blobs(category_path, category_name)
-    if not blob:
-        return False
-    return any(
-        marker in blob or marker in compact
-        for marker in HIGH_FEE_PATH_MARKERS
-    )
+    segments = _path_segments(category_path, category_name)
+    return any(segment in HIGH_FEE_PATH_SEGMENTS for segment in segments)
 
 
 def insertion_fee_usd(listing_fees: Optional[Mapping[str, Any]]) -> Optional[float]:

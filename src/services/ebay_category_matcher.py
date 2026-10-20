@@ -15,6 +15,15 @@ from typing import Dict, List, Optional, Any, Tuple
 from src.utils.product_context_signals import mentions_cooler_product, outdoor_context
 from src.services.ebay_auth import EbayOAuthService
 from src.utils.store_profile import get_store_profile
+from urllib.parse import parse_qs, urlparse
+
+
+def _category_id_from_subtree_href(href: str) -> str:
+    if not href:
+        return ""
+    parsed = urlparse(str(href))
+    values = parse_qs(parsed.query).get("category_id") or []
+    return str(values[0]).strip() if values else ""
 
 
 class EbayCategoryMatcher:
@@ -32,57 +41,114 @@ class EbayCategoryMatcher:
         category_name: str = "",
         title: str = "",
     ) -> str:
-        """Return the full taxonomy path (ancestors + leaf) for a category id."""
+        """Return the full taxonomy path (ancestors + leaf) for a category id.
+
+        Resolves by category id via get_category_subtree parent walks. A failed
+        lookup returns "" and is not cached as the leaf name, so callers can
+        fail safe and rely on blacklist-by-id instead of treating the leaf as
+        a complete, clean path.
+        """
         cid = str(category_id or "").strip()
         if cid and cid in self._path_cache:
             return self._path_cache[cid]
-
-        query = (title or category_name or cid)[:100]
-        fallback = str(category_name or "").strip()
-        if not query:
-            return fallback
+        if not cid:
+            return ""
 
         try:
-            token = None
-            try:
-                token = self.oauth.get_application_token()
-            except Exception:
-                token = self.oauth.get_valid_token()
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-            }
-            tree_id = get_store_profile().category_tree_id
+            path = self._path_from_subtree_walk(cid)
+        except Exception as exc:
+            logging.warning("[WARN] Category path lookup failed for %s: %s", cid, exc)
+            path = ""
+
+        if path:
+            self._path_cache[cid] = path
+            return path
+        logging.warning(
+            "[WARN] Category path unresolved for %s; relying on blacklist-by-id",
+            cid,
+        )
+        return ""
+
+    def _taxonomy_headers(self) -> Dict[str, str]:
+        try:
+            token = self.oauth.get_application_token()
+        except Exception:
+            token = self.oauth.get_valid_token()
+        return {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        }
+
+    def _taxonomy_tree_ids(self, category_id: str) -> List[str]:
+        from src.services.vehicle_compatibility import TREE0_FORCE_INVENTORY_CATEGORIES
+
+        profile = get_store_profile()
+        primary = (
+            "0"
+            if str(category_id or "").strip() in TREE0_FORCE_INVENTORY_CATEGORIES
+            else str(profile.category_tree_id or "0")
+        )
+        trees = [primary]
+        other = "100" if primary == "0" else "0"
+        if other not in trees:
+            trees.append(other)
+        return trees
+
+    def _path_from_subtree_walk(self, category_id: str) -> str:
+        headers = self._taxonomy_headers()
+        for tree_id in self._taxonomy_tree_ids(category_id):
+            path = self._walk_subtree_ancestors(category_id, tree_id, headers)
+            if path:
+                return path
+        return ""
+
+    def _walk_subtree_ancestors(
+        self,
+        category_id: str,
+        tree_id: str,
+        headers: Dict[str, str],
+    ) -> str:
+        names: List[str] = []
+        seen: set[str] = set()
+        current = str(category_id or "").strip()
+        while current and current not in seen:
+            seen.add(current)
             url = (
                 f"{self.base_url}/commerce/taxonomy/v1/category_tree/"
-                f"{tree_id}/get_category_suggestions"
+                f"{tree_id}/get_category_subtree"
             )
-            resp = requests.get(url, headers=headers, params={"q": query}, timeout=30)
-            if resp.status_code == 200:
-                for suggestion in (resp.json() or {}).get("categorySuggestions") or []:
-                    category = suggestion.get("category") or {}
-                    if cid and str(category.get("categoryId") or "").strip() != cid:
-                        continue
-                    ancestors = list(suggestion.get("categoryTreeNodeAncestors") or [])
-                    ancestors.sort(key=lambda node: node.get("categoryTreeNodeLevel") or 0)
-                    names = [
-                        str(node.get("categoryName") or "").strip()
-                        for node in ancestors
-                        if str(node.get("categoryName") or "").strip()
-                    ]
-                    leaf = str(category.get("categoryName") or fallback).strip()
-                    if leaf:
-                        names.append(leaf)
-                    path = " / ".join(names)
-                    if cid:
-                        self._path_cache[cid] = path
-                    return path
-        except Exception as exc:
-            logging.warning("[WARN] Category path lookup failed for %s: %s", cid or query, exc)
-
-        if cid:
-            self._path_cache[cid] = fallback
-        return fallback
+            resp = requests.get(
+                url,
+                headers=headers,
+                params={"category_id": current},
+                timeout=30,
+            )
+            if getattr(resp, "status_code", None) != 200:
+                return ""
+            node = (resp.json() or {}).get("categorySubtreeNode") or {}
+            category = node.get("category") or {}
+            name = str(category.get("categoryName") or "").strip()
+            if name:
+                names.append(name)
+            ancestors = list(node.get("categoryTreeNodeAncestors") or [])
+            if ancestors and len(names) == 1:
+                ancestors.sort(key=lambda item: item.get("categoryTreeNodeLevel") or 0)
+                ancestor_names = [
+                    str(item.get("categoryName") or "").strip()
+                    for item in ancestors
+                    if str(item.get("categoryName") or "").strip()
+                ]
+                if ancestor_names:
+                    return " / ".join(ancestor_names + names)
+            parent_href = str(node.get("parentCategoryTreeNodeHref") or "")
+            parent_id = _category_id_from_subtree_href(parent_href)
+            if not parent_id or parent_id == current:
+                break
+            current = parent_id
+        if not names:
+            return ""
+        names.reverse()
+        return " / ".join(names)
 
     def canonicalize_category(
         self,

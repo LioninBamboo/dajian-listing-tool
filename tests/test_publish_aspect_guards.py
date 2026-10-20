@@ -279,16 +279,27 @@ def test_empty_blacklist_logs_warning(tmp_path, monkeypatch, caplog):
     assert "empty" in caplog.text.lower()
 
 
-def test_leaf_trailer_name_without_path_does_not_block():
+def test_trailer_hitches_leaf_does_not_block():
     assert evaluate_insertion_fee_preview(
         category_id="33653",
-        category_name="Trailers",
+        category_name="Trailer Hitches",
+        category_path="eBay Motors / Parts & Accessories / Trailer Hitches",
         lookup_attempted=False,
         blacklist_path="/nonexistent-high-fee-blacklist.json",
     ) is None
 
 
-def test_full_taxonomy_trailers_path_blocks():
+def test_real_ebay_other_vehicles_and_trailers_path_blocks():
+    assert evaluate_insertion_fee_preview(
+        category_id="6038",
+        category_path="eBay Motors > Other Vehicles & Trailers > Trailers",
+        category_name="Trailers",
+        lookup_attempted=False,
+        blacklist_path="/nonexistent-high-fee-blacklist.json",
+    ) == "high_insertion_fee"
+
+
+def test_full_taxonomy_cars_and_trucks_path_blocks():
     assert evaluate_insertion_fee_preview(
         category_id="6001",
         category_path="eBay Motors / Vehicles / Trailers / Cars & Trucks",
