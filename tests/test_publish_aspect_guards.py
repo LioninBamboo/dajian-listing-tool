@@ -195,6 +195,47 @@ def test_quality_gate_expected_aspects_for_storage_ottoman():
     assert expected["Assembly Required"] == "Yes"
 
 
+def test_guard_and_gate_share_listing_title_dining_set_count():
+    from src.utils.listing_quality_gate import (
+        expected_dining_set_item_count,
+        quality_gate_expected_aspects,
+        validate_listing_quality,
+    )
+
+    listing_title = "5 Piece Dining Table Set with 4 Chairs"
+    source_title = "Set of 8 Dining Table and Chairs"
+    category_id = "107578"
+
+    shared = expected_dining_set_item_count(listing_title, category_id=category_id)
+    assert shared == "5"
+
+    expected = quality_gate_expected_aspects(
+        title=listing_title,
+        source_title=source_title,
+        category_id=category_id,
+    )
+    assert expected["Number of Items in Set"] == shared
+    assert expected["Number of Pieces"] == shared
+
+    issues = validate_listing_quality(
+        {
+            "title": listing_title,
+            "description": "<p>Five-piece dining set.</p>",
+            "categoryId": category_id,
+            "aspects": {
+                "Type": ["Dining Set"],
+                "Number of Items in Set": ["8"],
+                "Set Includes": expected.get("Set Includes", "Dining Table & Chairs"),
+            },
+        },
+        source_title=source_title,
+        images=["https://example.com/a.jpg", "https://example.com/b.jpg"],
+    )
+    count_issues = [issue for issue in issues if issue.code == "wrong_set_count"]
+    assert count_issues
+    assert "5" in count_issues[0].message
+
+
 def test_wood_does_not_match_hollywood():
     assert value_supported_by_source("Wood", "Hollywood vanity mirror") is False
 

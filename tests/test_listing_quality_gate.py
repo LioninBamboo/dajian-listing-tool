@@ -2333,3 +2333,265 @@ def test_package_includes_flags_set_type_when_box_lists_one_singular_item():
     )
     assert issue is not None
     assert issue.code == "package_includes_set_qty_mismatch"
+
+def test_invented_kit_size_flags_108_piece_not_in_source():
+    from src.utils.listing_quality_gate import find_invented_kit_size, validate_listing_quality
+
+    title = "Emergency Car Kit with Portable Air Compressor - 108-Piece Auto Safety & Roadsid"
+    description = (
+        '<div style="max-width:900px">'
+        "<div>AQUARIDES</div>"
+        "<p>Emergency Car Kit with Portable Air Compressor - 108-Piece Auto Safety &amp; Roadsid.</p>"
+        "<h2>KEY FEATURES</h2><ul><li>27-piece first aid kit</li></ul>"
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Auto Safety Emergency Kit</p>"
+        "<div>Thoughtfully curated for modern living</div>"
+        "</div>"
+    )
+    source_description = (
+        "1pc air compressor 12V; 1pc booster cable; 27pc first aid kit; hard shell case"
+    )
+    issue = find_invented_kit_size(
+        title,
+        description,
+        source_title="Auto Safety Emergency Kit",
+        source_description=source_description,
+    )
+    assert issue is not None
+    assert issue.code == "invented_kit_size"
+    assert "108" in issue.message
+
+    issues = validate_listing_quality(
+        {"title": title, "description": description, "aspects": {"Type": ["Safety Kits"]}},
+        source_title="Auto Safety Emergency Kit",
+        source_description=source_description,
+        images=["https://example.com/a.jpg", "https://example.com/b.jpg"],
+    )
+    assert any(i.code == "invented_kit_size" for i in issues)
+
+
+def test_invented_kit_size_allows_source_backed_piece_count():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "20-Piece Paintless Dent Repair Kit Stainless Steel Rods",
+        "PACKAGE INCLUDES: 1 x Paintless Dent Repair Rods Set",
+        source_title="20 Pcs Paintless Dent Repair Rods Kit",
+        source_description="20 Pcs stainless steel rods kit",
+    )
+    assert issue is None
+
+
+def test_invented_kit_size_allows_dining_title_and_number_of_pieces():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Dining Table Set with 4 Chairs Natural Wood",
+        "",
+        source_title="5 Piece Dining Table Set with 4 Chairs",
+        attributes={"Number of Pieces": "5"},
+    )
+    assert issue is None
+
+
+def test_invented_kit_size_allows_chinese_jian_tao():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Dining Table Set",
+        "",
+        source_title="北欧实木餐桌椅5件套 简约家用",
+    )
+    assert issue is None
+
+
+def test_invented_kit_size_allows_pieces_included_spec():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Dining Table Set",
+        "",
+        source_title="Dining Table Chair Bundle",
+        specs={"Pieces Included": "5"},
+    )
+    assert issue is None
+
+
+def test_invented_kit_size_allows_number_of_items_in_set_attr():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Dining Table Set",
+        "",
+        source_title="Dining Table Chair Bundle",
+        attributes={"Number of Items in Set": "5"},
+    )
+    assert issue is None
+
+
+def test_invented_kit_size_allows_table_plus_n_chairs_or_stools():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    chairs = find_invented_kit_size(
+        "5-Piece Dining Table Set",
+        "",
+        source_title="Dining Table with 4 Chairs",
+    )
+    stools = find_invented_kit_size(
+        "3-Piece Pub Table Set",
+        "",
+        source_title="Pub Table with 2 Stools",
+    )
+    assert chairs is None
+    assert stools is None
+
+
+def test_invented_kit_size_allows_chinese_ba_yi_chairs():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    four_chairs = find_invented_kit_size(
+        "4-Piece Chair Set",
+        "",
+        source_title="餐椅 4把椅",
+    )
+    table_plus_chairs = find_invented_kit_size(
+        "5-Piece Dining Table Set",
+        "",
+        source_title="实木餐桌 4把椅",
+    )
+    assert four_chairs is None
+    assert table_plus_chairs is None
+
+
+def test_invented_kit_size_still_blocks_unsupported_count():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "10-Piece Dining Table Set",
+        "",
+        source_title="5 Piece Dining Table Set with 4 Chairs",
+        source_description="北欧实木餐桌椅5件套",
+        attributes={"Number of Pieces": "5", "Number of Items in Set": "5"},
+        specs={"Pieces Included": "5"},
+    )
+    assert issue is not None
+    assert issue.code == "invented_kit_size"
+    assert "10" in issue.message
+
+
+def test_kit_table_regex_does_not_match_stable_vegetable_tablet():
+    from src.utils.listing_quality_gate import (
+        _TABLE_OR_DINING_RE,
+        _has_real_table,
+        _source_kit_size_evidence,
+    )
+
+    for text in ("stable 4 chairs", "vegetable 4 chairs", "tablet 4 chairs"):
+        assert _TABLE_OR_DINING_RE.search(text) is None
+        assert not _has_real_table(text)
+        evidence = _source_kit_size_evidence(source_title=text)
+        assert 4 in evidence
+        assert 5 not in evidence
+
+
+def test_invented_kit_size_allows_dining_chairs_without_table_plus_one():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "Set of 4 Dining Chairs",
+        "",
+        source_title="4 dining chairs",
+    )
+    assert issue is None
+
+
+def test_invented_kit_size_blocks_five_piece_when_source_is_four_chairs():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Chair Set",
+        "",
+        source_title="4 chairs",
+    )
+    assert issue is not None
+    assert issue.code == "invented_kit_size"
+    assert "5" in issue.message
+
+
+def test_invented_kit_size_allows_cn_table_plus_can_yi():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "5-Piece Dining Set",
+        "",
+        source_title="餐桌+4把餐椅",
+    )
+    assert issue is None
+
+
+def test_seating_ignores_dimension_numbers():
+    from src.utils.listing_quality_gate import (
+        _source_kit_size_evidence,
+        find_invented_kit_size,
+    )
+    from src.utils.publish_aspect_completion import (
+        infer_number_of_items_in_set,
+        seating_item_counts,
+        seating_plus_table_item_count,
+    )
+
+    inch_chairs = "47 Inch Wood Dining Chairs"
+    assert seating_item_counts(inch_chairs) == set()
+    assert seating_plus_table_item_count(inch_chairs) is None
+    assert infer_number_of_items_in_set(inch_chairs, category_id="107578") is None
+
+    mixed = "5 Piece Dining Set 48 inch upholstered chairs"
+    assert 48 not in seating_item_counts(mixed)
+    assert seating_plus_table_item_count(mixed) != "49"
+    assert 48 not in _source_kit_size_evidence(source_title=mixed)
+    assert 49 not in _source_kit_size_evidence(source_title=mixed)
+
+    assert seating_plus_table_item_count(
+        "Dining Table Set with 4 Upholstered Chairs"
+    ) == "5"
+    assert infer_number_of_items_in_set("Set of 2 Barrel Chairs") == "2"
+    assert seating_item_counts("Set of 2 Barrel Chairs") == {2}
+    assert seating_item_counts("4 dining chairs") == {4}
+
+    blocked = find_invented_kit_size(
+        "48-Piece Dining Chair Set",
+        "",
+        source_title="48 inch chairs",
+    )
+    assert blocked is not None
+    assert blocked.code == "invented_kit_size"
+    assert "48" in blocked.message
+
+
+def test_kit_evidence_ignores_size_and_model_numbers():
+    from src.utils.listing_quality_gate import (
+        _first_int,
+        _source_kit_size_evidence,
+        find_invented_kit_size,
+    )
+
+    for text in ("60 in Dining Bench", "W465P451141 Wrench Set", "3-Tier Shelf", "2-Drawer Nightstand"):
+        evidence = _source_kit_size_evidence(source_title=text)
+        assert 60 not in evidence
+        assert 465 not in evidence
+        assert 3 not in evidence
+        assert 2 not in evidence
+
+    assert _first_int("48 inch") is None
+    assert _first_int("3-Tier") is None
+    assert _first_int("2-Drawer") is None
+    assert _first_int("W465") is None
+    assert _first_int("5") == 5
+
+    issue = find_invented_kit_size(
+        "3-Piece Storage Cabinet",
+        "",
+        source_title="3-Tier 2-Drawer Storage Cabinet 60 in",
+        attributes={"Model": "W465"},
+    )
+    assert issue is not None
+    assert issue.code == "invented_kit_size"

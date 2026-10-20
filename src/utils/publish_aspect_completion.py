@@ -18,6 +18,41 @@ SET_INCLUDES_SKIP_CATEGORIES = {"48319"}
 MEASUREMENT_DEFAULT_SKIP = set(MEASUREMENT_ASPECT_KEYS) | {"Item Weight"}
 SET_INCLUDE_KEYWORDS = ("dining set", "table set", "piece", "set for", "set of")
 TABLE_TENNIS_KEYWORDS = ("table tennis", "ping pong")
+_TABLE_SET_DOMAIN_RE = re.compile(
+    r"\b(?:table|dining|patio|bistro)\b|\bpub set\b|\bconversation set\b",
+    re.IGNORECASE,
+)
+_SET_CONTEXT_RE = re.compile(
+    r"\b(?:dining set|table set|set for|set of)\b|"
+    r"\b\d{1,3}\s*[- ]?\s*pieces?\b|"
+    r"\bpieces?\b|"
+    r"table and chair|table\s*&\s*chair",
+    re.IGNORECASE,
+)
+# Units/size words that must not be read as a seat or piece count.
+_DIMENSION_AFTER_NUMBER = (
+    r"inch(?:es)?\b|in\b|\"|''|ft\b|feet\b|foot\b|cm\b|mm\b|"
+    r"lbs?\b|pounds?\b|kg\b|oz\b|seat\s+height\b|tiers?\b|drawers?\b"
+)
+NOT_DIMENSION_AFTER = rf"(?!\s*[-–—]?\s*(?:{_DIMENSION_AFTER_NUMBER}))"
+_NOT_DIMENSION_AFTER = NOT_DIMENSION_AFTER
+_DIMENSION_AFTER_NUMBER_RE = re.compile(
+    rf"\s*[-–—]?\s*(?:{_DIMENSION_AFTER_NUMBER})",
+    re.IGNORECASE,
+)
+# 0-3 adjective gap only after "with". Bare "N chairs" stays tight; one
+# non-unit adjective is allowed only for dining/upholstered chairs.
+_SEATING_COUNT_PATTERNS = (
+    rf"\bwith\s+(\d{{1,3}}){_NOT_DIMENSION_AFTER}\s+(?:[a-z]+\s+){{0,3}}?(?:chairs?|stools?)\b",
+    rf"\b(\d{{1,3}}){_NOT_DIMENSION_AFTER}\s+(?:barrel\s+)?chairs?\b",
+    rf"\b(\d{{1,3}}){_NOT_DIMENSION_AFTER}\s+stools?\b",
+    rf"\b(\d{{1,3}}){_NOT_DIMENSION_AFTER}\s+(?:dining|upholstered)\s+chairs?\b",
+)
+_SEATING_PLUS_ONE_PATTERNS = _SEATING_COUNT_PATTERNS + (
+    rf"\bseats?\s+(\d{{1,3}}){_NOT_DIMENSION_AFTER}\b",
+)
+_PLAUSIBLE_SEAT_MIN = 1
+_PLAUSIBLE_SEAT_MAX = 12
 BED_SIZE_MAP = {
     "twin xl": "Twin XL",
     "california king": "California King",
@@ -46,17 +81,75 @@ FABRIC_KEYWORDS = {
 }
 
 
+def has_table_set_domain(title: str) -> bool:
+    return bool(_TABLE_SET_DOMAIN_RE.search(title or ""))
+
+
+def number_is_dimension_bound(text: str, match: re.Match[str], group: int = 1) -> bool:
+    """True when the captured number is a size/model, not a count."""
+    if match.group(group) is None:
+        return False
+    start = match.start(group)
+    if start > 0:
+        prev = text[start - 1]
+        if prev in "/\\" or (prev.isascii() and prev.isalnum()):
+            return True
+    return bool(_DIMENSION_AFTER_NUMBER_RE.match(text[match.end(group):]))
+
+
+def plausible_seat_count(value: int) -> bool:
+    return _PLAUSIBLE_SEAT_MIN <= value <= _PLAUSIBLE_SEAT_MAX
+
+
+def _plausible_seat_count(value: int) -> bool:
+    return plausible_seat_count(value)
+
+
+def seating_item_counts(text: str) -> set[int]:
+    """N from 'N chairs/stools' phrases. Does not add the table."""
+    lowered = (text or "").lower()
+    counts: set[int] = set()
+    for seating_pattern in _SEATING_COUNT_PATTERNS:
+        for match in re.finditer(seating_pattern, lowered):
+            if number_is_dimension_bound(lowered, match):
+                continue
+            try:
+                value = int(match.group(1))
+            except ValueError:
+                continue
+            if _plausible_seat_count(value):
+                counts.add(value)
+    return counts
+
+
+def seating_plus_table_item_count(text: str) -> Optional[str]:
+    """Table/dining + N chairs/stools => N+1, same seating patterns as dining sets."""
+    lowered = (text or "").lower()
+    for seating_pattern in _SEATING_PLUS_ONE_PATTERNS:
+        match = re.search(seating_pattern, lowered)
+        if not match or number_is_dimension_bound(lowered, match):
+            continue
+        try:
+            value = int(match.group(1))
+        except ValueError:
+            return None
+        if not _plausible_seat_count(value):
+            continue
+        return str(value + 1)
+    return None
+
+
 def infer_number_of_items_in_set(title: str, *, category_id: str = "") -> Optional[str]:
     text = (title or "").lower()
 
     for pattern in (
-        r"\b(\d+)\s*-\s*piece\b",
-        r"\b(\d+)\s+piece\b",
-        r"\b(\d+)\s*pc\b",
-        r"\bset\s+of\s+(\d+)\b",
+        rf"\b(\d+){_NOT_DIMENSION_AFTER}\s*-\s*piece\b",
+        rf"\b(\d+){_NOT_DIMENSION_AFTER}\s+piece\b",
+        rf"\b(\d+){_NOT_DIMENSION_AFTER}\s*pc\b",
+        rf"\bset\s+of\s+(\d+){_NOT_DIMENSION_AFTER}\b",
     ):
         match = re.search(pattern, text)
-        if match:
+        if match and not number_is_dimension_bound(text, match):
             return match.group(1)
 
     is_dining_set = (
@@ -69,23 +162,7 @@ def infer_number_of_items_in_set(title: str, *, category_id: str = "") -> Option
     )
     if not is_dining_set:
         return None
-
-    for seating_pattern in (
-        r"\bwith\s+(\d+)\s+(?:[a-z]+\s+){0,3}?chairs?\b",
-        r"\bwith\s+(\d+)\s+(?:[a-z]+\s+){0,3}?stools?\b",
-        r"\b(\d+)\s+(?:barrel\s+)?chairs?\b",
-        r"\b(\d+)\s+stools?\b",
-        r"\bseats?\s+(\d+)\b",
-    ):
-        match = re.search(seating_pattern, text)
-        if not match:
-            continue
-        try:
-            return str(int(match.group(1)) + 1)
-        except ValueError:
-            return None
-
-    return None
+    return seating_plus_table_item_count(title)
 
 
 def _emit(log: Optional[Callable[[str], None]], message: str) -> None:
@@ -97,20 +174,18 @@ def infer_set_includes(title: str) -> Optional[str]:
     title_lower = (title or "").lower()
     if any(keyword in title_lower for keyword in TABLE_TENNIS_KEYWORDS):
         return "Table"
-    set_context = (
-        any(keyword in title_lower for keyword in SET_INCLUDE_KEYWORDS)
-        or "table and chair" in title_lower
-        or "table & chair" in title_lower
-    )
-    if "chair" in title_lower and set_context:
+    set_context = bool(_SET_CONTEXT_RE.search(title_lower))
+    if re.search(r"\bchairs?\b", title_lower) and set_context and has_table_set_domain(title_lower):
         if "table and chair" not in title_lower and "table & chair" not in title_lower:
             return "Chairs"
         return "Dining Table & Chairs" if "dining" in title_lower else "Table & Chairs"
-    if "stool" in title_lower and set_context:
+    if re.search(r"\bstools?\b", title_lower) and set_context and has_table_set_domain(title_lower):
         return "Dining Table & Stools" if "dining" in title_lower else "Table & Stools"
     if "sofa" in title_lower or "couch" in title_lower or "sectional" in title_lower:
         return "Sofa Set"
-    if any(keyword in title_lower for keyword in SET_INCLUDE_KEYWORDS):
+    if set_context:
+        if not has_table_set_domain(title_lower):
+            return None
         return "Table Set"
     if any(keyword in title_lower for keyword in ("coffee table", "side table", "end table", "console table", "bistro table", "patio table", "dining table")):
         return "Table"
