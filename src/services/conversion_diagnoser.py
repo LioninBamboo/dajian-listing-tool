@@ -36,7 +36,7 @@ PRICE_PREMIUM = 1.05
 
 # fill_specifics 仅在 specifics 偏少时才入队, 避免 matcher 已完整时日日空跳过
 MIN_ASPECTS_FOR_FILL = 8
-# SAFE_15 / 成本地板相对市场中位: 再推 price_drop 无效 (不能破地板)
+# SAFE_15 / 成本地板相对市场中位: 再推 price_drop 无效 (不能破地板); synced with NEAR_MARKET_BAND
 FLOOR_OVER_MARKET_LOCK = 1.30
 
 

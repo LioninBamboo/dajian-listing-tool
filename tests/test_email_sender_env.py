@@ -30,6 +30,35 @@ def test_send_email_loads_env_before_reading_credentials(monkeypatch, tmp_path):
     assert calls == [(email_sender.PROJECT_ROOT / '.env', False)]
 
 
+def test_send_email_send_smtp_false_skips_smtp(monkeypatch, tmp_path):
+    monkeypatch.setattr(email_sender, '_ENV_LOADED', True)
+    monkeypatch.setenv('NOTIFICATION_EMAIL', 'sender@example.com')
+    monkeypatch.setenv('NOTIFICATION_EMAIL_PASSWORD', 'secret')
+
+    smtp_calls = []
+
+    monkeypatch.setattr(
+        email_sender,
+        '_save_local_report',
+        lambda subject, body: str(tmp_path / 'report.html'),
+    )
+    monkeypatch.setattr(
+        email_sender,
+        '_send_via_smtp',
+        lambda *args, **kwargs: smtp_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        email_sender,
+        'get_smtp_attempts',
+        lambda sender: (_ for _ in ()).throw(AssertionError('SMTP should not run')),
+    )
+
+    ok = email_sender.send_email('subject', '<p>body</p>', send_smtp=False, retry_delay=0)
+
+    assert ok is True
+    assert smtp_calls == []
+
+
 def test_purge_old_email_report_artifacts_keeps_recent_files(tmp_path):
     old = tmp_path / 'daily_report_20260101_010101.html'
     old.write_text('old', encoding='utf-8')

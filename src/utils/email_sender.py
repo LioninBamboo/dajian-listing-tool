@@ -152,6 +152,7 @@ def send_email(
     to_email: Optional[str] = None,
     attachments: Optional[List[str]] = None,
     retry_delay: float = 2.0,
+    send_smtp: bool = True,
 ) -> bool:
     """
     发送 HTML 邮件（自动多提供商重试）。
@@ -173,6 +174,10 @@ def send_email(
 
     # ---- 本地保存（保底） ----
     local_path = _save_local_report(subject, html_body)
+
+    if not send_smtp:
+        logger.info(f"local-only email report (SMTP skipped): {local_path}")
+        return True
 
     # ---- 检查凭据 ----
     sender = os.getenv("NOTIFICATION_EMAIL", "").strip().strip("'\"")
