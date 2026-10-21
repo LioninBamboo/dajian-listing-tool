@@ -254,3 +254,22 @@ def refresh_category_tree_cache(
             )
         )
     return written
+
+
+def is_cached_leaf_category(
+    category_id: str,
+    cache_dir: Optional[Path] = None,
+    index: Optional[Mapping[str, tuple[str, str]]] = None,
+) -> bool:
+    """True when ``category_id`` exists in the cached tree and has no children.
+
+    Publish/audit use this instead of get_category_subtree. A missing cache or
+    unknown id is not a leaf (fail closed).
+    """
+    cid = str(category_id or "").strip()
+    if not cid:
+        return False
+    flat = dict(index) if index is not None else load_category_index(cache_dir)
+    if cid not in flat:
+        return False
+    return all(parent != cid for _name, parent in flat.values() if parent)

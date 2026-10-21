@@ -968,7 +968,12 @@ def publish_with_auto_category(product: dict) -> dict:
             )
             category_id = remap_legacy_category_id(category_id)
             stored_cat = remap_legacy_category_id(opt_data.get("categoryId", ""))
-            if stored_cat and not is_sellable_leaf_category(oauth, stored_cat):
+            from src.utils.approved_category import evaluate_approved_category
+
+            approved_decision = evaluate_approved_category(stored_cat, opt_data)
+            if approved_decision.approved and approved_decision.error:
+                return {"status": "error", "message": approved_decision.error}
+            if stored_cat and not approved_decision.preserve and not is_sellable_leaf_category(oauth, stored_cat):
                 print(f"[AUTO] Stored category {stored_cat} is invalid in current taxonomy, ignoring")
                 stored_cat = ""
             if category_id and not is_sellable_leaf_category(oauth, category_id):
@@ -976,7 +981,12 @@ def publish_with_auto_category(product: dict) -> dict:
                 category_id = ""
 
             protected_stored_categories = PROTECTED_STORED_CATEGORY_IDS
-            if stored_cat in protected_stored_categories and category_id and category_id != stored_cat:
+            if approved_decision.preserve and stored_cat:
+                print(f"[AUTO] Preserving human-approved category {stored_cat}")
+                category_id = stored_cat
+                category_name = opt_data.get("categoryName") or f"Category {stored_cat}"
+                completed_aspects = existing_aspects
+            elif stored_cat in protected_stored_categories and category_id and category_id != stored_cat:
                 print(f"[AUTO] Preserving stored protected category {stored_cat}; ignoring fallback/API {category_id}")
                 category_id = stored_cat
                 category_name = f"Category {stored_cat}"
