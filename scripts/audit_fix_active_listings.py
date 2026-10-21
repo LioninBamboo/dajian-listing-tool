@@ -97,7 +97,7 @@ from src.utils.dimension_helpers import (
     find_dimension,
     replace_description_measurements,
 )
-from src.utils.approved_category import is_category_approved, mark_category_approved as stamp_category_approved
+from src.utils.approved_category import is_category_approved
 from src.utils.publish_validation import first_aspect_text, measurement_issue
 from src.utils.publish_autofix import (
     SINGLE_VALUE_ASPECTS,
@@ -1974,11 +1974,6 @@ def create_parser():
         choices=["Yes"],
         help="Operator override: emit Assembly Required=Yes for assembly_package_conflict. Requires --sku or --sku-file.",
     )
-    parser.add_argument(
-        "--mark-category-approved",
-        action="store_true",
-        help="Stamp optimization.categoryApproved when applying a categoryId fix (human allow-category path).",
-    )
     return parser
 
 
@@ -3273,7 +3268,6 @@ def fix_listing_on_ebay(
     *,
     base_opt_raw=None,
     source_detail_cache: dict[str, dict] | None = None,
-    mark_category_approved: bool = False,
 ):
     """Apply fixes to a published eBay listing."""
     results = []
@@ -4415,8 +4409,6 @@ def fix_listing_on_ebay(
         opt["aspects"] = aspects
         if new_category:
             opt["categoryId"] = new_category
-        if mark_category_approved:
-            stamp_category_approved(opt, new_category or opt.get("categoryId"))
         if new_category_name:
             opt["categoryName"] = new_category_name
         if title_changed:
@@ -4734,7 +4726,6 @@ def main(argv=None):
                 conn,
                 base_opt_raw=audit_opt_raw if args.live else None,
                 source_detail_cache=semantic_source_detail_cache,
-                mark_category_approved=bool(args.mark_category_approved),
             )
             for r in fix_results:
                 if "ERROR" in r:

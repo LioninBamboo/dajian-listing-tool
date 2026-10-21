@@ -887,6 +887,153 @@ def test_validate_fix_scope_allows_package_conflict_accept_with_sku_file():
     assert args.accept_package_conflict_as == "Yes"
 
 
+def test_audit_parser_rejects_mark_category_approved_flag():
+    import inspect
+
+    parser = audit_fix_active_listings.create_parser()
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["--live", "--fix", "--sku", "W1", "--mark-category-approved"])
+    assert excinfo.value.code == 2
+    assert not hasattr(parser.parse_args(["--live"]), "mark_category_approved")
+    assert "mark_category_approved" not in inspect.signature(
+        audit_fix_active_listings.fix_listing_on_ebay
+    ).parameters
+    source = Path(audit_fix_active_listings.__file__).read_text(encoding="utf-8")
+    assert "--mark-category-approved" not in source
+    assert "stamp_category_approved" not in source
+
+
+def test_fix_listing_does_not_stamp_approval_on_category_remap(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    stored = {
+        "title": "Bathroom Storage Cabinet",
+        "description": "<div>Bathroom storage cabinet for towels.</div>",
+        "aspects": {"Brand": ["AquaVerve"]},
+        "categoryId": "20487",
+        "categoryName": "Cabinets & Cupboards",
+    }
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        ("W1", json.dumps(stored)),
+    )
+
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "_put_inventory_product_only",
+        lambda *args, **kwargs: (object(), stored["description"], stored["aspects"]),
+    )
+
+    class FakeClient:
+        def get_offers_by_sku(self, sku):
+            return [
+                {
+                    "offerId": "offer-1",
+                    "listing": {"listingId": "123"},
+                    "status": "PUBLISHED",
+                    "categoryId": "20487",
+                    "listingDescription": stored["description"],
+                }
+            ]
+
+        def update_offer_category(self, offer_id, category_id, price=None, listing_description=None):
+            return True
+
+        def publish_offer(self, offer_id):
+            return {"listingId": "123"}
+
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "W1",
+        {
+            "sku": "W1",
+            "title": "Bathroom Storage Cabinet",
+            "description": stored["description"],
+            "optimization": json.dumps(stored),
+            "attributes": "{}",
+            "specs": "{}",
+            "images": "[]",
+            "price": 10,
+            "suggested_price": 10,
+            "listing_id": "123",
+        },
+        {"categoryId": "176991", "categoryName": "Bathroom Cabinets"},
+        FakeClient(),
+        conn,
+    )
+
+    assert not any(str(item).startswith("ERROR") for item in results), results
+    opt = json.loads(
+        conn.execute("SELECT optimization FROM collected_products WHERE sku=?", ("W1",)).fetchone()[0]
+    )
+    assert opt["categoryId"] == "176991"
+    assert "categoryApproved" not in opt
+    assert "categoryApprovedId" not in opt
+
+
+def test_fix_listing_does_not_stamp_approval_without_category_remap(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    stored = {
+        "title": "Storage Cabinet",
+        "description": "<div>Storage cabinet.</div>",
+        "aspects": {"Brand": ["AquaVerve"], "Material": ["MDF"]},
+        "categoryId": "20487",
+    }
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+        ("W1", json.dumps(stored)),
+    )
+
+    monkeypatch.setattr(
+        audit_fix_active_listings,
+        "_put_inventory_product_only",
+        lambda ebay_client, sku, title, description, aspects: (object(), description, aspects),
+    )
+
+    class FakeClient:
+        def get_offers_by_sku(self, sku):
+            return [
+                {
+                    "offerId": "offer-1",
+                    "listing": {"listingId": "123"},
+                    "status": "PUBLISHED",
+                    "categoryId": "20487",
+                    "listingDescription": stored["description"],
+                }
+            ]
+
+        def publish_offer(self, offer_id):
+            return {"listingId": "123"}
+
+    results = audit_fix_active_listings.fix_listing_on_ebay(
+        "W1",
+        {
+            "sku": "W1",
+            "title": "Storage Cabinet",
+            "description": stored["description"],
+            "optimization": json.dumps(stored),
+            "attributes": "{}",
+            "specs": "{}",
+            "images": "[]",
+            "price": 10,
+            "suggested_price": 10,
+            "listing_id": "123",
+        },
+        {"Material": ["Particle Board"]},
+        FakeClient(),
+        conn,
+    )
+
+    assert not any(str(item).startswith("ERROR") for item in results), results
+    opt = json.loads(
+        conn.execute("SELECT optimization FROM collected_products WHERE sku=?", ("W1",)).fetchone()[0]
+    )
+    assert opt["categoryId"] == "20487"
+    assert opt["aspects"]["Material"] == ["Particle Board"]
+    assert "categoryApproved" not in opt
+    assert "categoryApprovedId" not in opt
+
+
 def _package_conflict_live_opt(assembly_required=None):
     aspects = {
         "Brand": ["AquaVerve"],
