@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import batch_publish
 from src.utils.approved_category import (
+    CATEGORY_APPROVED_ID_KEY,
     CATEGORY_APPROVED_KEY,
+    backfill_approved_category_id,
     evaluate_approved_category,
     is_category_approved,
     mark_category_approved,
 )
+from src.utils.publish_validation import get_publish_blockers
 from src.utils.listing_quality_gate import (
     normalize_generated_listing,
     validate_listing_quality,
@@ -108,7 +111,35 @@ def test_operator_marks_approval_on_optimization_json():
     assert is_category_approved(opt) is False
     mark_category_approved(opt)
     assert opt[CATEGORY_APPROVED_KEY] is True
+    assert opt[CATEGORY_APPROVED_ID_KEY] == "176991"
     assert is_category_approved(opt) is True
+
+
+def test_legacy_flag_does_not_mutate_on_read():
+    opt = {"categoryId": "176991", CATEGORY_APPROVED_KEY: True}
+    assert is_category_approved(opt) is True
+    assert CATEGORY_APPROVED_ID_KEY not in opt
+
+
+def test_legacy_flag_backfills_approved_id_explicitly():
+    opt = {"categoryId": "176991", CATEGORY_APPROVED_KEY: True}
+    assert backfill_approved_category_id(opt) == "176991"
+    assert opt[CATEGORY_APPROVED_ID_KEY] == "176991"
+    assert is_category_approved(opt) is True
+
+
+def test_mismatched_approved_id_is_treated_as_unapproved(caplog):
+    opt = {
+        "categoryId": "38200",
+        CATEGORY_APPROVED_KEY: True,
+        CATEGORY_APPROVED_ID_KEY: "20748",
+    }
+    with caplog.at_level("WARNING"):
+        assert is_category_approved(opt) is False
+    assert "does not match current categoryId" in caplog.text
+    decision = evaluate_approved_category("38200", opt)
+    assert decision.approved is False
+    assert decision.preserve is False
 
 
 def test_evaluate_preserves_approved_cached_leaf(monkeypatch, tmp_path):
@@ -188,6 +219,25 @@ def test_normalize_still_remaps_unapproved_bathroom_cabinet():
     )
     assert normalized["categoryId"] == "20487"
     assert normalized["categoryName"] == "Cabinets & Cupboards"
+
+
+def test_normalize_does_not_preserve_rewritten_unpinned_category():
+    opt = _bathroom_opt(approved=True)
+    opt["categoryId"] = "38204"
+    opt["categoryName"] = "Tables"
+    opt[CATEGORY_APPROVED_ID_KEY] = "176991"
+    normalized = normalize_generated_listing(
+        opt,
+        source_title="Bathroom Storage Cabinet with Doors and Shelves",
+        attributes={
+            "Assembled Length (in.)": "24",
+            "Assembled Width (in.)": "16",
+            "Assembled Height (in.)": "32",
+        },
+        specs={},
+        images=["img1", "img2"],
+    )
+    assert normalized["categoryId"] == "20487"
 
 
 def test_quality_gate_skips_mismatch_for_approved_category():
@@ -299,6 +349,7 @@ def test_batch_publish_rejects_non_leaf_approved_category(monkeypatch, tmp_path)
     product = _publish_bathroom_product(approved=True)
     product["optimization"]["categoryId"] = "20487"
     product["optimization"]["categoryName"] = "Cabinets & Cupboards"
+    product["optimization"][CATEGORY_APPROVED_ID_KEY] = "20487"
 
     result = batch_publish.publish_single_product(product, dry_run=True)
     assert result["status"] == "error"
@@ -351,6 +402,53 @@ def test_active_audit_does_not_remap_approved_dog_crate(monkeypatch):
     )
     assert not any(issue.get("type") == "category_mismatch" for issue in issues)
     assert "categoryId" not in fixes
+
+
+def test_publish_blockers_skip_canonicalize_for_approved_implausible_leaf():
+    class _Matcher:
+        def canonicalize_category(self, title_context, category_id, category_name, description=None):
+            raise AssertionError("approved leaf must not be canonicalized")
+
+        def is_category_plausible_for_text(self, title, category_id, category_name):
+            return False
+
+    aspects = {
+        "Item Length": ["36 in"],
+        "Item Width": ["22 in"],
+        "Item Height": ["30 in"],
+    }
+    title = "Wooden Dog Crate End Table Furniture Kennel"
+    assert get_publish_blockers(
+        _Matcher(),
+        title,
+        aspects,
+        "20748",
+        "Dog Houses",
+        skip_canonicalize=True,
+    ) == []
+
+    class _ImplausibleMatcher:
+        def canonicalize_category(self, title_context, category_id, category_name, description=None):
+            return category_id, category_name
+
+        def is_category_plausible_for_text(self, title, category_id, category_name):
+            return False
+
+    blockers = get_publish_blockers(
+        _ImplausibleMatcher(),
+        title,
+        aspects,
+        "20748",
+        "Dog Houses",
+    )
+    assert any("implausible category 20748" in item for item in blockers)
+
+
+def test_server_publish_passes_skip_canonicalize_for_approved_leaf():
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "server.py").read_text(encoding="utf-8")
+    assert "skip_canonicalize=preserve_approved_category" in source
 
 
 def test_choose_ready_category_keeps_approved_leaf():
