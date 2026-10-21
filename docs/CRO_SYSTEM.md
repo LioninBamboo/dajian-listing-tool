@@ -218,6 +218,7 @@ Production-facing S131-S140 entrypoints now go through `scripts/cro_ops_snapshot
 - `promote` can create missing ads only through `EbayAdService.create_ad_safe`; unsafe, blacklisted, or campaign-less SKUs must not be marked done.
 - CRO diagnose is additive; it should enqueue work, not directly mutate live listing state.
 - `scripts/cro_delist.py` stays human-confirmed. Never auto-delist live listings.
+- After a confirmed delist, `collected_products.status` becomes `ENDED` only when eBay readback shows the listing ended (or an injected confirmer says so). A withdraw that still leaves the item Active must not write `ENDED`.
 - The scheduler runs relist-lifecycle detect/evaluate only. Live withdraw/republish requires the operator path (`scripts/cro_relist_lifecycle.py --precheck/--execute --apply`); `execute_approved()` is a thin orchestrator over that same two-step flow, never a bypass.
 - Threshold promotion must stay shadow-gated before production promotion.
 - DR helpers must preserve enough metadata to verify backup integrity before restore.

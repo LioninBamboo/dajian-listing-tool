@@ -273,15 +273,13 @@ def run_inventory_sync(limit: int = 0, skip_synced_today: bool = True):
             if skipped_synced_today > 0:
                 st.write(f"⏭️ 跳过今日已同步的 {skipped_synced_today} 个产品")
         
-        published = service.get_published_products()
-        if not published:
-            st.warning("暂无已刊登产品可同步 (状态= PUBLISHED)")
-            return {'checked': 0, 'out_of_stock': [], 'price_changed': []}
-        
-        st.write(f"📦 发现 {len(published)} 个已刊登产品，开始同步...")
-        
-        # 使用快速模式同步（跳过eBay状态检查）
+        st.write("📦 按 eBay 实际在售状态确定同步范围（不只看 DB PUBLISHED）...")
+
+        # 使用快速模式同步（跳过逐条 offer 检查；覆盖面仍来自 ActiveList）
         results = service.sync_all(skip_ebay_check=True, limit=limit, skip_synced_today=skip_synced_today)
+        if not results and not getattr(service, "last_sync_scope_count", 0):
+            st.warning("暂无 eBay 在售且可映射到本地的产品可同步")
+            return {'checked': 0, 'out_of_stock': [], 'price_changed': []}
         
         # 处理结果
         if isinstance(results, list):

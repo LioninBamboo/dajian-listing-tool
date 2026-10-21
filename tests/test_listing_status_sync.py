@@ -56,9 +56,17 @@ def test_ready_with_dead_listing_id_cleared_others_untouched(patched, monkeypatc
         ("PUB_DEAD", "PUBLISHED", "999"),  # PUBLISHED 死链 → ENDED (原有行为)
     ])
     monkeypatch.setattr(
-        lss, "fetch_all_active_listing_ids",
-        lambda trading=None: ({"222", "333"}, 2, True),
+        lss, "fetch_all_active_listings",
+        lambda trading=None, max_pages=20: (
+            [
+                lss.LiveListing(item_id="222", sku="LIVE"),
+                lss.LiveListing(item_id="333", sku="OOS"),
+            ],
+            2,
+            True,
+        ),
     )
+    monkeypatch.setattr(lss, "confirm_listing_ended", lambda listing_id, trading=None: True)
 
     res = lss.sync_listing_status(force_refresh=True)
 
@@ -79,8 +87,8 @@ def test_incomplete_fetch_skips_all_reconciliation(patched, monkeypatch):
     ])
     # fetch_complete=False → 残缺快照, 必须整批跳过, 不动任何数据
     monkeypatch.setattr(
-        lss, "fetch_all_active_listing_ids",
-        lambda trading=None: (set(), 50, False),
+        lss, "fetch_all_active_listings",
+        lambda trading=None, max_pages=20: ([], 50, False),
     )
 
     res = lss.sync_listing_status(force_refresh=True)
@@ -96,8 +104,12 @@ def test_fetched_fewer_than_api_total_skips(patched, monkeypatch):
     db = _make_db(patched, [("DEAD", "READY", "111")])
     # fetch_complete=True 但抓到数(1) < api_total(100) → 仍判残缺, 跳过
     monkeypatch.setattr(
-        lss, "fetch_all_active_listing_ids",
-        lambda trading=None: ({"222"}, 100, True),
+        lss, "fetch_all_active_listings",
+        lambda trading=None, max_pages=20: (
+            [lss.LiveListing(item_id="222", sku="")],
+            100,
+            True,
+        ),
     )
 
     res = lss.sync_listing_status(force_refresh=True)
@@ -153,3 +165,82 @@ def test_fetch_incomplete_when_hits_max_pages():
     trading = _FakeTrading(pages)
     _ids, _total, complete = lss.fetch_all_active_listing_ids(trading, max_pages=3)
     assert complete is False
+
+
+def test_fetch_active_listings_includes_sku():
+    xml = (
+        '<GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">'
+        '<ActiveList><PaginationResult>'
+        '<TotalNumberOfEntries>1</TotalNumberOfEntries>'
+        '<TotalNumberOfPages>1</TotalNumberOfPages>'
+        '</PaginationResult>'
+        '<ItemArray><Item><ItemID>366701946479</ItemID>'
+        '<SKU>W465P220504</SKU></Item></ItemArray>'
+        '</ActiveList></GetMyeBaySellingResponse>'
+    )
+    listings, total, complete = lss.fetch_all_active_listings(_FakeTrading([xml]))
+    assert complete is True
+    assert total == 1
+    assert listings == [lss.LiveListing(item_id="366701946479", sku="W465P220504")]
+
+
+def test_sku_still_live_with_new_item_id_is_not_ended(patched, monkeypatch):
+    db = _make_db(patched, [
+        ("W465P220504", "PUBLISHED", "old-listing"),
+    ])
+    monkeypatch.setattr(
+        lss, "fetch_all_active_listings",
+        lambda trading=None, max_pages=20: (
+            [lss.LiveListing(item_id="366701946479", sku="W465P220504")],
+            1,
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        lss, "confirm_listing_ended",
+        lambda listing_id, trading=None: True,
+    )
+
+    res = lss.sync_listing_status(force_refresh=True)
+
+    assert res["stale_ended"] == []
+    assert _row(db, "W465P220504") == ("PUBLISHED", "old-listing")
+
+
+def test_active_readback_does_not_write_ended(patched, monkeypatch):
+    db = _make_db(patched, [
+        ("LIVE-ENDED-DRIFT", "PUBLISHED", "999"),
+    ])
+    monkeypatch.setattr(
+        lss, "fetch_all_active_listings",
+        lambda trading=None, max_pages=20: ([], 0, True),
+    )
+    monkeypatch.setattr(
+        lss, "confirm_listing_ended",
+        lambda listing_id, trading=None: False,
+    )
+
+    res = lss.sync_listing_status(force_refresh=True)
+
+    assert res["stale_ended"] == []
+    assert "LIVE-ENDED-DRIFT" in res["ended_unconfirmed"]
+    assert _row(db, "LIVE-ENDED-DRIFT") == ("PUBLISHED", "999")
+
+
+def test_confirm_listing_ended_requires_positive_end_status():
+    ended_xml = (
+        '<?xml version="1.0"?>'
+        '<GetItemResponse xmlns="urn:ebay:apis:eBLBaseComponents">'
+        '<Ack>Success</Ack><Item><ItemID>1</ItemID>'
+        '<SellingStatus><ListingStatus>Ended</ListingStatus></SellingStatus>'
+        '</Item></GetItemResponse>'
+    )
+    active_xml = (
+        '<?xml version="1.0"?>'
+        '<GetItemResponse xmlns="urn:ebay:apis:eBLBaseComponents">'
+        '<Ack>Success</Ack><Item><ItemID>1</ItemID>'
+        '<SellingStatus><ListingStatus>Active</ListingStatus></SellingStatus>'
+        '</Item></GetItemResponse>'
+    )
+    assert lss.confirm_listing_ended("1", trading=_FakeTrading([ended_xml])) is True
+    assert lss.confirm_listing_ended("1", trading=_FakeTrading([active_xml])) is False

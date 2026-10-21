@@ -30,6 +30,13 @@ from src.utils.inventory_restock_hold import (
     is_restock_held,
     should_block_positive_quantity,
 )
+from src.services.live_listing_coverage import (
+    CoverageReport,
+    LiveListing,
+    build_coverage_report,
+    load_db_listing_rows,
+    sync_scope_products,
+)
 from src.utils.sold_through_relist import (
     completed_because_sold,
     extract_item_id,
@@ -100,6 +107,7 @@ class InventorySyncService:
         self._last_dajian_connection_error = ""
         self.last_sync_scope_count = 0
         self.last_sync_skipped_count = 0
+        self.last_coverage_report: Optional[CoverageReport] = None
         self._init_sync_table()
 
     def _get_dajian_client(self):
@@ -345,7 +353,12 @@ class InventorySyncService:
         return skus
         
     def get_published_products(self) -> List[Dict]:
-        """获取所有已发布的产品"""
+        """DB rows marked PUBLISHED.
+
+        Cheap local read for dashboards and pre-counts. Inventory sync and the
+        qty=0 stock gate must not use this alone — call
+        ``load_live_sync_products`` / ``sync_all`` so coverage follows eBay.
+        """
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -358,16 +371,69 @@ class InventorySyncService:
         
         products = []
         for row in cur.fetchall():
+            breakdown = {}
+            raw_cost = row['cost_breakdown']
+            if raw_cost:
+                try:
+                    parsed = json.loads(raw_cost) if isinstance(raw_cost, str) else raw_cost
+                    if isinstance(parsed, dict):
+                        breakdown = parsed
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    breakdown = {}
             products.append({
                 'sku': row['sku'],
                 'title': row['title'],
                 'source_url': row['url'],
-                'cost_breakdown': json.loads(row['cost_breakdown']) if row['cost_breakdown'] else {},
+                'cost_breakdown': breakdown,
                 'ebay_listing_id': row['listing_id']
             })
         
         conn.close()
         return products
+
+    def load_live_sync_products(
+        self,
+        live_listings: Optional[List[LiveListing]] = None,
+        fetch_complete: Optional[bool] = None,
+    ) -> List[Dict]:
+        """Products the stock gate may touch: live on eBay and mapped to a DB row."""
+        report = self.build_live_coverage(
+            live_listings=live_listings,
+            fetch_complete=fetch_complete,
+        )
+        return sync_scope_products(report)
+
+    def build_live_coverage(
+        self,
+        live_listings: Optional[List[LiveListing]] = None,
+        fetch_complete: Optional[bool] = None,
+    ) -> CoverageReport:
+        if live_listings is None:
+            try:
+                from src.services.listing_status_sync import fetch_all_active_listings
+
+                live_listings, _api_total, fetched_complete = fetch_all_active_listings()
+                if fetch_complete is None:
+                    fetch_complete = fetched_complete
+            except Exception as exc:
+                self.logger.error(
+                    "Failed to fetch eBay ActiveList for sync coverage: %s", exc
+                )
+                live_listings = []
+                if fetch_complete is None:
+                    fetch_complete = False
+
+        if fetch_complete is None:
+            fetch_complete = True
+
+        report = build_coverage_report(
+            live_listings,
+            load_db_listing_rows(self.db_path),
+            fetch_complete=bool(fetch_complete),
+            logger_=self.logger,
+        )
+        self.last_coverage_report = report
+        return report
     
     def check_dajian_stock(self, sku: str) -> Tuple[Optional[bool], Optional[float], Optional[float], Optional[int]]:
         """
@@ -1244,23 +1310,52 @@ class InventorySyncService:
             return set()
     
     def sync_all(self, dry_run: bool = False, skip_ebay_check: bool = True, 
-                 limit: int = 0, skip_synced_today: bool = True) -> List[SyncResult]:
+                 limit: int = 0, skip_synced_today: bool = True,
+                 live_listings: Optional[List[LiveListing]] = None,
+                 fetch_complete: Optional[bool] = None) -> List[SyncResult]:
         """
-        同步所有已发布产品
+        同步 eBay 实际在售、且能映射到本地行的产品。
+
+        Coverage comes from ActiveList (or an injected live snapshot), not from
+        DB status='PUBLISHED' alone. Live+ENDED rows are included. Live listings
+        missing from the DB are logged as orphans and never invented. DB
+        PUBLISHED rows that are not live are flagged and not zeroed.
         
         Args:
             dry_run: 是否为测试模式（不实际更新）
             skip_ebay_check: 跳过eBay状态检查（加速同步）
             limit: 限制同步数量，0=全部
             skip_synced_today: 跳过今日已同步的SKU
+            live_listings: optional injected ActiveList snapshot (tests)
+            fetch_complete: optional completeness flag for the snapshot
         
         Returns:
             同步结果列表
         """
         results = []
-        products = self.get_published_products()
+        products = self.load_live_sync_products(
+            live_listings=live_listings,
+            fetch_complete=fetch_complete,
+        )
+        report = self.last_coverage_report
         self.last_sync_scope_count = len(products)
         self.last_sync_skipped_count = 0
+        if report and report.orphans:
+            self.logger.warning(
+                "Live orphans (in eBay ActiveList, missing from DB): %d",
+                len(report.orphans),
+            )
+        if report and report.published_not_live and report.fetch_complete:
+            for row in report.published_not_live:
+                results.append(SyncResult(
+                    sku=row.sku,
+                    action='ebay_ended_flagged',
+                    old_value=row.listing_id,
+                    message=(
+                        'DB PUBLISHED but listing is not active on eBay; '
+                        'skipped quantity write'
+                    ),
+                ))
         
         # 过滤今日已同步的 SKU
         skipped_count = 0
@@ -1276,7 +1371,10 @@ class InventorySyncService:
         if limit > 0:
             products = products[:limit]
         
-        self.logger.info(f"开始同步 {len(products)} 个已发布产品 (skip_ebay_check={skip_ebay_check}, 跳过今日已同步={skipped_count})...")
+        self.logger.info(
+            f"开始同步 {len(products)} 个 eBay 在售(已映射)产品 "
+            f"(skip_ebay_check={skip_ebay_check}, 跳过今日已同步={skipped_count})..."
+        )
         
         # 预加载收藏夹SKU集合 — 用于交叉验证产品是否仍存在于平台
         favorites_set = self._load_favorites_set()
@@ -1406,12 +1504,45 @@ class InventorySyncService:
                     supplier_in_stock=False,
                 )
             
+            # Incomplete ActiveList extras: zero if GIGA is OOS, never restock
+            # or revise a listing we did not see as live in this snapshot.
+            if product.get('sync_mode') == 'zero_only' and in_stock:
+                return SyncResult(
+                    sku=sku,
+                    action='skipped',
+                    message='ActiveList incomplete; skipped restock/revise for unconfirmed listing',
+                    supplier_in_stock=True,
+                )
+
             # 3.5 检查是否从缺货恢复 → 自动重新上架
             last_action = self.get_last_sync_action(sku)
             if last_action in ('out_of_stock', 'restock_held') and in_stock:
                 self.logger.info(f"  {sku}: 从缺货恢复，重新上架")
                 cap = _listing_quantity_cap()
                 restore_quantity = cap if isinstance(cap, int) and cap > 0 else 1
+                if available_quantity is not None:
+                    try:
+                        available = max(0, int(available_quantity))
+                    except (TypeError, ValueError):
+                        available = None
+                    else:
+                        restore_quantity = min(restore_quantity, available)
+                if restore_quantity <= 0:
+                    if not _set_ebay_quantity_zero():
+                        return SyncResult(
+                            sku=sku,
+                            action='error',
+                            message='大建库存不足以恢复，但 eBay 库存归零失败',
+                            supplier_in_stock=False,
+                        )
+                    return SyncResult(
+                        sku=sku,
+                        action='out_of_stock',
+                        old_value='有库存',
+                        new_value='库存设为0',
+                        message='大建可售数量为 0，已将 eBay 库存设为 0',
+                        supplier_in_stock=False,
+                    )
                 restored = True
                 if not dry_run:
                     restored = bool(self.update_ebay_quantity(sku, restore_quantity))
