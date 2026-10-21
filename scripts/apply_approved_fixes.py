@@ -443,6 +443,10 @@ def process_rows(
             )
             if should_stop:
                 return 1
+            # Not an eBay apply error. A rejected row still breaks the
+            # consecutive-apply-error streak, same as a later audit row
+            # that exits before `_apply_errors_for_sku` increments it.
+            consecutive = 0
             print()
             continue
 
@@ -458,6 +462,7 @@ def process_rows(
                 )
                 if should_stop:
                     return 1
+                consecutive = 0
                 print()
                 continue
             stamped, ok = _stamp_or_fail(
@@ -471,6 +476,10 @@ def process_rows(
                 if stop_on_error:
                     print(f"\n[STOP] {sku}: could not stamp approved category.")
                     return 1
+            # Approve-only never reaches the audit success path that clears
+            # `consecutive`. A successful stamp (or a non-stopping stamp
+            # failure) is not an apply error, so it must break the streak.
+            consecutive = 0
             print()
             continue
 

@@ -4415,8 +4415,8 @@ def fix_listing_on_ebay(
         opt["aspects"] = aspects
         if new_category:
             opt["categoryId"] = new_category
-        if mark_category_approved:
-            stamp_category_approved(opt, new_category or opt.get("categoryId"))
+            if mark_category_approved:
+                stamp_category_approved(opt, new_category or opt.get("categoryId"))
         if new_category_name:
             opt["categoryName"] = new_category_name
         if title_changed:
