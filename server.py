@@ -1737,6 +1737,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             completed_aspects,
             category_id,
             category_name,
+            skip_canonicalize=preserve_approved_category,
         )
         if publish_blockers:
             raise HTTPException(

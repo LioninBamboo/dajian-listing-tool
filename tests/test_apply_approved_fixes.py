@@ -83,6 +83,12 @@ class TestCategoryGuard:
         rows = [{"sku": "W1", "fix_keys": ["categoryId"], "note": "approved"}]
         aaf.check_guarded(rows, allow_category=True)  # must not raise
 
+    def test_category_approved_key_is_also_guarded(self):
+        rows = [{"sku": "W1", "fix_keys": ["categoryApproved"], "note": ""}]
+        with pytest.raises(SystemExit):
+            aaf.check_guarded(rows, allow_category=False)
+        aaf.check_guarded(rows, allow_category=True)
+
     def test_non_guarded_keys_need_no_optin(self):
         rows = [{"sku": "W1", "fix_keys": ["Assembly Required", "Item Length"], "note": ""}]
         aaf.check_guarded(rows, allow_category=False)  # must not raise
@@ -219,3 +225,62 @@ class TestApplyReportErrors:
         assert aaf._apply_errors_for_sku("W1") == [
             "ERROR [W1]: inventory update failed"
         ]
+
+
+class TestStampAlreadyCorrectCategory:
+    def _db(self, tmp_path, sku, opt):
+        import json
+        import sqlite3
+
+        db = tmp_path / "ebay_collection.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+            (sku, json.dumps(opt)),
+        )
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_dry_run_does_not_write(self, tmp_path):
+        import json
+        import sqlite3
+
+        db = self._db(tmp_path, "W808P391671", {"categoryId": "20748"})
+        result = aaf.stamp_local_category_approved(
+            "W808P391671", apply=False, db_path=db
+        )
+        assert result == {"ok": True, "dry_run": True, "category_id": "20748"}
+        raw = sqlite3.connect(db).execute(
+            "SELECT optimization FROM collected_products WHERE sku=?",
+            ("W808P391671",),
+        ).fetchone()[0]
+        assert json.loads(raw) == {"categoryId": "20748"}
+
+    def test_apply_pins_current_leaf(self, tmp_path):
+        import json
+        import sqlite3
+
+        db = self._db(tmp_path, "W808P391671", {"categoryId": "20748"})
+        result = aaf.stamp_local_category_approved(
+            "W808P391671", apply=True, db_path=db
+        )
+        assert result["ok"] is True
+        assert result["category_id"] == "20748"
+        opt = json.loads(
+            sqlite3.connect(db).execute(
+                "SELECT optimization FROM collected_products WHERE sku=?",
+                ("W808P391671",),
+            ).fetchone()[0]
+        )
+        assert opt["categoryApproved"] is True
+        assert opt["categoryApprovedId"] == "20748"
+
+    def test_missing_category_is_rejected(self, tmp_path):
+        db = self._db(tmp_path, "W1", {"title": "No category"})
+        result = aaf.stamp_local_category_approved("W1", apply=True, db_path=db)
+        assert result["ok"] is False
+        assert "no stored categoryId" in result["error"]

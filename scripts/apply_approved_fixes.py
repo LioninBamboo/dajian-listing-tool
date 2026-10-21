@@ -17,11 +17,19 @@ Manifest format (CSV, header required):
     W1234,Assembly Required,source says Yes
     W5678,categoryId|Item Length,approved by <name> 2026-07-28
 
-`fix_keys` is `|`-separated. `categoryId` additionally requires
-`--allow-category`, because category changes are the single most damaging
-class of wrong fix in this codebase's history (indoor bench -> Outdoor
-Daybeds; nightstand -> Bed Frames; console table -> Sofas; bell tent ->
-Ice Chests & Coolers).
+`fix_keys` is `|`-separated. `categoryId` / `categoryName` /
+`categoryApproved` additionally require `--allow-category`, because
+category changes are the single most damaging class of wrong fix in this
+codebase's history (indoor bench -> Outdoor Daybeds; nightstand -> Bed
+Frames; console table -> Sofas; bell tent -> Ice Chests & Coolers).
+
+When the current leaf is already correct, audit offers no `categoryId`
+fix. Pass `--mark-category-approved` to stamp
+`optimization.categoryApproved` + `categoryApprovedId` on the local
+row instead of failing the manifest:
+
+    python scripts/apply_approved_fixes.py manifest.csv --allow-category --mark-category-approved
+    python scripts/apply_approved_fixes.py manifest.csv --allow-category --mark-category-approved --apply
 
     python scripts/apply_approved_fixes.py manifest.csv            # dry run
     python scripts/apply_approved_fixes.py manifest.csv --apply
@@ -32,15 +40,23 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.utils.approved_category import mark_category_approved
+
 AUDIT = ROOT / "scripts" / "audit_fix_active_listings.py"
+DEFAULT_DB = ROOT / "ebay_collection.db"
 
 # Fix keys that may never be applied from a manifest without an extra opt-in.
-GUARDED_KEYS = {"categoryId", "categoryName"}
+GUARDED_KEYS = {"categoryId", "categoryName", "categoryApproved"}
+STAMPABLE_KEYS = frozenset(GUARDED_KEYS)
 
 
 def load_manifest(path: Path) -> list[dict]:
@@ -72,6 +88,54 @@ def check_guarded(rows: list[dict], allow_category: bool) -> None:
         print("\nCategory changes have caused live mis-categorisation repeatedly.")
         print("Re-run with --allow-category only after a human approved each row.")
         raise SystemExit(2)
+
+
+def stamp_local_category_approved(
+    sku: str,
+    *,
+    apply: bool,
+    db_path: Path | None = None,
+) -> dict:
+    """Pin the SKU's current stored categoryId as the approved leaf.
+
+    Used when the leaf is already correct, so audit offers no categoryId fix
+    and the operator would otherwise have to write the DB by hand.
+    """
+    path = Path(db_path) if db_path is not None else DEFAULT_DB
+    if not path.is_file():
+        return {"ok": False, "error": f"database not found: {path}"}
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT optimization FROM collected_products WHERE sku=?",
+            (sku,),
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": f"SKU {sku} not found"}
+        raw = row[0]
+        if isinstance(raw, str) and raw.strip():
+            try:
+                opt = json.loads(raw)
+            except ValueError:
+                opt = {}
+        elif isinstance(raw, dict):
+            opt = dict(raw)
+        else:
+            opt = {}
+        cid = str(opt.get("categoryId") or "").strip()
+        if not cid:
+            return {"ok": False, "error": f"{sku} has no stored categoryId to approve"}
+        if not apply:
+            return {"ok": True, "dry_run": True, "category_id": cid}
+        mark_category_approved(opt, cid)
+        conn.execute(
+            "UPDATE collected_products SET optimization=? WHERE sku=?",
+            (json.dumps(opt, ensure_ascii=False), sku),
+        )
+        conn.commit()
+        return {"ok": True, "applied": True, "category_id": cid}
+    finally:
+        conn.close()
 
 
 def build_command(sku: str, fix_keys: list[str], apply: bool) -> list[str]:
@@ -150,6 +214,14 @@ def main() -> int:
         action="store_true",
         help="permit categoryId/categoryName rows (each must be human-approved)",
     )
+    parser.add_argument(
+        "--mark-category-approved",
+        action="store_true",
+        help=(
+            "stamp optimization.categoryApproved + categoryApprovedId on the "
+            "current stored leaf when audit offers no categoryId fix"
+        ),
+    )
     parser.add_argument("--stop-on-error", action="store_true", default=True)
     parser.add_argument(
         "--max-consecutive-errors",
@@ -187,6 +259,23 @@ def main() -> int:
     for index, row in enumerate(rows, start=1):
         sku, keys = row["sku"], row["fix_keys"]
         print(f"[{index}/{len(rows)}] {sku}  keys={keys}" + (f"  # {row['note']}" if row["note"] else ""))
+        if args.mark_category_approved and keys and all(k in STAMPABLE_KEYS for k in keys):
+            stamped = stamp_local_category_approved(sku, apply=args.apply)
+            if not stamped.get("ok"):
+                failures += 1
+                print(f"      ! {stamped.get('error')}")
+                if args.stop_on_error:
+                    print(f"\n[STOP] {sku}: could not stamp approved category.")
+                    return 1
+                print()
+                continue
+            cid = stamped.get("category_id")
+            if stamped.get("dry_run"):
+                print(f"      would stamp categoryApprovedId={cid} on current leaf")
+            else:
+                print(f"      stamped categoryApprovedId={cid} on current leaf")
+            print()
+            continue
         cmd = build_command(sku, keys, args.apply)
         # encoding is explicit: the audit prints the store footer (✦) and Chinese
         # summaries, and Windows' default cp936 decode raised inside subprocess's
@@ -199,15 +288,45 @@ def main() -> int:
         for line in tail:
             print(f"      {line}")
         unavailable = _keys_not_offered(sku, keys)
-        if unavailable:
+        stampable_missing = [k for k in unavailable if k in STAMPABLE_KEYS]
+        other_missing = [k for k in unavailable if k not in STAMPABLE_KEYS]
+        if other_missing:
             failures += 1
-            print(f"      ! manifest names fix keys the audit does not offer: {unavailable}")
+            print(f"      ! manifest names fix keys the audit does not offer: {other_missing}")
             print(f"      ! nothing was applied for {sku} — fix the manifest, do not retry as-is")
             if args.stop_on_error:
                 print(f"\n[STOP] {sku}: unusable manifest row.")
                 return 1
             print()
             continue
+        if stampable_missing and not args.mark_category_approved:
+            failures += 1
+            print(f"      ! manifest names fix keys the audit does not offer: {stampable_missing}")
+            print("      ! category is already correct (or not offered); pass --mark-category-approved to stamp the current leaf")
+            if args.stop_on_error:
+                print(f"\n[STOP] {sku}: unusable manifest row.")
+                return 1
+            print()
+            continue
+        if stampable_missing:
+            stamped = stamp_local_category_approved(sku, apply=args.apply)
+            if not stamped.get("ok"):
+                failures += 1
+                print(f"      ! {stamped.get('error')}")
+                if args.stop_on_error:
+                    print(f"\n[STOP] {sku}: could not stamp approved category.")
+                    return 1
+                print()
+                continue
+            cid = stamped.get("category_id")
+            if stamped.get("dry_run"):
+                print(f"      would stamp categoryApprovedId={cid} on current leaf")
+            else:
+                print(f"      stamped categoryApprovedId={cid} on current leaf")
+            keys = [k for k in keys if k not in stampable_missing]
+            if not keys:
+                print()
+                continue
 
         apply_errors = _apply_errors_for_sku(sku) if args.apply else []
         if apply_errors:
@@ -230,6 +349,15 @@ def main() -> int:
             print()
             continue
         consecutive = 0
+
+        if args.mark_category_approved and any(k in STAMPABLE_KEYS for k in row["fix_keys"]):
+            stamped = stamp_local_category_approved(sku, apply=args.apply)
+            if stamped.get("ok"):
+                cid = stamped.get("category_id")
+                if stamped.get("dry_run"):
+                    print(f"      would stamp categoryApprovedId={cid} on current leaf")
+                else:
+                    print(f"      stamped categoryApprovedId={cid} on current leaf")
 
         if result.returncode != 0:
             failures += 1

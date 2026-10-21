@@ -1069,7 +1069,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         "aspects": completed_aspects,
     }
     if is_category_approved(opt):
-        mark_category_approved(quality_listing)
+        mark_category_approved(quality_listing, opt.get("categoryId"))
     quality_opt = _normalize_generated_listing(
         quality_listing,
         source_title=source_title or product.get('title', ''),
@@ -1198,7 +1198,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         "aspects": completed_aspects,
     }
     if is_category_approved(opt):
-        mark_category_approved(qc_candidate)
+        mark_category_approved(qc_candidate, opt.get("categoryId"))
     fs_conn = None
     try:
         fs_conn = sqlite3.connect(str(PROJECT_ROOT / "ebay_collection.db"), timeout=30)
