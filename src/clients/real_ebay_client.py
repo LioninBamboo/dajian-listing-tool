@@ -1551,14 +1551,24 @@ class RealEbayClient:
             logging.error(f"Error deleting offer: {e}")
             return False
 
-    def get_offers_by_sku(self, sku: str, marketplace_id: Optional[str] = None) -> list:
+    def get_offers_by_sku(
+        self,
+        sku: str,
+        marketplace_id: Optional[str] = None,
+        *,
+        strict: bool = False,
+    ) -> list:
         """
         Get all offers for a specific SKU.
         
         GET /sell/inventory/v1/offer?sku={sku}
         
         Returns:
-            List of offer dicts, or empty list on error
+            List of offer dicts. HTTP 404 is positive absence (empty list).
+            Other HTTP errors and transport failures return an empty list
+            unless ``strict`` is set, in which case they raise. Callers that
+            treat "no offers" as ended must use ``strict`` so a blip is not
+            mistaken for a deleted listing.
         """
         url = f"{self.base_url}/sell/inventory/v1/offer"
         token = self.oauth.get_valid_token()
@@ -1584,13 +1594,18 @@ class RealEbayClient:
                     return (marketplace_rank, active_rank, published_rank, offer.get("offerId", ""))
 
                 return sorted(offers, key=_sort_key)
-            elif response.status_code == 404:
+            if response.status_code == 404:
                 return []
-            else:
-                logging.warning(f"get_offers_by_sku({sku}): HTTP {response.status_code}")
-                return []
+            logging.warning(f"get_offers_by_sku({sku}): HTTP {response.status_code}")
+            if strict:
+                raise RuntimeError(
+                    f"get_offers_by_sku({sku}): HTTP {response.status_code}"
+                )
+            return []
         except Exception as e:
             logging.error(f"get_offers_by_sku error: {e}")
+            if strict:
+                raise
             return []
 
     def withdraw_offer(self, offer_id: str) -> bool:
@@ -1636,12 +1651,17 @@ class RealEbayClient:
         
         try:
             response = self.session.delete(url, headers=headers)
-            if response.status_code in [200, 204]:
-                logging.info(f"[SUCCESS] Inventory item deleted: {sku}")
+            # 404 means the SKU is already gone. A delist retry must treat that
+            # as success; otherwise the second pass records a hard failure and
+            # never writes local ENDED.
+            if response.status_code in [200, 204, 404]:
+                if response.status_code == 404:
+                    logging.info(f"[SUCCESS] Inventory item already absent: {sku}")
+                else:
+                    logging.info(f"[SUCCESS] Inventory item deleted: {sku}")
                 return True
-            else:
-                logging.error(f"Failed to delete inventory {sku}: {response.status_code}")
-                return False
+            logging.error(f"Failed to delete inventory {sku}: {response.status_code}")
+            return False
         except Exception as e:
             logging.error(f"Error deleting inventory item: {e}")
             return False

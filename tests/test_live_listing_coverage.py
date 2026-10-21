@@ -349,6 +349,80 @@ def test_invalid_cost_breakdown_and_null_optimization_still_cover(tmp_path):
     assert report.covered[0].sku == "W465P220504"
 
 
+def test_active_list_undercount_keeps_published_rows_on_qty_gate(tmp_path, monkeypatch):
+    db = _make_db(tmp_path, [
+        _row("LIVE", "PUBLISHED", "111"),
+        _row("MISSING-LIVE", "PUBLISHED", "222"),
+    ])
+    monkeypatch.setattr(
+        "src.services.listing_status_sync.fetch_all_active_listings",
+        lambda trading=None, max_pages=20: (
+            [LiveListing(item_id="111", sku="LIVE")],
+            100,
+            True,
+        ),
+    )
+    service = InventorySyncService(db_path=str(db))
+    service._load_favorites_set = lambda: set()
+    service._prefetch_dajian_data = lambda skus: None
+    seen = []
+
+    def fake_sync_single(product, dry_run, skip_ebay_check=True, favorites_set=None):
+        from src.plugins.inventory_sync.sync_service import SyncResult
+
+        seen.append((product["sku"], product.get("sync_mode")))
+        return SyncResult(sku=product["sku"], action="out_of_stock", message="zeroed")
+
+    service._sync_single_product = fake_sync_single
+    results = service.sync_all(
+        dry_run=False,
+        skip_ebay_check=True,
+        skip_synced_today=False,
+    )
+
+    assert service.last_coverage_report.fetch_complete is False
+    assert ("LIVE", None) in seen
+    assert ("MISSING-LIVE", "zero_only") in seen
+    assert all(row.action != "ebay_ended_flagged" for row in results)
+
+
+def test_active_list_count_match_still_flags_published_not_live(tmp_path, monkeypatch):
+    db = _make_db(tmp_path, [
+        _row("LIVE", "PUBLISHED", "111"),
+        _row("DEAD-PUB", "PUBLISHED", "999"),
+    ])
+    monkeypatch.setattr(
+        "src.services.listing_status_sync.fetch_all_active_listings",
+        lambda trading=None, max_pages=20: (
+            [LiveListing(item_id="111", sku="LIVE")],
+            1,
+            True,
+        ),
+    )
+    service = InventorySyncService(db_path=str(db))
+    service._load_favorites_set = lambda: set()
+    service._prefetch_dajian_data = lambda skus: None
+    seen = []
+
+    def fake_sync_single(product, dry_run, skip_ebay_check=True, favorites_set=None):
+        from src.plugins.inventory_sync.sync_service import SyncResult
+
+        seen.append(product["sku"])
+        return SyncResult(sku=product["sku"], action="no_change", message="ok")
+
+    service._sync_single_product = fake_sync_single
+    results = service.sync_all(
+        dry_run=False,
+        skip_ebay_check=True,
+        skip_synced_today=False,
+    )
+
+    assert service.last_coverage_report.fetch_complete is True
+    assert seen == ["LIVE"]
+    flagged = [row for row in results if row.action == "ebay_ended_flagged"]
+    assert [row.sku for row in flagged] == ["DEAD-PUB"]
+
+
 def test_mark_ended_apply_requires_ebay_confirmation(tmp_path):
     db = _make_db(tmp_path, [
         _row("DEAD-PUB", "PUBLISHED", "999"),

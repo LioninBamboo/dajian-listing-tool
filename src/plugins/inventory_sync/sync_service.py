@@ -412,9 +412,25 @@ class InventorySyncService:
             try:
                 from src.services.listing_status_sync import fetch_all_active_listings
 
-                live_listings, _api_total, fetched_complete = fetch_all_active_listings()
+                live_listings, api_total, fetched_complete = fetch_all_active_listings()
                 if fetch_complete is None:
-                    fetch_complete = fetched_complete
+                    # Pagination can finish while unique ItemIDs are still
+                    # below TotalNumberOfEntries. listing_status_sync refuses
+                    # that snapshot; coverage must too, or missing live SKUs
+                    # are flagged ended and skipped by the qty=0 gate.
+                    fetched_ids = {
+                        item.item_id for item in live_listings if item.item_id
+                    }
+                    count_complete = api_total <= 0 or len(fetched_ids) >= api_total
+                    fetch_complete = bool(fetched_complete) and count_complete
+                    if fetched_complete and not count_complete:
+                        self.logger.warning(
+                            "ActiveList undercount (fetched=%d, api_total=%d) — "
+                            "treating snapshot as incomplete so published-not-live "
+                            "rows stay on the qty=0 gate",
+                            len(fetched_ids),
+                            api_total,
+                        )
             except Exception as exc:
                 self.logger.error(
                     "Failed to fetch eBay ActiveList for sync coverage: %s", exc

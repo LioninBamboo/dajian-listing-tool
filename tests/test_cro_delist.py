@@ -586,3 +586,97 @@ def test_cro_end_writes_ended_only_after_ebay_confirmation(tmp_path):
     )
     assert confirmed['ok'] is True
     assert _collected_status(db, 'W465P220504') == 'ENDED'
+
+
+def test_confirm_accepts_empty_offers_or_not_found_and_rejects_active(monkeypatch):
+    from scripts import cro_delist as cd
+
+    class Offers:
+        def __init__(self, offers):
+            self.offers = offers
+
+        def get_offers_by_sku(self, sku, strict=False):
+            if strict and self.offers is None:
+                raise RuntimeError("offer read failed")
+            return [] if self.offers is None else self.offers
+
+    monkeypatch.setattr(cd, "_getitem_listing_status", lambda listing_id: "not_found")
+    assert cd.confirm_ebay_listing_ended(
+        "GONE", listing_id="366701946479", ebay_client=Offers([]),
+    ) is True
+    assert cd.confirm_ebay_listing_ended(
+        "NO-ID", listing_id="", ebay_client=Offers([]),
+    ) is True
+
+    monkeypatch.setattr(cd, "_getitem_listing_status", lambda listing_id: "active")
+    assert cd.confirm_ebay_listing_ended(
+        "LIVE", listing_id="366701946479", ebay_client=Offers([]),
+    ) is False
+    assert cd.confirm_ebay_listing_ended(
+        "STILL-PUBLISHED",
+        listing_id="",
+        ebay_client=Offers([{"status": "PUBLISHED", "listing": {"listingStatus": "ACTIVE"}}]),
+    ) is False
+    assert cd.confirm_ebay_listing_ended(
+        "READ-FAILED", listing_id="", ebay_client=Offers(None),
+    ) is False
+
+
+def test_delist_retry_writes_ended_after_inventory_already_gone(tmp_path, monkeypatch):
+    from scripts import cro_delist as cd
+    from src.clients.real_ebay_client import RealEbayClient
+
+    db = tmp_path / "d.db"
+    cd._ensure_schema(db)
+    _seed_collected(db, "RETRY-1", listing_id="366701946479")
+    expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    with __import__("sqlite3").connect(str(db)) as conn:
+        conn.execute(
+            """INSERT INTO cro_delist_pending (sku, token, expires_at, created_at)
+               VALUES (?, ?, ?, ?)""",
+            ("RETRY-1", cd.make_token("RETRY-1", expires), expires, expires),
+        )
+        conn.commit()
+
+    class Response:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self.text = ""
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    deletes = {"n": 0}
+
+    class Session:
+        def get(self, url, headers=None, params=None):
+            return Response(200, {"offers": []})
+
+        def delete(self, url, headers=None):
+            deletes["n"] += 1
+            return Response(204 if deletes["n"] == 1 else 404)
+
+    client = object.__new__(RealEbayClient)
+    client.session = Session()
+    client.oauth = type("OAuth", (), {"get_valid_token": lambda self: "token"})()
+    client.base_url = "https://api.ebay.com"
+    client.marketplace_id = "EBAY_US"
+    statuses = iter(["active", "not_found"])
+    monkeypatch.setattr(cd, "_getitem_listing_status", lambda listing_id: next(statuses))
+    source = lambda sku: {"verified": True, "sku_available": False}
+
+    first = cd.execute_pending_delist(
+        db, "RETRY-1", ebay_client=client, mark_queue=False, source_checker=source,
+    )
+    assert first["status"] == "ebay_end_unconfirmed"
+    assert _collected_status(db, "RETRY-1") == "PUBLISHED"
+    assert cd.lookup_pending(db, "RETRY-1") is not None
+
+    second = cd.execute_pending_delist(
+        db, "RETRY-1", ebay_client=client, mark_queue=False, source_checker=source,
+    )
+    assert second["ok"] is True
+    assert second["status"] == "ok"
+    assert _collected_status(db, "RETRY-1") == "ENDED"
+    assert cd.lookup_pending(db, "RETRY-1") is None

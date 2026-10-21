@@ -319,6 +319,54 @@ def _mark_collected_ended(db: Path, sku: str) -> bool:
         return False
 
 
+def _read_offers_for_end_check(ebay_client: Any, sku: str) -> Optional[list]:
+    """Offer list, or None when the read failed.
+
+    An empty list is positive absence. Transport and HTTP errors must not look
+    empty, or a blip after delist would be recorded as ENDED.
+    """
+    getter = ebay_client.get_offers_by_sku
+    try:
+        try:
+            offers = getter(sku, strict=True)
+        except TypeError:
+            offers = getter(sku)
+    except Exception as exc:
+        logger.warning("offer readback failed for %s: %s", sku, exc)
+        return None
+    if offers is None:
+        return []
+    if not isinstance(offers, list):
+        logger.warning("offer readback malformed for %s", sku)
+        return None
+    return offers
+
+
+def _getitem_listing_status(listing_id: str) -> str:
+    """Normalized GetItem status. Empty string means the read failed."""
+    lid = str(listing_id or "").strip()
+    if not lid or lid.startswith("DRAFT-"):
+        return ""
+    try:
+        from xml.sax.saxutils import escape as xml_escape
+
+        from src.services.listing_status_sync import _get_trading_client
+        from src.utils.sold_through_relist import parse_trading_item_xml
+
+        trading = _get_trading_client()
+        response_text = trading.call(
+            "GetItem",
+            f"<ItemID>{xml_escape(lid)}</ItemID>",
+        )
+        snapshot = parse_trading_item_xml(response_text)
+    except Exception as exc:
+        logger.warning("GetItem status read failed for %s: %s", lid, exc)
+        return ""
+    if not snapshot:
+        return ""
+    return str(snapshot.get("listing_status") or "").strip().lower()
+
+
 def confirm_ebay_listing_ended(
     sku: str,
     *,
@@ -326,7 +374,12 @@ def confirm_ebay_listing_ended(
     ebay_client: Any = None,
     ended_confirmer: Optional[Callable[[str], bool]] = None,
 ) -> bool:
-    """Positive eBay end evidence only. Fail closed on Active / errors."""
+    """Positive eBay end evidence only. Fail closed on Active / errors.
+
+    After withdraw + inventory delete, GetItem is often NOT_FOUND rather than
+    Ended, and a row with no listing_id can only be confirmed by a positive
+    empty offer read. Those are end evidence. A still-Active item is not.
+    """
     if ended_confirmer is not None:
         try:
             return bool(ended_confirmer(sku))
@@ -339,11 +392,11 @@ def confirm_ebay_listing_ended(
         except Exception as exc:
             logger.warning("client confirm_listing_ended failed for %s: %s", sku, exc)
             return False
+
+    offers: Optional[list] = None
     if ebay_client is not None and hasattr(ebay_client, "get_offers_by_sku"):
-        try:
-            offers = ebay_client.get_offers_by_sku(sku) or []
-        except Exception as exc:
-            logger.warning("offer readback failed for %s: %s", sku, exc)
+        offers = _read_offers_for_end_check(ebay_client, sku)
+        if offers is None:
             return False
         for offer in offers:
             listing = offer.get("listing") if isinstance(offer, dict) else None
@@ -357,14 +410,22 @@ def confirm_ebay_listing_ended(
                 "ENDED", "COMPLETED",
             }:
                 return False
-        if listing_id:
-            from src.services.listing_status_sync import confirm_listing_ended
-            return confirm_listing_ended(listing_id)
+
+    usable_id = str(listing_id or "").strip()
+    if usable_id.startswith("DRAFT-"):
+        usable_id = ""
+    if usable_id:
+        status = _getitem_listing_status(usable_id)
+        if status in {"ended", "completed"}:
+            return True
+        # Inventory delete removes the Trading item. NOT_FOUND is the
+        # successful readback once no offer is still live.
+        if status == "not_found" and offers == []:
+            return True
         return False
-    if listing_id:
-        from src.services.listing_status_sync import confirm_listing_ended
-        return confirm_listing_ended(listing_id)
-    return False
+
+    # No item id to GetItem. Only a positive empty offer read confirms.
+    return offers == []
 
 
 def execute_pending_delist(

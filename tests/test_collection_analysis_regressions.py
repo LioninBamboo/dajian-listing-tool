@@ -721,6 +721,50 @@ def test_delist_sku_reports_failure_when_inventory_delete_fails_without_offers()
     assert "Delete inventory item SKU-NO-OFFER: FAILED" in result["steps"]
 
 
+def test_delete_inventory_item_treats_404_as_already_gone():
+    client = object.__new__(RealEbayClient)
+    client.base_url = "https://api.ebay.com"
+    client.oauth = type("OAuth", (), {"get_valid_token": lambda self: "token"})()
+
+    class Response:
+        status_code = 404
+        text = "not found"
+
+    client.session = type("Session", (), {
+        "delete": lambda self, url, headers=None: Response(),
+    })()
+
+    assert client.delete_inventory_item("SKU-GONE") is True
+
+
+def test_delist_sku_succeeds_when_offers_and_inventory_are_already_gone():
+    client = object.__new__(RealEbayClient)
+    client.base_url = "https://api.ebay.com"
+    client.oauth = type("OAuth", (), {"get_valid_token": lambda self: "token"})()
+
+    class Response:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self.text = ""
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class Session:
+        def get(self, url, headers=None, params=None):
+            return Response(200, {"offers": []})
+
+        def delete(self, url, headers=None):
+            return Response(404)
+
+    client.session = Session()
+    result = client.delist_sku("SKU-GONE")
+
+    assert result["success"] is True
+    assert result["error"] is None
+
+
 def test_delist_sku_reports_failure_when_offer_delete_fails():
     client = object.__new__(RealEbayClient)
     client.get_offers_by_sku = lambda sku: [
