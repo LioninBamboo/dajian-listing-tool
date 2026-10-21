@@ -5,7 +5,7 @@ Operators mark a product's stored category as approved by setting
 ``optimization.categoryApprovedId`` to that leaf (same JSON that holds
 ``categoryId``). The allow-category path
 (``scripts/apply_approved_fixes.py --allow-category --mark-category-approved``)
-stamps both fields — including when the current leaf is already correct.
+stamps both fields to an explicit manifest ``category_id``.
 
 While the lock is set, canonicalize / profile-normalize / audit remap
 must keep that stored category if it is a sellable leaf in the cached

@@ -13,9 +13,10 @@ itself — the operator never composes `--fix-key` by hand and cannot widen it.
 
 Manifest format (CSV, header required):
 
-    sku,fix_keys,note
-    W1234,Assembly Required,source says Yes
-    W5678,categoryId|Item Length,approved by <name> 2026-07-28
+    sku,fix_keys,category_id,note
+    W1234,Assembly Required,,source says Yes
+    W5678,categoryId,176991,approved by <name> 2026-07-28
+    W808,categoryApproved,20748,already on the right leaf
 
 `fix_keys` is `|`-separated. `categoryId` / `categoryName` /
 `categoryApproved` additionally require `--allow-category`, because
@@ -23,15 +24,19 @@ category changes are the single most damaging class of wrong fix in this
 codebase's history (indoor bench -> Outdoor Daybeds; nightstand -> Bed
 Frames; console table -> Sofas; bell tent -> Ice Chests & Coolers).
 
-A `categoryId` / `categoryName` row always goes through the audit remap.
-`--mark-category-approved` then pins the leaf that is actually stored
-after a successful audit. Optional column `category_id` is the requested
-target; if it is set and does not match the stored leaf after audit,
-nothing is stamped.
+Approval is always tied to an explicit `category_id`. A missing target is
+never inferred from the stored leaf, and never stamped. With
+`--mark-category-approved` those rows are rejected before the audit.
 
-The stamp-only shortcut (no audit) applies only when the row's sole key
-is `categoryApproved` and no target `category_id` is given — the current
-stored leaf is already correct:
+A remap row (`categoryId` / `categoryName`) always goes through audit.
+`--mark-category-approved --apply` then stamps only when the audit exits
+0, reported no apply errors, actually offered the category fix, and the
+stored leaf equals the explicit `category_id`. Dry-run remap rows print
+`would stamp <category_id> after remap` and continue — they do not
+compare stored vs target.
+
+An approve-only row (sole key `categoryApproved` + `category_id`) never
+remaps. It stamps only when the stored leaf already equals `category_id`.
 
     python scripts/apply_approved_fixes.py manifest.csv --allow-category --mark-category-approved
     python scripts/apply_approved_fixes.py manifest.csv --allow-category --mark-category-approved --apply
@@ -115,40 +120,52 @@ def _parse_optimization(raw: object) -> dict:
     return {}
 
 
+def _row_keys(row: dict) -> list[str]:
+    return [str(k).strip() for k in (row.get("fix_keys") or []) if str(k).strip()]
+
+
 def requested_category_id(row: dict) -> str:
     return str(row.get("category_id") or "").strip()
 
 
-def is_stamp_only_row(row: dict) -> bool:
-    """True only when the sole key is categoryApproved and no target id is given.
-
-    A ``categoryId`` / ``categoryName`` key always goes through audit/remap.
-    """
-    keys = [str(k).strip() for k in (row.get("fix_keys") or []) if str(k).strip()]
-    if any(k in REMAP_KEYS for k in keys):
-        return False
-    return bool(keys) and all(k == "categoryApproved" for k in keys) and not requested_category_id(row)
+def is_remap_row(row: dict) -> bool:
+    return any(key in REMAP_KEYS for key in _row_keys(row))
 
 
-def can_stamp_after_audit(
+def is_approve_only_row(row: dict) -> bool:
+    keys = _row_keys(row)
+    return bool(keys) and all(key == "categoryApproved" for key in keys)
+
+
+def wants_approval_stamp(row: dict, mark_category_approved: bool) -> bool:
+    return bool(mark_category_approved) and any(key in STAMPABLE_KEYS for key in _row_keys(row))
+
+
+def can_stamp_after_remap(
     *,
+    requested_id: str,
     returncode: int,
     apply_errors: list[str] | None,
-    stored_category_id: str,
-    requested_id: str = "",
+    remap_offered: bool,
+    stored_category_id: str = "",
+    apply: bool = True,
 ) -> tuple[bool, str]:
-    """Stamp only the leaf stored after a successful remap."""
+    """Stamp a remap row only after an explicit target is verified."""
+    requested = str(requested_id or "").strip()
+    if not requested:
+        return False, "refusing to stamp without explicit category_id"
     if returncode != 0:
         return False, f"audit exited {returncode}"
     if apply_errors:
         return False, "audit reported apply errors"
+    if not remap_offered:
+        return False, "audit did not produce a categoryId fix"
+    if not apply:
+        return True, ""
     stored = str(stored_category_id or "").strip()
-    if not stored:
-        return False, "no stored categoryId after audit"
-    requested = str(requested_id or "").strip()
-    if requested and requested != stored:
+    if stored != requested:
         return False, (
-            f"requested categoryId={requested} differs from stored {stored}; "
+            f"stored categoryId={stored} != category_id={requested}; "
             "remap was not applied"
         )
     return True, ""
@@ -174,16 +191,18 @@ def load_stored_category_id(sku: str, db_path: Path | None = None) -> str:
 def stamp_local_category_approved(
     sku: str,
     *,
+    approved_category_id: str,
     apply: bool,
     db_path: Path | None = None,
-    expected_category_id: str = "",
 ) -> dict:
-    """Pin the SKU's current stored categoryId as the approved leaf.
+    """Pin ``approved_category_id`` as the approved leaf.
 
-    Used after a successful remap, or on the stamp-only shortcut when the
-    stored leaf is already the approved target. Refuses to stamp when
-    ``expected_category_id`` is set and does not match the stored leaf.
+    The target is required. This never infers an id from the stored leaf,
+    and never writes a different ``categoryApprovedId``.
     """
+    target = str(approved_category_id or "").strip()
+    if not target:
+        return {"ok": False, "error": "refusing to stamp without explicit category_id"}
     path = Path(db_path) if db_path is not None else DEFAULT_DB
     if not path.is_file():
         return {"ok": False, "error": f"database not found: {path}"}
@@ -196,27 +215,23 @@ def stamp_local_category_approved(
         if not row:
             return {"ok": False, "error": f"SKU {sku} not found"}
         opt = _parse_optimization(row[0])
-        cid = str(opt.get("categoryId") or "").strip()
-        if not cid:
+        stored = str(opt.get("categoryId") or "").strip()
+        if not stored:
             return {"ok": False, "error": f"{sku} has no stored categoryId to approve"}
-        expected = str(expected_category_id or "").strip()
-        if expected and expected != cid:
+        if stored != target:
             return {
                 "ok": False,
-                "error": (
-                    f"requested categoryId={expected} differs from stored {cid}; "
-                    "remap was not applied"
-                ),
+                "error": f"stored categoryId={stored} != category_id={target}",
             }
         if not apply:
-            return {"ok": True, "dry_run": True, "category_id": cid}
-        mark_category_approved(opt, cid)
+            return {"ok": True, "dry_run": True, "category_id": target}
+        mark_category_approved(opt, target)
         conn.execute(
             "UPDATE collected_products SET optimization=? WHERE sku=?",
             (json.dumps(opt, ensure_ascii=False), sku),
         )
         conn.commit()
-        return {"ok": True, "applied": True, "category_id": cid}
+        return {"ok": True, "applied": True, "category_id": target}
     finally:
         conn.close()
 
@@ -230,10 +245,8 @@ def build_command(sku: str, fix_keys: list[str], apply: bool) -> list[str]:
         cmd += ["--fix-key", key]
     if apply:
         cmd.append("--fix")
-    if any(key in GUARDED_KEYS for key in fix_keys):
-        # Human --allow-category path: persist optimization.categoryApproved so
-        # later publish/normalize/audit remaps cannot overwrite the leaf.
-        cmd.append("--mark-category-approved")
+    # The runner stamps categoryApprovedId itself after verifying the
+    # explicit target. Do not let the audit infer and pin the stored leaf.
     return cmd
 
 
@@ -301,9 +314,9 @@ def main() -> int:
         "--mark-category-approved",
         action="store_true",
         help=(
-            "after a successful category remap, stamp categoryApproved + "
-            "categoryApprovedId on the stored leaf; categoryApproved-only "
-            "rows with no target id stamp the current leaf without an audit"
+            "stamp categoryApproved + categoryApprovedId to the row's "
+            "explicit category_id after a successful remap, or on an "
+            "approve-only row whose stored leaf already matches"
         ),
     )
     parser.add_argument("--stop-on-error", action="store_true", default=True)
@@ -360,25 +373,41 @@ def _default_run_audit(sku: str, keys: list[str], apply: bool):
 def _stamp_or_fail(
     sku: str,
     *,
+    approved_category_id: str,
     apply: bool,
     db_path: Path | None,
-    expected_category_id: str = "",
 ) -> tuple[dict, bool]:
     stamped = stamp_local_category_approved(
         sku,
+        approved_category_id=approved_category_id,
         apply=apply,
         db_path=db_path,
-        expected_category_id=expected_category_id,
     )
     if not stamped.get("ok"):
         print(f"      ! {stamped.get('error')}")
         return stamped, False
     cid = stamped.get("category_id")
     if stamped.get("dry_run"):
-        print(f"      would stamp categoryApprovedId={cid} on stored leaf")
+        print(f"      would stamp categoryApprovedId={cid}")
     else:
-        print(f"      stamped categoryApprovedId={cid} on stored leaf")
+        print(f"      stamped categoryApprovedId={cid}")
     return stamped, True
+
+
+def _fail_row(
+    sku: str,
+    *,
+    failures: int,
+    stop_on_error: bool,
+    message: str,
+    stop_label: str,
+) -> tuple[int, bool]:
+    """Increment failures; return (failures, should_stop)."""
+    print(f"      ! {message}")
+    if stop_on_error:
+        print(f"\n[STOP] {sku}: {stop_label}")
+        return failures + 1, True
+    return failures + 1, False
 
 
 def process_rows(
@@ -398,9 +427,45 @@ def process_rows(
     for index, row in enumerate(rows, start=1):
         sku, keys = row["sku"], list(row["fix_keys"])
         requested = requested_category_id(row)
+        wants_stamp = wants_approval_stamp(row, mark_category_approved)
         print(f"[{index}/{len(rows)}] {sku}  keys={keys}" + (f"  # {row['note']}" if row.get("note") else ""))
-        if mark_category_approved and is_stamp_only_row(row):
-            stamped, ok = _stamp_or_fail(sku, apply=apply, db_path=db_path)
+
+        if wants_stamp and not requested:
+            failures, should_stop = _fail_row(
+                sku,
+                failures=failures,
+                stop_on_error=stop_on_error,
+                message=(
+                    "--mark-category-approved requires an explicit category_id; "
+                    "refusing to infer approval from the stored leaf"
+                ),
+                stop_label="missing category_id, nothing stamped.",
+            )
+            if should_stop:
+                return 1
+            print()
+            continue
+
+        if wants_stamp and is_approve_only_row(row):
+            stored = load_stored_category_id(sku, db_path=db_path)
+            if stored != requested:
+                failures, should_stop = _fail_row(
+                    sku,
+                    failures=failures,
+                    stop_on_error=stop_on_error,
+                    message=f"stored categoryId={stored} != category_id={requested}",
+                    stop_label="approve-only target does not match stored leaf.",
+                )
+                if should_stop:
+                    return 1
+                print()
+                continue
+            stamped, ok = _stamp_or_fail(
+                sku,
+                approved_category_id=requested,
+                apply=apply,
+                db_path=db_path,
+            )
             if not ok:
                 failures += 1
                 if stop_on_error:
@@ -414,6 +479,7 @@ def process_rows(
         for line in tail:
             print(f"      {line}")
         unavailable = _keys_not_offered(sku, keys)
+        remap_missing = [k for k in unavailable if k in REMAP_KEYS]
         stampable_missing = [k for k in unavailable if k in STAMPABLE_KEYS]
         other_missing = [k for k in unavailable if k not in STAMPABLE_KEYS]
         if other_missing:
@@ -425,10 +491,19 @@ def process_rows(
                 return 1
             print()
             continue
+        if remap_missing:
+            failures += 1
+            print(f"      ! manifest names fix keys the audit does not offer: {remap_missing}")
+            print("      ! category remap was not produced; nothing stamped")
+            if stop_on_error:
+                print(f"\n[STOP] {sku}: unusable manifest row.")
+                return 1
+            print()
+            continue
         if stampable_missing and not mark_category_approved:
             failures += 1
             print(f"      ! manifest names fix keys the audit does not offer: {stampable_missing}")
-            print("      ! category is already correct (or not offered); pass --mark-category-approved to stamp the current leaf")
+            print("      ! category is already correct (or not offered); pass --mark-category-approved with an explicit category_id")
             if stop_on_error:
                 print(f"\n[STOP] {sku}: unusable manifest row.")
                 return 1
@@ -468,27 +543,37 @@ def process_rows(
             print()
             continue
 
-        if mark_category_approved and any(k in STAMPABLE_KEYS for k in row["fix_keys"]):
-            stored = load_stored_category_id(sku, db_path=db_path)
-            ok, reason = can_stamp_after_audit(
+        if wants_stamp:
+            stored = load_stored_category_id(sku, db_path=db_path) if apply else ""
+            ok, reason = can_stamp_after_remap(
+                requested_id=requested,
                 returncode=result.returncode,
                 apply_errors=apply_errors,
+                remap_offered=not remap_missing,
                 stored_category_id=stored,
-                requested_id=requested,
+                apply=apply,
             )
             if not ok:
-                failures += 1
-                print(f"      ! {reason}")
-                if stop_on_error:
-                    print(f"\n[STOP] {sku}: refused to stamp approved category.")
+                failures, should_stop = _fail_row(
+                    sku,
+                    failures=failures,
+                    stop_on_error=stop_on_error,
+                    message=reason,
+                    stop_label="refused to stamp approved category.",
+                )
+                if should_stop:
                     return 1
+                print()
+                continue
+            if not apply:
+                print(f"      would stamp {requested} after remap")
                 print()
                 continue
             stamped, stamped_ok = _stamp_or_fail(
                 sku,
-                apply=apply,
+                approved_category_id=requested,
+                apply=True,
                 db_path=db_path,
-                expected_category_id=requested,
             )
             if not stamped_ok:
                 failures += 1

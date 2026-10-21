@@ -129,9 +129,9 @@ class TestCommandConstruction:
     def test_apply_adds_the_write_flag(self):
         assert "--fix" in aaf.build_command("W1", ["Assembly Required"], apply=True)
 
-    def test_category_apply_stamps_approved_flag(self):
+    def test_category_apply_does_not_delegate_stamp_to_audit(self):
         cmd = aaf.build_command("W1", ["categoryId"], apply=True)
-        assert "--mark-category-approved" in cmd
+        assert "--mark-category-approved" not in cmd
 
     def test_non_category_apply_does_not_stamp_approved_flag(self):
         cmd = aaf.build_command("W1", ["Assembly Required"], apply=True)
@@ -261,7 +261,7 @@ class TestStampAlreadyCorrectCategory:
 
         db = self._db(tmp_path, "W808P391671", {"categoryId": "20748"})
         result = aaf.stamp_local_category_approved(
-            "W808P391671", apply=False, db_path=db
+            "W808P391671", approved_category_id="20748", apply=False, db_path=db
         )
         assert result == {"ok": True, "dry_run": True, "category_id": "20748"}
         raw = sqlite3.connect(db).execute(
@@ -270,13 +270,13 @@ class TestStampAlreadyCorrectCategory:
         ).fetchone()[0]
         assert json.loads(raw) == {"categoryId": "20748"}
 
-    def test_apply_pins_current_leaf(self, tmp_path):
+    def test_apply_pins_explicit_leaf(self, tmp_path):
         import json
         import sqlite3
 
         db = self._db(tmp_path, "W808P391671", {"categoryId": "20748"})
         result = aaf.stamp_local_category_approved(
-            "W808P391671", apply=True, db_path=db
+            "W808P391671", approved_category_id="20748", apply=True, db_path=db
         )
         assert result["ok"] is True
         assert result["category_id"] == "20748"
@@ -291,90 +291,146 @@ class TestStampAlreadyCorrectCategory:
 
     def test_missing_category_is_rejected(self, tmp_path):
         db = self._db(tmp_path, "W1", {"title": "No category"})
-        result = aaf.stamp_local_category_approved("W1", apply=True, db_path=db)
+        result = aaf.stamp_local_category_approved(
+            "W1", approved_category_id="20748", apply=True, db_path=db
+        )
         assert result["ok"] is False
         assert "no stored categoryId" in result["error"]
+
+    def test_empty_target_is_rejected(self, tmp_path):
+        db = self._db(tmp_path, "W1", {"categoryId": "20748"})
+        result = aaf.stamp_local_category_approved(
+            "W1", approved_category_id="", apply=True, db_path=db
+        )
+        assert result["ok"] is False
+        assert "explicit category_id" in result["error"]
 
     def test_expected_id_mismatch_is_rejected(self, tmp_path):
         db = self._db(tmp_path, "W1", {"categoryId": "20487"})
         result = aaf.stamp_local_category_approved(
-            "W1", apply=True, db_path=db, expected_category_id="176991"
+            "W1", approved_category_id="176991", apply=True, db_path=db
         )
         assert result["ok"] is False
-        assert "remap was not applied" in result["error"]
+        assert "stored categoryId=20487 != category_id=176991" in result["error"]
 
 
-class TestStampOnlyRow:
-    def test_approved_only_without_target_is_stamp_only(self):
-        assert aaf.is_stamp_only_row(
-            {"sku": "W1", "fix_keys": ["categoryApproved"], "category_id": ""}
+class TestRowClassification:
+    def test_approve_only_is_not_a_remap(self):
+        row = {"sku": "W1", "fix_keys": ["categoryApproved"], "category_id": "20748"}
+        assert aaf.is_approve_only_row(row)
+        assert not aaf.is_remap_row(row)
+
+    def test_category_id_row_is_a_remap(self):
+        for keys in (["categoryId"], ["categoryName"], ["categoryId", "categoryApproved"]):
+            row = {"sku": "W1", "fix_keys": keys, "category_id": "176991"}
+            assert aaf.is_remap_row(row)
+            assert not aaf.is_approve_only_row(row)
+
+    def test_stamp_requires_the_mark_flag(self):
+        row = {"sku": "W1", "fix_keys": ["categoryId"], "category_id": "176991"}
+        assert aaf.wants_approval_stamp(row, True)
+        assert not aaf.wants_approval_stamp(row, False)
+
+
+class TestCanStampAfterRemap:
+    def test_empty_target_refuses(self):
+        ok, reason = aaf.can_stamp_after_remap(
+            requested_id="",
+            returncode=0,
+            apply_errors=[],
+            remap_offered=True,
+            stored_category_id="176991",
+            apply=True,
         )
+        assert ok is False
+        assert "explicit category_id" in reason
 
-    def test_category_id_row_always_requires_audit(self):
-        assert not aaf.is_stamp_only_row(
-            {"sku": "W1", "fix_keys": ["categoryId"], "category_id": ""}
-        )
-        assert not aaf.is_stamp_only_row(
-            {"sku": "W1", "fix_keys": ["categoryName"], "category_id": ""}
-        )
-        assert not aaf.is_stamp_only_row(
-            {
-                "sku": "W1",
-                "fix_keys": ["categoryId", "categoryApproved"],
-                "category_id": "",
-            }
-        )
-
-    def test_approved_with_target_requires_audit(self):
-        assert not aaf.is_stamp_only_row(
-            {"sku": "W1", "fix_keys": ["categoryApproved"], "category_id": "176991"}
-        )
-
-
-class TestCanStampAfterAudit:
     def test_nonzero_returncode_refuses(self):
-        ok, reason = aaf.can_stamp_after_audit(
+        ok, reason = aaf.can_stamp_after_remap(
+            requested_id="176991",
             returncode=1,
             apply_errors=[],
+            remap_offered=True,
             stored_category_id="176991",
+            apply=True,
         )
         assert ok is False
         assert "exited 1" in reason
 
     def test_apply_errors_refuse(self):
-        ok, reason = aaf.can_stamp_after_audit(
+        ok, reason = aaf.can_stamp_after_remap(
+            requested_id="176991",
             returncode=0,
             apply_errors=["ERROR [W1]: inventory update failed"],
+            remap_offered=True,
             stored_category_id="176991",
+            apply=True,
         )
         assert ok is False
         assert "apply errors" in reason
 
-    def test_requested_mismatch_refuses(self):
-        ok, reason = aaf.can_stamp_after_audit(
+    def test_remap_not_offered_refuses(self):
+        ok, reason = aaf.can_stamp_after_remap(
+            requested_id="176991",
             returncode=0,
             apply_errors=[],
-            stored_category_id="20487",
+            remap_offered=False,
+            stored_category_id="176991",
+            apply=True,
+        )
+        assert ok is False
+        assert "did not produce a categoryId fix" in reason
+
+    def test_apply_mismatch_refuses(self):
+        ok, reason = aaf.can_stamp_after_remap(
             requested_id="176991",
+            returncode=0,
+            apply_errors=[],
+            remap_offered=True,
+            stored_category_id="20487",
+            apply=True,
         )
         assert ok is False
         assert "remap was not applied" in reason
 
-    def test_successful_remap_allows_stored_leaf(self):
-        ok, reason = aaf.can_stamp_after_audit(
+    def test_dry_run_skips_stored_comparison(self):
+        ok, reason = aaf.can_stamp_after_remap(
+            requested_id="176991",
             returncode=0,
             apply_errors=[],
-            stored_category_id="176991",
+            remap_offered=True,
+            stored_category_id="20487",
+            apply=False,
+        )
+        assert ok is True
+        assert reason == ""
+
+    def test_successful_remap_allows_explicit_leaf(self):
+        ok, reason = aaf.can_stamp_after_remap(
             requested_id="176991",
+            returncode=0,
+            apply_errors=[],
+            remap_offered=True,
+            stored_category_id="176991",
+            apply=True,
         )
         assert ok is True
         assert reason == ""
 
 
-class TestStampPathGoesThroughAudit:
-    def _isolate_reports(self, tmp_path, monkeypatch):
+class TestExplicitCategoryStamp:
+    """Table of stamp-path cases. Approval is never inferred from storage."""
+
+    def _isolate_reports(self, tmp_path, monkeypatch, offered=None):
+        import json
+
         logs = tmp_path / "logs"
         logs.mkdir(exist_ok=True)
+        if offered is not None:
+            (logs / "listing_audit_fix_20261021_999999.json").write_text(
+                json.dumps({"issues": [{"sku": "W1", "fix_keys": offered}]}),
+                encoding="utf-8",
+            )
         monkeypatch.setattr(aaf, "ROOT", tmp_path)
 
     def _db(self, tmp_path, sku, opt):
@@ -404,8 +460,75 @@ class TestStampPathGoesThroughAudit:
         ).fetchone()[0]
         return json.loads(raw)
 
-    def test_category_id_row_runs_audit_then_stamps_new_id(self, tmp_path, monkeypatch):
+    def _run(self, rows, *, db, apply, run_audit=None):
+        return aaf.process_rows(
+            rows,
+            apply=apply,
+            mark_category_approved=True,
+            db_path=db,
+            run_audit=run_audit or (lambda sku, keys, apply: (_ for _ in ()).throw(
+                AssertionError("audit should not run")
+            )),
+        )
+
+    def test_remap_row_without_category_id_is_rejected(self, tmp_path, monkeypatch, capsys):
         self._isolate_reports(tmp_path, monkeypatch)
+        db = self._db(tmp_path, "W1", {"categoryId": "20487"})
+        calls = []
+
+        def run_audit(sku, keys, apply):
+            calls.append(sku)
+            raise AssertionError("missing category_id must be rejected before audit")
+
+        rc = self._run(
+            [{"sku": "W1", "fix_keys": ["categoryId"], "note": "", "category_id": ""}],
+            db=db,
+            apply=True,
+            run_audit=run_audit,
+        )
+        assert rc == 1
+        assert calls == []
+        assert "categoryApproved" not in self._opt(db, "W1")
+        assert "explicit category_id" in capsys.readouterr().out
+
+    def test_remap_not_offered_does_not_stamp(self, tmp_path, monkeypatch):
+        self._isolate_reports(tmp_path, monkeypatch, offered=[])
+        from types import SimpleNamespace
+
+        db = self._db(tmp_path, "W1", {"categoryId": "20487"})
+
+        def run_audit(sku, keys, apply):
+            return SimpleNamespace(returncode=0, stdout="no category fix", stderr="")
+
+        rc = self._run(
+            [{"sku": "W1", "fix_keys": ["categoryId"], "note": "", "category_id": "176991"}],
+            db=db,
+            apply=True,
+            run_audit=run_audit,
+        )
+        assert rc == 1
+        assert self._opt(db, "W1") == {"categoryId": "20487"}
+
+    def test_failed_audit_does_not_stamp(self, tmp_path, monkeypatch):
+        self._isolate_reports(tmp_path, monkeypatch, offered=["categoryId"])
+        from types import SimpleNamespace
+
+        db = self._db(tmp_path, "W1", {"categoryId": "20487"})
+
+        def run_audit(sku, keys, apply):
+            return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+        rc = self._run(
+            [{"sku": "W1", "fix_keys": ["categoryId"], "note": "", "category_id": "176991"}],
+            db=db,
+            apply=True,
+            run_audit=run_audit,
+        )
+        assert rc == 1
+        assert self._opt(db, "W1") == {"categoryId": "20487"}
+
+    def test_successful_remap_stamps_new_id(self, tmp_path, monkeypatch):
+        self._isolate_reports(tmp_path, monkeypatch, offered=["categoryId"])
         import json
         import sqlite3
         from types import SimpleNamespace
@@ -424,19 +547,10 @@ class TestStampPathGoesThroughAudit:
             conn.close()
             return SimpleNamespace(returncode=0, stdout="remapped", stderr="")
 
-        rows = [
-            {
-                "sku": "W1",
-                "fix_keys": ["categoryId"],
-                "note": "",
-                "category_id": "176991",
-            }
-        ]
-        rc = aaf.process_rows(
-            rows,
+        rc = self._run(
+            [{"sku": "W1", "fix_keys": ["categoryId"], "note": "", "category_id": "176991"}],
+            db=db,
             apply=True,
-            mark_category_approved=True,
-            db_path=db,
             run_audit=run_audit,
         )
         assert rc == 0
@@ -446,73 +560,117 @@ class TestStampPathGoesThroughAudit:
         assert opt["categoryApproved"] is True
         assert opt["categoryApprovedId"] == "176991"
 
-    def test_audit_failure_does_not_stamp(self, tmp_path, monkeypatch):
-        self._isolate_reports(tmp_path, monkeypatch)
-        from types import SimpleNamespace
-
-        db = self._db(tmp_path, "W1", {"categoryId": "20487"})
-
-        def run_audit(sku, keys, apply):
-            return SimpleNamespace(returncode=1, stdout="", stderr="boom")
-
-        rows = [
-            {"sku": "W1", "fix_keys": ["categoryId"], "note": "", "category_id": "176991"}
-        ]
-        rc = aaf.process_rows(
-            rows,
-            apply=True,
-            mark_category_approved=True,
-            db_path=db,
-            run_audit=run_audit,
-        )
-        assert rc == 1
-        opt = self._opt(db, "W1")
-        assert opt == {"categoryId": "20487"}
-        assert "categoryApproved" not in opt
-
-    def test_requested_vs_stored_mismatch_does_not_stamp(self, tmp_path, monkeypatch):
-        self._isolate_reports(tmp_path, monkeypatch)
-        from types import SimpleNamespace
-
-        db = self._db(tmp_path, "W1", {"categoryId": "20487"})
-
-        def run_audit(sku, keys, apply):
-            return SimpleNamespace(returncode=0, stdout="no remap", stderr="")
-
-        rows = [
-            {"sku": "W1", "fix_keys": ["categoryId"], "note": "", "category_id": "176991"}
-        ]
-        rc = aaf.process_rows(
-            rows,
-            apply=True,
-            mark_category_approved=True,
-            db_path=db,
-            run_audit=run_audit,
-        )
-        assert rc == 1
-        opt = self._opt(db, "W1")
-        assert opt == {"categoryId": "20487"}
-        assert "categoryApproved" not in opt
-
-    def test_approved_only_row_stamps_current_leaf_without_audit(self, tmp_path, monkeypatch):
+    def test_approve_only_matching_stamps(self, tmp_path, monkeypatch):
         self._isolate_reports(tmp_path, monkeypatch)
         db = self._db(tmp_path, "W1", {"categoryId": "20748"})
-
-        def run_audit(sku, keys, apply):
-            raise AssertionError("stamp-only categoryApproved row must not run audit")
-
-        rows = [
-            {"sku": "W1", "fix_keys": ["categoryApproved"], "note": "", "category_id": ""}
-        ]
-        rc = aaf.process_rows(
-            rows,
+        rc = self._run(
+            [{"sku": "W1", "fix_keys": ["categoryApproved"], "note": "", "category_id": "20748"}],
+            db=db,
             apply=True,
-            mark_category_approved=True,
-            db_path=db,
-            run_audit=run_audit,
         )
         assert rc == 0
         opt = self._opt(db, "W1")
         assert opt["categoryApproved"] is True
         assert opt["categoryApprovedId"] == "20748"
-        assert opt["categoryId"] == "20748"
+
+    def test_approve_only_mismatching_fails(self, tmp_path, monkeypatch):
+        self._isolate_reports(tmp_path, monkeypatch)
+        db = self._db(tmp_path, "W1", {"categoryId": "20487"})
+        rc = self._run(
+            [{"sku": "W1", "fix_keys": ["categoryApproved"], "note": "", "category_id": "176991"}],
+            db=db,
+            apply=True,
+        )
+        assert rc == 1
+        assert self._opt(db, "W1") == {"categoryId": "20487"}
+
+    def test_approve_only_without_category_id_is_rejected(self, tmp_path, monkeypatch, capsys):
+        self._isolate_reports(tmp_path, monkeypatch)
+        db = self._db(tmp_path, "W1", {"categoryId": "20748"})
+        rc = self._run(
+            [{"sku": "W1", "fix_keys": ["categoryApproved"], "note": "", "category_id": ""}],
+            db=db,
+            apply=True,
+        )
+        assert rc == 1
+        assert "categoryApproved" not in self._opt(db, "W1")
+        assert "explicit category_id" in capsys.readouterr().out
+
+    def test_dry_run_remap_with_target_continues(self, tmp_path, monkeypatch, capsys):
+        self._isolate_reports(tmp_path, monkeypatch, offered=["categoryId"])
+        from types import SimpleNamespace
+
+        db = self._db(tmp_path, "W1", {"categoryId": "20487"})
+
+        def run_audit(sku, keys, apply):
+            assert apply is False
+            return SimpleNamespace(returncode=0, stdout="would remap", stderr="")
+
+        rc = self._run(
+            [{"sku": "W1", "fix_keys": ["categoryId"], "note": "", "category_id": "176991"}],
+            db=db,
+            apply=False,
+            run_audit=run_audit,
+        )
+        assert rc == 0
+        assert self._opt(db, "W1") == {"categoryId": "20487"}
+        assert "would stamp 176991 after remap" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "stored,requested,apply_flag",
+        [
+            ("20487", "", True),
+            ("20487", "", False),
+            ("20487", "176991", True),
+            ("20748", "20748", True),
+            ("20748", "20748", False),
+            ("38200", "20748", True),
+        ],
+    )
+    def test_stamp_only_writes_explicit_category_id(
+        self, tmp_path, stored, requested, apply_flag
+    ):
+        db = self._db(tmp_path, "W1", {"categoryId": stored})
+        result = aaf.stamp_local_category_approved(
+            "W1",
+            approved_category_id=requested,
+            apply=apply_flag,
+            db_path=db,
+        )
+        opt = self._opt(db, "W1")
+        if result.get("applied"):
+            assert requested, "a successful stamp must have an explicit category_id"
+            assert result["category_id"] == requested
+            assert opt["categoryApprovedId"] == requested
+        else:
+            assert "categoryApprovedId" not in opt
+            assert "categoryApproved" not in opt
+        if not requested:
+            assert result["ok"] is False
+
+    @pytest.mark.parametrize(
+        "keys,stored,requested,expect_stamp",
+        [
+            (["categoryApproved"], "20748", "20748", True),
+            (["categoryApproved"], "20487", "176991", False),
+            (["categoryApproved"], "20748", "", False),
+            (["categoryId"], "20487", "", False),
+        ],
+    )
+    def test_process_rows_stamp_only_writes_explicit_id(
+        self, tmp_path, monkeypatch, keys, stored, requested, expect_stamp
+    ):
+        self._isolate_reports(tmp_path, monkeypatch)
+        db = self._db(tmp_path, "W1", {"categoryId": stored})
+        rc = self._run(
+            [{"sku": "W1", "fix_keys": keys, "note": "", "category_id": requested}],
+            db=db,
+            apply=True,
+        )
+        opt = self._opt(db, "W1")
+        if expect_stamp:
+            assert rc == 0
+            assert opt["categoryApprovedId"] == requested
+        else:
+            assert "categoryApprovedId" not in opt
+            assert rc == 1
