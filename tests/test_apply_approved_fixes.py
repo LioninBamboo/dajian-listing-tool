@@ -113,6 +113,14 @@ class TestCommandConstruction:
     def test_apply_adds_the_write_flag(self):
         assert "--fix" in aaf.build_command("W1", ["Assembly Required"], apply=True)
 
+    def test_category_apply_stamps_approved_flag(self):
+        cmd = aaf.build_command("W1", ["categoryId"], apply=True)
+        assert "--mark-category-approved" in cmd
+
+    def test_non_category_apply_does_not_stamp_approved_flag(self):
+        cmd = aaf.build_command("W1", ["Assembly Required"], apply=True)
+        assert "--mark-category-approved" not in cmd
+
     def test_scope_is_always_a_single_sku(self):
         cmd = aaf.build_command("W1", ["Assembly Required"], apply=True)
         assert cmd.count("--sku") == 1

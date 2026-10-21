@@ -97,6 +97,7 @@ from src.utils.dimension_helpers import (
     find_dimension,
     replace_description_measurements,
 )
+from src.utils.approved_category import is_category_approved, mark_category_approved as stamp_category_approved
 from src.utils.publish_validation import first_aspect_text, measurement_issue
 from src.utils.publish_autofix import (
     SINGLE_VALUE_ASPECTS,
@@ -952,8 +953,10 @@ def audit_single_product(
         fixes["__restore_live_description_from_local__"] = True
 
     # ── 1. Category Check — deterministic product profile wins over taxonomy drift ──
+    # A human-approved stored category is not remapped by profile or canonicalize.
+    skip_category_remap = is_category_approved(opt) and bool(stored_category)
     profile = classify_listing_profile(title_context or title, live_description, stored_category)
-    if profile.category_id:
+    if not skip_category_remap and profile.category_id:
         if stored_category != profile.category_id:
             issues.append({
                 "type": "category_mismatch",
@@ -968,7 +971,7 @@ def audit_single_product(
             fixes["categoryId"] = profile.category_id
             if profile.category_name:
                 fixes["categoryName"] = profile.category_name
-    elif stored_category:
+    elif not skip_category_remap and stored_category:
         canonical_category, canonical_name = matcher.canonicalize_category(
             title_context,
             stored_category,
@@ -1970,6 +1973,11 @@ def create_parser():
         "--accept-package-conflict-as",
         choices=["Yes"],
         help="Operator override: emit Assembly Required=Yes for assembly_package_conflict. Requires --sku or --sku-file.",
+    )
+    parser.add_argument(
+        "--mark-category-approved",
+        action="store_true",
+        help="Stamp optimization.categoryApproved when applying a categoryId fix (human allow-category path).",
     )
     return parser
 
@@ -3265,6 +3273,7 @@ def fix_listing_on_ebay(
     *,
     base_opt_raw=None,
     source_detail_cache: dict[str, dict] | None = None,
+    mark_category_approved: bool = False,
 ):
     """Apply fixes to a published eBay listing."""
     results = []
@@ -4406,6 +4415,8 @@ def fix_listing_on_ebay(
         opt["aspects"] = aspects
         if new_category:
             opt["categoryId"] = new_category
+            if mark_category_approved:
+                stamp_category_approved(opt)
         if new_category_name:
             opt["categoryName"] = new_category_name
         if title_changed:
@@ -4723,6 +4734,7 @@ def main(argv=None):
                 conn,
                 base_opt_raw=audit_opt_raw if args.live else None,
                 source_detail_cache=semantic_source_detail_cache,
+                mark_category_approved=bool(args.mark_category_approved),
             )
             for r in fix_results:
                 if "ERROR" in r:

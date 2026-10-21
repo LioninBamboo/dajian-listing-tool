@@ -68,6 +68,11 @@ from src.utils.publish_source_aspect_guard import (
     guard_unsourced_aspects,
     restore_sourced_aspects,
 )
+from src.utils.approved_category import (
+    evaluate_approved_category,
+    is_category_approved,
+    mark_category_approved,
+)
 from src.utils.publish_fee_preview import evaluate_insertion_fee_preview
 from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP, PROTECTED_STORED_CATEGORY_IDS
 from src.utils.dimension_helpers import (
@@ -936,11 +941,23 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     title_context = title or source_title
     stored_cat = str(opt.get('categoryId') or '').strip() or None
     stored_cat_name = opt.get('categoryName')
-    if stored_cat in INVALID_CATEGORY_REMAP:
+    approved_decision = evaluate_approved_category(
+        stored_cat or "",
+        opt,
+        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+    )
+    if approved_decision.approved and approved_decision.error:
+        record_error(sku, approved_decision.error)
+        result = {"status": "error", "message": approved_decision.error}
+        if approved_decision.error == "high_insertion_fee":
+            result["copy_skip_reasons"] = ["high_insertion_fee"]
+        return result
+    preserve_approved_category = approved_decision.preserve
+    if stored_cat in INVALID_CATEGORY_REMAP and not preserve_approved_category:
         remapped = INVALID_CATEGORY_REMAP[stored_cat]
         logger.warning(f"  [CAT] Remapping legacy invalid stored category {stored_cat} -> {remapped}")
         stored_cat = remapped
-    if stored_cat:
+    if stored_cat and not preserve_approved_category:
         canonical_cat, canonical_name = category_matcher.canonicalize_category(
             title_context,
             stored_cat,
@@ -950,7 +967,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         if canonical_cat != stored_cat:
             logger.warning(f"  [CAT] Canonicalizing stored category {stored_cat} -> {canonical_cat}")
         stored_cat, stored_cat_name = canonical_cat, canonical_name
-    if stored_cat and not _is_sellable_leaf_category(oauth, stored_cat):
+    if stored_cat and not preserve_approved_category and not _is_sellable_leaf_category(oauth, stored_cat):
         logger.warning(f"  [CAT] Stored category {stored_cat} is not a sellable leaf in EBAY_US; ignoring stored category")
         stored_cat = None
         stored_cat_name = None
@@ -978,7 +995,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     protected_stored_categories = PROTECTED_STORED_CATEGORY_IDS
     stored_plausible = bool(
         stored_cat and (
-            stored_cat in protected_stored_categories
+            preserve_approved_category
+            or stored_cat in protected_stored_categories
             or category_matcher.is_category_plausible_for_text(title_context, stored_cat, stored_cat_name)
         )
     )
@@ -998,6 +1016,9 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         if stored_cat in protected_stored_categories and api_cat_id and api_cat_id != stored_cat:
             completed_aspects = existing_aspects
             logger.warning(f"  [CAT] Preserving stored protected category {stored_cat}; ignoring fallback/API={api_cat_id}")
+        elif preserve_approved_category:
+            completed_aspects = existing_aspects
+            logger.info(f"  [CAT] Preserving human-approved category {stored_cat}")
         elif api_cat_id and api_cat_id != stored_cat:
             required_aspects, recommended_aspects = category_matcher._get_category_aspects(stored_cat)
             completed_aspects = category_matcher._complete_aspects(
@@ -1040,14 +1061,17 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         log=lambda message: logger.info(f"  {message}"),
     )
 
+    quality_listing = {
+        "title": title,
+        "description": description,
+        "categoryId": category_id,
+        "categoryName": category_name,
+        "aspects": completed_aspects,
+    }
+    if is_category_approved(opt):
+        mark_category_approved(quality_listing)
     quality_opt = _normalize_generated_listing(
-        {
-            "title": title,
-            "description": description,
-            "categoryId": category_id,
-            "categoryName": category_name,
-            "aspects": completed_aspects,
-        },
+        quality_listing,
         source_title=source_title or product.get('title', ''),
         source_description=product.get('description', ''),
         attributes=product.get('attributes', {}) or {},
@@ -1157,7 +1181,15 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     publish_blockers = []
     publish_blockers.extend(aspect_blockers)
     publish_blockers.extend(_measurement_validation_errors(completed_aspects))
-    publish_blockers.extend(_category_validation_errors(category_matcher, title_context, category_id, category_name))
+    publish_blockers.extend(
+        _category_validation_errors(
+            category_matcher,
+            title_context,
+            category_id,
+            category_name,
+            skip_canonicalize=preserve_approved_category,
+        )
+    )
     qc_candidate = {
         "title": title,
         "description": description,
@@ -1165,6 +1197,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         "categoryName": category_name,
         "aspects": completed_aspects,
     }
+    if is_category_approved(opt):
+        mark_category_approved(qc_candidate)
     fs_conn = None
     try:
         fs_conn = sqlite3.connect(str(PROJECT_ROOT / "ebay_collection.db"), timeout=30)

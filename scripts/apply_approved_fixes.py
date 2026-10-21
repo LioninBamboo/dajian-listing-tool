@@ -83,6 +83,10 @@ def build_command(sku: str, fix_keys: list[str], apply: bool) -> list[str]:
         cmd += ["--fix-key", key]
     if apply:
         cmd.append("--fix")
+    if any(key in GUARDED_KEYS for key in fix_keys):
+        # Human --allow-category path: persist optimization.categoryApproved so
+        # later publish/normalize/audit remaps cannot overwrite the leaf.
+        cmd.append("--mark-category-approved")
     return cmd
 
 
