@@ -28,7 +28,7 @@ from src.utils.dimension_helpers import (
 from src.utils.publish_autofix import sanitize_placeholder_aspects
 from src.utils.report_images import normalize_image_list
 from src.utils.publish_validation import first_aspect_text, measurement_issue
-from src.utils.approved_category import is_category_approved
+from src.utils.approved_category import evaluate_approved_category
 from src.utils.listing_quality_gate import (
     normalize_generated_listing,
 )
@@ -578,7 +578,12 @@ def choose_ready_category(
     current_category_name,
     optimization=None,
 ):
-    if is_category_approved(optimization) and str(current_category_id or "").strip():
+    approved_decision = evaluate_approved_category(
+        str(current_category_id or ""),
+        optimization,
+        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+    )
+    if approved_decision.preserve:
         return current_category_id, current_category_name, aspects
 
     candidates = []

@@ -306,7 +306,7 @@ def test_batch_publish_rejects_non_leaf_approved_category(monkeypatch, tmp_path)
     assert "not a sellable leaf" in result["message"]
 
 
-def test_active_audit_does_not_remap_approved_dog_crate(monkeypatch):
+def _load_active_audit():
     import importlib.util
     from pathlib import Path
 
@@ -317,44 +317,87 @@ def test_active_audit_does_not_remap_approved_dog_crate(monkeypatch):
     )
     audit = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(audit)
+    return audit
 
-    class _Matcher:
-        def canonicalize_category(self, title_context, category_id, category_name, description=None):
-            return "38200", "End Tables"
 
-        def is_category_plausible_for_text(self, title, category_id, category_name):
-            return False
+class _DogCrateMatcher:
+    def canonicalize_category(self, title_context, category_id, category_name, description=None):
+        return "38200", "End Tables"
 
-        def get_category_and_aspects(self, title, aspects, description):
-            return "38200", "End Tables", aspects
+    def is_category_plausible_for_text(self, title, category_id, category_name):
+        return False
 
-        def _get_category_aspects(self, category_id):
-            return [], []
+    def get_category_and_aspects(self, title, aspects, description):
+        return "38200", "End Tables", aspects
 
-    monkeypatch.setattr(audit, "get_category_matcher", lambda: _Matcher())
+    def _get_category_aspects(self, category_id):
+        return [], []
 
-    opt = {
+
+def _dog_crate_opt(*, category_id: str, category_name: str) -> dict:
+    return {
         "title": "Wooden Dog Crate End Table Furniture Kennel",
         "description": "<div>Pet crate that doubles as an end table.</div>",
-        "categoryId": "20748",
-        "categoryName": "Dog Houses",
+        "categoryId": category_id,
+        "categoryName": category_name,
         "categoryApproved": True,
         "aspects": {"Brand": ["AquaVerve"]},
     }
+
+
+def test_active_audit_does_not_remap_approved_dog_crate(monkeypatch, tmp_path):
+    _install_leaf_tree(monkeypatch, tmp_path)
+    audit = _load_active_audit()
+    monkeypatch.setattr(audit, "get_category_matcher", lambda: _DogCrateMatcher())
+
     issues, fixes = audit.audit_single_product(
         "W808P391671",
         "Wooden Dog Crate End Table Furniture Kennel",
         "{}",
         "{}",
-        opt,
+        _dog_crate_opt(category_id="20748", category_name="Dog Houses"),
         "Pet crate furniture",
     )
     assert not any(issue.get("type") == "category_mismatch" for issue in issues)
     assert "categoryId" not in fixes
 
 
-def test_choose_ready_category_keeps_approved_leaf():
+def test_active_audit_remaps_blacklisted_or_non_leaf_approved_category(monkeypatch, tmp_path):
+    _install_leaf_tree(monkeypatch, tmp_path)
+    blacklist = tmp_path / "high_fee.json"
+    blacklist.write_text('{"publish_skip_category_ids": ["20748"]}', encoding="utf-8")
+    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", str(blacklist))
+    audit = _load_active_audit()
+    monkeypatch.setattr(audit, "get_category_matcher", lambda: _DogCrateMatcher())
+
+    blacklisted_issues, blacklisted_fixes = audit.audit_single_product(
+        "W808P391671",
+        "Wooden Dog Crate End Table Furniture Kennel",
+        "{}",
+        "{}",
+        _dog_crate_opt(category_id="20748", category_name="Dog Houses"),
+        "Pet crate furniture",
+    )
+    assert any(issue.get("type") == "category_mismatch" for issue in blacklisted_issues)
+    assert blacklisted_fixes.get("categoryId") == "38200"
+
+    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", "/nonexistent-high-fee-blacklist.json")
+    non_leaf_issues, non_leaf_fixes = audit.audit_single_product(
+        "W808P391671",
+        "Wooden Dog Crate End Table Furniture Kennel",
+        "{}",
+        "{}",
+        _dog_crate_opt(category_id="11700", category_name="Home & Garden"),
+        "Pet crate furniture",
+    )
+    assert any(issue.get("type") == "category_mismatch" for issue in non_leaf_issues)
+    assert non_leaf_fixes.get("categoryId") == "38200"
+
+
+def test_choose_ready_category_keeps_approved_leaf(monkeypatch, tmp_path):
     from scripts.audit_fix_ready_drafts import choose_ready_category
+
+    _install_leaf_tree(monkeypatch, tmp_path)
 
     class _Matcher:
         def get_category_and_aspects(self, title, aspects, description):
@@ -377,3 +420,53 @@ def test_choose_ready_category_keeps_approved_leaf():
         {"categoryId": "176991", CATEGORY_APPROVED_KEY: True},
     )
     assert (category_id, category_name) == ("176991", "Bathroom Cabinets")
+
+
+def test_choose_ready_category_drops_blacklisted_or_non_leaf_approval(monkeypatch, tmp_path):
+    from scripts.audit_fix_ready_drafts import choose_ready_category
+
+    _install_leaf_tree(monkeypatch, tmp_path)
+    blacklist = tmp_path / "high_fee.json"
+    blacklist.write_text('{"publish_skip_category_ids": ["176991"]}', encoding="utf-8")
+    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", str(blacklist))
+
+    class _Matcher:
+        def get_category_and_aspects(self, title, aspects, description):
+            return "20487", "Cabinets & Cupboards", aspects
+
+        def canonicalize_category(self, title, category_id, category_name=None, description=None):
+            return category_id, category_name
+
+        def is_category_plausible_for_text(self, title, category_id, category_name=None):
+            return category_id == "20487"
+
+        def _get_category_aspects(self, category_id):
+            return [], []
+
+        def _complete_aspects(self, aspects, required, recommended, title, category_name):
+            return aspects
+
+    blacklisted_id, blacklisted_name, _ = choose_ready_category(
+        _Matcher(),
+        "Bathroom Storage Cabinet",
+        "Bathroom Storage Cabinet with Doors",
+        "",
+        {"Brand": ["AquaVerve"]},
+        "176991",
+        "Bathroom Cabinets",
+        {"categoryId": "176991", CATEGORY_APPROVED_KEY: True},
+    )
+    assert (blacklisted_id, blacklisted_name) == ("20487", "Cabinets & Cupboards")
+
+    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", "/nonexistent-high-fee-blacklist.json")
+    non_leaf_id, non_leaf_name, _ = choose_ready_category(
+        _Matcher(),
+        "Bathroom Storage Cabinet",
+        "Bathroom Storage Cabinet with Doors",
+        "",
+        {"Brand": ["AquaVerve"]},
+        "11700",
+        "Home & Garden",
+        {"categoryId": "11700", CATEGORY_APPROVED_KEY: True},
+    )
+    assert (non_leaf_id, non_leaf_name) == ("20487", "Cabinets & Cupboards")

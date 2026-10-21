@@ -97,7 +97,10 @@ from src.utils.dimension_helpers import (
     find_dimension,
     replace_description_measurements,
 )
-from src.utils.approved_category import is_category_approved, mark_category_approved as stamp_category_approved
+from src.utils.approved_category import (
+    evaluate_approved_category,
+    mark_category_approved as stamp_category_approved,
+)
 from src.utils.publish_validation import first_aspect_text, measurement_issue
 from src.utils.publish_autofix import (
     SINGLE_VALUE_ASPECTS,
@@ -953,8 +956,13 @@ def audit_single_product(
         fixes["__restore_live_description_from_local__"] = True
 
     # ── 1. Category Check — deterministic product profile wins over taxonomy drift ──
-    # A human-approved stored category is not remapped by profile or canonicalize.
-    skip_category_remap = is_category_approved(opt) and bool(stored_category)
+    # Approved lock only when the id is a cached sellable leaf and not high-fee.
+    approved_decision = evaluate_approved_category(
+        stored_category,
+        opt,
+        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+    )
+    skip_category_remap = approved_decision.preserve
     profile = classify_listing_profile(title_context or title, live_description, stored_category)
     if not skip_category_remap and profile.category_id:
         if stored_category != profile.category_id:

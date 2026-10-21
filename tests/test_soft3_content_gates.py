@@ -40,6 +40,17 @@ def test_furniture_set_includes_allowed_on_furniture():
     assert g.find_wrong_domain_set_includes("5 Piece Dining Table Set", {"Set Includes": ["Table Set"]}) is None
 
 
+def test_tablet_stable_vegetable_are_not_furniture_for_set_includes():
+    aspects = {"Set Includes": ["Table Set"], "Type": ["Tablet Stand"]}
+    for title in ("Tablet Stand", "Stable Storage Rack", "Vegetable Chopper"):
+        issue = g.find_wrong_domain_set_includes(title, aspects)
+        assert issue is not None
+        assert issue.code == "wrong_domain_set_includes"
+    assert g.is_furniture_context("Outdoor Tables") is True
+    assert g.is_furniture_context("Tablet Stand") is False
+    assert g.is_furniture_context("Router Table") is False
+
+
 def test_fixed_listing_passes():
     desc = (
         "<p><strong>Source Spec:</strong> This set includes 7 high-quality wrenches that exceed ANSI standards.</p>"

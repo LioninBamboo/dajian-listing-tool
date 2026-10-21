@@ -2686,6 +2686,37 @@ _KIT_SIZE_CLAIM_RE = re.compile(
 )
 _SOURCE_KIT_CN_RE = re.compile(r"(\d{1,3})\s*(?:件套|件|套)")
 _SOURCE_KIT_CN_CHAIRS_RE = re.compile(r"(\d{1,3})\s*把\S{0,3}?椅")
+# Supplier qty that is not already "N-piece" / 件套: "includes 7 wrenches",
+# "3 seater", "三人位". Evidence only — live claims stay N-piece/pack/set.
+_SOURCE_INCLUDES_COUNT_RE = re.compile(
+    rf"\bincludes?\s*:?\s+(\d{{1,3}}){NOT_DIMENSION_AFTER}\s+[A-Za-z]",
+    re.IGNORECASE,
+)
+_SOURCE_INCLUDES_NON_ITEM_RE = re.compile(
+    r"years?|months?|weeks?|days?|hours?|warrant(?:y|ies)|colou?rs?",
+    re.IGNORECASE,
+)
+_SOURCE_SEATER_RE = re.compile(
+    rf"\b(\d{{1,3}}){NOT_DIMENSION_AFTER}\s*[- ]?\s*seaters?\b",
+    re.IGNORECASE,
+)
+_SOURCE_CN_RENWEI_RE = re.compile(
+    r"(?<![0-9零一二两三四五六七八九十])"
+    r"(\d{1,3}|[零一二两三四五六七八九十]{1,3})\s*人位"
+)
+_CN_KIT_DIGITS = {
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
 _PIECE_COUNT_KEY_RE = re.compile(
     r"\b(?:number of pieces|pieces included|number of items in set|"
     r"items in set|piece count)\b",
@@ -2753,6 +2784,48 @@ def _has_real_table(text: str) -> bool:
     return has_real_table(text)
 
 
+def _cn_small_int(token: str) -> int | None:
+    """Parse a 1–99 Chinese count such as 三 / 十 / 十二 / 二十三."""
+    if not token or any(ch not in _CN_KIT_DIGITS and ch != "十" for ch in token):
+        return None
+    if token == "十":
+        return 10
+    if "十" not in token:
+        if len(token) == 1:
+            return _CN_KIT_DIGITS[token]
+        return None
+    left, _, right = token.partition("十")
+    if (left and left not in _CN_KIT_DIGITS) or (right and right not in _CN_KIT_DIGITS):
+        return None
+    return (_CN_KIT_DIGITS[left] if left else 1) * 10 + (_CN_KIT_DIGITS[right] if right else 0)
+
+
+def _add_loose_kit_evidence(text: str, evidence: set[int]) -> None:
+    """Count includes-N / N-seater / N人位 phrases as source qty evidence."""
+    plain = html_lib.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    for match in _SOURCE_INCLUDES_COUNT_RE.finditer(plain):
+        if number_is_dimension_bound(plain, match):
+            continue
+        word = re.match(r"\s+([A-Za-z]+)", plain[match.end(1):])
+        if word and _SOURCE_INCLUDES_NON_ITEM_RE.fullmatch(word.group(1)):
+            continue
+        _add_kit_count(evidence, match.group(1))
+    for match in _SOURCE_SEATER_RE.finditer(plain):
+        if number_is_dimension_bound(plain, match):
+            continue
+        _add_kit_count(evidence, match.group(1))
+    for match in _SOURCE_CN_RENWEI_RE.finditer(plain):
+        token = match.group(1)
+        if token.isdigit():
+            if number_is_dimension_bound(plain, match):
+                continue
+            _add_kit_count(evidence, token)
+            continue
+        parsed = _cn_small_int(token)
+        if parsed is not None:
+            _add_kit_count(evidence, parsed)
+
+
 def _source_kit_size_evidence(
     source_title: str = "",
     source_description: str = "",
@@ -2793,6 +2866,7 @@ def _source_kit_size_evidence(
         _add_kit_count(evidence, chairs)
         if _has_real_table(blob) and plausible_seat_count(chairs):
             _add_kit_count(evidence, chairs + 1)
+    _add_loose_kit_evidence(blob, evidence)
     return evidence
 
 
@@ -2845,6 +2919,8 @@ _SOFT3_FURNITURE_HINTS = (
     "dining", "table", "sofa", "couch", "sectional", "chair", "stool", "bistro",
     "patio set", "conversation set", "bed ", "mattress", "ottoman", "loveseat",
 )
+# "table" is a substring of tablet / stable / vegetable. Match the word, keep plural.
+_SOFT3_TABLE_WORD_RE = re.compile(r"(?<![a-z0-9])tables?(?![a-z0-9])")
 _SOFT3_BOX_HEADS = ("WHAT'S IN THE BOX", "WHAT&#39;S IN THE BOX", "PACKAGE INCLUDES")
 _SOFT3_SECTION_ENDS = ("Specifications", "KEY FEATURES", "Ships from", "WHAT'S IN THE BOX", "PACKAGE INCLUDES")
 
@@ -2879,7 +2955,14 @@ def is_furniture_context(title: str, aspects: Mapping[str, Any] | None = None) -
     blob = f"{title or ''} {first_aspect_text(aspects or {}, 'Type') or ''}".lower()
     for tool_word in ("router table", "work table", "table saw", "workbench", "setup block"):
         blob = blob.replace(tool_word, " ")
-    return any(h in blob for h in _SOFT3_FURNITURE_HINTS)
+    for hint in _SOFT3_FURNITURE_HINTS:
+        if hint == "table":
+            if _SOFT3_TABLE_WORD_RE.search(blob):
+                return True
+            continue
+        if hint in blob:
+            return True
+    return False
 
 
 def find_wrong_domain_set_includes(title: str, aspects: Mapping[str, Any] | None) -> ListingQualityIssue | None:

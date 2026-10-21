@@ -2462,6 +2462,48 @@ def test_invented_kit_size_allows_chinese_ba_yi_chairs():
     assert table_plus_chairs is None
 
 
+def test_invented_kit_size_allows_includes_seater_and_renwei():
+    from src.utils.listing_quality_gate import (
+        _source_kit_size_evidence,
+        find_invented_kit_size,
+    )
+
+    wrenches = find_invented_kit_size(
+        "7-Piece Metric Jumbo Combination Wrench Set",
+        "",
+        source_description="this set includes 7 high-quality wrenches",
+    )
+    seater = find_invented_kit_size(
+        "3-Piece Sofa",
+        "",
+        source_title="3 seater sofa",
+    )
+    renwei = find_invented_kit_size(
+        "3-Piece Sofa",
+        "",
+        source_title="布艺沙发三人位",
+    )
+    assert wrenches is None
+    assert seater is None
+    assert renwei is None
+    assert 3 in _source_kit_size_evidence(source_title="3-seater")
+    assert 3 in _source_kit_size_evidence(source_title="3人位")
+    assert 12 in _source_kit_size_evidence(source_title="十二人位")
+    assert 2 in _source_kit_size_evidence(source_description="includes 2 wrenches")
+    assert _source_kit_size_evidence(source_description="includes 2 year warranty") == set()
+    assert _source_kit_size_evidence(source_description="includes 12V booster") == set()
+
+    still_invented = find_invented_kit_size(
+        "10-Piece Sofa",
+        "",
+        source_title="3 seater sofa 三人位",
+        source_description="this set includes 7 high-quality wrenches",
+    )
+    assert still_invented is not None
+    assert still_invented.code == "invented_kit_size"
+    assert "10" in still_invented.message
+
+
 def test_invented_kit_size_still_blocks_unsupported_count():
     from src.utils.listing_quality_gate import find_invented_kit_size
 
