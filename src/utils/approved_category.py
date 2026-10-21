@@ -17,7 +17,9 @@ Unapproved products keep the existing remap behavior.
 The lock is bound to ``categoryApprovedId``. If another tool later
 rewrites ``categoryId`` without clearing the flag, the new id does not
 inherit protection. Legacy rows that only have ``categoryApproved=true``
-treat the current ``categoryId`` as approved and backfill the id.
+are still treated as approved for the current ``categoryId``; persist the
+id with ``backfill_approved_category_id`` (``is_category_approved`` does
+not mutate).
 """
 
 from __future__ import annotations
@@ -52,8 +54,6 @@ def approved_category_id(optimization: Mapping[str, Any] | None) -> str:
 def is_category_approved(
     optimization: Mapping[str, Any] | None,
     category_id: str | None = None,
-    *,
-    backfill: bool = True,
 ) -> bool:
     if not isinstance(optimization, Mapping):
         return False
@@ -63,9 +63,7 @@ def is_category_approved(
     current = str(category_id or optimization.get("categoryId") or "").strip()
     pinned = approved_category_id(optimization)
     if not pinned:
-        if current and backfill and isinstance(optimization, dict):
-            optimization[CATEGORY_APPROVED_ID_KEY] = current
-            logger.info("Backfilled categoryApprovedId=%s from current categoryId", current)
+        # Legacy flag-only rows: honor the current leaf, but do not write.
         return bool(current)
 
     if pinned != current:
@@ -76,6 +74,26 @@ def is_category_approved(
         )
         return False
     return True
+
+
+def backfill_approved_category_id(
+    optimization: dict[str, Any],
+    category_id: str | None = None,
+) -> str:
+    """Persist ``categoryApprovedId`` for a legacy flag-only row."""
+    if not isinstance(optimization, dict):
+        return ""
+    if optimization.get(CATEGORY_APPROVED_KEY) not in _TRUTHY:
+        return ""
+    pinned = approved_category_id(optimization)
+    if pinned:
+        return pinned
+    cid = str(category_id or optimization.get("categoryId") or "").strip()
+    if not cid:
+        return ""
+    optimization[CATEGORY_APPROVED_ID_KEY] = cid
+    logger.info("Backfilled categoryApprovedId=%s from current categoryId", cid)
+    return cid
 
 
 def mark_category_approved(

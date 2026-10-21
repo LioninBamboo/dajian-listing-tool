@@ -6,6 +6,7 @@ import batch_publish
 from src.utils.approved_category import (
     CATEGORY_APPROVED_ID_KEY,
     CATEGORY_APPROVED_KEY,
+    backfill_approved_category_id,
     evaluate_approved_category,
     is_category_approved,
     mark_category_approved,
@@ -114,10 +115,17 @@ def test_operator_marks_approval_on_optimization_json():
     assert is_category_approved(opt) is True
 
 
-def test_legacy_flag_backfills_approved_id():
+def test_legacy_flag_does_not_mutate_on_read():
     opt = {"categoryId": "176991", CATEGORY_APPROVED_KEY: True}
     assert is_category_approved(opt) is True
+    assert CATEGORY_APPROVED_ID_KEY not in opt
+
+
+def test_legacy_flag_backfills_approved_id_explicitly():
+    opt = {"categoryId": "176991", CATEGORY_APPROVED_KEY: True}
+    assert backfill_approved_category_id(opt) == "176991"
     assert opt[CATEGORY_APPROVED_ID_KEY] == "176991"
+    assert is_category_approved(opt) is True
 
 
 def test_mismatched_approved_id_is_treated_as_unapproved(caplog):
