@@ -203,6 +203,9 @@ def test_execute_pending_delist_marks_success_once(tmp_path, monkeypatch):
             self.calls.append(sku)
             return {'success': True, 'sku': sku}
 
+        def confirm_listing_ended(self, sku):
+            return True
+
     db = tmp_path / 'd.db'
     ensure_schema(db)
     cd._ensure_schema(db)
@@ -480,6 +483,9 @@ def test_batch_confirm_pending_delists_dedupes_and_counts(tmp_path):
             self.calls.append(sku)
             return {'success': sku != 'FAIL-1', 'error': 'blocked'}
 
+        def confirm_listing_ended(self, sku):
+            return sku != 'FAIL-1'
+
     db = tmp_path / 'd.db'
     cd._ensure_schema(db)
     expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
@@ -512,3 +518,71 @@ def test_batch_confirm_pending_delists_dedupes_and_counts(tmp_path):
     assert [r['status'] for r in rep['results']] == [
         'ok', 'not_pending', 'failed'
     ]
+
+
+def _seed_collected(db, sku, status='PUBLISHED', listing_id='366701946479'):
+    import sqlite3
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS collected_products "
+            "(sku TEXT PRIMARY KEY, status TEXT, listing_id TEXT, optimization TEXT)"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO collected_products (sku, status, listing_id) "
+            "VALUES (?, ?, ?)",
+            (sku, status, listing_id),
+        )
+        conn.commit()
+
+
+def _collected_status(db, sku):
+    import sqlite3
+    with sqlite3.connect(str(db)) as conn:
+        row = conn.execute(
+            "SELECT status FROM collected_products WHERE sku = ?", (sku,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def test_cro_end_writes_ended_only_after_ebay_confirmation(tmp_path):
+    from scripts import cro_delist as cd
+
+    db = tmp_path / 'd.db'
+    cd._ensure_schema(db)
+    _seed_collected(db, 'W465P220504')
+    expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    with __import__('sqlite3').connect(str(db)) as conn:
+        conn.execute(
+            """INSERT INTO cro_delist_pending (sku, token, expires_at, created_at)
+               VALUES (?, ?, ?, ?)""",
+            ('W465P220504', cd.make_token('W465P220504', expires), expires, expires),
+        )
+        conn.commit()
+
+    class FakeEbayClient:
+        def delist_sku(self, sku):
+            return {'success': True}
+
+    still_live = cd.execute_pending_delist(
+        db,
+        'W465P220504',
+        ebay_client=FakeEbayClient(),
+        mark_queue=False,
+        source_checker=lambda sku: {'verified': True, 'sku_available': False},
+        ended_confirmer=lambda sku: False,
+    )
+    assert still_live['ok'] is False
+    assert still_live['status'] == 'ebay_end_unconfirmed'
+    assert _collected_status(db, 'W465P220504') == 'PUBLISHED'
+    assert cd.lookup_pending(db, 'W465P220504') is not None
+
+    confirmed = cd.execute_pending_delist(
+        db,
+        'W465P220504',
+        ebay_client=FakeEbayClient(),
+        mark_queue=False,
+        source_checker=lambda sku: {'verified': True, 'sku_available': False},
+        ended_confirmer=lambda sku: True,
+    )
+    assert confirmed['ok'] is True
+    assert _collected_status(db, 'W465P220504') == 'ENDED'

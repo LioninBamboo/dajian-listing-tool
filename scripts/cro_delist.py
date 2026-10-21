@@ -279,6 +279,94 @@ def _mark_queue_done(sku: str) -> None:
         pass
 
 
+def _lookup_collected_listing_id(db: Path, sku: str) -> str:
+    try:
+        with sqlite3.connect(str(db)) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'collected_products'"
+            ).fetchone()
+            if not exists:
+                return ""
+            row = conn.execute(
+                "SELECT listing_id FROM collected_products WHERE sku = ? LIMIT 1",
+                (sku,),
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return ""
+    if not row:
+        return ""
+    return str(row[0] or "").strip()
+
+
+def _mark_collected_ended(db: Path, sku: str) -> bool:
+    """Set collected_products.status=ENDED after an eBay-confirmed end."""
+    try:
+        with sqlite3.connect(str(db)) as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'collected_products'"
+            ).fetchone()
+            if not exists:
+                return False
+            cur = conn.execute(
+                "UPDATE collected_products SET status = 'ENDED' WHERE sku = ?",
+                (sku,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+    except sqlite3.OperationalError:
+        return False
+
+
+def confirm_ebay_listing_ended(
+    sku: str,
+    *,
+    listing_id: str = "",
+    ebay_client: Any = None,
+    ended_confirmer: Optional[Callable[[str], bool]] = None,
+) -> bool:
+    """Positive eBay end evidence only. Fail closed on Active / errors."""
+    if ended_confirmer is not None:
+        try:
+            return bool(ended_confirmer(sku))
+        except Exception as exc:
+            logger.warning("ended confirmer failed for %s: %s", sku, exc)
+            return False
+    if ebay_client is not None and hasattr(ebay_client, "confirm_listing_ended"):
+        try:
+            return bool(ebay_client.confirm_listing_ended(sku))
+        except Exception as exc:
+            logger.warning("client confirm_listing_ended failed for %s: %s", sku, exc)
+            return False
+    if ebay_client is not None and hasattr(ebay_client, "get_offers_by_sku"):
+        try:
+            offers = ebay_client.get_offers_by_sku(sku) or []
+        except Exception as exc:
+            logger.warning("offer readback failed for %s: %s", sku, exc)
+            return False
+        for offer in offers:
+            listing = offer.get("listing") if isinstance(offer, dict) else None
+            listing_status = ""
+            if isinstance(listing, dict):
+                listing_status = str(listing.get("listingStatus") or "")
+            offer_status = str(offer.get("status") or "") if isinstance(offer, dict) else ""
+            if listing_status.upper() in {"ACTIVE", "OUT_OF_STOCK"}:
+                return False
+            if offer_status.upper() == "PUBLISHED" and listing_status.upper() not in {
+                "ENDED", "COMPLETED",
+            }:
+                return False
+        if listing_id:
+            from src.services.listing_status_sync import confirm_listing_ended
+            return confirm_listing_ended(listing_id)
+        return not offers
+    if listing_id:
+        from src.services.listing_status_sync import confirm_listing_ended
+        return confirm_listing_ended(listing_id)
+    return False
+
+
 def execute_pending_delist(
     db: Path,
     sku: str,
@@ -287,6 +375,7 @@ def execute_pending_delist(
     ebay_client_factory: Optional[Callable[[], Any]] = None,
     source_checker: Optional[Callable[[str], dict[str, Any]]] = None,
     mark_queue: bool = True,
+    ended_confirmer: Optional[Callable[[str], bool]] = None,
 ) -> dict:
     """Execute one human-confirmed pending delist.
 
@@ -372,15 +461,41 @@ def execute_pending_delist(
             'error': str(exc),
         }
 
-    mark_confirmed(db, sku, 'ok' if ok else f"failed: {result.get('error', '')}")
-    if ok and mark_queue:
+    if not ok:
+        mark_confirmed(db, sku, f"failed: {result.get('error', '')}")
+        return {
+            'sku': sku,
+            'ok': False,
+            'status': 'failed',
+            'result': result,
+            'error': result.get('error', ''),
+        }
+
+    listing_id = _lookup_collected_listing_id(db, sku)
+    if not confirm_ebay_listing_ended(
+        sku,
+        listing_id=listing_id,
+        ebay_client=client,
+        ended_confirmer=ended_confirmer,
+    ):
+        return {
+            'sku': sku,
+            'ok': False,
+            'status': 'ebay_end_unconfirmed',
+            'result': result,
+            'error': 'eBay did not confirm the listing ended; local ENDED not written',
+        }
+
+    _mark_collected_ended(db, sku)
+    mark_confirmed(db, sku, 'ok')
+    if mark_queue:
         _mark_queue_done(sku)
     return {
         'sku': sku,
-        'ok': ok,
-        'status': 'ok' if ok else 'failed',
+        'ok': True,
+        'status': 'ok',
         'result': result,
-        'error': '' if ok else result.get('error', ''),
+        'error': '',
     }
 
 
@@ -392,6 +507,7 @@ def batch_confirm_pending_delists(
     source_checker: Optional[Callable[[str], dict[str, Any]]] = None,
     mark_queue: bool = True,
     max_count: int = 200,
+    ended_confirmer: Optional[Callable[[str], bool]] = None,
 ) -> dict:
     db = Path(db_path) if db_path else DEFAULT_DB
     normalized: list[str] = []
@@ -416,6 +532,7 @@ def batch_confirm_pending_delists(
             ebay_client=client,
             source_checker=source_checker,
             mark_queue=mark_queue,
+            ended_confirmer=ended_confirmer,
         )
         for sku in normalized
     ]

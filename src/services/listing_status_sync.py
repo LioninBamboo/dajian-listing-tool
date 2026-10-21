@@ -18,11 +18,17 @@ import sqlite3
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime, timedelta
+from xml.sax.saxutils import escape as xml_escape
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.services.live_listing_coverage import LiveListing
+from src.utils.sold_through_relist import parse_trading_item_xml
+
 logger = logging.getLogger(__name__)
+
+_ENDED_LISTING_STATUSES = {"ended", "completed"}
 
 # 缓存文件路径和TTL
 SYNC_CACHE_FILE = PROJECT_ROOT / 'logs' / '_listing_sync_cache.json'
@@ -54,6 +60,104 @@ def _get_trading_client():
     return EbayTradingClient(ebay)
 
 
+def _item_text(item, *names, ns=None) -> str:
+    for name in names:
+        elem = item.find(name, ns) if ns else item.find(name)
+        if elem is not None and elem.text and str(elem.text).strip():
+            return str(elem.text).strip()
+    return ""
+
+
+def fetch_all_active_listings(trading=None, max_pages=20) -> tuple[list[LiveListing], int, bool]:
+    """Fetch every ActiveList item as (item_id, sku).
+
+    GetMyeBaySelling + ActiveList, paginated. Zero-quantity Out-of-Stock
+    Control listings stay Active and are included.
+
+    Returns:
+        (listings, api_total, fetch_complete). Callers must not treat a
+        missing id as ended when fetch_complete is False.
+    """
+    if trading is None:
+        trading = _get_trading_client()
+
+    listings: list[LiveListing] = []
+    seen_ids: set[str] = set()
+    api_total = 0
+    per_page = 200
+    ns = {'ebay': 'urn:ebay:apis:eBLBaseComponents'}
+    fetch_complete = False
+
+    for page in range(1, max_pages + 1):
+        xml_payload = f"""
+        <ActiveList>
+            <Include>true</Include>
+            <Pagination>
+                <EntriesPerPage>{per_page}</EntriesPerPage>
+                <PageNumber>{page}</PageNumber>
+            </Pagination>
+        </ActiveList>
+        <DetailLevel>ReturnAll</DetailLevel>
+        """
+
+        response_text = None
+        for attempt in range(3):
+            try:
+                response_text = trading.call("GetMyeBaySelling", xml_payload)
+                break
+            except Exception as e:
+                logger.warning(f"GetMyeBaySelling page {page} attempt {attempt+1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(3 * (attempt + 1))
+
+        if not response_text:
+            logger.error(f"Skipping page {page} after 3 retries")
+            fetch_complete = False
+            break
+
+        root = ET.fromstring(response_text)
+
+        if page == 1:
+            total_elem = root.find(
+                './/ebay:ActiveList/ebay:PaginationResult/ebay:TotalNumberOfEntries', ns
+            )
+            if total_elem is not None and total_elem.text:
+                api_total = int(total_elem.text)
+                logger.info(f"  eBay API TotalNumberOfEntries: {api_total}")
+
+        items = root.findall('.//ebay:ActiveList/ebay:ItemArray/ebay:Item', ns)
+
+        if not items:
+            fetch_complete = True
+            break
+
+        for item in items:
+            item_id = _item_text(item, 'ebay:ItemID', ns=ns)
+            if not item_id or item_id in seen_ids:
+                continue
+            seen_ids.add(item_id)
+            sku = _item_text(item, 'ebay:SKU', ns=ns)
+            listings.append(LiveListing(item_id=item_id, sku=sku))
+
+        total_pages_elem = root.find(
+            './/ebay:ActiveList/ebay:PaginationResult/ebay:TotalNumberOfPages', ns
+        )
+        if total_pages_elem is not None:
+            total_pages = int(total_pages_elem.text)
+            if page >= total_pages:
+                fetch_complete = True
+                break
+
+        logger.info(f"  Page {page}: {len(items)} items, cumulative {len(listings)}")
+        time.sleep(0.5)
+    else:
+        fetch_complete = False
+
+    logger.info(f"Total active listings from API: {len(listings)} "
+                f"(API reported: {api_total}, complete={fetch_complete})")
+    return listings, api_total, fetch_complete
+
+
 def fetch_all_active_listing_ids(trading=None, max_pages=20) -> tuple[set, int, bool]:
     """
     获取 eBay 上所有在售的 listing ID 集合
@@ -71,85 +175,43 @@ def fetch_all_active_listing_ids(trading=None, max_pages=20) -> tuple[set, int, 
            未撞 max_pages 上限）。调用方必须在 fetch_complete=False 时放弃
            "死链"协调，否则会把没抓到的在售 listing 误判为已结束。)
     """
+    listings, api_total, fetch_complete = fetch_all_active_listings(
+        trading, max_pages=max_pages
+    )
+    return {item.item_id for item in listings}, api_total, fetch_complete
+
+
+def confirm_listing_ended(listing_id: str, trading=None) -> bool:
+    """True only with positive eBay end evidence (GetItem Ended/Completed).
+
+    Active, OutOfStock, NOT_FOUND, parse failures, and transport errors are
+    not confirmation. Callers must fail closed and leave the local status.
+    """
+    lid = str(listing_id or "").strip()
+    if not lid or lid.startswith("DRAFT-"):
+        return False
     if trading is None:
         trading = _get_trading_client()
-
-    active_ids = set()
-    api_total = 0
-    per_page = 200
-    ns = {'ebay': 'urn:ebay:apis:eBLBaseComponents'}
-    fetch_complete = False  # 只有确认翻到最后一页/无更多条目才置 True
-
-    for page in range(1, max_pages + 1):
-        xml_payload = f"""
-        <ActiveList>
-            <Include>true</Include>
-            <Pagination>
-                <EntriesPerPage>{per_page}</EntriesPerPage>
-                <PageNumber>{page}</PageNumber>
-            </Pagination>
-        </ActiveList>
-        <DetailLevel>ReturnAll</DetailLevel>
-        """
-
-        # Retry with backoff
-        response_text = None
-        for attempt in range(3):
-            try:
-                response_text = trading.call("GetMyeBaySelling", xml_payload)
-                break
-            except Exception as e:
-                logger.warning(f"GetMyeBaySelling page {page} attempt {attempt+1} failed: {e}")
-                if attempt < 2:
-                    time.sleep(3 * (attempt + 1))
-
-        if not response_text:
-            logger.error(f"Skipping page {page} after 3 retries")
-            fetch_complete = False  # 抓取失败 → 快照残缺，禁止据此判死链
-            break
-
-        root = ET.fromstring(response_text)
-
-        # 首页：获取 API 报告的总数
-        if page == 1:
-            total_elem = root.find(
-                './/ebay:ActiveList/ebay:PaginationResult/ebay:TotalNumberOfEntries', ns
-            )
-            if total_elem is not None and total_elem.text:
-                api_total = int(total_elem.text)
-                logger.info(f"  eBay API TotalNumberOfEntries: {api_total}")
-
-        # 关键修复：只匹配 ActiveList/ItemArray/Item，不匹配嵌套子元素
-        items = root.findall('.//ebay:ActiveList/ebay:ItemArray/ebay:Item', ns)
-
-        if not items:
-            fetch_complete = True  # 无更多条目 → 抓完
-            break
-
-        for item in items:
-            item_id_elem = item.find('ebay:ItemID', ns)
-            if item_id_elem is not None and item_id_elem.text:
-                active_ids.add(item_id_elem.text)
-
-        # 检查是否还有更多页
-        total_pages_elem = root.find(
-            './/ebay:ActiveList/ebay:PaginationResult/ebay:TotalNumberOfPages', ns
+    try:
+        response_text = trading.call(
+            "GetItem",
+            f"<ItemID>{xml_escape(lid)}</ItemID>",
         )
-        if total_pages_elem is not None:
-            total_pages = int(total_pages_elem.text)
-            if page >= total_pages:
-                fetch_complete = True  # 翻到最后一页 → 抓完
-                break
+    except Exception as exc:
+        logger.warning("GetItem confirm-ended failed for %s: %s", lid, exc)
+        return False
 
-        logger.info(f"  Page {page}: {len(items)} items, cumulative {len(active_ids)}")
-        time.sleep(0.5)  # Rate limit courtesy
-    else:
-        # for 正常耗尽 range 而未 break → 撞上 max_pages 上限, 可能还有更多页
-        fetch_complete = False
-
-    logger.info(f"Total active listing IDs from API: {len(active_ids)} "
-                f"(API reported: {api_total}, complete={fetch_complete})")
-    return active_ids, api_total, fetch_complete
+    snapshot = parse_trading_item_xml(response_text)
+    if not snapshot:
+        return False
+    status = str(snapshot.get("listing_status") or "").strip().lower()
+    if status in _ENDED_LISTING_STATUSES:
+        return True
+    logger.info(
+        "GetItem %s listingStatus=%s — not treating as ended",
+        lid, snapshot.get("listing_status") or "-",
+    )
+    return False
 
 
 def get_db_published_listings() -> list:
@@ -225,8 +287,11 @@ def sync_listing_status(force_refresh=False) -> dict:
             'error': str(e),
         }
 
-    # 1. 获取 eBay 真实在售
-    active_ids, api_total, fetch_complete = fetch_all_active_listing_ids(trading)
+    # 1. 获取 eBay 真实在售 (ItemID + SKU)。SKU 用来避免「旧 listing_id
+    #    已结束 / 重刊后新 ItemID 仍在售」被误标 ENDED。
+    live_listings, api_total, fetch_complete = fetch_all_active_listings(trading)
+    active_ids = {item.item_id for item in live_listings}
+    live_skus = {item.sku for item in live_listings if item.sku}
 
     # 使用 API 报告的 TotalNumberOfEntries 作为权威数据
     # （比我们自己计数更准确，因为 eBay 内部可能有我们看不到的过滤）
@@ -258,15 +323,33 @@ def sync_listing_status(force_refresh=False) -> dict:
     db_listings = get_db_published_listings()
     db_published_count = len(db_listings)
 
-    # 3. 找出本地 PUBLISHED 但 eBay 上已不在售的 → 标记 ENDED
+    # 3. 找出本地 PUBLISHED 但 eBay 上已不在售的 → 仅在 eBay 确认结束后标 ENDED
     stale_skus = []
+    skipped_unconfirmed = []
     for item in db_listings:
         lid = item['listing_id']
+        sku = item['sku']
         # 跳过 DRAFT offers 和空 listing ID
         if not lid or lid.startswith('DRAFT-'):
             continue
-        if lid not in active_ids:
-            stale_skus.append(item['sku'])
+        if lid in active_ids:
+            continue
+        if sku in live_skus:
+            logger.info(
+                "  %s listing_id=%s not in ActiveList but SKU is still live — "
+                "not marking ENDED (likely relist / listing_id drift)",
+                sku, lid,
+            )
+            continue
+        if not confirm_listing_ended(lid, trading):
+            skipped_unconfirmed.append(sku)
+            logger.warning(
+                "  %s listing_id=%s missing from ActiveList but eBay did not "
+                "confirm Ended/Completed — leaving status PUBLISHED",
+                sku, lid,
+            )
+            continue
+        stale_skus.append(sku)
 
     # 3b. 找出 READY/READY_TO_PUBLISH 但挂着已失效 listing_id 的行:
     #     MI 重识别的"曾刊登 → 未出单 → 死链 → 下架"候选。stale listing_id 会让
@@ -312,6 +395,7 @@ def sync_listing_status(force_refresh=False) -> dict:
         'db_active_after_sync': db_published_count - len(stale_skus),
         'stale_ended': stale_skus,
         'stale_ready_cleared': stale_ready_cleared,
+        'ended_unconfirmed': skipped_unconfirmed,
         'synced_at': datetime.now().isoformat(),
     }
 
