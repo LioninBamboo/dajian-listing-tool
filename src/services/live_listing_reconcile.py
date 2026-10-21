@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from src.services.live_listing_coverage import (
     CoverageReport,
@@ -151,11 +151,34 @@ def _apply_status_listing_id(
     )
 
 
+def _confirmed_ended(
+    change: ReconcileChange,
+    ended_confirmer: Optional[Callable[[str, str], bool]],
+) -> bool:
+    sku = str(change.sku or "").strip()
+    listing_id = str(change.item_id or change.db_listing_id_before or "").strip()
+    if ended_confirmer is not None:
+        try:
+            return bool(ended_confirmer(sku, listing_id))
+        except Exception as exc:
+            logger.warning("ended confirmer failed for %s: %s", sku, exc)
+            return False
+    if not listing_id:
+        return False
+    try:
+        from src.services.listing_status_sync import confirm_listing_ended
+        return bool(confirm_listing_ended(listing_id))
+    except Exception as exc:
+        logger.warning("GetItem confirm-ended failed for %s: %s", listing_id, exc)
+        return False
+
+
 def apply_reconcile(
     db_path: str | Path,
     changes: Iterable[ReconcileChange],
     *,
     apply: bool = False,
+    ended_confirmer: Optional[Callable[[str, str], bool]] = None,
 ) -> list[ReconcileChange]:
     """Write status/listing_id only. Never touches optimization / category locks."""
     applied: list[ReconcileChange] = []
@@ -166,6 +189,17 @@ def apply_reconcile(
     conn = sqlite3.connect(str(db_path))
     try:
         for change in writable:
+            if not str(change.sku or "").strip():
+                continue
+            if change.action == ACTION_MARK_ENDED and not _confirmed_ended(
+                change, ended_confirmer
+            ):
+                logger.warning(
+                    "reconcile skip mark_ended sku=%s — eBay did not confirm Ended",
+                    change.sku,
+                )
+                change.applied = False
+                continue
             _apply_status_listing_id(
                 conn,
                 change.sku,
@@ -197,6 +231,7 @@ def build_reconcile_report(
     fetch_complete: bool = True,
     apply: bool = False,
     db_rows: Optional[list[DbListingRow]] = None,
+    ended_confirmer: Optional[Callable[[str, str], bool]] = None,
 ) -> ReconcileReport:
     rows = db_rows if db_rows is not None else load_db_listing_rows(db_path)
     coverage = build_coverage_report(
@@ -206,7 +241,12 @@ def build_reconcile_report(
     )
     changes = plan_reconcile(coverage)
     if apply:
-        apply_reconcile(db_path, changes, apply=True)
+        apply_reconcile(
+            db_path,
+            changes,
+            apply=True,
+            ended_confirmer=ended_confirmer,
+        )
     orphans = [
         {
             "sku": item.sku or "",

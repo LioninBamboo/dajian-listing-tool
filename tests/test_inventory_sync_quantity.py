@@ -72,6 +72,64 @@ def test_sync_single_product_restocks_with_quantity_cap_two(monkeypatch):
     assert result.new_value == "库存恢复为2"
 
 
+def test_sync_single_product_restock_never_exceeds_giga_quantity(monkeypatch):
+    monkeypatch.setenv("EBAY_LISTING_QUANTITY_CAP", "2")
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    service = InventorySyncService.__new__(InventorySyncService)
+    service.logger = logging.getLogger(__name__)
+    service.check_dajian_stock = lambda sku: (True, 120.0, 25.0, 1)
+    service.get_last_sync_action = lambda sku: "out_of_stock"
+    service._check_and_update_price = lambda *args, **kwargs: None
+    seen = {}
+    service.update_ebay_quantity = lambda sku, quantity: seen.update(sku=sku, quantity=quantity) or True
+
+    result = service._sync_single_product(
+        {"sku": "SKU-GIGA-ONE", "cost_breakdown": {}},
+        dry_run=False,
+        skip_ebay_check=True,
+        favorites_set=set(),
+    )
+
+    assert seen == {"sku": "SKU-GIGA-ONE", "quantity": 1}
+    assert result.action == "restocked"
+    assert result.new_value == "库存恢复为1"
+
+
+def test_incomplete_snapshot_extra_row_can_zero_but_not_restock():
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    service = InventorySyncService.__new__(InventorySyncService)
+    service.logger = logging.getLogger(__name__)
+    seen = {}
+    service.update_ebay_quantity = lambda sku, quantity: seen.update(sku=sku, quantity=quantity) or True
+    service.get_last_sync_action = lambda sku: "out_of_stock"
+    service._check_and_update_price = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("price update must not run in zero_only mode")
+    )
+
+    service.check_dajian_stock = lambda sku: (False, 120.0, 25.0, 0)
+    zeroed = service._sync_single_product(
+        {"sku": "MAYBE-LIVE", "cost_breakdown": {}, "sync_mode": "zero_only"},
+        dry_run=False,
+        skip_ebay_check=True,
+        favorites_set=set(),
+    )
+    assert zeroed.action == "out_of_stock"
+    assert seen == {"sku": "MAYBE-LIVE", "quantity": 0}
+
+    seen.clear()
+    service.check_dajian_stock = lambda sku: (True, 120.0, 25.0, 7)
+    skipped = service._sync_single_product(
+        {"sku": "MAYBE-LIVE", "cost_breakdown": {}, "sync_mode": "zero_only"},
+        dry_run=False,
+        skip_ebay_check=True,
+        favorites_set=set(),
+    )
+    assert skipped.action == "skipped"
+    assert seen == {}
+
+
 def test_sync_single_product_reports_zero_quantity_write_failure_as_error():
     from src.plugins.inventory_sync.sync_service import InventorySyncService
 

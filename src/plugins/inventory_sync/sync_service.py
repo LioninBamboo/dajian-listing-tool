@@ -371,11 +371,20 @@ class InventorySyncService:
         
         products = []
         for row in cur.fetchall():
+            breakdown = {}
+            raw_cost = row['cost_breakdown']
+            if raw_cost:
+                try:
+                    parsed = json.loads(raw_cost) if isinstance(raw_cost, str) else raw_cost
+                    if isinstance(parsed, dict):
+                        breakdown = parsed
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    breakdown = {}
             products.append({
                 'sku': row['sku'],
                 'title': row['title'],
                 'source_url': row['url'],
-                'cost_breakdown': json.loads(row['cost_breakdown']) if row['cost_breakdown'] else {},
+                'cost_breakdown': breakdown,
                 'ebay_listing_id': row['listing_id']
             })
         
@@ -1495,12 +1504,45 @@ class InventorySyncService:
                     supplier_in_stock=False,
                 )
             
+            # Incomplete ActiveList extras: zero if GIGA is OOS, never restock
+            # or revise a listing we did not see as live in this snapshot.
+            if product.get('sync_mode') == 'zero_only' and in_stock:
+                return SyncResult(
+                    sku=sku,
+                    action='skipped',
+                    message='ActiveList incomplete; skipped restock/revise for unconfirmed listing',
+                    supplier_in_stock=True,
+                )
+
             # 3.5 检查是否从缺货恢复 → 自动重新上架
             last_action = self.get_last_sync_action(sku)
             if last_action in ('out_of_stock', 'restock_held') and in_stock:
                 self.logger.info(f"  {sku}: 从缺货恢复，重新上架")
                 cap = _listing_quantity_cap()
                 restore_quantity = cap if isinstance(cap, int) and cap > 0 else 1
+                if available_quantity is not None:
+                    try:
+                        available = max(0, int(available_quantity))
+                    except (TypeError, ValueError):
+                        available = None
+                    else:
+                        restore_quantity = min(restore_quantity, available)
+                if restore_quantity <= 0:
+                    if not _set_ebay_quantity_zero():
+                        return SyncResult(
+                            sku=sku,
+                            action='error',
+                            message='大建库存不足以恢复，但 eBay 库存归零失败',
+                            supplier_in_stock=False,
+                        )
+                    return SyncResult(
+                        sku=sku,
+                        action='out_of_stock',
+                        old_value='有库存',
+                        new_value='库存设为0',
+                        message='大建可售数量为 0，已将 eBay 库存设为 0',
+                        supplier_in_stock=False,
+                    )
                 restored = True
                 if not dry_run:
                     restored = bool(self.update_ebay_quantity(sku, restore_quantity))

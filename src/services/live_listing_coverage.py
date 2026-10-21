@@ -203,9 +203,21 @@ def build_coverage_report(
     for item in live:
         row = None
         match_by = ""
-        if item.sku and item.sku in by_sku:
-            row = by_sku[item.sku]
-            match_by = "sku"
+        if item.sku:
+            if item.sku in by_sku:
+                row = by_sku[item.sku]
+                match_by = "sku"
+            else:
+                # SKU is present on eBay but absent locally. Do not bind the
+                # live item to some other row just because listing_id collided.
+                orphans.append(item)
+                log.warning(
+                    "LIVE_ORPHAN sku=%s item_id=%s — live on eBay but missing from DB; "
+                    "not inventing a row",
+                    item.sku,
+                    item.item_id,
+                )
+                continue
         elif item.item_id in by_listing_id:
             row = by_listing_id[item.item_id]
             match_by = "listing_id"
@@ -287,5 +299,9 @@ def sync_scope_products(report: CoverageReport) -> list[dict]:
     for row in report.published_not_live:
         if row.sku in covered_skus:
             continue
-        products.append(row.product_dict())
+        product = row.product_dict()
+        # Partial ActiveList: keep the qty=0 gate, but never restock/relist
+        # a listing we did not actually see as live.
+        product["sync_mode"] = "zero_only"
+        products.append(product)
     return products

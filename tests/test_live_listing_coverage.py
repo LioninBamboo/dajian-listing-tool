@@ -180,6 +180,7 @@ def test_reconcile_restores_live_ended_and_skips_category_payload(tmp_path):
         live,
         fetch_complete=True,
         apply=True,
+        ended_confirmer=lambda sku, listing_id: True,
     )
     assert any(row.applied and row.sku == "W465P220504" for row in applied.changes)
 
@@ -228,5 +229,141 @@ def test_incomplete_fetch_does_not_mark_published_ended(tmp_path):
     ).fetchone()[0] == "PUBLISHED"
     assert conn.execute(
         "SELECT status FROM collected_products WHERE sku='ENDED-LIVE'"
+    ).fetchone()[0] == "PUBLISHED"
+    conn.close()
+
+
+SPEC_ORPHAN_SKUS = (
+    "W2932P435459",
+    "W2519S00001",
+    "W2932P000003",
+    "W2932P000004",
+    "W2519S00005",
+    "W2519S00006",
+    "W2932P000007",
+)
+
+
+def test_spec_skus_ended_ready_and_seven_orphans(tmp_path, caplog):
+    """2026-10-22 scan cases: live+ENDED, READY+live, 7 live orphans."""
+    db = _make_db(tmp_path, [
+        _row("W465P220504", "ENDED", "366701946479"),
+        _row("W465P229056", "READY", "ready-old-id"),
+        _row("DEAD-PUB", "PUBLISHED", "ended-on-ebay"),
+    ])
+    live = [
+        LiveListing(item_id="366701946479", sku="W465P220504"),
+        LiveListing(item_id="229056111111", sku="W465P229056"),
+        *[
+            LiveListing(item_id=f"orphan-{index}", sku=sku)
+            for index, sku in enumerate(SPEC_ORPHAN_SKUS, start=1)
+        ],
+    ]
+    caplog.set_level(logging.WARNING)
+    report = build_coverage_report(live, load_db_listing_rows(db), fetch_complete=True)
+    covered = {match.sku: match for match in report.covered}
+
+    assert "W465P220504" in covered
+    assert covered["W465P220504"].db_status == "ENDED"
+    assert "W465P229056" in covered
+    assert covered["W465P229056"].db_status == "READY"
+    assert {item.sku for item in report.orphans} == set(SPEC_ORPHAN_SKUS)
+    assert [row.sku for row in report.published_not_live] == ["DEAD-PUB"]
+    assert "W465P220504" in {p["sku"] for p in sync_scope_products(report)}
+    assert "W465P229056" in {p["sku"] for p in sync_scope_products(report)}
+    assert "DEAD-PUB" not in {p["sku"] for p in sync_scope_products(report)}
+    assert "W2932P435459" in caplog.text
+    assert "W2519S00001" in caplog.text
+
+    planned = build_reconcile_report(db, live, fetch_complete=True, apply=False)
+    by_sku = {row.sku: row for row in planned.changes}
+    assert by_sku["W465P220504"].action == ACTION_RESTORE_PUBLISHED
+    assert by_sku["W465P229056"].action == ACTION_RESTORE_PUBLISHED
+    assert by_sku["W465P229056"].db_listing_id_after == "229056111111"
+    assert {row["sku"] for row in planned.orphans} == set(SPEC_ORPHAN_SKUS)
+    conn = sqlite3.connect(str(db))
+    assert conn.execute("SELECT COUNT(*) FROM collected_products").fetchone()[0] == 3
+    conn.close()
+
+
+def test_orphan_sku_does_not_bind_to_colliding_listing_id(tmp_path, caplog):
+    db = _make_db(tmp_path, [
+        _row("OTHER-SKU", "ENDED", "shared-item"),
+    ])
+    live = [LiveListing(item_id="shared-item", sku="W2932P435459")]
+    caplog.set_level(logging.WARNING)
+    report = build_coverage_report(live, load_db_listing_rows(db), fetch_complete=True)
+
+    assert report.covered == []
+    assert [item.sku for item in report.orphans] == ["W2932P435459"]
+    assert "LIVE_ORPHAN sku=W2932P435459" in caplog.text
+    recon = build_reconcile_report(db, live, fetch_complete=True, apply=True)
+    assert recon.changes == []
+    conn = sqlite3.connect(str(db))
+    assert conn.execute(
+        "SELECT status, listing_id FROM collected_products WHERE sku='OTHER-SKU'"
+    ).fetchone() == ("ENDED", "shared-item")
+    assert conn.execute(
+        "SELECT 1 FROM collected_products WHERE sku='W2932P435459'"
+    ).fetchone() is None
+    conn.close()
+
+
+def test_null_listing_id_still_matches_sku_and_reconcile_fills_it(tmp_path):
+    db = _make_db(tmp_path, [
+        _row("W465P220504", "ENDED", None),
+    ])
+    live = [LiveListing(item_id="366701946479", sku="W465P220504")]
+    report = build_coverage_report(live, load_db_listing_rows(db), fetch_complete=True)
+    assert report.covered[0].sku == "W465P220504"
+    assert report.covered[0].match_by == "sku"
+
+    build_reconcile_report(db, live, fetch_complete=True, apply=True)
+    conn = sqlite3.connect(str(db))
+    assert conn.execute(
+        "SELECT status, listing_id FROM collected_products WHERE sku='W465P220504'"
+    ).fetchone() == ("PUBLISHED", "366701946479")
+    conn.close()
+
+
+def test_invalid_cost_breakdown_and_null_optimization_still_cover(tmp_path):
+    db = tmp_path / "ebay_collection.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE collected_products "
+        "(sku TEXT PRIMARY KEY, status TEXT, listing_id TEXT, "
+        "title TEXT, url TEXT, cost_breakdown TEXT, optimization TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO collected_products VALUES (?,?,?,?,?,?,?)",
+        ("W465P220504", "ENDED", "366701946479", "t", "", "not-json", None),
+    )
+    conn.commit()
+    conn.close()
+    report = build_coverage_report(
+        [LiveListing(item_id="366701946479", sku="W465P220504")],
+        load_db_listing_rows(db),
+        fetch_complete=True,
+    )
+    assert report.covered[0].product["cost_breakdown"] == {}
+    assert report.covered[0].sku == "W465P220504"
+
+
+def test_mark_ended_apply_requires_ebay_confirmation(tmp_path):
+    db = _make_db(tmp_path, [
+        _row("DEAD-PUB", "PUBLISHED", "999"),
+    ])
+    report = build_reconcile_report(
+        db,
+        [],
+        fetch_complete=True,
+        apply=True,
+        ended_confirmer=lambda sku, listing_id: False,
+    )
+    assert report.changes[0].action == ACTION_MARK_ENDED
+    assert report.changes[0].applied is False
+    conn = sqlite3.connect(str(db))
+    assert conn.execute(
+        "SELECT status FROM collected_products WHERE sku='DEAD-PUB'"
     ).fetchone()[0] == "PUBLISHED"
     conn.close()

@@ -360,7 +360,7 @@ def confirm_ebay_listing_ended(
         if listing_id:
             from src.services.listing_status_sync import confirm_listing_ended
             return confirm_listing_ended(listing_id)
-        return not offers
+        return False
     if listing_id:
         from src.services.listing_status_sync import confirm_listing_ended
         return confirm_listing_ended(listing_id)
