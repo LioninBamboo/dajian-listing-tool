@@ -68,6 +68,30 @@ def _item_text(item, *names, ns=None) -> str:
     return ""
 
 
+def _trading_ack(root, ns) -> str:
+    text = root.findtext("ebay:Ack", default="", namespaces=ns)
+    return str(text or "").strip()
+
+
+def _empty_active_page_is_complete(root, ns, *, fetched: int, api_total: int) -> bool:
+    """An empty ItemArray is a finished snapshot only for a real zero-result list.
+
+    Failure / PartialFailure, a body with no ActiveList, and a short page
+    (fewer items than TotalNumberOfEntries) are incomplete. Callers must not
+    treat ids missing from that snapshot as ended.
+    """
+    ack = _trading_ack(root, ns).lower()
+    if ack in {"failure", "partialfailure"}:
+        return False
+    if root.find(".//ebay:ActiveList", ns) is None:
+        return False
+    if ack and ack not in {"success", "warning"}:
+        return False
+    if api_total > fetched:
+        return False
+    return True
+
+
 def fetch_all_active_listings(trading=None, max_pages=20) -> tuple[list[LiveListing], int, bool]:
     """Fetch every ActiveList item as (item_id, sku).
 
@@ -76,7 +100,9 @@ def fetch_all_active_listings(trading=None, max_pages=20) -> tuple[list[LiveList
 
     Returns:
         (listings, api_total, fetch_complete). Callers must not treat a
-        missing id as ended when fetch_complete is False.
+        missing id as ended when fetch_complete is False. An empty Item
+        page is complete only for a successful zero-result ActiveList.
+        Failure responses and short counts stay incomplete.
     """
     if trading is None:
         trading = _get_trading_client()
@@ -128,7 +154,17 @@ def fetch_all_active_listings(trading=None, max_pages=20) -> tuple[list[LiveList
         items = root.findall('.//ebay:ActiveList/ebay:ItemArray/ebay:Item', ns)
 
         if not items:
-            fetch_complete = True
+            if _empty_active_page_is_complete(
+                root, ns, fetched=len(listings), api_total=api_total,
+            ):
+                fetch_complete = True
+            else:
+                logger.error(
+                    f"GetMyeBaySelling page {page} has no items "
+                    f"(ack={_trading_ack(root, ns) or '-'}, fetched={len(listings)}, "
+                    f"api_total={api_total}) — snapshot incomplete"
+                )
+                fetch_complete = False
             break
 
         for item in items:
@@ -151,6 +187,13 @@ def fetch_all_active_listings(trading=None, max_pages=20) -> tuple[list[LiveList
         logger.info(f"  Page {page}: {len(items)} items, cumulative {len(listings)}")
         time.sleep(0.5)
     else:
+        fetch_complete = False
+
+    if fetch_complete and api_total > 0 and len(listings) < api_total:
+        logger.warning(
+            f"ActiveList short of reported total "
+            f"(fetched={len(listings)}, api_total={api_total}) — snapshot incomplete"
+        )
         fetch_complete = False
 
     logger.info(f"Total active listings from API: {len(listings)} "

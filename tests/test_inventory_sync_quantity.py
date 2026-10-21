@@ -130,6 +130,69 @@ def test_incomplete_snapshot_extra_row_can_zero_but_not_restock():
     assert seen == {}
 
 
+def test_sync_single_product_writes_quantity_with_live_listing_id():
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    service = InventorySyncService.__new__(InventorySyncService)
+    service.logger = logging.getLogger(__name__)
+    service.check_dajian_stock = lambda sku: (False, 120.0, 25.0, 0)
+    seen = {}
+
+    def fake_update_ebay_quantity(sku, quantity, known_listing_id=None):
+        seen["sku"] = sku
+        seen["quantity"] = quantity
+        seen["known_listing_id"] = known_listing_id
+        return True
+
+    service.update_ebay_quantity = fake_update_ebay_quantity
+    result = service._sync_single_product(
+        {
+            "sku": "W465P220504",
+            "listing_id": "366701946479",
+            "ebay_listing_id": "366701946479",
+            "cost_breakdown": {},
+        },
+        dry_run=False,
+        skip_ebay_check=True,
+        favorites_set=set(),
+    )
+
+    assert result.action == "out_of_stock"
+    assert seen == {
+        "sku": "W465P220504",
+        "quantity": 0,
+        "known_listing_id": "366701946479",
+    }
+
+
+def test_sync_single_product_restock_uses_live_listing_id(monkeypatch):
+    monkeypatch.setenv("EBAY_LISTING_QUANTITY_CAP", "1")
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    service = InventorySyncService.__new__(InventorySyncService)
+    service.logger = logging.getLogger(__name__)
+    service.check_dajian_stock = lambda sku: (True, 120.0, 25.0, 7)
+    service.get_last_sync_action = lambda sku: "out_of_stock"
+    service._check_and_update_price = lambda *args, **kwargs: None
+    seen = {}
+
+    def fake_update_ebay_quantity(sku, quantity, known_listing_id=None):
+        seen["quantity"] = quantity
+        seen["known_listing_id"] = known_listing_id
+        return True
+
+    service.update_ebay_quantity = fake_update_ebay_quantity
+    result = service._sync_single_product(
+        {"sku": "SKU-RESTOCK-LIVE", "ebay_listing_id": "LIVE-ITEM", "cost_breakdown": {}},
+        dry_run=False,
+        skip_ebay_check=True,
+        favorites_set=set(),
+    )
+
+    assert result.action == "restocked"
+    assert seen == {"quantity": 1, "known_listing_id": "LIVE-ITEM"}
+
+
 def test_sync_single_product_reports_zero_quantity_write_failure_as_error():
     from src.plugins.inventory_sync.sync_service import InventorySyncService
 

@@ -87,6 +87,50 @@ def test_live_ended_row_is_covered_and_orphan_is_logged(tmp_path, caplog):
     assert "W465P220504" in {p["sku"] for p in sync_scope_products(report)}
 
 
+def test_short_active_list_keeps_published_rows_in_stock_gate(tmp_path, monkeypatch):
+    """A truncated ActiveList must not look finished.
+
+    Unseen PUBLISHED rows stay in the qty=0 gate (zero_only) instead of being
+    flagged as ended and dropped.
+    """
+    db = _make_db(tmp_path, [
+        _row("LIVE", "PUBLISHED", "111"),
+        _row("UNSEEN", "PUBLISHED", "999"),
+    ])
+    monkeypatch.setattr(
+        "src.services.listing_status_sync.fetch_all_active_listings",
+        lambda trading=None, max_pages=20: (
+            [LiveListing(item_id="111", sku="LIVE")],
+            40,
+            True,
+        ),
+    )
+    service = InventorySyncService(db_path=str(db))
+    service._load_favorites_set = lambda: set()
+    service._prefetch_dajian_data = lambda skus: None
+    service.record_sync = lambda result: None
+    seen = []
+
+    def fake_sync_single(product, dry_run, skip_ebay_check=True, favorites_set=None):
+        from src.plugins.inventory_sync.sync_service import SyncResult
+
+        seen.append((product["sku"], product.get("sync_mode")))
+        return SyncResult(sku=product["sku"], action="out_of_stock", message="zeroed")
+
+    service._sync_single_product = fake_sync_single
+    results = service.sync_all(
+        dry_run=False,
+        skip_ebay_check=True,
+        skip_synced_today=False,
+    )
+
+    assert ("LIVE", None) in seen
+    assert ("UNSEEN", "zero_only") in seen
+    assert all(row.action != "ebay_ended_flagged" for row in results)
+    assert service.last_coverage_report is not None
+    assert service.last_coverage_report.fetch_complete is False
+
+
 def test_db_published_but_ended_on_ebay_is_flagged_not_zeroed(tmp_path, caplog):
     db = _make_db(tmp_path, [
         _row("DEAD-PUB", "PUBLISHED", "999"),

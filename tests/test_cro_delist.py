@@ -544,6 +544,81 @@ def _collected_status(db, sku):
     return row[0] if row else None
 
 
+def test_retry_after_unconfirmed_end_keeps_pending_when_inventory_already_gone(tmp_path):
+    """Second delist must not consume the magic link when the item is already gone.
+
+    The first withdraw succeeded but GetItem had not yet shown Ended. Retry
+    finds no offers and DELETE inventory returns 404. That is still a
+    successful inventory cleanup, so confirmation stays pending until eBay
+    readback says the listing ended.
+    """
+    from types import SimpleNamespace
+
+    from scripts import cro_delist as cd
+    from src.clients.real_ebay_client import RealEbayClient
+
+    db = tmp_path / "d.db"
+    cd._ensure_schema(db)
+    _seed_collected(db, "RETRY-1", status="PUBLISHED", listing_id="999")
+    expires = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    with __import__("sqlite3").connect(str(db)) as conn:
+        conn.execute(
+            """INSERT INTO cro_delist_pending (sku, token, expires_at, created_at)
+               VALUES (?, ?, ?, ?)""",
+            ("RETRY-1", cd.make_token("RETRY-1", expires), expires, expires),
+        )
+        conn.commit()
+
+    client = object.__new__(RealEbayClient)
+    client.base_url = "https://api.ebay.com"
+    client.oauth = SimpleNamespace(get_valid_token=lambda: "token")
+
+    class _Resp:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self.text = ""
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class _Session:
+        def get(self, url, headers=None, params=None):
+            return _Resp(200, {"offers": []})
+
+        def delete(self, url, headers=None):
+            return _Resp(404)
+
+    client.session = _Session()
+    source_ok = lambda sku: {"verified": True, "sku_available": False}
+
+    still_live = cd.execute_pending_delist(
+        db,
+        "RETRY-1",
+        ebay_client=client,
+        mark_queue=False,
+        source_checker=source_ok,
+        ended_confirmer=lambda sku: False,
+    )
+    assert still_live["ok"] is False
+    assert still_live["status"] == "ebay_end_unconfirmed"
+    assert _collected_status(db, "RETRY-1") == "PUBLISHED"
+    assert cd.lookup_pending(db, "RETRY-1") is not None
+
+    confirmed = cd.execute_pending_delist(
+        db,
+        "RETRY-1",
+        ebay_client=client,
+        mark_queue=False,
+        source_checker=source_ok,
+        ended_confirmer=lambda sku: True,
+    )
+    assert confirmed["ok"] is True
+    assert confirmed["status"] == "ok"
+    assert _collected_status(db, "RETRY-1") == "ENDED"
+    assert cd.lookup_pending(db, "RETRY-1") is None
+
+
 def test_cro_end_writes_ended_only_after_ebay_confirmation(tmp_path):
     from scripts import cro_delist as cd
 

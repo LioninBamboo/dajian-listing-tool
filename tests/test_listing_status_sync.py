@@ -167,6 +167,59 @@ def test_fetch_incomplete_when_hits_max_pages():
     assert complete is False
 
 
+def test_fetch_incomplete_when_failure_page_has_no_items():
+    xml = (
+        '<GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">'
+        "<Ack>Failure</Ack>"
+        "<Errors><ShortMessage>RequestError</ShortMessage></Errors>"
+        "</GetMyeBaySellingResponse>"
+    )
+    listings, total, complete = lss.fetch_all_active_listings(_FakeTrading([xml]))
+    assert listings == []
+    assert total == 0
+    assert complete is False
+
+
+def test_fetch_complete_when_catalog_is_empty():
+    xml = (
+        '<GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">'
+        "<Ack>Success</Ack>"
+        "<ActiveList><PaginationResult>"
+        "<TotalNumberOfEntries>0</TotalNumberOfEntries>"
+        "<TotalNumberOfPages>0</TotalNumberOfPages>"
+        "</PaginationResult></ActiveList>"
+        "</GetMyeBaySellingResponse>"
+    )
+    listings, total, complete = lss.fetch_all_active_listings(_FakeTrading([xml]))
+    assert listings == []
+    assert total == 0
+    assert complete is True
+
+
+def test_fetch_incomplete_when_later_page_is_empty_but_short():
+    page2 = (
+        '<GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">'
+        "<Ack>Success</Ack>"
+        "<ActiveList><ItemArray></ItemArray></ActiveList>"
+        "</GetMyeBaySellingResponse>"
+    )
+    listings, total, complete = lss.fetch_all_active_listings(
+        _FakeTrading([_active_xml(["1"], 4, 2), page2])
+    )
+    assert [item.item_id for item in listings] == ["1"]
+    assert total == 4
+    assert complete is False
+
+
+def test_fetch_incomplete_when_single_page_is_short_of_api_total():
+    listings, total, complete = lss.fetch_all_active_listings(
+        _FakeTrading([_active_xml(["1", "2"], 100, 1)])
+    )
+    assert [item.item_id for item in listings] == ["1", "2"]
+    assert total == 100
+    assert complete is False
+
+
 def test_fetch_active_listings_includes_sku():
     xml = (
         '<GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">'

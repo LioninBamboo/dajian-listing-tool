@@ -1628,7 +1628,9 @@ class RealEbayClient:
         DELETE /sell/inventory/v1/inventory_item/{sku}
         
         Returns:
-            True if successful
+            True if the item was deleted or is already absent (HTTP 404).
+            A retry after a successful withdraw must not treat "already gone"
+            as a failed delist.
         """
         url = f"{self.base_url}/sell/inventory/v1/inventory_item/{sku}"
         token = self.oauth.get_valid_token()
@@ -1639,9 +1641,11 @@ class RealEbayClient:
             if response.status_code in [200, 204]:
                 logging.info(f"[SUCCESS] Inventory item deleted: {sku}")
                 return True
-            else:
-                logging.error(f"Failed to delete inventory {sku}: {response.status_code}")
-                return False
+            if response.status_code == 404:
+                logging.info(f"Inventory item already absent: {sku}")
+                return True
+            logging.error(f"Failed to delete inventory {sku}: {response.status_code}")
+            return False
         except Exception as e:
             logging.error(f"Error deleting inventory item: {e}")
             return False

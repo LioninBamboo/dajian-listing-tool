@@ -412,9 +412,21 @@ class InventorySyncService:
             try:
                 from src.services.listing_status_sync import fetch_all_active_listings
 
-                live_listings, _api_total, fetched_complete = fetch_all_active_listings()
+                live_listings, api_total, fetched_complete = fetch_all_active_listings()
                 if fetch_complete is None:
-                    fetch_complete = fetched_complete
+                    fetched_count = len(live_listings)
+                    # Same gate as sync_listing_status: a pagination flag alone
+                    # is not proof that every live listing was returned.
+                    fetch_complete = bool(fetched_complete) and (
+                        api_total <= 0 or fetched_count >= api_total
+                    )
+                    if fetched_complete and not fetch_complete:
+                        self.logger.warning(
+                            "ActiveList short of reported total "
+                            "(fetched=%d, api_total=%d) — coverage incomplete",
+                            fetched_count,
+                            api_total,
+                        )
             except Exception as exc:
                 self.logger.error(
                     "Failed to fetch eBay ActiveList for sync coverage: %s", exc
@@ -1407,10 +1419,27 @@ class InventorySyncService:
                               favorites_set: set = None) -> SyncResult:
         """同步单个产品"""
         sku = product['sku']
+        # Coverage copies the ActiveList ItemID onto the product. Re-reading
+        # collected_products.listing_id would revise a stale ended item and
+        # leave the live listing untouched once the Inventory offer is gone.
+        live_listing_id = str(
+            product.get('listing_id') or product.get('ebay_listing_id') or ''
+        ).strip()
+
+        def _write_ebay_quantity(quantity: int) -> bool:
+            if dry_run:
+                return True
+            if live_listing_id:
+                return bool(self.update_ebay_quantity(
+                    sku,
+                    quantity,
+                    known_listing_id=live_listing_id,
+                ))
+            return bool(self.update_ebay_quantity(sku, quantity))
 
         def _set_ebay_quantity_zero() -> bool:
             """Return whether the requested zero-quantity write succeeded."""
-            return dry_run or bool(self.update_ebay_quantity(sku, 0))
+            return _write_ebay_quantity(0)
         
         try:
             # 1. 可选：检查 eBay 状态（跳过可加速同步）
@@ -1543,9 +1572,7 @@ class InventorySyncService:
                         message='大建可售数量为 0，已将 eBay 库存设为 0',
                         supplier_in_stock=False,
                     )
-                restored = True
-                if not dry_run:
-                    restored = bool(self.update_ebay_quantity(sku, restore_quantity))
+                restored = _write_ebay_quantity(restore_quantity)
                 if not restored:
                     return SyncResult(
                         sku=sku,

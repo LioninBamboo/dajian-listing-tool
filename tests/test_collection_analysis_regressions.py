@@ -710,6 +710,48 @@ def test_existing_offer_update_completes_missing_business_policies():
     assert policies["paymentPolicyId"]
 
 
+def _fake_delist_client(delete_status: int):
+    from types import SimpleNamespace
+
+    client = object.__new__(RealEbayClient)
+    client.base_url = "https://api.ebay.com"
+    client.oauth = SimpleNamespace(get_valid_token=lambda: "token")
+
+    class _Resp:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self.text = ""
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class _Session:
+        def get(self, url, headers=None, params=None):
+            return _Resp(200, {"offers": []})
+
+        def delete(self, url, headers=None):
+            return _Resp(delete_status)
+
+    client.session = _Session()
+    return client
+
+
+def test_delist_sku_treats_missing_inventory_item_as_already_removed():
+    result = _fake_delist_client(404).delist_sku("SKU-RETRY")
+
+    assert result["success"] is True
+    assert result["error"] is None
+    assert "Delete inventory item SKU-RETRY: OK" in result["steps"]
+
+
+def test_delist_sku_still_fails_when_inventory_delete_returns_server_error():
+    result = _fake_delist_client(500).delist_sku("SKU-RETRY")
+
+    assert result["success"] is False
+    assert result["error"] == "Failed to delete inventory item SKU-RETRY"
+
+
 def test_delist_sku_reports_failure_when_inventory_delete_fails_without_offers():
     client = object.__new__(RealEbayClient)
     client.get_offers_by_sku = lambda sku: []
