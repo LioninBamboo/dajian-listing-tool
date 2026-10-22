@@ -250,8 +250,11 @@ def audit_candidate(
     if locked:
         # Never use a fresh matcher rematch for locked rows.
         target_id = override_plan["target_id"] or None
-        if target_id and str(opt.get("categoryId") or "").strip() == target_id:
+        stored_leaf = str(opt.get("categoryId") or "").strip()
+        if target_id and stored_leaf == target_id:
             target_name = local_category_name or f"Category {target_id}"
+        elif target_id and live_category_id == target_id and live_category_name:
+            target_name = live_category_name
         elif target_id:
             target_name = f"Category {target_id}"
         else:
@@ -260,7 +263,7 @@ def audit_candidate(
         final_category_id = target_id or live_category_id or local_category_id
         final_category_name = target_name or live_category_name or local_category_name
         needs_live_revision = override_plan["action"] == "REVISE_LIVE"
-        needs_db_sync = False
+        needs_db_sync = bool(override_category_lock and override_plan["action"] == "SYNC_DB")
         action = "LOCKED"
         if override_category_lock:
             action = override_plan["action"]

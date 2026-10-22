@@ -84,8 +84,10 @@ def plan_locked_override_revision(
     """What ``--override-category-lock`` may do to a locked listing.
 
     Target is the operator's explicit per-SKU id, else ``categoryApprovedId``.
-    Never a matcher rematch. Skip when live already equals that leaf, or when
-    no approved / explicit target exists.
+    Never a matcher rematch. Revise live when it differs from that leaf. When
+    live already matches, sync a drifted stored ``categoryId`` back to the
+    pin so publish does not fail closed on the mismatch. Skip when no target
+    exists, or when live and the stored leaf already match.
     """
     target = str(explicit_target_id or approved_category_id(optimization) or "").strip()
     live = str(live_category_id or "").strip()
@@ -96,6 +98,17 @@ def plan_locked_override_revision(
             "reason": "locked with no categoryApprovedId and no explicit --target-category",
         }
     if live == target:
+        opt = _as_optimization(optimization)
+        stored = str((opt or {}).get("categoryId") or "").strip()
+        if stored != target:
+            return {
+                "action": "SYNC_DB",
+                "target_id": target,
+                "reason": (
+                    f"live {live} already equals approved leaf {target}; "
+                    f"local categoryId {stored or 'blank'} drifted"
+                ),
+            }
         return {
             "action": "SKIP",
             "target_id": target,

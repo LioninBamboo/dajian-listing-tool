@@ -431,6 +431,41 @@ def test_repair_override_skips_locked_row_when_live_equals_approved(monkeypatch)
     assert candidate["target_category_id"] != COLLECTIBLES
 
 
+def test_repair_override_syncs_drifted_local_category_when_live_matches_pin(monkeypatch):
+    """Live already equals the pin, but a drifted categoryId still fail-closes publish."""
+    monkeypatch.setattr(
+        repair_published_taxonomy,
+        "get_live_offer_info",
+        lambda _client, _sku: {
+            "offer_id": "off-1",
+            "live_category_id": COOKWARE_LEAF,
+            "live_category_name": "Other Cookware",
+        },
+    )
+    row = _repair_row(approved=True, pinned=COOKWARE_LEAF, category_id=COLLECTIBLES)
+    candidate = repair_published_taxonomy.audit_candidate(
+        row,
+        _RemapMatcher(),
+        client=None,
+        override_category_lock=True,
+    )
+    assert candidate["action"] == "SYNC_DB"
+    assert candidate["override_action"] == "SYNC_DB"
+    assert candidate["target_category_id"] == COOKWARE_LEAF
+    assert candidate["final_category_id"] == COOKWARE_LEAF
+    assert candidate["final_category_name"] == "Other Cookware"
+    assert candidate["target_category_id"] != COLLECTIBLES
+
+    without_override = repair_published_taxonomy.audit_candidate(
+        row,
+        _RemapMatcher(),
+        client=None,
+        override_category_lock=False,
+    )
+    assert without_override["action"] == "LOCKED"
+    assert without_override["override_action"] == "SYNC_DB"
+
+
 def test_repair_override_revises_locked_row_to_approved_leaf_not_matcher(monkeypatch):
     monkeypatch.setattr(
         repair_published_taxonomy,
@@ -545,6 +580,14 @@ def test_repair_dry_run_shows_override_plan_without_apply_flag(monkeypatch):
 def test_plan_locked_override_and_explicit_target_parse():
     locked = _cookware_opt(approved=True)
     assert plan_locked_override_revision(locked, COOKWARE_LEAF)["action"] == "SKIP"
+    local_drift = dict(locked)
+    local_drift["categoryId"] = COLLECTIBLES
+    synced = plan_locked_override_revision(local_drift, COOKWARE_LEAF)
+    assert synced["action"] == "SYNC_DB"
+    assert synced["target_id"] == COOKWARE_LEAF
+    blank_local = dict(locked)
+    blank_local["categoryId"] = ""
+    assert plan_locked_override_revision(blank_local, COOKWARE_LEAF)["action"] == "SYNC_DB"
     drifted = plan_locked_override_revision(locked, COLLECTIBLES)
     assert drifted["action"] == "REVISE_LIVE"
     assert drifted["target_id"] == COOKWARE_LEAF
