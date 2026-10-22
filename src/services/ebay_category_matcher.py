@@ -14,11 +14,14 @@ from typing import Dict, List, Optional, Any, Tuple
 
 from src.utils.product_context_signals import (
     has_any_phrase,
+    has_dual_use_indoor_outdoor,
     has_phrase,
     mentions_cooler_product,
     outdoor_context,
     primary_product_noun,
+    strip_dual_use_indoor_outdoor,
     strip_room_location_lists,
+    title_names_dining_table_and_chairs,
 )
 from src.services.ebay_auth import EbayOAuthService
 from src.utils.category_tree_cache import build_category_path
@@ -281,6 +284,7 @@ class EbayCategoryMatcher:
                 for kw in ("nursery", "living room", "bedroom", "indoor", "office")
             )
         )
+        chair_title = strip_dual_use_indoor_outdoor(title_lower)
         has_outdoor_chair = (
             has_outdoor_context
             and not has_outdoor_daybed
@@ -289,7 +293,7 @@ class EbayCategoryMatcher:
             and (
                 has_outdoor_rocker
                 or any(
-                    kw in title_lower
+                    kw in chair_title
                     for kw in (
                         "outdoor chair",
                         "patio chair",
@@ -339,6 +343,7 @@ class EbayCategoryMatcher:
                     "6 piece dining",
                 )
             )
+            or title_names_dining_table_and_chairs(title_lower)
             or any(
                 kw in text_lower
                 for kw in (
@@ -1687,8 +1692,23 @@ class EbayCategoryMatcher:
             )
         ):
             return "139849", "Patio & Garden Furniture Sets"
-        if outdoor_title and "dining chair" in title_lower:
+        # Table + chairs is a dining set. The chair shortcut must not run first:
+        # "Outdoor Dining Table and 6 Dining Chairs" contains "dining chair".
+        if title_names_dining_table_and_chairs(title_lower):
+            return "107578", "Dining Sets"
+        # "indoor & outdoor" is dual-use, not an outdoor dining-chair product.
+        chair_title = strip_dual_use_indoor_outdoor(title_lower)
+        chair_outdoor = any(kw in chair_title for kw in ("outdoor", "patio", "garden"))
+        if chair_outdoor and "dining chair" in chair_title and "dining table" not in chair_title:
             return "79684", "Outdoor Chairs"
+        # Plural "dining chairs" misses the later keyword leaf and would fall
+        # through to generic Furniture. Dual-use copy stays on indoor chairs.
+        if (
+            has_dual_use_indoor_outdoor(title_lower)
+            and "dining chair" in title_lower
+            and "dining table" not in chair_title
+        ):
+            return "54235", "Chairs"
         if outdoor_title and any(
             kw in title_lower for kw in ("side table", "end table", "dining table")
         ) and not any(kw in title_lower for kw in ("coffee table", "nesting table", "cocktail table")):

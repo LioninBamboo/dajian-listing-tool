@@ -107,6 +107,44 @@ _OTTOMAN_COMPOUND_RE = re.compile(
     re.IGNORECASE,
 )
 
+# "Dining Table and 6 Dining Chairs" is one set. The count sits between the
+# table and the chairs, so a contiguous "dining table and chairs" phrase misses it
+# and the chair head-noun wins.
+_CHAIR_NOT_PRODUCT = r"(?!\s+(?:height|rail|rails|cushion|cushions|cover|covers|pad|pads|mat|mats)\b)"
+_DUAL_USE_INDOOR_OUTDOOR_RE = re.compile(
+    r"\bindoor(?:\s*&\s*|\s+and\s+|\s*/\s*|\s+)outdoor\b",
+    re.IGNORECASE,
+)
+
+
+def strip_dual_use_indoor_outdoor(text: str) -> str:
+    """Drop ``indoor & outdoor`` so the phrase is not an outdoor product signal."""
+    cleaned = _DUAL_USE_INDOOR_OUTDOOR_RE.sub(" ", str(text or ""))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def has_dual_use_indoor_outdoor(text: str) -> bool:
+    return _DUAL_USE_INDOOR_OUTDOOR_RE.search(str(text or "")) is not None
+
+
+_DINING_TABLE_AND_CHAIRS_RE = re.compile(
+    rf"(?:"
+    rf"\b(?:dining|kitchen)\s+tables?\b(?:\s+\w+){{0,8}}\s*(?:and|&|with)\s+"
+    rf"(?:(?:\d+|a|an|the|set|of|two|four|six|eight)\s+){{0,4}}"
+    rf"(?:\w+\s+){{0,4}}chairs?\b{_CHAIR_NOT_PRODUCT}"
+    rf"|"
+    rf"\bchairs?\b{_CHAIR_NOT_PRODUCT}(?:\s+\w+){{0,6}}\s*(?:and|&|with)\s+"
+    rf"(?:(?:\d+|a|an|the|set|of)\s+){{0,3}}"
+    rf"(?:\w+\s+){{0,4}}(?:dining|kitchen)\s+tables?\b"
+    rf")",
+    re.IGNORECASE,
+)
+
+
+def title_names_dining_table_and_chairs(text: str) -> bool:
+    """True when the title bundles a dining/kitchen table with chairs."""
+    return _DINING_TABLE_AND_CHAIRS_RE.search(str(text or "")) is not None
+
 
 def has_compound_product_signal(text: str) -> bool:
     """True when the title is a set/bundle/compound, not a single product noun."""
@@ -114,6 +152,8 @@ def has_compound_product_signal(text: str) -> bool:
     if not hay:
         return False
     if has_any_phrase(hay, _COMPOUND_PHRASES):
+        return True
+    if title_names_dining_table_and_chairs(hay):
         return True
     if has_phrase(hay, "desk"):
         return True

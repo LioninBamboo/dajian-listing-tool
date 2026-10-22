@@ -21,10 +21,13 @@ from src.utils.dimension_helpers import (
 )
 from src.utils.product_context_signals import (
     has_any_phrase,
+    has_dual_use_indoor_outdoor,
     has_outdoor_marker,
     outdoor_context as strict_outdoor_context,
     primary_product_noun,
+    strip_dual_use_indoor_outdoor,
     strip_room_location_lists,
+    title_names_dining_table_and_chairs,
 )
 from src.utils.publish_aspect_completion import (
     NOT_DIMENSION_AFTER,
@@ -221,10 +224,20 @@ _INDOOR_TABLE_LEAVES = frozenset({"38199", "38200", "38204"})
 
 
 def _title_has_outdoor_product_signal(text: str) -> bool:
-    """Title-level outdoor/patio/garden product context (rooms already stripped)."""
-    if _has_marker(text, "outdoor", "patio", "garden"):
+    """Title-level outdoor/patio/garden product context (rooms already stripped).
+
+    Dual-use ``indoor & outdoor`` is not an outdoor product, same as tables.
+    Description or source copy must not count — only the title does.
+    """
+    core = strip_dual_use_indoor_outdoor(text)
+    if _has_marker(core, "outdoor", "patio", "garden"):
         return True
-    return _has_marker(text, "acacia") and has_outdoor_marker(text)
+    return _has_marker(core, "acacia") and has_outdoor_marker(core)
+
+
+def _uncertain_dual_use_chair(title_text: str) -> bool:
+    """Indoor/outdoor wording without a real outdoor product word stays unmapped."""
+    return has_dual_use_indoor_outdoor(title_text) and not _title_has_outdoor_product_signal(title_text)
 
 
 _OUTDOOR_TABLE_PHRASES = (
@@ -1543,10 +1556,12 @@ def classify_listing_profile(
             set_includes="Chair",
             room="Living Room",
         )
-    if primary == "dining_chair":
+    if primary == "dining_chair" and not title_names_dining_table_and_chairs(title_text):
         if _has_marker(title_text, "accent chair"):
             return ListingProfile(kind="unknown")
-        if _title_has_outdoor_product_signal(title_text) or outdoor_context_strict:
+        if _uncertain_dual_use_chair(title_text):
+            return ListingProfile(kind="unknown")
+        if _title_has_outdoor_product_signal(title_text):
             return ListingProfile(
                 kind="outdoor_chair",
                 category_id="79684",
@@ -1694,9 +1709,10 @@ def classify_listing_profile(
         "console table",
         "nesting table",
     )
-    if _has_marker(title_text, *dining_set_markers) and not _has_marker(
-        title_text, *kids_table_set_markers, *non_dining_table_set_markers
-    ):
+    if (
+        _has_marker(title_text, *dining_set_markers)
+        or title_names_dining_table_and_chairs(title_text)
+    ) and not _has_marker(title_text, *kids_table_set_markers, *non_dining_table_set_markers):
         return ListingProfile(
             kind="dining_set",
             category_id="107578",
@@ -1930,15 +1946,18 @@ def classify_listing_profile(
             remove_aspects=frozenset(GAME_TABLE_FORBIDDEN_ASPECTS),
         )
 
-    if _has_marker(title_text, "dining chair") or (
-        _has_marker(title_text, "chair")
-        and _has_marker(title_text, "dining")
-        and _has_marker(title_text, "set of", "chairs")
-        and not _has_marker(title_text, "accent chair", "armchair", "reading chair")
+    if not title_names_dining_table_and_chairs(title_text) and (
+        _has_marker(title_text, "dining chair")
+        or (
+            _has_marker(title_text, "chair")
+            and _has_marker(title_text, "dining")
+            and _has_marker(title_text, "set of", "chairs")
+            and not _has_marker(title_text, "accent chair", "armchair", "reading chair")
+        )
     ):
-        if _has_marker(title_text, "accent chair"):
+        if _has_marker(title_text, "accent chair") or _uncertain_dual_use_chair(title_text):
             return ListingProfile(kind="unknown")
-        if _title_has_outdoor_product_signal(title_text) or outdoor_context_strict:
+        if _title_has_outdoor_product_signal(title_text):
             return ListingProfile(
                 kind="outdoor_chair",
                 category_id="79684",
