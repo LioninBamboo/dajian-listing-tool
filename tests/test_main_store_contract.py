@@ -50,6 +50,10 @@ class TestProfileDefaultsContract:
         assert p.is_ops_scheduler is False
         assert p.scheduler_mutex_name == ""
         assert p.resolved_scheduler_mutex_name() == "Global\\DajianSchedulerDaemonMutex"
+        assert p.scheduler_allowed_jobs == ()
+        assert p.resolved_scheduler_allowed_jobs is None
+        assert p.job_is_allowed("smart_reprice") is True
+        assert p.job_is_allowed("listing_audit") is True
 
     def test_main_store_return_policy_is_buyer_paid_everywhere(self):
         # The Motors seller-paid return is auto-parts-only. With no Motors return

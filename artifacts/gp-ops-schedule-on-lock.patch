@@ -1,0 +1,1076 @@
+diff --git a/config/store_profile.grovepop.example.yaml b/config/store_profile.grovepop.example.yaml
+new file mode 100644
+index 0000000..cf0ce9a
+--- /dev/null
++++ b/config/store_profile.grovepop.example.yaml
+@@ -0,0 +1,17 @@
++# GrovePop 生效画像请复制为 config/store_profile.local.yaml（不被 git 跟踪）。
++# scheduler_profile=ops 必须带显式 allowlist；空/未知名单 fail-closed 为这两岗。
++# GrovePop Content QC 必须保持 Disabled，不由本调度表拉起。
++
++store:
++  store_kind: garden
++  brand_name: GrovePop
++
++server:
++  port: 8000
++  scheduler_profile: ops
++  scheduler_mutex_name: Global\GrovePopSchedulerDaemonMutex
++  scheduler_enable_ads: false
++  scheduler_enable_qc_autofix: false
++  scheduler_allowed_jobs:
++    - ops_daily
++    - order_recheck
+diff --git a/scheduler_daemon.py b/scheduler_daemon.py
+index 907ce43..f3df6c8 100644
+--- a/scheduler_daemon.py
++++ b/scheduler_daemon.py
+@@ -223,11 +223,25 @@ def acquire_lock():
+ 
+ 
+ def _scheduler_profile_name() -> str:
+-    return str(getattr(get_store_profile(), 'scheduler_profile', 'full') or 'full').strip().lower()
++    try:
++        return str(getattr(get_store_profile(), 'scheduler_profile', 'full') or 'full').strip().lower()
++    except Exception:
++        return ''
+ 
+ 
+ def _is_ops_scheduler() -> bool:
+-    return _scheduler_profile_name() == 'ops'
++    """Trust a successfully loaded profile; peek YAML only when load fails.
++
++    A leftover GrovePop ``scheduler_profile: ops`` in STORE_PROFILE_PATH /
++    store_profile.local.yaml must not shrink a Main full/daily cadence that
++    already loaded cleanly.
++    """
++    try:
++        profile = get_store_profile()
++    except Exception:
++        from src.utils.store_profile import peek_yaml_says_ops
++        return peek_yaml_says_ops()
++    return bool(getattr(profile, 'is_ops_scheduler', False))
+ 
+ 
+ def _ops_qc_autofix_enabled() -> bool:
+@@ -244,6 +258,43 @@ def _ops_ads_enabled() -> bool:
+         return False
+ 
+ 
++def _resolved_allowed_jobs():
++    """None = unrestricted (Main/full). frozenset = ops fail-closed allowlist."""
++    from src.utils.store_profile import (
++        DEFAULT_OPS_ALLOWED_JOBS,
++        peek_yaml_says_ops,
++    )
++    try:
++        profile = get_store_profile()
++        return profile.resolved_scheduler_allowed_jobs
++    except Exception as exc:
++        if peek_yaml_says_ops():
++            logger.warning(
++                "store profile unreadable (%s); fail-closed to ops allowlist %s",
++                exc,
++                list(DEFAULT_OPS_ALLOWED_JOBS),
++            )
++            return frozenset(DEFAULT_OPS_ALLOWED_JOBS)
++        return None
++
++
++def _job_is_allowed(job_name: str) -> bool:
++    allow = _resolved_allowed_jobs()
++    if allow is None:
++        return True
++    return str(job_name or '').strip() in allow
++
++
++def _log_skip_disallowed(job_name: str, *, via: str) -> None:
++    allow = _resolved_allowed_jobs()
++    logger.info(
++        "skip %s (%s): not on ops allowlist %s",
++        job_name,
++        via,
++        sorted(allow) if allow is not None else [],
++    )
++
++
+ def release_lock():
+     """释放 PID 锁和 mutex"""
+     global _mutex_handle
+@@ -506,6 +557,9 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
+     - 超时自动杀死
+     - 返回 (success, message)
+     """
++    if not _job_is_allowed(task_name):
++        _log_skip_disallowed(task_name, via='run_task')
++        return False, f"skipped: not on ops allowlist ({task_name})"
+     cmd_str = ' '.join(cmd_args)
+     logger.info(f"{'='*50}")
+     logger.info(f"▶ 启动任务: {task_name}")
+@@ -1784,50 +1838,149 @@ def setup_schedule():
+         _setup_schedule_full()
+ 
+ 
++def _register_ops_job(job_name: str, register_fn, *, why_candidate: str = "") -> bool:
++    """Register an ops job only when it is on the fail-closed allowlist."""
++    if _job_is_allowed(job_name):
++        register_fn()
++        return True
++    extra = f" ({why_candidate})" if why_candidate else ""
++    _log_skip_disallowed(job_name, via=f"setup_schedule{extra}")
++    return False
++
++
+ def _setup_schedule_ops():
+-    """子店 lean 档: 库存运营 + 出单源复核; QC/广告切片按 profile 开关叠加."""
+-    schedule.every().day.at("09:30").do(task_ops_daily).tag('daily', 'ops')
+-    schedule.every(6).hours.do(task_order_recheck).tag('recurring', 'order_recheck')
++    """子店 lean 档: 默认只装 ops_daily + order_recheck.
++
++    Every other ops-catalog job is considered and skipped with a why-line.
++    ads/QC flags cannot register a job that is not on scheduler_allowed_jobs.
++    GrovePop's allowlist is the two ops jobs, so Thursday 09:35 --apply reprice
++    never enters the table.
++    """
++    _register_ops_job(
++        'ops_daily',
++        lambda: schedule.every().day.at("09:30").do(task_ops_daily).tag('daily', 'ops'),
++    )
++    _register_ops_job(
++        'order_recheck',
++        lambda: schedule.every(6).hours.do(task_order_recheck).tag('recurring', 'order_recheck'),
++    )
+ 
+     qc_on = _ops_qc_autofix_enabled()
+     ads_on = _ops_ads_enabled()
+-    if ads_on:
+-        schedule.every().monday.at("09:35").do(task_smart_reprice).tag('weekly', 'smart_reprice')
+-        schedule.every().thursday.at("09:35").do(task_smart_reprice).tag('weekly', 'smart_reprice')
+-        schedule.every().day.at("09:40").do(task_ad_restore).tag('daily', 'ad_restore')
+-        schedule.every().day.at("09:45").do(task_blacklist_cleanup).tag('daily', 'bl_cleanup')
+-        schedule.every().day.at("09:50").do(task_guard_anomaly).tag('daily', 'guard_alert')
+-        schedule.every().day.at("10:25").do(task_ads_enroll).tag('daily', 'ads_enroll')
+-        schedule.every().tuesday.at("10:00").do(task_smart_bid).tag('weekly', 'smart_bid')
+-        schedule.every().tuesday.at("11:00").do(task_bid_rollback).tag('weekly', 'bid_rollback')
+-        schedule.every(6).hours.do(task_promotion_rotate).tag('recurring', 'promotion')
+-    if qc_on:
+-        schedule.every().day.at("10:55").do(task_source_refresh).tag('daily', 'source_refresh')
+-        schedule.every().day.at("11:30").do(task_listing_audit).tag('daily', 'listing_audit')
+-        schedule.every().day.at("12:10").do(task_source_aspect_autofix).tag('daily', 'source_aspect_autofix')
+-        schedule.every().day.at("12:30").do(task_semantic_rewrite).tag('daily', 'semantic_rewrite')
+-        schedule.every().day.at("13:00").do(task_missing_video_autofix).tag('daily', 'missing_video_autofix')
++    ads_why = "scheduler_enable_ads=true" if ads_on else "ads slice off"
++    qc_why = "scheduler_enable_qc_autofix=true" if qc_on else "qc slice off"
++
++    optional_jobs = (
++        (
++            'smart_reprice',
++            ads_on,
++            ads_why,
++            lambda: (
++                schedule.every().monday.at("09:35").do(task_smart_reprice).tag('weekly', 'smart_reprice'),
++                schedule.every().thursday.at("09:35").do(task_smart_reprice).tag('weekly', 'smart_reprice'),
++            ),
++        ),
++        (
++            'ad_restore',
++            ads_on,
++            ads_why,
++            lambda: schedule.every().day.at("09:40").do(task_ad_restore).tag('daily', 'ad_restore'),
++        ),
++        (
++            'blacklist_cleanup',
++            ads_on,
++            ads_why,
++            lambda: schedule.every().day.at("09:45").do(task_blacklist_cleanup).tag('daily', 'bl_cleanup'),
++        ),
++        (
++            'guard_anomaly',
++            ads_on,
++            ads_why,
++            lambda: schedule.every().day.at("09:50").do(task_guard_anomaly).tag('daily', 'guard_alert'),
++        ),
++        (
++            'ads_enroll',
++            ads_on,
++            ads_why,
++            lambda: schedule.every().day.at("10:25").do(task_ads_enroll).tag('daily', 'ads_enroll'),
++        ),
++        (
++            'smart_bid',
++            ads_on,
++            ads_why,
++            lambda: schedule.every().tuesday.at("10:00").do(task_smart_bid).tag('weekly', 'smart_bid'),
++        ),
++        (
++            'bid_rollback',
++            ads_on,
++            ads_why,
++            lambda: schedule.every().tuesday.at("11:00").do(task_bid_rollback).tag('weekly', 'bid_rollback'),
++        ),
++        (
++            'promotion_rotate',
++            ads_on,
++            ads_why,
++            lambda: schedule.every(6).hours.do(task_promotion_rotate).tag('recurring', 'promotion'),
++        ),
++        (
++            'source_refresh',
++            qc_on,
++            qc_why,
++            lambda: schedule.every().day.at("10:55").do(task_source_refresh).tag('daily', 'source_refresh'),
++        ),
++        (
++            'listing_audit',
++            qc_on,
++            qc_why,
++            lambda: schedule.every().day.at("11:30").do(task_listing_audit).tag('daily', 'listing_audit'),
++        ),
++        (
++            'source_aspect_autofix',
++            qc_on,
++            qc_why,
++            lambda: schedule.every().day.at("12:10").do(task_source_aspect_autofix).tag('daily', 'source_aspect_autofix'),
++        ),
++        (
++            'semantic_rewrite',
++            qc_on,
++            qc_why,
++            lambda: schedule.every().day.at("12:30").do(task_semantic_rewrite).tag('daily', 'semantic_rewrite'),
++        ),
++        (
++            'missing_video_autofix',
++            qc_on,
++            qc_why,
++            lambda: schedule.every().day.at("13:00").do(task_missing_video_autofix).tag('daily', 'missing_video_autofix'),
++        ),
++    )
++    for job_name, slice_on, slice_why, register_fn in optional_jobs:
++        if not _job_is_allowed(job_name):
++            _log_skip_disallowed(job_name, via=f"setup_schedule ({slice_why})")
++            continue
++        if not slice_on:
++            logger.info(
++                "skip %s (setup_schedule): on allowlist but %s",
++                job_name,
++                slice_why,
++            )
++            continue
++        register_fn()
+ 
+-    profile = get_store_profile()
++    allow = _resolved_allowed_jobs() or frozenset()
++    try:
++        profile = get_store_profile()
++        brand = profile.brand_name
++        mutex = profile.resolved_scheduler_mutex_name()
++    except Exception:
++        brand = "(unreadable)"
++        mutex = "(unreadable)"
+     logger.info("调度表已配置 (scheduler_profile=ops):")
+-    logger.info(f"  店铺: {profile.brand_name} | mutex={profile.resolved_scheduler_mutex_name()}")
+-    logger.info("  09:30  库存运营包 (daily_tasks.py --ops-only)")
+-    logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 48 --email)")
+-    if ads_on:
+-        logger.info("  周一/周四 09:35  智能调价 (batch_smart_reprice --apply --email)")
+-        logger.info("  09:40  广告恢复审计 (ad_restore_audit --apply --email)")
+-        logger.info("  09:45  广告黑名单清理 (ad_blacklist_cleanup)")
+-        logger.info("  09:50  守门员异常告警 (guard_anomaly_alert)")
+-        logger.info("  10:25  广告入驻 (store_marketing --levers promoted --apply)")
+-        logger.info("  周二 10:00  分级 Bid 优化 (batch_smart_bid --apply --email)")
+-        logger.info("  周二 11:00  Bid 7 天回溯 (bid_rollback_audit --apply --email)")
+-        logger.info("  每 6h  促销轮转 (auto_rotate_promotions.py)")
+-    if qc_on:
+-        logger.info("  10:55  源内容刷新 (source_content_refresh --email)")
+-        logger.info("  11:30  eBay/GIGA live listing 内容审计 (audit --live --email)")
+-        logger.info("  12:10  源参数写回 live (白名单 --fix-key, 不含 categoryId)")
+-        logger.info("  12:30  语义改写闭环 (需 SEMANTIC_REWRITE_APPLY_ENABLED=1)")
+-        logger.info("  13:00  缺视频限量同步 (limit 80)")
++    logger.info(f"  店铺: {brand} | mutex={mutex}")
++    logger.info(f"  allowlist: {sorted(allow)}")
++    if _job_is_allowed('ops_daily'):
++        logger.info("  09:30  库存运营包 (daily_tasks.py --ops-only)")
++    if _job_is_allowed('order_recheck'):
++        logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 48 --email)")
+ 
+ 
+ def _setup_schedule_full():
+@@ -2005,8 +2158,14 @@ def run_once():
+     logger.info("立即执行全部任务 (--once 模式)")
+     logger.info("=" * 60)
+ 
+-    task_listing_audit()
+-    task_daily_full()  # 已包含库存同步 + 智能调价
++    if _job_is_allowed('listing_audit'):
++        task_listing_audit()
++    else:
++        _log_skip_disallowed('listing_audit', via='--once')
++    if _job_is_allowed('ops_daily') or _job_is_allowed('daily_tasks'):
++        task_daily_full()  # 已包含库存同步 + 智能调价
++    else:
++        _log_skip_disallowed('daily_tasks', via='--once')
+ 
+     logger.info("全部任务执行完毕")
+ 
+@@ -2034,6 +2193,9 @@ def recover_missed_tasks(log_when_clean=True):
+ 
+         for config in ordered_tasks:
+             task_name = str(config['name'])
++            if not _job_is_allowed(task_name):
++                _log_skip_disallowed(task_name, via='检查是否有遗漏的定时任务')
++                continue
+             weekday = config.get('weekday')
+             if weekday is not None and now.weekday() != int(weekday):
+                 continue
+@@ -2112,6 +2274,8 @@ def _get_critical_recovery_tasks():
+                 'priority': 20,
+             },
+         ]
++        # Ads/QC recovery entries exist only when the job is also allowlisted.
++        # GrovePop's default allowlist never includes these --apply jobs.
+         if _ops_ads_enabled():
+             tasks.extend(
+                 [
+@@ -2173,7 +2337,7 @@ def _get_critical_recovery_tasks():
+                     },
+                 ]
+             )
+-        return tasks
++        return [task for task in tasks if _job_is_allowed(str(task['name']))]
+ 
+     tasks = [
+             {
+@@ -2620,6 +2784,17 @@ def main():
+             'giga_dropship_push': task_giga_dropship_push,
+             'giga_dropship_sync': task_giga_dropship_sync,
+         }
++        alias_to_job = {
++            'daily': 'ops_daily' if _is_ops_scheduler() else 'daily_tasks',
++            'reprice': 'smart_reprice',
++            'health': 'health_check',
++            'promotion': 'promotion_rotate',
++            'cro_ops': 'cro_ops_snapshot',
++        }
++        job_name = alias_to_job.get(args.task, args.task)
++        if not _job_is_allowed(job_name):
++            _log_skip_disallowed(job_name, via=f'--task {args.task}')
++            return
+         task_map[args.task]()
+         return
+ 
+diff --git a/scheduler_watchdog.py b/scheduler_watchdog.py
+index f4637ef..40513cc 100644
+--- a/scheduler_watchdog.py
++++ b/scheduler_watchdog.py
+@@ -62,7 +62,14 @@ def _store_profile():
+ def _is_ops_scheduler():
+     """Match daemon scheduler_profile=ops so substores never recover the full catalog."""
+     profile = _store_profile()
+-    return bool(getattr(profile, 'is_ops_scheduler', False)) if profile is not None else False
++    if profile is not None:
++        return bool(getattr(profile, 'is_ops_scheduler', False))
++    try:
++        sys.path.insert(0, str(PROJECT_ROOT))
++        from src.utils.store_profile import peek_yaml_says_ops
++        return peek_yaml_says_ops()
++    except Exception:
++        return False
+ 
+ 
+ def _ops_qc_autofix_enabled():
+@@ -75,6 +82,15 @@ def _ops_ads_enabled():
+     return bool(getattr(profile, 'ops_ads_enabled', False)) if profile is not None else False
+ 
+ 
++def _job_is_allowed(job_name):
++    profile = _store_profile()
++    if profile is not None:
++        return bool(profile.job_is_allowed(job_name))
++    if _is_ops_scheduler():
++        return job_name in {'ops_daily', 'order_recheck'}
++    return True
++
++
+ def _watchdog_critical_tasks():
+     if not _is_ops_scheduler():
+         return CRITICAL_DAILY_TASKS
+@@ -88,7 +104,19 @@ def _watchdog_critical_tasks():
+         ])
+     if _ops_qc_autofix_enabled():
+         tasks.append({'health_name': 'listing_audit', 'deadline': '11:45', 'daemon_task': 'listing_audit'})
+-    return tasks
++    alias = {
++        'reprice': 'smart_reprice',
++        'daily': 'daily_tasks',
++        'health': 'health_check',
++    }
++    allowed = []
++    for task in tasks:
++        job_name = alias.get(task.get('daemon_task'), task.get('health_name'))
++        if _job_is_allowed(job_name):
++            allowed.append(task)
++        else:
++            log(f"[WATCHDOG] skip {job_name}: not on ops allowlist")
++    return allowed
+ 
+ 
+ def _daemon_task_command(task_alias):
+diff --git a/src/utils/store_profile.py b/src/utils/store_profile.py
+index 5357c45..5a336dd 100644
+--- a/src/utils/store_profile.py
++++ b/src/utils/store_profile.py
+@@ -137,6 +137,9 @@ class StoreProfile:
+     # store (scheduler_profile=full) ignores these flags.
+     scheduler_enable_qc_autofix: bool = False
+     scheduler_enable_ads: bool = False
++    # Explicit ops allowlist. Empty on an ops profile => {ops_daily, order_recheck}.
++    # The main full/daily profile ignores this field (unrestricted).
++    scheduler_allowed_jobs: tuple = ()
+ 
+     @property
+     def brand_name_lower(self) -> str:
+@@ -198,6 +201,38 @@ class StoreProfile:
+         """True only on an ops instance that opted into the ads/marketing slice."""
+         return self.is_ops_scheduler and bool(self.scheduler_enable_ads)
+ 
++    @property
++    def resolved_scheduler_allowed_jobs(self) -> frozenset[str] | None:
++        """Fail-closed allowlist for ops; None means unrestricted (main/full).
++
++        An ops profile with a missing, empty, or unknown allowlist schedules
++        only ``ops_daily`` and ``order_recheck``. Unknown ``scheduler_profile``
++        values stay unrestricted so a Main typo cannot shrink the furniture
++        cadence.
++        """
++        name = str(self.scheduler_profile or "full").strip().lower()
++        if name in {"full", "daily", ""}:
++            return None
++        if name != "ops":
++            return None
++        explicit = tuple(
++            str(job).strip()
++            for job in (self.scheduler_allowed_jobs or ())
++            if str(job).strip()
++        )
++        if not explicit:
++            return frozenset(DEFAULT_OPS_ALLOWED_JOBS)
++        unknown = [job for job in explicit if job not in KNOWN_SCHEDULER_JOBS]
++        if unknown:
++            return frozenset(DEFAULT_OPS_ALLOWED_JOBS)
++        return frozenset(explicit)
++
++    def job_is_allowed(self, job_name: str) -> bool:
++        allow = self.resolved_scheduler_allowed_jobs
++        if allow is None:
++            return True
++        return str(job_name or "").strip() in allow
++
+     def resolved_scheduler_mutex_name(self) -> str:
+         """Kernel mutex name for scheduler_daemon (one per store instance)."""
+         explicit = str(self.scheduler_mutex_name or "").strip()
+@@ -264,6 +299,7 @@ _SECTION_FIELD_MAP = {
+         "scheduler_mutex_name",
+         "scheduler_enable_qc_autofix",
+         "scheduler_enable_ads",
++        "scheduler_allowed_jobs",
+     },
+ }
+ 
+@@ -291,7 +327,56 @@ _BOOL_FIELDS = {
+     "scheduler_enable_qc_autofix",
+     "scheduler_enable_ads",
+ }
+-_TUPLE_FIELDS = {"banned_terms"}
++_TUPLE_FIELDS = {"banned_terms", "scheduler_allowed_jobs"}
++
++DEFAULT_OPS_ALLOWED_JOBS = ("ops_daily", "order_recheck")
++KNOWN_SCHEDULER_JOBS = frozenset(
++    {
++        "ops_daily",
++        "order_recheck",
++        "smart_reprice",
++        "ad_restore",
++        "blacklist_cleanup",
++        "guard_anomaly",
++        "ads_enroll",
++        "smart_bid",
++        "bid_rollback",
++        "promotion_rotate",
++        "source_refresh",
++        "listing_audit",
++        "source_aspect_autofix",
++        "semantic_rewrite",
++        "missing_video_autofix",
++    }
++)
++
++
++def peek_yaml_says_ops(*paths: os.PathLike | str) -> bool:
++    """True when a profile file text says ``scheduler_profile: ops``.
++
++    Used when the YAML is unreadable: fail closed to the two ops jobs instead
++    of loading the Main furniture cadence on a GrovePop checkout.
++    """
++    candidates = [Path(p) for p in paths if p]
++    if not candidates:
++        env_path = os.getenv("STORE_PROFILE_PATH")
++        if env_path:
++            candidates.append(Path(env_path))
++        candidates.extend((_LOCAL_PROFILE_PATH, _DEFAULT_PROFILE_PATH))
++    for path in candidates:
++        try:
++            if not path.is_file():
++                continue
++            text = path.read_text(encoding="utf-8", errors="replace")
++        except OSError:
++            continue
++        for line in text.splitlines():
++            stripped = line.split("#", 1)[0].strip().lower()
++            if stripped.startswith("scheduler_profile") and ":" in stripped:
++                value = stripped.split(":", 1)[1].strip().strip("'\"")
++                if value == "ops":
++                    return True
++    return False
+ 
+ 
+ def _coerce(field_name: str, value: Any) -> Any:
+diff --git a/tests/test_main_store_contract.py b/tests/test_main_store_contract.py
+index 008e569..443a3d5 100644
+--- a/tests/test_main_store_contract.py
++++ b/tests/test_main_store_contract.py
+@@ -50,6 +50,10 @@ class TestProfileDefaultsContract:
+         assert p.is_ops_scheduler is False
+         assert p.scheduler_mutex_name == ""
+         assert p.resolved_scheduler_mutex_name() == "Global\\DajianSchedulerDaemonMutex"
++        assert p.scheduler_allowed_jobs == ()
++        assert p.resolved_scheduler_allowed_jobs is None
++        assert p.job_is_allowed("smart_reprice") is True
++        assert p.job_is_allowed("listing_audit") is True
+ 
+     def test_main_store_return_policy_is_buyer_paid_everywhere(self):
+         # The Motors seller-paid return is auto-parts-only. With no Motors return
+diff --git a/tests/test_scheduler_profile_ops.py b/tests/test_scheduler_profile_ops.py
+index a59d1b9..9355758 100644
+--- a/tests/test_scheduler_profile_ops.py
++++ b/tests/test_scheduler_profile_ops.py
+@@ -1,4 +1,5 @@
+ import importlib.util
++from datetime import datetime
+ from pathlib import Path
+ 
+ import pytest
+@@ -38,10 +39,44 @@ def test_ops_profile_registers_only_inventory_and_order_recheck(monkeypatch):
+     assert frozenset({"recurring", "order_recheck"}) in tags
+ 
+ 
+-def test_full_profile_registers_cro_and_mi_tasks(monkeypatch):
++def _isolate_profile_paths(tmp_path, monkeypatch, *, env_text=None, local_text=None, default_text=None):
++    """Point every peek/load path at tmp_path so leftover GrovePop YAML cannot leak in."""
++    from src.utils import store_profile as sp
++
++    env_path = tmp_path / "env_store_profile.yaml"
++    local_path = tmp_path / "store_profile.local.yaml"
++    default_path = tmp_path / "store_profile.yaml"
++    if env_text is None:
++        monkeypatch.delenv("STORE_PROFILE_PATH", raising=False)
++    else:
++        env_path.write_text(env_text, encoding="utf-8")
++        monkeypatch.setenv("STORE_PROFILE_PATH", str(env_path))
++    if local_text is not None:
++        local_path.write_text(local_text, encoding="utf-8")
++    if default_text is not None:
++        default_path.write_text(default_text, encoding="utf-8")
++    monkeypatch.setattr(sp, "_LOCAL_PROFILE_PATH", local_path)
++    monkeypatch.setattr(sp, "_DEFAULT_PROFILE_PATH", default_path)
++    return env_path, local_path, default_path
++
++
++_OPS_YAML = "server:\n  scheduler_profile: ops\n"
++_FULL_YAML = "server:\n  scheduler_profile: full\n"
++
++
++def _bind_profile(monkeypatch, mod, profile_or_fn):
++    from src.utils import store_profile as sp
++
++    getter = profile_or_fn if callable(profile_or_fn) else (lambda: profile_or_fn)
++    monkeypatch.setattr(sp, "get_store_profile", getter)
++    monkeypatch.setattr(mod, "get_store_profile", getter)
++
++
++def test_full_profile_registers_cro_and_mi_tasks(tmp_path, monkeypatch):
+     from src.utils import store_profile as sp
+     from src.utils.store_profile import StoreProfile
+ 
++    _isolate_profile_paths(tmp_path, monkeypatch, local_text=_OPS_YAML)
+     monkeypatch.setattr(sp, "get_store_profile", lambda: StoreProfile())
+ 
+     mod = _load_scheduler()
+@@ -96,3 +131,319 @@ def test_ops_task_daily_full_dispatches_to_ops_only(monkeypatch):
+     assert any(str(arg).endswith("daily_tasks.py") for arg in cmd_args)
+     assert "--ops-only" in cmd_args
+     assert timeout_sec == mod.TASK_TIMEOUT["ops_daily"]
++
++
++def _gp_ops_profile(**kwargs):
++    from src.utils.store_profile import StoreProfile
++
++    values = {
++        "scheduler_profile": "ops",
++        "brand_name": "GrovePop",
++        "scheduler_enable_ads": True,
++        "scheduler_enable_qc_autofix": True,
++    }
++    values.update(kwargs)
++    return StoreProfile(**values)
++
++
++def _job_tags(jobs):
++    return {frozenset(job.tags) for job in jobs}
++
++
++def test_gp_profile_schedules_exactly_ops_daily_and_order_recheck(monkeypatch):
++    from src.utils import store_profile as sp
++
++    monkeypatch.setattr(sp, "get_store_profile", lambda: _gp_ops_profile())
++    mod = _load_scheduler()
++    mod.setup_schedule()
++    jobs = schedule.get_jobs()
++    assert len(jobs) == 2
++    assert _job_tags(jobs) == {
++        frozenset({"daily", "ops"}),
++        frozenset({"recurring", "order_recheck"}),
++    }
++
++
++def test_gp_does_not_schedule_thursday_0935_reprice(monkeypatch):
++    from src.utils import store_profile as sp
++
++    monkeypatch.setattr(sp, "get_store_profile", lambda: _gp_ops_profile())
++    mod = _load_scheduler()
++    mod.setup_schedule()
++    for job in schedule.get_jobs():
++        assert "smart_reprice" not in job.tags
++        assert getattr(job, "start_day", None) != "thursday"
++
++
++def test_main_daily_profile_schedule_unchanged(tmp_path, monkeypatch):
++    from src.utils import store_profile as sp
++    from src.utils.store_profile import StoreProfile
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML, local_text=_OPS_YAML)
++    monkeypatch.setattr(sp, "get_store_profile", lambda: StoreProfile())
++    mod = _load_scheduler()
++    mod.setup_schedule()
++    tags = _job_tags(schedule.get_jobs())
++    assert frozenset({"daily", "full"}) in tags
++    assert frozenset({"daily", "mi_snapshot"}) in tags
++    assert frozenset({"daily", "cro_consume"}) in tags
++    assert frozenset({"daily", "listing_audit"}) in tags
++    # Main reprice stays inside daily_tasks (Mon/Thu), not a standalone 09:35 job.
++    assert not any("smart_reprice" in job.tags for job in schedule.get_jobs())
++    assert frozenset({"daily", "ad_restore"}) in tags
++    assert frozenset({"recurring", "promotion"}) in tags
++    assert frozenset({"daily", "finance_sync"}) in tags
++    assert frozenset({"daily", "health"}) in tags
++
++
++class _Oct22Afternoon(datetime):
++    @classmethod
++    def now(cls, tz=None):
++        return cls(2026, 10, 22, 15, 5, 0)
++
++
++def test_ops_catchup_after_12_day_outage_only_ops_daily(tmp_path, monkeypatch):
++    """10/10 → 10/22 outage: catch-up must not backfill reprice/CRO/MI/audit."""
++    from src.utils import store_profile as sp
++
++    health = tmp_path / "_scheduler_health.json"
++    health.write_text(
++        '{"tasks": {"ops_daily": {"status": "success", "at": "2026-10-10T09:31:00"},'
++        ' "daily_tasks": {"status": "success", "at": "2026-10-10T09:31:00"},'
++        ' "smart_reprice": {"status": "success", "at": "2026-10-09T09:35:00"},'
++        ' "listing_audit": {"status": "success", "at": "2026-10-10T11:30:00"}}}',
++        encoding="utf-8",
++    )
++    monkeypatch.setattr(sp, "get_store_profile", lambda: _gp_ops_profile())
++    mod = _load_scheduler()
++    monkeypatch.setattr(mod, "HEALTH_FILE", health)
++    monkeypatch.setattr(mod, "datetime", _Oct22Afternoon)
++    recovered = []
++    monkeypatch.setattr(mod, "task_ops_daily", lambda: recovered.append("ops_daily"))
++    monkeypatch.setattr(mod, "task_smart_reprice", lambda: recovered.append("smart_reprice"))
++    monkeypatch.setattr(mod, "task_ad_restore", lambda: recovered.append("ad_restore"))
++    monkeypatch.setattr(mod, "task_listing_audit", lambda: recovered.append("listing_audit"))
++    monkeypatch.setattr(mod, "task_source_aspect_autofix", lambda: recovered.append("source_aspect_autofix"))
++    monkeypatch.setattr(mod, "task_ads_enroll", lambda: recovered.append("ads_enroll"))
++
++    # Recovery table still holds the original funcs; rebuild after patches.
++    tasks = mod._get_critical_recovery_tasks()
++    assert [t["name"] for t in tasks] == ["ops_daily"]
++    for task in tasks:
++        if task["name"] == "ops_daily":
++            task["func"] = lambda: recovered.append("ops_daily")
++
++    monkeypatch.setattr(mod, "_get_critical_recovery_tasks", lambda: tasks)
++    mod.recover_missed_tasks(log_when_clean=False)
++    assert recovered == ["ops_daily"]
++
++
++def test_unreadable_ops_profile_fail_closed_to_two_jobs(monkeypatch):
++    from src.utils import store_profile as sp
++
++    def boom():
++        raise RuntimeError("cannot read store profile")
++
++    monkeypatch.setattr(sp, "get_store_profile", boom)
++    monkeypatch.setattr(sp, "peek_yaml_says_ops", lambda *a, **k: True)
++    mod = _load_scheduler()
++    monkeypatch.setattr(mod, "get_store_profile", boom)
++    # peek_yaml_says_ops is imported inside the fail-closed helpers.
++    mod.setup_schedule()
++    assert len(schedule.get_jobs()) == 2
++    assert _job_tags(schedule.get_jobs()) == {
++        frozenset({"daily", "ops"}),
++        frozenset({"recurring", "order_recheck"}),
++    }
++
++
++def test_unknown_allowlist_entries_fail_closed(monkeypatch):
++    from src.utils import store_profile as sp
++
++    monkeypatch.setattr(
++        sp,
++        "get_store_profile",
++        lambda: _gp_ops_profile(scheduler_allowed_jobs=("not-a-job", "smart_reprice")),
++    )
++    mod = _load_scheduler()
++    mod.setup_schedule()
++    assert len(schedule.get_jobs()) == 2
++    for job in schedule.get_jobs():
++        assert "smart_reprice" not in job.tags
++
++
++def test_run_task_skips_disallowed_apply_jobs_on_gp(monkeypatch):
++    from src.utils import store_profile as sp
++
++    monkeypatch.setattr(sp, "get_store_profile", lambda: _gp_ops_profile())
++    mod = _load_scheduler()
++    spawned = []
++    monkeypatch.setattr(mod.subprocess, "Popen", lambda *a, **k: spawned.append(a) or (_ for _ in ()).throw(AssertionError("must not spawn")))
++    ok, msg = mod.run_task("listing_audit", ["python", "-c", "print(1)"])
++    assert ok is False
++    assert "allowlist" in msg
++    assert spawned == []
++    ok, msg = mod.run_task("smart_reprice", ["python", "-c", "print(1)"])
++    assert ok is False
++    assert spawned == []
++
++
++def test_run_once_on_gp_skips_listing_audit_and_reprice(monkeypatch):
++    from src.utils import store_profile as sp
++
++    monkeypatch.setattr(sp, "get_store_profile", lambda: _gp_ops_profile())
++    mod = _load_scheduler()
++    called = []
++    monkeypatch.setattr(mod, "task_listing_audit", lambda: called.append("listing_audit"))
++    monkeypatch.setattr(mod, "task_smart_reprice", lambda: called.append("smart_reprice"))
++    monkeypatch.setattr(mod, "task_ops_daily", lambda: called.append("ops_daily") or (True, "ok"))
++    mod.run_once()
++    assert called == ["ops_daily"]
++
++
++def test_gp_setup_logs_skip_why_for_apply_jobs(monkeypatch, caplog):
++    from src.utils import store_profile as sp
++
++    monkeypatch.setattr(sp, "get_store_profile", lambda: _gp_ops_profile())
++    mod = _load_scheduler()
++    with caplog.at_level("INFO"):
++        mod.setup_schedule()
++    text = caplog.text
++    for job in (
++        "smart_reprice",
++        "ad_restore",
++        "listing_audit",
++        "source_aspect_autofix",
++        "semantic_rewrite",
++        "missing_video_autofix",
++        "promotion_rotate",
++    ):
++        assert f"skip {job}" in text
++        assert "not on ops allowlist" in text
++
++
++def test_full_load_ignores_stray_ops_on_store_profile_path(tmp_path, monkeypatch):
++    """(a) Successful full load must not peek a leftover ops YAML on STORE_PROFILE_PATH."""
++    from src.utils.store_profile import StoreProfile
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, StoreProfile())
++    assert mod._is_ops_scheduler() is False
++    mod.setup_schedule()
++    tags = _job_tags(schedule.get_jobs())
++    assert frozenset({"daily", "full"}) in tags
++    assert len(schedule.get_jobs()) > 10
++
++
++def test_full_load_ignores_stray_ops_in_local_yaml(tmp_path, monkeypatch):
++    """(b) Successful full load must not peek leftover ops in store_profile.local.yaml."""
++    from src.utils.store_profile import StoreProfile
++
++    _isolate_profile_paths(tmp_path, monkeypatch, local_text=_OPS_YAML, default_text=_FULL_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, StoreProfile())
++    assert mod._is_ops_scheduler() is False
++    mod.setup_schedule()
++    tags = _job_tags(schedule.get_jobs())
++    assert frozenset({"daily", "full"}) in tags
++    assert frozenset({"daily", "ops"}) not in tags
++
++
++def test_ops_load_is_ops_even_if_stray_full_yaml_exists(tmp_path, monkeypatch):
++    """(c) Successful ops load -> True and the 2-job table."""
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_FULL_YAML, local_text=_FULL_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, _gp_ops_profile())
++    assert mod._is_ops_scheduler() is True
++    mod.setup_schedule()
++    assert len(schedule.get_jobs()) == 2
++    assert _job_tags(schedule.get_jobs()) == {
++        frozenset({"daily", "ops"}),
++        frozenset({"recurring", "order_recheck"}),
++    }
++
++
++def test_unreadable_profile_peeks_ops_yaml_fail_closed(tmp_path, monkeypatch):
++    """(d) Load raises and YAML says ops -> fail-closed ops."""
++    from src.utils import store_profile as sp
++
++    def boom():
++        raise RuntimeError("cannot read store profile")
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML)
++    monkeypatch.setattr(sp, "get_store_profile", boom)
++    mod = _load_scheduler()
++    monkeypatch.setattr(mod, "get_store_profile", boom)
++    assert mod._is_ops_scheduler() is True
++    mod.setup_schedule()
++    assert len(schedule.get_jobs()) == 2
++
++
++def test_unreadable_profile_peeks_full_yaml_stays_full(tmp_path, monkeypatch):
++    """(e) Load raises and YAML says full -> not ops."""
++    from src.utils import store_profile as sp
++
++    def boom():
++        raise RuntimeError("cannot read store profile")
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_FULL_YAML, local_text=_FULL_YAML, default_text=_FULL_YAML)
++    monkeypatch.setattr(sp, "get_store_profile", boom)
++    mod = _load_scheduler()
++    monkeypatch.setattr(mod, "get_store_profile", boom)
++    assert mod._is_ops_scheduler() is False
++    mod.setup_schedule()
++    tags = _job_tags(schedule.get_jobs())
++    assert frozenset({"daily", "full"}) in tags
++    assert len(schedule.get_jobs()) > 10
++
++
++def test_task_daily_alias_stays_daily_tasks_on_full_despite_stray_ops(tmp_path, monkeypatch):
++    """(f) --task daily maps to daily_tasks under a loaded full profile."""
++    from src.utils.store_profile import StoreProfile
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML, local_text=_OPS_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, StoreProfile())
++    assert mod._is_ops_scheduler() is False
++    alias = "ops_daily" if mod._is_ops_scheduler() else "daily_tasks"
++    assert alias == "daily_tasks"
++
++
++def test_resolved_allowlist_ignores_stray_ops_yaml_on_full_load(tmp_path, monkeypatch):
++    """Successful full load must stay unrestricted even if leftover YAML says ops."""
++    from src.utils.store_profile import StoreProfile
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML, local_text=_OPS_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, StoreProfile())
++    assert mod._resolved_allowed_jobs() is None
++    assert mod._job_is_allowed("smart_reprice") is True
++    assert mod._job_is_allowed("listing_audit") is True
++
++
++def test_empty_scheduler_profile_on_successful_load_does_not_peek(tmp_path, monkeypatch):
++    """Blank scheduler_profile loads as not-ops; stray ops YAML must not flip it."""
++    from src.utils.store_profile import StoreProfile
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, StoreProfile(scheduler_profile=""))
++    assert mod._is_ops_scheduler() is False
++    alias = "ops_daily" if mod._is_ops_scheduler() else "daily_tasks"
++    assert alias == "daily_tasks"
++
++
++def test_unreadable_profile_with_no_yaml_is_not_ops(tmp_path, monkeypatch):
++    """Load raises and isolated paths have no ops marker -> do not fail-closed to ops."""
++    from src.utils import store_profile as sp
++
++    def boom():
++        raise RuntimeError("cannot read store profile")
++
++    _isolate_profile_paths(tmp_path, monkeypatch)
++    monkeypatch.setattr(sp, "get_store_profile", boom)
++    mod = _load_scheduler()
++    monkeypatch.setattr(mod, "get_store_profile", boom)
++    assert mod._is_ops_scheduler() is False
++    assert mod._resolved_allowed_jobs() is None
+diff --git a/tests/test_scheduler_watchdog.py b/tests/test_scheduler_watchdog.py
+index a4e1bba..4a62a2b 100644
+--- a/tests/test_scheduler_watchdog.py
++++ b/tests/test_scheduler_watchdog.py
+@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
+ WATCHDOG_SPEC = importlib.util.spec_from_file_location('scheduler_watchdog', ROOT / 'scheduler_watchdog.py')
+ scheduler_watchdog = importlib.util.module_from_spec(WATCHDOG_SPEC)
+ WATCHDOG_SPEC.loader.exec_module(scheduler_watchdog)
++_ORIG_WATCHDOG_IS_OPS = scheduler_watchdog._is_ops_scheduler
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -507,6 +508,50 @@ def test_watchdog_ops_profile_recovers_only_ops_daily(tmp_path, monkeypatch):
+     assert 'ad_restore' not in aliases
+ 
+ 
++def test_watchdog_gp_ads_qc_allowlist_never_launches_apply_jobs(monkeypatch):
++    """GrovePop with ads+qc flags still on must not backfill --apply jobs."""
++    monkeypatch.setattr(scheduler_watchdog, '_is_ops_scheduler', lambda: True)
++    monkeypatch.setattr(scheduler_watchdog, '_ops_ads_enabled', lambda: True)
++    monkeypatch.setattr(scheduler_watchdog, '_ops_qc_autofix_enabled', lambda: True)
++    monkeypatch.setattr(
++        scheduler_watchdog,
++        '_job_is_allowed',
++        lambda name: name in {'ops_daily', 'order_recheck'},
++    )
++
++    tasks = scheduler_watchdog._watchdog_critical_tasks()
++    names = [task['health_name'] for task in tasks]
++    aliases = [task['daemon_task'] for task in tasks]
++    assert names == ['ops_daily']
++    assert aliases == ['ops_daily']
++    assert 'smart_reprice' not in names
++    assert 'ad_restore' not in names
++    assert 'ads_enroll' not in names
++    assert 'listing_audit' not in names
++
++
++def test_watchdog_full_profile_ignores_stray_ops_yaml(tmp_path, monkeypatch):
++    """Successful full load must keep the Main recovery table despite leftover ops YAML."""
++    from src.utils import store_profile as sp
++    from src.utils.store_profile import StoreProfile
++
++    stray = tmp_path / 'ops.yaml'
++    stray.write_text('server:\n  scheduler_profile: ops\n', encoding='utf-8')
++    monkeypatch.setenv('STORE_PROFILE_PATH', str(stray))
++    monkeypatch.setattr(sp, '_LOCAL_PROFILE_PATH', tmp_path / 'store_profile.local.yaml')
++    monkeypatch.setattr(sp, '_DEFAULT_PROFILE_PATH', tmp_path / 'store_profile.yaml')
++    monkeypatch.setattr(sp, 'get_store_profile', lambda: StoreProfile())
++    monkeypatch.setattr(scheduler_watchdog, '_is_ops_scheduler', _ORIG_WATCHDOG_IS_OPS)
++
++    assert scheduler_watchdog._is_ops_scheduler() is False
++    tasks = scheduler_watchdog._watchdog_critical_tasks()
++    names = [task['health_name'] for task in tasks]
++    assert 'daily_tasks' in names
++    assert 'listing_audit' in names
++    assert 'cro_consume' in names
++    assert names != ['ops_daily']
++
++
+ def test_watchdog_tick_stops_when_maintenance_starts_between_phases(tmp_path, monkeypatch):
+     maintenance_file = tmp_path / '_maintenance.lock'
+     calls = []
+diff --git a/tests/test_store_profile.py b/tests/test_store_profile.py
+index 43e6c18..e45cd5f 100644
+--- a/tests/test_store_profile.py
++++ b/tests/test_store_profile.py
+@@ -129,6 +129,81 @@ class TestOverrides:
+         assert profile.scheduler_profile == "ops"
+         assert profile.is_ops_scheduler is True
+         assert profile.resolved_scheduler_mutex_name() == "Global\\GrovePopSchedulerDaemonMutex"
++        assert profile.resolved_scheduler_allowed_jobs == frozenset({"ops_daily", "order_recheck"})
++        assert profile.job_is_allowed("ops_daily") is True
++        assert profile.job_is_allowed("smart_reprice") is False
++
++    def test_ops_allowlist_unknown_jobs_fail_closed(self, tmp_path):
++        yaml_file = tmp_path / "ops.yaml"
++        yaml_file.write_text(
++            textwrap.dedent(
++                """
++                server:
++                  scheduler_profile: ops
++                  scheduler_allowed_jobs:
++                    - not-a-real-job
++                    - ops_daily
++                """
++            ),
++            encoding="utf-8",
++        )
++        profile = load_store_profile(yaml_file)
++        assert profile.resolved_scheduler_allowed_jobs == frozenset({"ops_daily", "order_recheck"})
++
++    def test_full_profile_allowlist_is_unrestricted(self):
++        profile = load_store_profile()
++        assert profile.scheduler_profile == "full"
++        assert profile.resolved_scheduler_allowed_jobs is None
++        assert profile.job_is_allowed("smart_reprice") is True
++
++    def test_full_profile_ignores_explicit_allowlist(self):
++        # Old / accidental Main config must not shrink the furniture cadence.
++        profile = StoreProfile(
++            scheduler_profile="full",
++            scheduler_allowed_jobs=("ops_daily", "order_recheck"),
++        )
++        assert profile.resolved_scheduler_allowed_jobs is None
++        assert profile.job_is_allowed("listing_audit") is True
++        assert profile.job_is_allowed("smart_reprice") is True
++
++    def test_unknown_non_ops_profile_stays_unrestricted(self):
++        profile = StoreProfile(scheduler_profile="fullish", scheduler_allowed_jobs=("ops_daily",))
++        assert profile.is_ops_scheduler is False
++        assert profile.resolved_scheduler_allowed_jobs is None
++        assert profile.job_is_allowed("daily_tasks") is True
++
++    def test_ops_rejects_blank_job_names(self):
++        profile = StoreProfile(scheduler_profile="ops")
++        assert profile.job_is_allowed("") is False
++        assert profile.job_is_allowed(None) is False
++
++    def test_ops_allowlist_from_comma_string(self, tmp_path):
++        yaml_file = tmp_path / "ops.yaml"
++        yaml_file.write_text(
++            textwrap.dedent(
++                """
++                server:
++                  scheduler_profile: ops
++                  scheduler_allowed_jobs: "ops_daily, order_recheck"
++                """
++            ),
++            encoding="utf-8",
++        )
++        profile = load_store_profile(yaml_file)
++        assert profile.resolved_scheduler_allowed_jobs == frozenset({"ops_daily", "order_recheck"})
++
++    def test_peek_yaml_says_ops(self, tmp_path):
++        from src.utils.store_profile import peek_yaml_says_ops
++
++        ops = tmp_path / "ops.yaml"
++        ops.write_text("server:\n  scheduler_profile: ops\n", encoding="utf-8")
++        broken = tmp_path / "broken.yaml"
++        broken.write_text("server: [\n  scheduler_profile: ops\n", encoding="utf-8")
++        full = tmp_path / "full.yaml"
++        full.write_text("server:\n  scheduler_profile: full\n", encoding="utf-8")
++        assert peek_yaml_says_ops(ops) is True
++        assert peek_yaml_says_ops(broken) is True
++        assert peek_yaml_says_ops(full) is False
+ 
+     def test_v2_listing_and_pricing_sections(self, tmp_path):
+         yaml_file = tmp_path / "blindbox.yaml"

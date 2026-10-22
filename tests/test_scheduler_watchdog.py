@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WATCHDOG_SPEC = importlib.util.spec_from_file_location('scheduler_watchdog', ROOT / 'scheduler_watchdog.py')
 scheduler_watchdog = importlib.util.module_from_spec(WATCHDOG_SPEC)
 WATCHDOG_SPEC.loader.exec_module(scheduler_watchdog)
+_ORIG_WATCHDOG_IS_OPS = scheduler_watchdog._is_ops_scheduler
 
 
 @pytest.fixture(autouse=True)
@@ -505,6 +506,50 @@ def test_watchdog_ops_profile_recovers_only_ops_daily(tmp_path, monkeypatch):
     assert 'listing_audit' not in aliases
     assert 'cro_sentinel' not in aliases
     assert 'ad_restore' not in aliases
+
+
+def test_watchdog_gp_ads_qc_allowlist_never_launches_apply_jobs(monkeypatch):
+    """GrovePop with ads+qc flags still on must not backfill --apply jobs."""
+    monkeypatch.setattr(scheduler_watchdog, '_is_ops_scheduler', lambda: True)
+    monkeypatch.setattr(scheduler_watchdog, '_ops_ads_enabled', lambda: True)
+    monkeypatch.setattr(scheduler_watchdog, '_ops_qc_autofix_enabled', lambda: True)
+    monkeypatch.setattr(
+        scheduler_watchdog,
+        '_job_is_allowed',
+        lambda name: name in {'ops_daily', 'order_recheck'},
+    )
+
+    tasks = scheduler_watchdog._watchdog_critical_tasks()
+    names = [task['health_name'] for task in tasks]
+    aliases = [task['daemon_task'] for task in tasks]
+    assert names == ['ops_daily']
+    assert aliases == ['ops_daily']
+    assert 'smart_reprice' not in names
+    assert 'ad_restore' not in names
+    assert 'ads_enroll' not in names
+    assert 'listing_audit' not in names
+
+
+def test_watchdog_full_profile_ignores_stray_ops_yaml(tmp_path, monkeypatch):
+    """Successful full load must keep the Main recovery table despite leftover ops YAML."""
+    from src.utils import store_profile as sp
+    from src.utils.store_profile import StoreProfile
+
+    stray = tmp_path / 'ops.yaml'
+    stray.write_text('server:\n  scheduler_profile: ops\n', encoding='utf-8')
+    monkeypatch.setenv('STORE_PROFILE_PATH', str(stray))
+    monkeypatch.setattr(sp, '_LOCAL_PROFILE_PATH', tmp_path / 'store_profile.local.yaml')
+    monkeypatch.setattr(sp, '_DEFAULT_PROFILE_PATH', tmp_path / 'store_profile.yaml')
+    monkeypatch.setattr(sp, 'get_store_profile', lambda: StoreProfile())
+    monkeypatch.setattr(scheduler_watchdog, '_is_ops_scheduler', _ORIG_WATCHDOG_IS_OPS)
+
+    assert scheduler_watchdog._is_ops_scheduler() is False
+    tasks = scheduler_watchdog._watchdog_critical_tasks()
+    names = [task['health_name'] for task in tasks]
+    assert 'daily_tasks' in names
+    assert 'listing_audit' in names
+    assert 'cro_consume' in names
+    assert names != ['ops_daily']
 
 
 def test_watchdog_tick_stops_when_maintenance_starts_between_phases(tmp_path, monkeypatch):

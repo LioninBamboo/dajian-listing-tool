@@ -1,0 +1,17 @@
+# GrovePop 生效画像请复制为 config/store_profile.local.yaml（不被 git 跟踪）。
+# scheduler_profile=ops 必须带显式 allowlist；空/未知名单 fail-closed 为这两岗。
+# GrovePop Content QC 必须保持 Disabled，不由本调度表拉起。
+
+store:
+  store_kind: garden
+  brand_name: GrovePop
+
+server:
+  port: 8000
+  scheduler_profile: ops
+  scheduler_mutex_name: Global\GrovePopSchedulerDaemonMutex
+  scheduler_enable_ads: false
+  scheduler_enable_qc_autofix: false
+  scheduler_allowed_jobs:
+    - ops_daily
+    - order_recheck
