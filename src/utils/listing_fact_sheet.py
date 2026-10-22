@@ -776,6 +776,13 @@ def parse_noun_count(text: str, noun: str) -> int | None:
             continue
         if re.match(r"[\s\-–]*in[\s\-–]*1\b", between, re.IGNORECASE):
             continue
+        spanned = hay[match.start():match.end()]
+        if re.search(
+            rf"\b{re.escape(match.group('n'))}\s*-?\s*(?:tier|level)s?\b",
+            spanned,
+            re.IGNORECASE,
+        ):
+            continue
         values.append(int(match.group("n")))
 
     word_alt = "|".join(re.escape(word) for word in _COUNT_WORD_NUMBERS)
@@ -803,9 +810,25 @@ def parse_noun_count(text: str, noun: str) -> int | None:
         if match.start("noun") > 0 and hay[match.start("noun") - 1] == "-":
             continue
         noun = str(match.group("noun") or "").lower()
+        between = hay[match.start():match.start("noun")]
         # Mattress size "Double Bed" is not a count of two beds.
         if noun in {"bed", "beds"}:
             continue
+        if re.search(r"\bsided\b", between, re.IGNORECASE):
+            continue
+        # "Double Bed with Drawers" / "double door cabinet" — double modifies
+        # another noun, not the target.
+        after_double = re.search(
+            r"\b(?:double|pair of)\b\s*-?\s*([A-Za-z][A-Za-z0-9-]*)",
+            hay[match.start():match.end()],
+            re.IGNORECASE,
+        )
+        if after_double:
+            first = after_double.group(1).lower()
+            noun_roots = {n.rstrip("s") for n in terms}
+            other_nouns = {"bed", "door", "sided"}
+            if first.rstrip("s") in other_nouns and first.rstrip("s") not in noun_roots:
+                continue
         values.append(2)
 
     set_pat = re.compile(
@@ -1053,7 +1076,26 @@ def compare_fact_sheets(
             )
 
     count_nouns = set(live["counts"]) | set(source["counts"])
+    no_text = source_text is None and live_text is None
     for noun in sorted(count_nouns):
+        if no_text:
+            live_sheet = live["counts"].get(noun)
+            source_sheet = source["counts"].get(noun)
+            if live_sheet is None or source_sheet is None:
+                continue
+            try:
+                if int(live_sheet) != int(source_sheet):
+                    violations.append(
+                        {
+                            "claim_type": "count_unverifiable",
+                            "claim_text": f"{live_sheet} {noun} (source: {source_sheet})",
+                            "severity": "INFO",
+                            "source_evidence": str(source_sheet),
+                        }
+                    )
+            except (TypeError, ValueError):
+                continue
+            continue
         live_count = _resolved_count(noun, live["counts"].get(noun), live_text)
         source_count = _resolved_count(noun, source["counts"].get(noun), source_text)
         if live_count is None or source_count is None:

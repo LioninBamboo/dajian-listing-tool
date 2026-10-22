@@ -70,7 +70,16 @@ def test_feature_singular_plural_not_flagged():
 
 def test_count_mismatch_detected():
     live = dict(SOURCE_SHEET, counts={"doors": 2, "poles": 12})
-    violations = compare_fact_sheets(SOURCE_SHEET, live)
+    # No-text legacy rows must not emit semantic_count (spec R13).
+    unverifiable = compare_fact_sheets(SOURCE_SHEET, live)
+    assert not any(v["claim_type"] == "semantic_count" for v in unverifiable)
+    assert any(v["claim_type"] == "count_unverifiable" for v in unverifiable)
+    violations = compare_fact_sheets(
+        SOURCE_SHEET,
+        live,
+        source_text="2 doors 8 poles",
+        live_text="2 doors 12 poles",
+    )
     counts = [v for v in violations if v["claim_type"] == "semantic_count"]
     assert counts and "12 pole" in counts[0]["claim_text"]
 

@@ -338,6 +338,35 @@ _TASK_STARTED_TODAY_STATUSES = {
 }
 
 
+def _newer_qualifying_audit_since(since_iso, now=None):
+    """True when a same-day full live_audit appeared after a skipped run."""
+    now = now or datetime.now()
+    try:
+        since_ts = datetime.fromisoformat(str(since_iso)).timestamp()
+    except (TypeError, ValueError):
+        return False
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from scripts.semantic_rewrite import pick_latest_daily_live_audit
+        picked = pick_latest_daily_live_audit(
+            list((PROJECT_ROOT / 'logs').glob('listing_audit_fix_*.json')),
+            now=now,
+        )
+    except Exception:
+        return False
+    if not picked:
+        return False
+    path, data = picked
+    try:
+        from scripts.semantic_rewrite import _parse_generated_at
+        age_ts = _parse_generated_at(data.get('generated_at'))
+        if age_ts is None:
+            age_ts = path.stat().st_mtime
+    except Exception:
+        return False
+    return float(age_ts) > since_ts
+
+
 def _task_succeeded_today(task_name, now=None):
     """判断任务今天是否已经成功执行过（用于防止重复触发）。"""
     now = now or datetime.now()
@@ -347,7 +376,8 @@ def _task_succeeded_today(task_name, now=None):
 
     status = str(info.get('status', '')).lower()
     at = info.get('at')
-    if status not in {'success', 'ok', 'partial_success', 'completed_with_errors'} or not at:
+    done_statuses = {'success', 'ok', 'partial_success', 'completed_with_errors', 'skipped'}
+    if status not in done_statuses or not at:
         return False
 
     try:
@@ -355,7 +385,11 @@ def _task_succeeded_today(task_name, now=None):
     except (TypeError, ValueError):
         return False
 
-    return last_dt.date() == now.date()
+    if last_dt.date() != now.date():
+        return False
+    if status == 'skipped' and _newer_qualifying_audit_since(at, now=now):
+        return False
+    return True
 
 
 def _task_already_started_today(task_name, now=None):
@@ -786,8 +820,13 @@ def _pick_fresh_daily_live_audit_or_skip(task_name: str):
         update_health(task_name, 'skipped', f'SKIP: no fresh daily live_audit ({exc})')
         return None
     if not picked:
-        logger.info("SKIP: no fresh daily live_audit")
-        update_health(task_name, 'skipped', 'SKIP: no fresh daily live_audit')
+        try:
+            from scripts.semantic_rewrite import last_daily_audit_skip_message
+            msg = last_daily_audit_skip_message()
+        except Exception:
+            msg = "SKIP: no fresh daily live_audit"
+        logger.info(msg)
+        update_health(task_name, 'skipped', msg)
         return None
     report_path, data = picked
     logger.info(
@@ -822,7 +861,11 @@ def task_source_aspect_autofix():
 
     picked = _pick_fresh_daily_live_audit_or_skip('source_aspect_autofix')
     if not picked:
-        return True, 'SKIP: no fresh daily live_audit'
+        try:
+            from scripts.semantic_rewrite import last_daily_audit_skip_message
+            return True, last_daily_audit_skip_message()
+        except Exception:
+            return True, 'SKIP: no fresh daily live_audit'
 
     report_path, _data = picked
     run_task(
@@ -840,7 +883,11 @@ def task_missing_video_autofix():
 
     picked = _pick_fresh_daily_live_audit_or_skip('missing_video_autofix')
     if not picked:
-        return True, 'SKIP: no fresh daily live_audit'
+        try:
+            from scripts.semantic_rewrite import last_daily_audit_skip_message
+            return True, last_daily_audit_skip_message()
+        except Exception:
+            return True, 'SKIP: no fresh daily live_audit'
 
     report_path, _data = picked
     run_task(
@@ -882,7 +929,11 @@ def task_semantic_rewrite():
 
     picked = _pick_fresh_daily_live_audit_or_skip('semantic_rewrite')
     if not picked:
-        return True, 'SKIP: no fresh daily live_audit'
+        try:
+            from scripts.semantic_rewrite import last_daily_audit_skip_message
+            return True, last_daily_audit_skip_message()
+        except Exception:
+            return True, 'SKIP: no fresh daily live_audit'
 
     run_task(
         'semantic_rewrite',

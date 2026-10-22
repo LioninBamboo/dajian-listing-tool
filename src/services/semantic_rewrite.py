@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 APPLY_ENV_FLAG = "SEMANTIC_REWRITE_APPLY_ENABLED"
+# Automatic rewrite may touch title/description/aspects only — never categoryId.
+SEMANTIC_REWRITE_AUTOFIX_FIX_KEYS = frozenset({"title", "description", "aspects"})
 BACKUP_DIR = Path("logs/semantic_rewrite_backups")
 # Curated maps (human-queue drain). Missing/invalid file → empty maps (safe fallback).
 MAPS_PATH = Path("config/semantic_rewrite_maps.yaml")

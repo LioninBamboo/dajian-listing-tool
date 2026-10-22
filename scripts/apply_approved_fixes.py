@@ -60,6 +60,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.utils.approved_category import mark_category_approved
+from src.utils.publish_fee_preview import high_fee_category_block_reason
 
 AUDIT = ROOT / "scripts" / "audit_fix_active_listings.py"
 DEFAULT_DB = ROOT / "ebay_collection.db"
@@ -429,6 +430,17 @@ def process_rows(
         requested = requested_category_id(row)
         wants_stamp = wants_approval_stamp(row, mark_category_approved)
         print(f"[{index}/{len(rows)}] {sku}  keys={keys}" + (f"  # {row['note']}" if row.get("note") else ""))
+
+        if requested and any(key in GUARDED_KEYS for key in keys):
+            blocked = high_fee_category_block_reason(category_id=requested)
+            if blocked:
+                print(f"      {blocked}")
+                failures += 1
+                if stop_on_error:
+                    print(f"\n[STOP] {sku}: high-fee category write blocked.")
+                    return 1
+                print()
+                continue
 
         if wants_stamp and not requested:
             failures, should_stop = _fail_row(

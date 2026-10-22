@@ -1102,7 +1102,7 @@ def test_from_daily_audit_empty_queue_exits_zero(monkeypatch, capsys):
     monkeypatch.setattr(
         cli,
         "pick_latest_daily_live_audit",
-        lambda files, *, max_age_hours=36, now=None: (
+        lambda files, *, max_age_hours=36, now=None, allow_yesterday=False: (
             __import__("pathlib").Path("listing_audit_fix_today.json"),
             {"issues": [{"sku": "X1"}]},
         ),

@@ -126,6 +126,11 @@ class TestDiningSetBundleAndMixedOutdoor:
     def test_chair_cushions_are_accessories(self):
         assert title_is_chair_accessory("Patio Chair Cushions") is True
         assert title_allows_outdoor_chair_remap("Patio Chair Cushions") is False
+        assert title_is_chair_accessory("Dining Chairs Set of 2 Navy Cushions") is False
+        assert title_is_dining_set_bundle("Dining Set for 4-6 People") is False
+        assert title_is_dining_set_bundle("Counter Height Dining Table (Chairs Not Included)") is False
+        assert title_has_mixed_indoor_outdoor("Perfect for Indoor or Outdoor Use") is True
+        assert title_has_clear_outdoor_word("Side Table Perfect for Indoor or Outdoor Use") is False
 
 
 class TestBothEnginesUseTheSharedSignals:

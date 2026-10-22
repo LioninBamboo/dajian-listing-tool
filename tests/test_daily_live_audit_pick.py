@@ -98,7 +98,11 @@ def test_pick_yesterday_full_over_today_sku_scope(tmp_path):
         generated_at=now - timedelta(minutes=5),
         mtime=(now - timedelta(minutes=5)).timestamp(),
     )
-    picked = pick_latest_daily_live_audit(list(tmp_path.glob("*.json")), now=now)
+    # Same-day-only: yesterday is not accepted unless --allow-yesterday.
+    assert pick_latest_daily_live_audit(list(tmp_path.glob("*.json")), now=now) is None
+    picked = pick_latest_daily_live_audit(
+        list(tmp_path.glob("*.json")), now=now, allow_yesterday=True
+    )
     assert picked is not None
     assert picked[0] == yesterday
 
@@ -134,7 +138,12 @@ def test_corrupt_json_does_not_block_today_full(tmp_path):
     from scripts.semantic_rewrite import pick_latest_daily_live_audit
 
     now = datetime(2026, 10, 22, 12, 10, 0)
-    _write_report(tmp_path / "listing_audit_fix_bad.json", corrupt=True)
+    # Older corrupt file must not block a newer parseable same-day full report.
+    _write_report(
+        tmp_path / "listing_audit_fix_bad.json",
+        corrupt=True,
+        mtime=(now - timedelta(hours=3)).timestamp(),
+    )
     today = _write_report(
         tmp_path / "listing_audit_fix_20261022_113009.json",
         published=217,

@@ -257,9 +257,10 @@ def parse_json(val):
         return val
     if isinstance(val, str) and val.strip():
         try:
-            return json.loads(val)
+            parsed = json.loads(val)
         except Exception:
             return {}
+        return parsed if isinstance(parsed, dict) else {}
     return {}
 
 
@@ -952,72 +953,45 @@ def audit_single_product(
         })
         fixes["__restore_live_description_from_local__"] = True
 
-    # ── 1. Category Check — deterministic product profile wins over taxonomy drift ──
-    # A human-approved stored category is not remapped by profile or canonicalize.
+    # ── 1. Category Check — one decision contract, same as the publish path ──
+    # A human-approved stored category is not remapped. API-suggest is not a
+    # second leaf source: uncertain stays unknown.
     skip_category_remap = is_category_approved(opt) and bool(stored_category)
-    profile = classify_listing_profile(
-        opt_title or title,
-        live_description,
-        stored_category,
-        source_title=title if opt_title else "",
-    )
-    if not skip_category_remap and profile.category_id:
-        if stored_category != profile.category_id:
-            issues.append({
-                "type": "category_mismatch",
-                "severity": "CRITICAL",
-                "current": stored_category or None,
-                "expected": profile.category_id,
-                "detail": (
-                    f"Product profile '{profile.kind}' should use category {profile.category_id} "
-                    f"for '{opt_title[:60] or title[:60]}'"
-                ),
-            })
-            fixes["categoryId"] = profile.category_id
-            if profile.category_name:
-                fixes["categoryName"] = profile.category_name
-    elif not skip_category_remap and stored_category:
-        canonical_category, canonical_name = matcher.canonicalize_category(
-            title_context,
-            stored_category,
-            stored_category_name,
-            live_description,
-        )
+    from src.utils.category_decision import decision_category_id, resolve_category_decision
 
-        if canonical_category and canonical_category != stored_category:
-            issues.append({
-                "type": "category_mismatch",
-                "severity": "CRITICAL",
-                "current": stored_category,
-                "expected": canonical_category,
-                "detail": f"Stale category {stored_category} should be {canonical_category} for '{opt_title[:60] or title[:60]}'"
-            })
-            fixes["categoryId"] = canonical_category
-            if canonical_name:
-                fixes["categoryName"] = canonical_name
-        elif not matcher.is_category_plausible_for_text(combined_title, stored_category, stored_category_name):
-            suggested_category, suggested_name, _ = matcher.get_category_and_aspects(
-                title_context,
-                aspects,
-                live_description,
-            )
-            suggested_category, suggested_name = matcher.canonicalize_category(
-                title_context,
-                suggested_category,
-                suggested_name,
-                live_description,
-            )
-            if suggested_category and suggested_category != stored_category:
-                issues.append({
-                    "type": "category_mismatch",
-                    "severity": "CRITICAL",
-                    "current": stored_category,
-                    "expected": suggested_category,
-                    "detail": f"Implausible category {stored_category} for '{opt_title[:60] or title[:60]}'; expected {suggested_category}"
-                })
-                fixes["categoryId"] = suggested_category
-                if suggested_name:
-                    fixes["categoryName"] = suggested_name
+    decision = resolve_category_decision(
+        opt_title,
+        title,
+        "",
+        stored_category,
+        stored_category_name,
+    )
+    write_id = decision_category_id(decision, stored_category)
+    if decision.conflict or decision.reason == "title_source_conflict":
+        issues.append({
+            "type": "title_source_conflict",
+            "severity": "INFO",
+            "current": stored_category or None,
+            "expected": None,
+            "detail": (
+                f"Live title and GIGA title disagree on the product leaf; "
+                f"holding stored category {stored_category or 'none'}"
+            ),
+        })
+    if not skip_category_remap and write_id:
+        issues.append({
+            "type": "category_mismatch",
+            "severity": "CRITICAL",
+            "current": stored_category or None,
+            "expected": write_id,
+            "detail": (
+                f"Product profile '{decision.kind}' should use category {write_id} "
+                f"for '{(opt_title or title)[:60]}'"
+            ),
+        })
+        fixes["categoryId"] = write_id
+        if decision.category_name:
+            fixes["categoryName"] = decision.category_name
 
     # ── 2. Dimension Accuracy ──
     source_dims = extract_all_dimensions(attrs)
@@ -3368,6 +3342,22 @@ def fix_listing_on_ebay(
     # Apply aspect fixes
     for key, value in fixes.items():
         if key == "categoryId":
+            from src.utils.publish_fee_preview import high_fee_category_block_reason
+
+            listing_fees = None
+            try:
+                preview = getattr(ebay_client, "publish_fee_preview", None)
+                if callable(preview):
+                    listing_fees = preview(sku, value)
+            except Exception:
+                listing_fees = None
+            blocked = high_fee_category_block_reason(
+                category_id=str(value or ""),
+                category_name=str(fixes.get("categoryName") or new_category_name or ""),
+                listing_fees=listing_fees,
+            )
+            if blocked:
+                return [f"{blocked} [{sku}]"]
             new_category = value
             category_changed = True
             continue

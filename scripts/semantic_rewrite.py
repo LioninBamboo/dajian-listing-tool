@@ -191,56 +191,131 @@ def _report_is_full_daily_scope(data: dict) -> bool:
     return str(scope).strip() == "full"
 
 
+_LAST_DAILY_AUDIT_SKIP = "SKIP: no fresh daily live_audit"
+
+
+def last_daily_audit_skip_message() -> str:
+    return _LAST_DAILY_AUDIT_SKIP
+
+
+def _report_timestamp(path: Path, data: dict | None, clock: datetime) -> float | None:
+    age_ts = _parse_generated_at((data or {}).get("generated_at")) if data else None
+    if age_ts is None:
+        try:
+            age_ts = path.stat().st_mtime
+        except OSError:
+            return None
+    return age_ts
+
+
+def _same_local_day_after_six(ts: float, clock: datetime) -> bool:
+    try:
+        generated = datetime.fromtimestamp(ts)
+    except (TypeError, ValueError, OSError):
+        return False
+    if generated.date() != clock.date():
+        return False
+    return generated.hour >= 6
+
+
 def pick_latest_daily_live_audit(
     files: list[Path],
     *,
     max_age_hours: float = 36,
     now: datetime | None = None,
+    allow_yesterday: bool = False,
 ) -> tuple[Path, dict] | None:
-    """Newest fresh full-store live_audit. Never fall back to an older report.
+    """Newest same-day full-store live_audit after 06:00.
 
-    First take the newest full live_audit inside the window (mode=live_audit,
-    unscoped: scope=full, or legacy reports with no scope and
-    total_published >= 20, generated_at/mtime within max_age_hours, parseable
-    JSON). If that newest full report has empty issues or fails any check,
-    return None and skip — do not use yesterday's findings when a newer full
-    audit already exists.
+    36h is only an upper bound for the manual ``--from-daily-audit`` CLI when
+    ``allow_yesterday`` is on. Scheduled tasks never accept yesterday.
+
+    If any ``listing_audit_fix_*.json`` newer than the chosen report is
+    unparseable, or is a full live_audit missing the ``issues`` key, fail
+    closed.
     """
+    global _LAST_DAILY_AUDIT_SKIP
+    _LAST_DAILY_AUDIT_SKIP = "SKIP: no fresh daily live_audit"
     clock = now or datetime.now()
     try:
-        cutoff = clock.timestamp() - float(max_age_hours) * 3600
+        window_hours = float(max_age_hours)
     except (TypeError, ValueError):
-        cutoff = clock.timestamp() - 36 * 3600
-    candidates: list[tuple[float, Path, dict]] = []
+        window_hours = 36.0
+    cutoff = clock.timestamp() - window_hours * 3600
+
+    indexed: list[tuple[float, Path, dict | None, str | None]] = []
     for path in files or []:
         if path is None:
             continue
+        name = getattr(path, "name", "") or ""
+        if "listing_audit_fix_" not in name:
+            continue
+        parse_error = None
+        data = None
         try:
             raw = path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-        except Exception:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                data = parsed
+            else:
+                parse_error = f"{path.name}: not an object"
+        except Exception as exc:
+            parse_error = f"{path.name}: {exc}"
+        ts = _report_timestamp(path, data, clock)
+        if ts is None:
             continue
-        if not isinstance(data, dict):
+        indexed.append((ts, path, data, parse_error))
+
+    if not indexed:
+        return None
+    indexed.sort(key=lambda item: item[0], reverse=True)
+
+    candidates: list[tuple[float, Path, dict]] = []
+    for ts, path, data, parse_error in indexed:
+        if parse_error or data is None:
             continue
         if str(data.get("mode") or "") != "live_audit":
             continue
         if not _report_is_full_daily_scope(data):
             continue
-        age_ts = _parse_generated_at(data.get("generated_at"))
-        if age_ts is None:
-            try:
-                age_ts = path.stat().st_mtime
-            except OSError:
-                continue
-        if age_ts < cutoff:
+        if ts < cutoff:
             continue
-        candidates.append((age_ts, path, data))
+        if allow_yesterday:
+            pass
+        elif not _same_local_day_after_six(ts, clock):
+            continue
+        candidates.append((ts, path, data))
+
     if not candidates:
         return None
-    candidates.sort(key=lambda item: item[0], reverse=True)
     _ts, chosen, data = candidates[0]
+
+    for ts, path, newer_data, parse_error in indexed:
+        if ts <= _ts:
+            continue
+        if parse_error:
+            logger_name = path.name
+            _LAST_DAILY_AUDIT_SKIP = f"SKIP: no fresh daily live_audit (unparseable newer {logger_name})"
+            print(f"[pick] fail-closed: newer report unparseable: {logger_name}")
+            return None
+        if (
+            newer_data is not None
+            and str(newer_data.get("mode") or "") == "live_audit"
+            and _report_is_full_daily_scope(newer_data)
+            and "issues" not in newer_data
+        ):
+            _LAST_DAILY_AUDIT_SKIP = (
+                f"SKIP: no fresh daily live_audit (partial newer {path.name} missing issues)"
+            )
+            print(f"[pick] fail-closed: newer full live_audit missing issues key: {path.name}")
+            return None
+
     issues = data.get("issues")
+    if "issues" not in data:
+        _LAST_DAILY_AUDIT_SKIP = f"SKIP: no fresh daily live_audit (partial {chosen.name} missing issues)"
+        return None
     if not isinstance(issues, list) or not issues:
+        _LAST_DAILY_AUDIT_SKIP = f"SKIP: fresh daily live_audit has 0 issues ({chosen.name})"
         return None
     return chosen, data
 
@@ -347,6 +422,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Derive incremental queue from latest non-empty audit, exclude DONE/human_queue, then process",
     )
     p.add_argument(
+        "--allow-yesterday",
+        action="store_true",
+        default=False,
+        help="For --from-daily-audit only: allow a report from the last 36h even if it is yesterday's",
+    )
+    p.add_argument(
         "--apply",
         action="store_true",
         help="Push to eBay (requires SEMANTIC_REWRITE_APPLY_ENABLED=1).",
@@ -378,9 +459,12 @@ def main(argv: list[str] | None = None) -> int:
     from_daily = bool(args.from_daily_audit)
     if from_daily:
         logs = ROOT / "logs"
-        picked = pick_latest_daily_live_audit(list(logs.glob("listing_audit_fix_*.json")))
+        picked = pick_latest_daily_live_audit(
+            list(logs.glob("listing_audit_fix_*.json")),
+            allow_yesterday=bool(args.allow_yesterday),
+        )
         if not picked:
-            print("SKIP: no fresh daily live_audit")
+            print(last_daily_audit_skip_message())
             return 0
         skus = derive_queue_from_latest_audit(limit=None)
         skus = _exclude_done_and_human(skus)

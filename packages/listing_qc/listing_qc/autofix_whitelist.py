@@ -43,3 +43,10 @@ MISSING_VIDEO_AUTOFIX_ISSUE_TYPES = frozenset({"missing_video"})
 MISSING_VIDEO_AUTOFIX_FIX_KEYS = frozenset({"__sync_video__"})
 MISSING_VIDEO_DAILY_LIMIT_DEFAULT = 80
 SEMANTIC_REWRITE_DAILY_LIMIT_DEFAULT = 80
+# Semantic rewrite may rewrite title / description / aspects. It must never
+# remap categoryId automatically.
+SEMANTIC_REWRITE_AUTOFIX_FIX_KEYS = frozenset({
+    "title",
+    "description",
+    "aspects",
+})

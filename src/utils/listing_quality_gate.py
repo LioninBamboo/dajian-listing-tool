@@ -20,7 +20,9 @@ from src.utils.dimension_helpers import (
     replace_description_measurements,
 )
 from src.utils.product_context_signals import (
+    compound_product_family,
     has_any_phrase,
+    has_compound_product_signal,
     has_outdoor_marker,
     outdoor_context as strict_outdoor_context,
     primary_product_noun,
@@ -241,9 +243,11 @@ _OUTDOOR_TABLE_PHRASES = (
 
 def _title_has_outdoor_table_signal(text: str) -> bool:
     """Outdoor table as the product, not a room-list or indoor/outdoor dual-use coffee table."""
+    from src.utils.product_context_signals import head_clause
+
     if title_has_mixed_indoor_outdoor(text):
         return False
-    core = strip_mixed_indoor_outdoor(str(text or ""))
+    core = strip_mixed_indoor_outdoor(head_clause(text) or str(text or ""))
     if _has_marker(core, *_OUTDOOR_TABLE_PHRASES):
         return True
     if _has_marker(core, "coffee table", "nesting table", "cocktail table"):
@@ -1565,6 +1569,8 @@ def classify_listing_profile(
     if primary == "dining_chair":
         if _has_marker(title_text, "accent chair"):
             return ListingProfile(kind="unknown")
+        if title_is_chair_accessory(title_text):
+            return ListingProfile(kind="unknown")
         if title_is_dining_set_bundle(title_text):
             return _dining_set_bundle_profile(title_text)
         if title_allows_outdoor_chair_remap(title_text):
@@ -1615,6 +1621,92 @@ def classify_listing_profile(
             type_value="Bench",
             set_includes="Bench",
         )
+
+    # Compound / set titles stop here. Never fall through to the ottoman /
+    # pantry / cabinet keyword ladder (root cause of sofa+ottoman → 20490).
+    compound_kind = compound_product_family(title_text)
+    if compound_kind == "dining_set":
+        if title_has_clear_outdoor_word(title_text):
+            return _outdoor_dining_set_profile(title_text)
+        if _has_marker(title_text, "dining set", "dining table set", "piece dining"):
+            return ListingProfile(
+                kind="dining_set",
+                category_id="107578",
+                category_name="Dining Sets",
+                type_value="Dining Set",
+                set_includes="Dining Table & Chairs",
+            )
+        return ListingProfile(kind="unknown")
+    if compound_kind == "patio_furniture_set":
+        return ListingProfile(
+            kind="patio_furniture_set",
+            category_id="139849",
+            category_name="Patio & Garden Furniture Sets",
+            type_value="Patio Furniture Set",
+            set_includes="Sofa Set",
+            room="Patio",
+            indoor_outdoor="Outdoor",
+        )
+    if compound_kind == "sofa":
+        return ListingProfile(
+            kind="sofa",
+            category_id="38208",
+            category_name="Sofas, Armchairs & Couches",
+            type_value="Sofa",
+            set_includes="Sofa",
+            room="Living Room",
+        )
+    if compound_kind == "armchair":
+        return ListingProfile(
+            kind="armchair",
+            category_id="38208",
+            category_name="Sofas, Armchairs & Couches",
+            type_value="Armchair",
+            set_includes="Chair",
+            room="Living Room",
+        )
+    if compound_kind == "coffee_table":
+        return ListingProfile(
+            kind="coffee_table",
+            category_id="38204",
+            category_name="Coffee Tables",
+            type_value="Coffee Table",
+            set_includes="Table",
+            room="Living Room",
+        )
+    if compound_kind == "bed":
+        bed_type = (
+            "Loft Bed"
+            if _has_marker(title_text, "loft bed")
+            else ("Bunk Bed" if _has_marker(title_text, "bunk bed", "twin over", "full over", "queen over") else "Bed Frame")
+        )
+        return ListingProfile(
+            kind="bed",
+            category_id="175758",
+            category_name="Beds & Bed Frames",
+            type_value=bed_type,
+            room="Bedroom",
+        )
+    if compound_kind == "desk":
+        return ListingProfile(
+            kind="desk",
+            category_id="88057",
+            category_name="Desks & Tables",
+        )
+    if compound_kind == "kids_table_set":
+        return ListingProfile(
+            kind="kids_table_set",
+            category_id="66743",
+            category_name="Play Table & Chair Sets",
+            type_value="Play Table & Chair Set",
+            set_includes="Table & Chairs",
+            room="Playroom",
+        )
+    if compound_kind in {"unknown", "kitchen_island"}:
+        return ListingProfile(kind="unknown")
+    if has_compound_product_signal(title_text):
+        return ListingProfile(kind="unknown")
+
     sofa_context = _has_marker(
         title_text,
         "sectional sofa",
@@ -1779,6 +1871,16 @@ def classify_listing_profile(
             category_id="20487",
             category_name="Cabinets & Cupboards",
             type_value="Cabinet",
+        )
+
+    if _has_marker(title_text, "display cabinet", "curio cabinet", "glass display cabinet") and not _has_marker(
+        title_text, "wine rack", "stemware rack"
+    ):
+        return ListingProfile(
+            kind="display_cabinet",
+            category_id="20493",
+            category_name="Display Cabinets",
+            type_value="Display Cabinet",
         )
 
     if _has_marker(title_text, "golf") and _has_marker(title_text, "golf putting green", "putting green"):
@@ -1968,6 +2070,7 @@ def classify_listing_profile(
         and _has_marker(title_text, "dining")
         and _has_marker(title_text, "set of", "chairs")
         and not _has_marker(title_text, "accent chair", "armchair", "reading chair")
+        and not _has_marker(title_text, "chairs not included", "without chairs", "table only")
     ):
         if _has_marker(title_text, "accent chair"):
             return ListingProfile(kind="unknown")
@@ -2003,7 +2106,10 @@ def classify_listing_profile(
             remove_aspects=frozenset({"Set Includes"}),
         )
 
-    if _has_marker(title_text, "dining table") and not _has_marker(title_text, "chair", "bench"):
+    seating_negated = _has_marker(title_text, "chairs not included", "without chairs", "table only")
+    if _has_marker(title_text, "dining table") and (
+        seating_negated or not _has_marker(title_text, "chair", "bench")
+    ):
         if _title_has_outdoor_table_signal(title_text):
             return _outdoor_table_profile(category_id)
         return ListingProfile(
@@ -2397,20 +2503,51 @@ def normalize_generated_listing(
     if not isinstance(opt["aspects"], dict):
         opt["aspects"] = {}
 
-    title_context = " ".join(part for part in (source_title, opt.get("title")) if part).strip()
-    profile = classify_listing_profile(title_context or opt.get("title", ""), opt.get("description", ""), opt.get("categoryId", ""))
+    live_title = str(opt.get("title") or "")
+    giga_title = str(source_title or "")
+    stored_category = str(opt.get("categoryId") or "")
+    # Aspects still come from the live-title profile. The leaf comes from the
+    # shared decision so publish and audit cannot disagree.
+    profile = classify_listing_profile(
+        live_title or giga_title,
+        "",
+        stored_category,
+        source_title="",
+    )
     preserve_category = is_category_approved(opt)
+    if not preserve_category:
+        from src.utils.category_decision import decision_category_id, resolve_category_decision
 
-    if category_matcher and opt.get("categoryId") and not preserve_category:
-        category_id, category_name = category_matcher.canonicalize_category(
-            title_context or opt.get("title", ""),
-            str(opt.get("categoryId") or ""),
+        decision = resolve_category_decision(
+            live_title,
+            giga_title,
+            "",
+            stored_category,
             opt.get("categoryName"),
-            opt.get("description", ""),
         )
-        opt["categoryId"] = category_id
-        if category_name:
-            opt["categoryName"] = category_name
+        write_id = decision_category_id(decision, stored_category)
+        if write_id:
+            profile = ListingProfile(
+                kind=decision.kind or profile.kind,
+                category_id=write_id,
+                category_name=decision.category_name or profile.category_name,
+                type_value=profile.type_value,
+                set_includes=profile.set_includes,
+                room=profile.room,
+                indoor_outdoor=profile.indoor_outdoor,
+                remove_aspects=profile.remove_aspects,
+            )
+        else:
+            profile = ListingProfile(
+                kind=profile.kind if decision.kind == "keep" else (decision.kind or "unknown"),
+                category_id=None,
+                category_name=None,
+                type_value=profile.type_value,
+                set_includes=profile.set_includes,
+                room=profile.room,
+                indoor_outdoor=profile.indoor_outdoor,
+                remove_aspects=profile.remove_aspects,
+            )
 
     seeded_attributes = _seed_attributes_from_description(attributes, opt.get("description", ""))
     updates = _fill_measurement_aspects(opt["aspects"], seeded_attributes)
@@ -3374,29 +3511,48 @@ def validate_listing_quality(
 
     category_id = str(opt.get("categoryId") or "").strip()
     preserve_category = is_category_approved(opt)
+    from src.utils.category_decision import decision_category_id, resolve_category_decision
+
     profile = classify_listing_profile(
         title or source_title,
-        description,
+        "",
         category_id,
-        source_title=source_title,
+        source_title="",
     )
-    if not preserve_category and profile.category_id and category_id != profile.category_id:
+    decision = resolve_category_decision(
+        title,
+        source_title,
+        "",
+        category_id,
+        opt.get("categoryName"),
+    )
+    write_id = decision_category_id(decision, category_id)
+    if decision.conflict or decision.reason == "title_source_conflict":
+        issues.append(
+            ListingQualityIssue(
+                "title_source_conflict",
+                "live title and GIGA title disagree on the product leaf; holding stored category",
+                severity="INFO",
+                field="title",
+            )
+        )
+    if not preserve_category and write_id and category_id != write_id:
         issues.append(
             ListingQualityIssue(
                 "category_mismatch",
-                f"{profile.kind} should use category {profile.category_id}, got {category_id or 'missing'}",
+                f"{decision.kind} should use category {write_id}, got {category_id or 'missing'}",
                 field="categoryId",
             )
         )
     elif not category_id:
         issues.append(ListingQualityIssue("missing_category", "missing categoryId", field="categoryId"))
 
-    if category_matcher and category_id and not preserve_category:
-        if not category_matcher.is_category_plausible_for_text(title, category_id, opt.get("categoryName")):
+    if category_matcher and write_id and not preserve_category:
+        if not category_matcher.is_category_plausible_for_text(title or source_title, write_id, opt.get("categoryName")):
             issues.append(
                 ListingQualityIssue(
                     "category_mismatch",
-                    f"category {category_id} is implausible for title '{title[:120]}'",
+                    f"category {write_id} is implausible for title '{(title or source_title)[:120]}'",
                     field="categoryId",
                 )
             )
@@ -3610,5 +3766,9 @@ def validate_listing_quality(
 
 def blocking_issue_messages(issues: list[ListingQualityIssue]) -> list[str]:
     return [issue.message for issue in issues if issue.severity == "BLOCKER"]
+
+
+# Spec name for the publish-path normalizer. Same function, same category gate.
+normalize_listing_optimization = normalize_generated_listing
 
 

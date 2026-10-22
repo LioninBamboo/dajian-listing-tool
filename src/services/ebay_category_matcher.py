@@ -18,6 +18,7 @@ from src.utils.product_context_signals import (
     mentions_cooler_product,
     outdoor_context,
     primary_product_noun,
+    stored_leaf_locked,
     strip_mixed_indoor_outdoor,
     strip_room_location_lists,
     title_allows_outdoor_chair_remap,
@@ -568,6 +569,16 @@ class EbayCategoryMatcher:
             "32880": ("22656", "Coat & Hat Racks"),
         }
         if cid in direct_replacements:
+            if stored_leaf_locked(title_lower, cid):
+                return cid, category_name
+            # Coffee-table + ottoman SKUs were historically stored on 175761.
+            # That retired leaf must not become 20490 when the head noun is a table.
+            if cid == "175761" and has_any_phrase(title_lower, ("coffee table", "cocktail table")):
+                return cid, category_name
+            if cid == "38205" and has_phrase(title_lower, "console table"):
+                return cid, category_name
+            if cid in {"42425", "42428"} and has_any_phrase(title_lower, ("medicine cabinet", "bathroom cabinet")):
+                return cid, category_name
             return direct_replacements[cid]
 
         # 42430 Outdoor Storage is retired. Pick the leaf from the product text.
@@ -626,8 +637,13 @@ class EbayCategoryMatcher:
         if has_explicit_dining_set and cid != "107578":
             return "107578", "Dining Sets"
 
+        # Display / curio cabinets go to 20493, never 20689. "Wine cabinet"
+        # stuffing inside a display-cabinet title is not a wine rack.
+        if has_display_cabinet and cid != "20493":
+            return "20493", "Display Cabinets"
+
         # Wine/bar liquor cabinets and hall trees must win over generic pantry remap.
-        if has_wine_storage and cid != "20689":
+        if has_wine_storage and not has_display_cabinet and cid != "20689":
             return "20689", "Wine Racks & Bottle Holders"
 
         if has_hall_tree and cid != "261263":
@@ -1012,7 +1028,9 @@ class EbayCategoryMatcher:
         luggage_categories = {"16080"}
         arcade_game_categories = {"36278", "20270", "13716", "2540"}
         kids_table_set_categories = {"66743"}
-        outdoor_table_categories = {"112590", "107578", "139849", "79686", "38204"}
+        outdoor_table_categories = {"112590"}
+        if title_is_dining_set_bundle(title_lower):
+            outdoor_table_categories = {"112590", "139849", "107578"}
         wine_storage_categories = {"20689"}
         hall_tree_categories = {"261263"}
         patio_furniture_set_categories = {"139849"}

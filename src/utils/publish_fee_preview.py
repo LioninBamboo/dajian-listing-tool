@@ -182,6 +182,42 @@ def category_is_high_fee(
     return False
 
 
+def high_fee_category_block_reason(
+    category_id: str = "",
+    category_path: str = "",
+    category_name: str = "",
+    listing_fees: Optional[Mapping[str, Any]] = None,
+    blacklist_path: Optional[str] = None,
+) -> Optional[str]:
+    """Human-readable BLOCKED_HIGH_FEE reason, or None if the write may proceed.
+
+    Empty/missing blacklist still applies HIGH_FEE_PATH_SEGMENTS. A $20+
+    insertion-fee preview fails closed. Missing preview is not a block here —
+    callers that already have a fee payload must pass it.
+    """
+    cid = str(category_id or "").strip()
+    # Touch the blacklist so a missing file logs its warning.
+    load_high_fee_category_blacklist(blacklist_path)
+    if category_is_high_fee(
+        cid,
+        category_path=category_path,
+        category_name=category_name,
+        blacklist_path=blacklist_path,
+    ):
+        return (
+            f"BLOCKED_HIGH_FEE: category {cid or category_name or category_path} "
+            "is on the high-fee blacklist or path-segment list"
+        )
+    if listing_fees is not None:
+        fee = insertion_fee_usd(listing_fees)
+        if fee is not None and fee >= HIGH_INSERTION_FEE_USD:
+            return (
+                f"BLOCKED_HIGH_FEE: category {cid} insertion fee ${fee:.2f} >= "
+                f"${HIGH_INSERTION_FEE_USD:.2f}"
+            )
+    return None
+
+
 def insertion_fee_usd(listing_fees: Optional[Mapping[str, Any]]) -> Optional[float]:
     if listing_fees is None or not isinstance(listing_fees, Mapping):
         return None

@@ -521,9 +521,11 @@ def test_coffee_table_description_does_not_reclassify_to_kids_table_set():
 def test_non_leaf_furniture_categories_canonicalize_to_sellable_leaves():
     matcher = object.__new__(EbayCategoryMatcher)
 
+    # 38205 console tables stay on the stored leaf when the live head noun is a
+    # console table (spec R8 / N711P230809B). Do not collapse them into 38204.
     assert matcher.canonicalize_category("63 Inch Console Table with Drawers", "38205", "Console Tables") == (
-        "38204",
-        "Tables",
+        "38205",
+        "Console Tables",
     )
     assert matcher.canonicalize_category("Kitchen Pantry Cabinet with Pull-Out Shelves", "42428", "Pantry Cabinets") == (
         "20487",
