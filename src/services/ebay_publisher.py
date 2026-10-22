@@ -1230,16 +1230,20 @@ class EbayPublisher:
                     self._sync_inventory_compatibility(sku, compatibility)
                     
                     # 更新 offer 类目与 buyer-facing 描述
+                    # The lock pins the stored leaf already returned above.
+                    # A drifted live offer must be restored to that leaf.
+                    # Keep the live id only when the lookup refused a leaf,
+                    # so this path does not write a blank categoryId.
                     current_category = existing_offer.get("categoryId", "")
                     from src.utils.approved_category import blocks_automated_category_change
 
                     if (
-                        current_category
-                        and current_category != category_id
+                        not category_id
+                        and current_category
                         and blocks_automated_category_change(product.get("optimization"))
                     ):
                         self.logger.warning(
-                            f"[CATEGORY] lock set; keeping live offer category {current_category}"
+                            f"[CATEGORY] lock set but no approved leaf; keeping live offer category {current_category}"
                         )
                         category_id = current_category
                     if current_category != category_id:

@@ -809,6 +809,7 @@ def audit_single_product(
     videos_raw=None,
     live_inventory=None,
     accept_package_conflict_as=None,
+    override_category_lock: bool = False,
 ):
     """Audit a single product. Returns (issues, fixes) where fixes are actionable corrections."""
     issues = []
@@ -926,9 +927,12 @@ def audit_single_product(
 
     # ── 1. Category Check — deterministic product profile wins over taxonomy drift ──
     # A human-approved stored category is not remapped by profile or canonicalize.
-    # Fail closed: any categoryApproved flag blocks generation of category fixes.
+    # Fail closed: any categoryApproved flag blocks generation of category fixes
+    # unless the operator passed --override-category-lock.
     # Motors also refuses a tree-0 target such as 20487.
-    skip_category_remap = blocks_automated_category_change(opt)
+    skip_category_remap = blocks_automated_category_change(
+        opt, override=override_category_lock
+    )
     profile = classify_listing_profile(title_context or title, live_description, stored_category)
     if not skip_category_remap and profile.category_id and not listing_category_rejection(profile.category_id):
         if stored_category != profile.category_id:
@@ -4676,6 +4680,7 @@ def main(argv=None):
             videos_raw=row["videos"],
             live_inventory=live_inventory if args.live else None,
             accept_package_conflict_as=args.accept_package_conflict_as,
+            override_category_lock=bool(getattr(args, "override_category_lock", False)),
         )
         issues = preflight_issues + issues
         transport_issues, content_issues = split_transport_issues(issues)
