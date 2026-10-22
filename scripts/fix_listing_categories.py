@@ -113,8 +113,10 @@ CATEGORY_NAMES = {
 }
 
 
-def get_fixes(conn):
+def get_fixes(conn, include_locked=False):
     """Get all published products that need category fixes."""
+    from src.utils.approved_category import blocks_automated_category_change
+
     cur = conn.cursor()
     rows = cur.execute(
         'SELECT sku, title, listing_id, optimization FROM collected_products WHERE status = ?',
@@ -124,6 +126,8 @@ def get_fixes(conn):
     fixes = []
     for sku, title, listing_id, opt_json in rows:
         opt = json.loads(opt_json) if opt_json else {}
+        if blocks_automated_category_change(opt) and not include_locked:
+            continue
         current_cat = str(opt.get('categoryId', ''))
 
         new_cat = None
@@ -151,12 +155,22 @@ def get_fixes(conn):
     return fixes
 
 
-def apply_fix(ebay_client, conn, fix, dry_run=True):
+def apply_fix(ebay_client, conn, fix, dry_run=True, override_category_lock=False):
     """Apply a single category fix to eBay and local DB."""
+    from src.utils.approved_category import locked_category_write_error
+
     sku = fix['sku']
     new_cat = fix['new_cat']
     old_cat = fix['old_cat']
     cat_name = CATEGORY_NAMES.get(new_cat, new_cat)
+
+    cur = conn.cursor()
+    row = cur.execute('SELECT optimization FROM collected_products WHERE sku = ?', (sku,)).fetchone()
+    opt = json.loads(row[0]) if row and row[0] else {}
+    lock_error = locked_category_write_error(opt, override=override_category_lock)
+    if lock_error:
+        print(f"  [LOCK] {sku}: {lock_error}")
+        return False
 
     if dry_run:
         print(f"  [DRY] {sku}: {old_cat} → {new_cat} ({cat_name})")
@@ -200,12 +214,17 @@ def main():
     parser = argparse.ArgumentParser(description='Fix wrong eBay listing categories')
     parser.add_argument('--apply', action='store_true', help='Actually apply fixes (default: dry run)')
     parser.add_argument('--sku', type=str, help='Fix only a specific SKU')
+    parser.add_argument(
+        '--override-category-lock',
+        action='store_true',
+        help='Allow remapping a listing whose optimization.categoryApproved flag is set',
+    )
     args = parser.parse_args()
 
     dry_run = not args.apply
 
     conn = sqlite3.connect('ebay_collection.db')
-    fixes = get_fixes(conn)
+    fixes = get_fixes(conn, include_locked=args.override_category_lock)
 
     if args.sku:
         fixes = [f for f in fixes if f['sku'] == args.sku]
@@ -252,7 +271,13 @@ def main():
 
     for i, fix in enumerate(fixes):
         print(f"\n[{i+1}/{len(fixes)}] Fixing {fix['sku']}...")
-        ok = apply_fix(ebay_client, conn, fix, dry_run=False)
+        ok = apply_fix(
+            ebay_client,
+            conn,
+            fix,
+            dry_run=False,
+            override_category_lock=args.override_category_lock,
+        )
         if ok:
             success_count += 1
         else:

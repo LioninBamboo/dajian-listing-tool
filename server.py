@@ -1533,7 +1533,20 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         category_matcher = EbayCategoryMatcher(ebay_client.oauth)
         stored_cat = str(opt_data.get("categoryId") or "").strip() or None
         stored_cat_name = opt_data.get("categoryName")
-        if stored_cat:
+        from src.utils.approved_category import evaluate_approved_category
+
+        approved_decision = evaluate_approved_category(stored_cat or "", opt_data)
+        if approved_decision.approved and approved_decision.error:
+            raise HTTPException(status_code=400, detail=approved_decision.error)
+        preserve_approved_category = approved_decision.preserve
+        from src.utils.approved_category import blocks_automated_category_change
+
+        if not preserve_approved_category and blocks_automated_category_change(opt_data):
+            raise HTTPException(
+                status_code=400,
+                detail=approved_decision.error or "invalid_or_blank_category_id",
+            )
+        if stored_cat and not preserve_approved_category:
             stored_cat, stored_cat_name = category_matcher.canonicalize_category(
                 title_context,
                 stored_cat,
@@ -1555,7 +1568,8 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         
         stored_plausible = bool(
             stored_cat and (
-                stored_cat in protected_stored_categories
+                preserve_approved_category
+                or stored_cat in protected_stored_categories
                 or category_matcher.is_category_plausible_for_text(title_context, stored_cat, stored_cat_name)
             )
         )
@@ -1668,6 +1682,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             completed_aspects,
             category_id,
             category_name,
+            skip_canonicalize=preserve_approved_category,
         )
         if publish_blockers:
             raise HTTPException(

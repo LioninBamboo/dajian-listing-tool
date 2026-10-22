@@ -681,7 +681,19 @@ def publish_to_ebay(product: dict) -> dict:
         title = opt_data.get("title", product.get('title', ''))[:80]
         description = opt_data.get("description", product.get('description', ''))
         category_id = remap_legacy_category_id(opt_data.get("categoryId", ""))
-        if not is_sellable_leaf_category(oauth, category_id):
+        from src.utils.approved_category import evaluate_approved_category
+
+        approved_decision = evaluate_approved_category(category_id, opt_data)
+        if approved_decision.approved and approved_decision.error:
+            return {"status": "error", "message": approved_decision.error}
+        from src.utils.approved_category import blocks_automated_category_change
+
+        if not approved_decision.preserve and blocks_automated_category_change(opt_data):
+            return {
+                "status": "error",
+                "message": approved_decision.error or "invalid_or_blank_category_id",
+            }
+        if not approved_decision.preserve and not is_sellable_leaf_category(oauth, category_id):
             from src.services.ebay_category_matcher import EbayCategoryMatcher
             matcher = EbayCategoryMatcher(oauth)
             matched_id, _, _ = matcher.get_category_and_aspects(
@@ -953,10 +965,27 @@ def publish_with_auto_category(product: dict) -> dict:
             )
             category_id = remap_legacy_category_id(category_id)
             stored_cat = remap_legacy_category_id(opt_data.get("categoryId", ""))
-            if stored_cat and not is_sellable_leaf_category(oauth, stored_cat):
+            from src.utils.approved_category import evaluate_approved_category
+
+            approved_decision = evaluate_approved_category(stored_cat, opt_data)
+            if approved_decision.approved and approved_decision.error:
+                return {"status": "error", "message": approved_decision.error}
+            from src.utils.approved_category import blocks_automated_category_change
+
+            if not approved_decision.preserve and blocks_automated_category_change(opt_data):
+                return {
+                    "status": "error",
+                    "message": approved_decision.error or "invalid_or_blank_category_id",
+                }
+            if stored_cat and not approved_decision.preserve and not is_sellable_leaf_category(oauth, stored_cat):
                 print(f"[AUTO] Stored category {stored_cat} is invalid in current taxonomy, ignoring")
                 stored_cat = ""
-            if category_id and not is_sellable_leaf_category(oauth, category_id):
+            if approved_decision.preserve and stored_cat:
+                category_id = stored_cat
+                category_name = opt_data.get("categoryName") or f"Category {stored_cat}"
+                completed_aspects = existing_aspects
+                print(f"[AUTO] Preserving human-approved category {stored_cat}")
+            if category_id and not approved_decision.preserve and not is_sellable_leaf_category(oauth, category_id):
                 print(f"[AUTO] Matched category {category_id} is invalid in current taxonomy, ignoring")
                 category_id = ""
 
@@ -1095,7 +1124,7 @@ def publish_with_auto_category(product: dict) -> dict:
                     print(f"[重试 {attempt + 1}/{max_retries}] 已应用属性自动修复，准备重试")
                     continue
 
-                if is_invalid_category_error(error_msg):
+                if is_invalid_category_error(error_msg) and not approved_decision.preserve:
                     remapped = remap_legacy_category_id(category_id)
                     if remapped and remapped != category_id and is_sellable_leaf_category(oauth, remapped):
                         print(f"[AUTO-FIX] 类目重映射: {category_id} -> {remapped}")

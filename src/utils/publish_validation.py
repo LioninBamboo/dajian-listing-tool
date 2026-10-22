@@ -84,22 +84,28 @@ def category_validation_errors(
     title_context: str,
     category_id: str,
     category_name: str = None,
+    *,
+    skip_canonicalize: bool = False,
 ) -> list[str]:
     normalized_category_id = str(category_id or '').strip()
     if not normalized_category_id:
         return ["missing categoryId"]
 
-    if category_matcher:
+    if category_matcher and not skip_canonicalize:
         normalized_category_id, category_name = category_matcher.canonicalize_category(
             title_context,
             normalized_category_id,
             category_name,
         )
 
-    if category_matcher and not category_matcher.is_category_plausible_for_text(
-        title_context,
-        normalized_category_id,
-        category_name,
+    if (
+        category_matcher
+        and not skip_canonicalize
+        and not category_matcher.is_category_plausible_for_text(
+            title_context,
+            normalized_category_id,
+            category_name,
+        )
     ):
         return [f"implausible category {normalized_category_id} for title '{title_context[:120]}'"]
 
@@ -112,7 +118,17 @@ def get_publish_blockers(
     aspects: dict,
     category_id: str,
     category_name: str = None,
+    *,
+    skip_canonicalize: bool = False,
 ) -> list[str]:
     blockers = measurement_validation_errors(aspects)
-    blockers.extend(category_validation_errors(category_matcher, title_context, category_id, category_name))
+    blockers.extend(
+        category_validation_errors(
+            category_matcher,
+            title_context,
+            category_id,
+            category_name,
+            skip_canonicalize=skip_canonicalize,
+        )
+    )
     return blockers

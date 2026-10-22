@@ -25,6 +25,10 @@ from src.clients.real_ebay_client import create_real_ebay_client  # noqa: E402
 from src.services.ebay_category_matcher import create_category_matcher  # noqa: E402
 from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP  # noqa: E402
 from src.utils.dimension_helpers import build_package_weight_and_size  # noqa: E402
+from src.utils.approved_category import (  # noqa: E402
+    blocks_automated_category_change,
+    locked_category_write_error,
+)
 from src.utils.publish_validation import (  # noqa: E402
     category_validation_errors,
     measurement_validation_errors,
@@ -233,7 +237,9 @@ def audit_candidate(product_row: dict, matcher, client):
     )
 
     action = "OK"
-    if needs_live_revision:
+    if blocks_automated_category_change(opt):
+        action = "LOCKED"
+    elif needs_live_revision:
         action = "REVISE_LIVE"
     elif needs_db_sync:
         action = "SYNC_DB"
@@ -261,8 +267,22 @@ def audit_candidate(product_row: dict, matcher, client):
     }
 
 
-def apply_live_revision(conn: sqlite3.Connection, matcher, client, product_row: dict, candidate: dict):
+def apply_live_revision(
+    conn: sqlite3.Connection,
+    matcher,
+    client,
+    product_row: dict,
+    candidate: dict,
+    *,
+    override_category_lock: bool = False,
+):
     sku = product_row["sku"]
+    lock_error = locked_category_write_error(
+        product_row.get("optimization") or {},
+        override=override_category_lock,
+    )
+    if lock_error:
+        raise RuntimeError(lock_error)
     enrich_product_dimensions(product_row)
 
     opt = dict(product_row.get("optimization") or {})
@@ -315,7 +335,19 @@ def apply_live_revision(conn: sqlite3.Connection, matcher, client, product_row: 
     }
 
 
-def apply_db_sync(conn: sqlite3.Connection, product_row: dict, candidate: dict):
+def apply_db_sync(
+    conn: sqlite3.Connection,
+    product_row: dict,
+    candidate: dict,
+    *,
+    override_category_lock: bool = False,
+):
+    lock_error = locked_category_write_error(
+        product_row.get("optimization") or {},
+        override=override_category_lock,
+    )
+    if lock_error:
+        raise RuntimeError(lock_error)
     update_local_optimization(
         conn,
         product_row["sku"],
@@ -335,6 +367,11 @@ def main():
     parser = argparse.ArgumentParser(description="Repair stale taxonomy for published listings")
     parser.add_argument("--apply", action="store_true", help="Apply live and local fixes")
     parser.add_argument("--sku", type=str, help="Limit to one published SKU")
+    parser.add_argument(
+        "--override-category-lock",
+        action="store_true",
+        help="Allow revising a listing whose optimization.categoryApproved flag is set",
+    )
     args = parser.parse_args()
 
     conn = sqlite3.connect(str(ROOT / "ebay_collection.db"), timeout=30)
@@ -368,9 +405,36 @@ def main():
         for row, candidate in zip(rows, results):
             try:
                 if candidate["action"] == "REVISE_LIVE":
-                    applied.append(apply_live_revision(conn, matcher, client, row, candidate))
+                    applied.append(
+                        apply_live_revision(
+                            conn,
+                            matcher,
+                            client,
+                            row,
+                            candidate,
+                            override_category_lock=args.override_category_lock,
+                        )
+                    )
+                elif candidate["action"] == "LOCKED" and args.override_category_lock:
+                    applied.append(
+                        apply_live_revision(
+                            conn,
+                            matcher,
+                            client,
+                            row,
+                            candidate,
+                            override_category_lock=True,
+                        )
+                    )
                 elif candidate["action"] == "SYNC_DB":
-                    applied.append(apply_db_sync(conn, row, candidate))
+                    applied.append(
+                        apply_db_sync(
+                            conn,
+                            row,
+                            candidate,
+                            override_category_lock=args.override_category_lock,
+                        )
+                    )
                 time.sleep(1.0)
             except Exception as exc:
                 logger.error("%s failed: %s", candidate["sku"], exc)
