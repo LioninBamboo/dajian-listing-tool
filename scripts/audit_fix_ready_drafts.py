@@ -25,6 +25,8 @@ from src.utils.dimension_helpers import (
     extract_product_weight_from_text,
     replace_description_measurements,
 )
+from src.utils.approved_category import blocks_automated_category_change
+from src.utils.motors_category_tree import listing_category_rejection
 from src.utils.publish_autofix import sanitize_placeholder_aspects
 from src.utils.report_images import normalize_image_list
 from src.utils.publish_validation import first_aspect_text, measurement_issue
@@ -575,7 +577,13 @@ def choose_ready_category(
     aspects,
     current_category_id,
     current_category_name,
+    optimization=None,
 ):
+    if blocks_automated_category_change(optimization):
+        # Flag set: keep the stored leaf, including a blank one. Do not invent
+        # a category and do not follow the matcher.
+        return current_category_id, current_category_name, aspects
+
     candidates = []
     seen_titles = set()
 
@@ -597,6 +605,8 @@ def choose_ready_category(
             candidate_name,
             description or "",
         )
+        if listing_category_rejection(candidate_id):
+            candidate_id, candidate_name = None, None
         candidates.append({
             "label": label,
             "title": normalized_title,
@@ -623,6 +633,8 @@ def choose_ready_category(
         current_category_name,
         description or "",
     )
+    if listing_category_rejection(current_id):
+        current_id, current_category_name = None, None
     preferred = next((candidate for candidate in candidates if candidate["plausible"] and candidate["strong"]), None)
     if not preferred:
         preferred = next((candidate for candidate in candidates if candidate["plausible"]), None)
@@ -947,6 +959,7 @@ def audit_and_fix_ready_drafts(
             aspects,
             original_opt.get("categoryId"),
             original_opt.get("categoryName"),
+            optimization=original_opt,
         )
         if completed_aspects:
             aspects = completed_aspects

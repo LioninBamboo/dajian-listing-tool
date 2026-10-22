@@ -62,6 +62,14 @@ from src.utils.publish_autofix import (
     try_fix_publish_error,
 )
 from src.utils.publish_aspect_completion import complete_publish_aspects
+from src.utils.approved_category import (
+    blocks_automated_category_change,
+    evaluate_approved_category,
+    is_category_approved,
+    mark_category_approved,
+    should_auto_remap_invalid_category,
+)
+from src.utils.motors_category_tree import listing_category_rejection
 from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP, PROTECTED_STORED_CATEGORY_IDS
 from src.utils.dimension_helpers import (
     extract_all_dimensions, find_dimension,
@@ -250,8 +258,15 @@ def _persist_prepared_listing(
     description: str,
     aspects: dict,
     compatibility=None,
+    *,
+    dry_run: bool = False,
 ):
-    """Persist prepared title/description/category/aspects into the local optimization record."""
+    """Persist prepared title/description/category/aspects into the local optimization record.
+
+    A dry run may append compatibility lines to the log column only. It must
+    not write optimization or category fields — that path previously saved the
+    whole optimization back and overwrote an approved leaf with a bad id.
+    """
     from src.db.collection_db import SessionLocal
     from src.db.collection_models import CollectedProduct
 
@@ -261,34 +276,47 @@ def _persist_prepared_listing(
         if not product:
             return
 
-        optimization = dict(product.optimization or {})
-        optimization["categoryId"] = category_id
-        if category_name:
-            optimization["categoryName"] = category_name
-        optimization["title"] = title
-        optimization["description"] = description
-        optimization["aspects"] = aspects
-        if compatibility is not None:
-            new_mc = serialize_compatibility_analysis(compatibility)
-            prior_cp = (optimization.get("motorsCompatibility") or {}).get("compatibleProducts") or []
-            new_cp = (new_mc or {}).get("compatibleProducts") or []
-            # Never overwrite authoritative structured fitment (77 Year/Make/Model
-            # from GIGA) with a poorer text re-derivation (0). This runs on BOTH
-            # dry-run and live, so a clobber here silently poisons the next publish.
-            if len(new_cp) >= len(prior_cp):
-                optimization["motorsCompatibility"] = new_mc
-        product.optimization = optimization
-        flag_modified(product, "optimization")
+        if not dry_run:
+            optimization = dict(product.optimization or {})
+            optimization["categoryId"] = category_id
+            if category_name:
+                optimization["categoryName"] = category_name
+            optimization["title"] = title
+            optimization["description"] = description
+            optimization["aspects"] = aspects
+            if compatibility is not None:
+                new_mc = serialize_compatibility_analysis(compatibility)
+                prior_cp = (optimization.get("motorsCompatibility") or {}).get("compatibleProducts") or []
+                new_cp = (new_mc or {}).get("compatibleProducts") or []
+                # Never overwrite authoritative structured fitment (77 Year/Make/Model
+                # from GIGA) with a poorer text re-derivation (0).
+                if len(new_cp) >= len(prior_cp):
+                    optimization["motorsCompatibility"] = new_mc
+            product.optimization = optimization
+            flag_modified(product, "optimization")
 
-        log_entries = product.logs or []
+        log_entries = list(product.logs or [])
+        appended = False
         if compatibility is not None:
             compat_summary = f"[COMPAT {datetime.now(timezone.utc).isoformat()}] {compatibility.summary}"
             if compat_summary not in log_entries:
                 log_entries.append(compat_summary)
+                appended = True
             for issue in compatibility.issues:
                 msg = f"[COMPAT-WARN {datetime.now(timezone.utc).isoformat()}] {issue}"
                 if msg not in log_entries:
                     log_entries.append(msg)
+                    appended = True
+
+        if dry_run:
+            # Logging may append to the log column. Optimization stays untouched,
+            # and a dry run with nothing to log does not write the row at all.
+            if appended:
+                product.logs = log_entries
+                flag_modified(product, "logs")
+                db.commit()
+            return
+
         product.logs = log_entries
         flag_modified(product, "logs")
         db.commit()
@@ -736,6 +764,15 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     sku = product['sku']
     environment = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION")
     publish_image_limit = _publish_image_limit(sku)
+    opt_raw = product.get('optimization', {})
+    if isinstance(opt_raw, str):
+        try:
+            opt_raw = json.loads(opt_raw)
+        except ValueError:
+            opt_raw = {}
+    if not isinstance(opt_raw, dict):
+        opt_raw = {}
+    product['optimization'] = opt_raw
 
     # Publish gate: never live-list blacklisted GIGA sellers (N735*/W1706*/ZL*).
     from src.utils.copy_skip_gate import seller_is_blacklisted
@@ -803,21 +840,43 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     title_context = title or source_title
     stored_cat = str(opt.get('categoryId') or '').strip() or None
     stored_cat_name = opt.get('categoryName')
-    if stored_cat in INVALID_CATEGORY_REMAP:
+    approved_decision = evaluate_approved_category(
+        stored_cat or "",
+        opt,
+        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+    )
+    if approved_decision.approved and approved_decision.error:
+        record_error(sku, approved_decision.error)
+        return {"status": "error", "message": approved_decision.error}
+    preserve_approved_category = approved_decision.preserve
+    if (
+        not preserve_approved_category
+        and blocks_automated_category_change(opt)
+    ):
+        err = approved_decision.error or "invalid_or_blank_category_id"
+        record_error(sku, err)
+        return {"status": "error", "message": err}
+    if stored_cat in INVALID_CATEGORY_REMAP and not preserve_approved_category:
         remapped = INVALID_CATEGORY_REMAP[stored_cat]
         logger.warning(f"  [CAT] Remapping legacy invalid stored category {stored_cat} -> {remapped}")
         stored_cat = remapped
-    if stored_cat:
+    if stored_cat and not preserve_approved_category:
         canonical_cat, canonical_name = category_matcher.canonicalize_category(
             title_context,
             stored_cat,
             stored_cat_name,
             product.get('description', ''),
         )
-        if canonical_cat != stored_cat:
-            logger.warning(f"  [CAT] Canonicalizing stored category {stored_cat} -> {canonical_cat}")
-        stored_cat, stored_cat_name = canonical_cat, canonical_name
-    if stored_cat and not _is_sellable_leaf_category(oauth, stored_cat):
+        if canonical_cat and listing_category_rejection(canonical_cat):
+            logger.warning(
+                f"  [CAT] Canonical category {canonical_cat} is not a Motors tree-100 leaf; "
+                f"keeping stored {stored_cat}"
+            )
+        else:
+            if canonical_cat != stored_cat:
+                logger.warning(f"  [CAT] Canonicalizing stored category {stored_cat} -> {canonical_cat}")
+            stored_cat, stored_cat_name = canonical_cat, canonical_name
+    if stored_cat and not preserve_approved_category and not _is_sellable_leaf_category(oauth, stored_cat):
         logger.warning(f"  [CAT] Stored category {stored_cat} is not a sellable leaf in EBAY_US; ignoring stored category")
         stored_cat = None
         stored_cat_name = None
@@ -838,14 +897,17 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             api_cat_name,
             product.get('description', ''),
         )
-        if not _is_sellable_leaf_category(oauth, api_cat_id):
-            logger.warning(f"  [CAT] Auto category {api_cat_id} is not a sellable leaf in EBAY_US; ignoring auto category")
+        if listing_category_rejection(api_cat_id) or not _is_sellable_leaf_category(oauth, api_cat_id):
+            logger.warning(
+                f"  [CAT] Auto category {api_cat_id} is not a sellable Motors/US leaf; ignoring auto category"
+            )
             api_cat_id, api_cat_name = None, None
 
     protected_stored_categories = PROTECTED_STORED_CATEGORY_IDS
     stored_plausible = bool(
         stored_cat and (
-            stored_cat in protected_stored_categories
+            preserve_approved_category
+            or stored_cat in protected_stored_categories
             or category_matcher.is_category_plausible_for_text(title_context, stored_cat, stored_cat_name)
         )
     )
@@ -865,6 +927,9 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         if stored_cat in protected_stored_categories and api_cat_id and api_cat_id != stored_cat:
             completed_aspects = existing_aspects
             logger.warning(f"  [CAT] Preserving stored protected category {stored_cat}; ignoring fallback/API={api_cat_id}")
+        elif preserve_approved_category:
+            completed_aspects = existing_aspects
+            logger.info(f"  [CAT] Preserving human-approved category {stored_cat}")
         elif api_cat_id and api_cat_id != stored_cat:
             required_aspects, recommended_aspects = category_matcher._get_category_aspects(stored_cat)
             completed_aspects = category_matcher._complete_aspects(
@@ -907,14 +972,17 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         log=lambda message: logger.info(f"  {message}"),
     )
 
+    quality_listing = {
+        "title": title,
+        "description": description,
+        "categoryId": category_id,
+        "categoryName": category_name,
+        "aspects": completed_aspects,
+    }
+    if is_category_approved(opt, opt.get("categoryId")):
+        mark_category_approved(quality_listing, opt.get("categoryId"))
     quality_opt = _normalize_generated_listing(
-        {
-            "title": title,
-            "description": description,
-            "categoryId": category_id,
-            "categoryName": category_name,
-            "aspects": completed_aspects,
-        },
+        quality_listing,
         source_title=source_title or product.get('title', ''),
         source_description=product.get('description', ''),
         attributes=product.get('attributes', {}) or {},
@@ -955,9 +1023,22 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         for issue in compatibility.issues:
             logger.warning(f"  [COMPAT] {issue}")
 
+    category_rejection = listing_category_rejection(category_id)
+    if category_rejection:
+        record_error(sku, category_rejection)
+        return {"status": "error", "message": category_rejection}
+
     publish_blockers = []
     publish_blockers.extend(_measurement_validation_errors(completed_aspects))
-    publish_blockers.extend(_category_validation_errors(category_matcher, title_context, category_id, category_name))
+    publish_blockers.extend(
+        _category_validation_errors(
+            category_matcher,
+            title_context,
+            category_id,
+            category_name,
+            skip_canonicalize=preserve_approved_category,
+        )
+    )
     qc_candidate = {
         "title": title,
         "description": description,
@@ -965,6 +1046,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         "categoryName": category_name,
         "aspects": completed_aspects,
     }
+    if is_category_approved(opt, opt.get("categoryId")):
+        mark_category_approved(qc_candidate, opt.get("categoryId"))
     fs_conn = None
     try:
         fs_conn = sqlite3.connect(str(PROJECT_ROOT / "ebay_collection.db"), timeout=30)
@@ -1004,6 +1087,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         description=description,
         aspects=completed_aspects,
         compatibility=compatibility if compatibility.mode != "not_applicable" else None,
+        dry_run=dry_run,
     )
 
     logger.info(f"  Category: {category_id} ({category_name})")
@@ -1339,15 +1423,21 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                     if deleted:
                         logger.info(f"  [FIX] Deleted {deleted} stale offer(s) after category error")
 
-                    if category_id not in protected_stored_categories and not category_reselected:
+                    if (
+                        category_id not in protected_stored_categories
+                        and not category_reselected
+                        and should_auto_remap_invalid_category(
+                            opt, preserve=preserve_approved_category
+                        )
+                    ):
                         new_id, new_name, new_aspects = category_matcher.get_category_and_aspects(
                             title, completed_aspects, description
                         )
                         if new_id:
                             new_id = str(new_id).strip()
                             new_id = INVALID_CATEGORY_REMAP.get(new_id, new_id)
-                            if not _is_sellable_leaf_category(oauth, new_id):
-                                logger.warning(f"  [FIX] Auto reselected category {new_id} is not sellable leaf; keeping current category")
+                            if listing_category_rejection(new_id) or not _is_sellable_leaf_category(oauth, new_id):
+                                logger.warning(f"  [FIX] Auto reselected category {new_id} is not a sellable tree-100/US leaf; keeping current category")
                                 new_id = None
                         if new_id and new_id != category_id:
                             logger.info(f"  [FIX] Category {category_id} invalid, switching to API-suggested: {new_id} ({new_name})")

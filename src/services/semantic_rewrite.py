@@ -1970,7 +1970,9 @@ def apply_rewrite(ebay, conn, plan: RewritePlan, *, cli_apply: bool = False) -> 
         opt["description"] = description
         opt["aspects"] = aspects
         if category_id:
-            opt["categoryId"] = str(category_id)
+            from src.utils.approved_category import apply_live_category_readback
+
+            apply_live_category_readback(opt, str(category_id))
         logs = []
         if row and row.get("logs"):
             try:

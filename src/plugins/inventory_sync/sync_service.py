@@ -39,6 +39,33 @@ from src.utils.sold_through_relist import (
 )
 
 
+def pin_offer_category_fields(offer: dict) -> dict:
+    """Snapshot live offer category fields so sync PUTs cannot move taxonomy."""
+    listing = offer.get("listing") if isinstance(offer.get("listing"), dict) else {}
+    return {
+        "categoryId": offer.get("categoryId"),
+        "listing_categoryId": listing.get("categoryId") if listing else None,
+    }
+
+
+def apply_pinned_offer_category(offer: dict, pinned: dict | None) -> dict:
+    """Restore GET-time category fields onto an outgoing offer payload."""
+    if not isinstance(offer, dict) or not pinned:
+        return offer
+    if "categoryId" in pinned:
+        if pinned["categoryId"] is None:
+            offer.pop("categoryId", None)
+        else:
+            offer["categoryId"] = pinned["categoryId"]
+    listing = offer.get("listing")
+    if isinstance(listing, dict) and "listing_categoryId" in pinned:
+        if pinned["listing_categoryId"] is None:
+            listing.pop("categoryId", None)
+        else:
+            listing["categoryId"] = pinned["listing_categoryId"]
+    return offer
+
+
 def _env_int(name: str, default: int) -> int:
     value = os.getenv(name, "").strip()
     if not value:
@@ -906,7 +933,9 @@ class InventorySyncService:
         offer_ok = False
         if offer_id:
             try:
+                pinned_category = pin_offer_category_fields(offer)
                 offer['availableQuantity'] = quantity
+                apply_pinned_offer_category(offer, pinned_category)
                 put_offer = requests.put(
                     f"{base}/sell/inventory/v1/offer/{offer_id}",
                     headers=headers,
@@ -1036,9 +1065,11 @@ class InventorySyncService:
         
         offer = offers[0]
         offer_id = offer['offerId']
+        pinned_category = pin_offer_category_fields(offer)
         
         # 更新价格
         offer['pricingSummary']['price']['value'] = str(round(new_price, 2))
+        apply_pinned_offer_category(offer, pinned_category)
         
         url = f"https://api.ebay.com/sell/inventory/v1/offer/{offer_id}"
         resp = requests.put(url, headers=headers, json=offer, timeout=30, verify=False)
