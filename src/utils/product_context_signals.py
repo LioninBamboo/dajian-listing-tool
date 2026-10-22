@@ -182,6 +182,11 @@ def primary_product_noun(live_title: str, source_title: str = "") -> str | None:
             continue
         if has_compound_product_signal(core):
             return None
+        has_dining_chair = has_any_phrase(core, ("dining chair", "dining chairs"))
+        has_accent_chair = has_any_phrase(core, ("accent chair", "accent chairs"))
+        # Dining-chair copy that also stuffs "accent chairs" is uncertain — no remap.
+        if has_dining_chair and has_accent_chair:
+            return None
         # "Sofa with Storage Ottoman" is a sofa. A title whose head noun is the
         # ottoman/bench, with "sofa" only as stuffing, stays ottoman/bench.
         accessory_ottoman = re.search(

@@ -147,6 +147,15 @@ def test_dimension_units_are_not_count_claims():
     assert _count_claim_in_text(2, "bed", "Double Bed with Storage") is False
 
 
+def test_n_in_1_combo_is_unknown_count():
+    assert parse_noun_count("3-in-1 sofa bed", "sofa") is None
+    assert parse_noun_count("5 in 1 convertible tool", "tool") is None
+    assert parse_noun_count("4-in-1 ladder", "ladder") is None
+    assert _count_claim_in_text(1, "tool", "4-in-1 tool") is False
+    assert _count_claim_in_text(4, "tool", "4-in-1 tool") is False
+    assert _count_claim_in_text(3, "sofa", "3-in-1 sofa bed") is False
+
+
 def test_cached_sheet_one_without_text_corroboration_is_skipped():
     source = {"materials": [], "features": [], "counts": {"drawers": 3}, "capacity": None, "certifications": [], "dimensions": {}}
     live = dict(source, counts={"drawers": 1})

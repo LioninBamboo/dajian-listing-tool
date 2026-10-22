@@ -749,6 +749,9 @@ def parse_noun_count(text: str, noun: str) -> int | None:
     do not count as doors.
     """
     hay = str(text or "")
+    # "3-in-1" / "5 in 1" is a combo label, not a count of 3 or of 1.
+    n_in_1 = bool(re.search(r"\b\d+\s*-?\s*in\s*-?\s*1\b", hay, re.IGNORECASE))
+    hay = re.sub(r"\b\d+\s*-?\s*in\s*-?\s*1\b", " ", hay, flags=re.IGNORECASE)
     terms = _noun_count_terms(noun)
     if not hay or not terms:
         return None
@@ -770,6 +773,8 @@ def parse_noun_count(text: str, noun: str) -> int | None:
         if re.search(rf"\bof\b", between, re.IGNORECASE):
             continue
         if re.search(r"\bsided\b", between, re.IGNORECASE):
+            continue
+        if re.match(r"[\s\-–]*in[\s\-–]*1\b", between, re.IGNORECASE):
             continue
         values.append(int(match.group("n")))
 
@@ -842,6 +847,8 @@ def parse_noun_count(text: str, noun: str) -> int | None:
         singular_alt = "|".join(re.escape(term) for term in singulars)
         if re.search(rf"\bsided\s+(?:{singular_alt})\b", hay, re.IGNORECASE):
             return None
+        if n_in_1:
+            return None
         return 1
     return None
 
@@ -869,6 +876,7 @@ def _count_claim_in_text(count: int, noun: str, text: str) -> bool:
         return False
     terms = "|".join(re.escape(term) for term in synonyms)
     hay = str(text or "")
+    hay = re.sub(r"\b\d+\s*-?\s*in\s*-?\s*1\b", " ", hay, flags=re.IGNORECASE)
 
     def _non_count_gap(gap: str) -> bool:
         if re.search(rf"{_COUNT_DIMENSION_UNIT}\b", gap, re.IGNORECASE):

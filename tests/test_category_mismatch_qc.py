@@ -284,3 +284,139 @@ def test_approved_category_is_not_remapped(monkeypatch):
     )
     assert not any(issue.get("type") == "category_mismatch" for issue in issues)
     assert "categoryId" not in fixes
+
+
+def _matcher():
+    from src.services.ebay_category_matcher import EbayCategoryMatcher
+
+    class _Oauth:
+        def get_application_token(self):
+            return "offline"
+
+    return EbayCategoryMatcher(_Oauth())
+
+
+def _proposed_leaves(title, stored, description=""):
+    profile = classify_listing_profile(title, description, stored)
+    canon, _ = _matcher().canonicalize_category(title, stored, None, description)
+    return profile, canon
+
+
+STAY_ON_LEAF_CASES = (
+    (
+        "N762P455540D",
+        "Outdoor Dining Chairs Set of 2 – Acacia Patio Chairs",
+        "79684",
+        {"79684"},
+        {"54235"},
+    ),
+    (
+        "N762P455581D",
+        "Acacia Wood Outdoor Dining Chairs Set of 2",
+        "79684",
+        {"79684"},
+        {"54235"},
+    ),
+    (
+        "N704P417249L",
+        "Set of 2 Outdoor Acacia Wood Dining Chairs",
+        "79684",
+        {"79684"},
+        {"54235"},
+    ),
+    (
+        "N768P516661D",
+        "Clementine Outdoor Dining Chairs Set of 2 PE Wicker",
+        "79684",
+        {"79684"},
+        {"54235"},
+    ),
+    (
+        "N770P269704G",
+        "Acacia Wood Outdoor Dining Chair with Rope Armrests",
+        "79684",
+        {"79684"},
+        {"54235"},
+    ),
+    (
+        "N770P290585B",
+        "Outdoor Dining Chairs Set of 2 – Rope & Metal Patio",
+        "79684",
+        {"79684"},
+        {"54235"},
+    ),
+    (
+        "W2105P540786",
+        "Velvet Dining Chairs Set of 2 Upholstered Accent Chairs",
+        "54235",
+        {"54235"},
+        {"38208", "79684"},
+    ),
+    (
+        "N770P358870T",
+        "Acacia Wood Outdoor Dining Table",
+        "107578",
+        {"107578", "112590"},
+        {"38200", "38204"},
+    ),
+    (
+        "N770P200252C",
+        "Outdoor Side Table Cube Patio End Table",
+        "112590",
+        {"112590", "107578"},
+        {"38200", "38204"},
+    ),
+    (
+        "N770P313252G",
+        "Acacia Round Outdoor Side Table Patio",
+        "112590",
+        {"112590", "107578"},
+        {"38200", "38204"},
+    ),
+    (
+        "N711P541930A",
+        "Outdoor Side Table, Faux Marble",
+        "38204",
+        {"38204", "112590"},
+        {"38200"},
+    ),
+    (
+        "W3098P470275",
+        "Upholstered Storage Bench, Bed End Foot",
+        "20490",
+        {"20490"},
+        {"262980", "38208"},
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "sku,title,stored,allowed,forbidden",
+    STAY_ON_LEAF_CASES,
+    ids=[row[0] for row in STAY_ON_LEAF_CASES],
+)
+def test_replay_wrong_remaps_stay_on_stored_or_outdoor_leaf(sku, title, stored, allowed, forbidden):
+    profile, canon = _proposed_leaves(title, stored)
+    if profile.category_id:
+        assert profile.category_id in allowed, (sku, profile.kind, profile.category_id)
+        assert profile.category_id not in forbidden
+    assert canon in allowed or canon in {None, stored}
+    assert canon not in forbidden
+
+
+def test_w5368_indoor_side_end_table_still_remaps_off_nightstand():
+    title = "Modern Wood Side Table End Table with Storage Shelf for Living Room"
+    profile, canon = _proposed_leaves(title, "38199")
+    assert profile.kind == "side_table"
+    assert profile.category_id == "38200"
+    assert canon in {None, "38199", "38200"}
+    assert canon != "38199" or profile.category_id == "38200"
+
+
+def test_w2105_accent_armchair_still_remaps_off_dining_chairs():
+    title = "Velvet Accent Chair Armchair, Modern High Back Living Room Chair"
+    profile, canon = _proposed_leaves(title, "54235")
+    assert profile.kind == "armchair"
+    assert profile.category_id == "38208"
+    assert canon in {None, "54235", "38208"}
+    assert "38208" in {profile.category_id, canon}
