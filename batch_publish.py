@@ -1431,6 +1431,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                         category_id not in protected_stored_categories
                         and not category_reselected
                         and not preserve_approved_category
+                        and not blocks_automated_category_change(opt)
                     ):
                         new_id, new_name, new_aspects = category_matcher.get_category_and_aspects(
                             title, completed_aspects, description

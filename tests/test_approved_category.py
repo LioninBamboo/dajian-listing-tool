@@ -381,3 +381,98 @@ def test_publish_rule_blank_or_mismatched_lock_fails_closed():
     decision = evaluate_approved_category(COOKWARE_LEAF, mismatched)
     assert decision.preserve is False
     assert blocks_automated_category_change(mismatched) is True
+
+
+def test_normalize_pin_mismatch_does_not_remap():
+    """Flag + pin/current mismatch must keep the stored leaf, not follow rematch."""
+    opt = _cookware_opt(approved=True, pinned=COLLECTIBLES, category_id=COOKWARE_LEAF)
+    out = normalize_generated_listing(
+        opt,
+        source_title=opt["title"],
+        source_description=opt["description"],
+        category_matcher=_RemapMatcher(),
+    )
+    assert out["categoryId"] == COOKWARE_LEAF
+
+
+def test_json_string_optimization_is_treated_as_locked():
+    payload = json.dumps(_cookware_opt(approved=True))
+    assert blocks_automated_category_change(payload) is True
+    assert is_category_approved(payload) is True
+    assert blocks_automated_category_change("{not-json") is False
+    assert blocks_automated_category_change(None) is False
+
+
+def test_stringy_true_flag_blocks_and_legacy_rows_without_fields_do_not():
+    stringy = {"categoryId": COOKWARE_LEAF, CATEGORY_APPROVED_KEY: "true"}
+    assert blocks_automated_category_change(stringy) is True
+    assert is_category_approved(stringy) is True
+
+    yes_flag = {"categoryId": COOKWARE_LEAF, CATEGORY_APPROVED_KEY: "yes"}
+    assert blocks_automated_category_change(yes_flag) is True
+
+    legacy_missing = {"categoryId": COOKWARE_LEAF, "title": "pre-lock GP row"}
+    assert CATEGORY_APPROVED_KEY not in legacy_missing
+    assert CATEGORY_APPROVED_ID_KEY not in legacy_missing
+    assert blocks_automated_category_change(legacy_missing) is False
+    assert is_category_approved(legacy_missing) is False
+
+
+def test_publisher_blank_lock_does_not_follow_suggested_id():
+    import logging
+
+    from src.services.ebay_publisher import EbayPublisher
+
+    pub = object.__new__(EbayPublisher)
+    pub.logger = logging.getLogger("test-category-lock")
+
+    def _must_not_complete(*_a, **_k):
+        raise AssertionError("locked blank category must not rematch or complete aspects")
+
+    pub._ensure_required_aspects = _must_not_complete
+    product = {
+        "optimization": {CATEGORY_APPROVED_KEY: True, "categoryId": ""},
+    }
+    cat_id, _name, aspects = EbayPublisher._get_category_and_aspects(
+        pub,
+        "Pre-Seasoned Cast Iron Dutch Oven",
+        {"Brand": ["GrovePop"]},
+        product,
+        suggested_id=COLLECTIBLES,
+    )
+    assert cat_id == ""
+    assert aspects == {"Brand": ["GrovePop"]}
+
+
+def test_publisher_json_string_optimization_keeps_locked_leaf():
+    import logging
+
+    from src.services.ebay_publisher import EbayPublisher
+
+    pub = object.__new__(EbayPublisher)
+    pub.logger = logging.getLogger("test-category-lock")
+    pub._ensure_required_aspects = lambda *_a, **_k: {"Brand": ["GrovePop"]}
+    product = {"optimization": json.dumps(_cookware_opt(approved=True))}
+    cat_id, _name, _aspects = EbayPublisher._get_category_and_aspects(
+        pub,
+        "Pre-Seasoned Cast Iron Dutch Oven",
+        {"Brand": ["GrovePop"]},
+        product,
+        suggested_id=COLLECTIBLES,
+    )
+    assert cat_id == COOKWARE_LEAF
+
+
+def test_inventory_pin_missing_category_does_not_invent_a_leaf():
+    live = {
+        "offerId": "off-2",
+        "listing": {"listingStatus": "ACTIVE"},
+        "pricingSummary": {"price": {"value": "49.00"}},
+        "availableQuantity": 0,
+    }
+    pinned = pin_offer_category_fields(live)
+    live["categoryId"] = COLLECTIBLES
+    live["listing"]["categoryId"] = COLLECTIBLES
+    apply_pinned_offer_category(live, pinned)
+    assert "categoryId" not in live
+    assert "categoryId" not in live["listing"]

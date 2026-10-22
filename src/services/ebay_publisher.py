@@ -1611,12 +1611,18 @@ class EbayPublisher:
         from src.utils.approved_category import blocks_automated_category_change
 
         if blocks_automated_category_change(opt):
-            locked_id = str(opt.get("categoryId") or suggested_id or "").strip()
+            # Fail closed: never inherit suggested_id / rematch when the flag is
+            # set. A blank or invalid stored leaf must not publish a new leaf.
+            locked_id = str(opt.get("categoryId") or "").strip()
             if locked_id:
                 self.logger.info(f"[CATEGORY] Preserving locked category {locked_id}")
                 cat_name = str(opt.get("categoryName") or f"Category {locked_id}")
                 aspects = self._ensure_required_aspects(locked_id, existing_aspects, title, product)
                 return locked_id, cat_name, aspects
+            self.logger.warning(
+                "[CATEGORY] lock set but categoryId is blank; refusing rematch"
+            )
+            return "", str(opt.get("categoryName") or ""), existing_aspects
 
         # Collect all known category IDs from our verified maps
         known_ids = set(self.CATEGORY_REQUIRED_ASPECTS.keys())

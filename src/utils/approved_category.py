@@ -50,33 +50,49 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BLACKLIST = Path("data/config/high_fee_category_blacklist.json")
 
 
+def _as_optimization(optimization: Any) -> Mapping[str, Any] | None:
+    """Accept a dict or a JSON object string (SQLite / publisher payload)."""
+    if isinstance(optimization, Mapping):
+        return optimization
+    if isinstance(optimization, str) and optimization.strip():
+        try:
+            data = json.loads(optimization)
+        except ValueError:
+            return None
+        return data if isinstance(data, Mapping) else None
+    return None
+
+
 def is_valid_category_id(category_id: str | None) -> bool:
     cid = str(category_id or "").strip()
     return bool(cid) and cid.isdigit()
 
 
 def approved_category_id(optimization: Mapping[str, Any] | None) -> str:
-    if not isinstance(optimization, Mapping):
+    opt = _as_optimization(optimization)
+    if opt is None:
         return ""
-    return str(optimization.get(CATEGORY_APPROVED_ID_KEY) or "").strip()
+    return str(opt.get(CATEGORY_APPROVED_ID_KEY) or "").strip()
 
 
 def category_approval_flag_set(optimization: Mapping[str, Any] | None) -> bool:
     """True when an operator stamped the approval flag, even if the pin is bad."""
-    if not isinstance(optimization, Mapping):
+    opt = _as_optimization(optimization)
+    if opt is None:
         return False
-    return optimization.get(CATEGORY_APPROVED_KEY) in _TRUTHY
+    return opt.get(CATEGORY_APPROVED_KEY) in _TRUTHY
 
 
 def is_category_approved(
     optimization: Mapping[str, Any] | None,
     category_id: str | None = None,
 ) -> bool:
-    if not category_approval_flag_set(optimization):
+    opt = _as_optimization(optimization)
+    if opt is None or not category_approval_flag_set(opt):
         return False
 
-    current = str(category_id or (optimization or {}).get("categoryId") or "").strip()
-    pinned = approved_category_id(optimization)
+    current = str(category_id or opt.get("categoryId") or "").strip()
+    pinned = approved_category_id(opt)
     if not pinned:
         # Legacy flag-only rows: honor the current leaf, but do not write.
         return bool(current)
@@ -128,7 +144,7 @@ def backfill_approved_category_id(
     """Persist ``categoryApprovedId`` for a legacy flag-only row."""
     if not isinstance(optimization, dict):
         return ""
-    if optimization.get(CATEGORY_APPROVED_KEY) not in _TRUTHY:
+    if not category_approval_flag_set(optimization):
         return ""
     pinned = approved_category_id(optimization)
     if pinned:

@@ -24,7 +24,7 @@ from src.utils.product_context_signals import (
     outdoor_context as strict_outdoor_context,
 )
 from src.utils.publish_aspect_completion import infer_number_of_items_in_set
-from src.utils.approved_category import is_category_approved
+from src.utils.approved_category import blocks_automated_category_change
 from src.utils.publish_autofix import sanitize_placeholder_aspects, sanitize_single_value_aspects
 from src.utils.publish_validation import (
     REQUIRED_MEASUREMENT_ASPECT_KEYS,
@@ -2037,7 +2037,7 @@ def normalize_generated_listing(
 
     title_context = " ".join(part for part in (source_title, opt.get("title")) if part).strip()
     profile = classify_listing_profile(title_context or opt.get("title", ""), opt.get("description", ""), opt.get("categoryId", ""))
-    preserve_category = is_category_approved(opt)
+    preserve_category = blocks_automated_category_change(opt)
 
     if category_matcher and opt.get("categoryId") and not preserve_category:
         category_id, category_name = category_matcher.canonicalize_category(
@@ -2892,7 +2892,7 @@ def validate_listing_quality(
         )
 
     category_id = str(opt.get("categoryId") or "").strip()
-    preserve_category = is_category_approved(opt)
+    preserve_category = blocks_automated_category_change(opt)
     profile = classify_listing_profile(" ".join(part for part in (source_title, title) if part), description, category_id)
     if not preserve_category and profile.category_id and category_id != profile.category_id:
         issues.append(
