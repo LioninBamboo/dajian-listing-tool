@@ -41,6 +41,7 @@ from src.utils.approved_category import (
     is_category_approved,
     locked_category_write_error,
     mark_category_approved,
+    plan_locked_override_revision,
     should_auto_remap_invalid_category,
 )
 from src.utils.listing_quality_gate import (
@@ -391,6 +392,173 @@ def test_repair_taxonomy_marks_locked_action(monkeypatch):
     )
     candidate = repair_published_taxonomy.audit_candidate(product_row, _RemapMatcher(), client=None)
     assert candidate["action"] == "LOCKED"
+    assert candidate["target_category_id"] == COOKWARE_LEAF
+    assert candidate["override_action"] == "SKIP"
+    assert "already equals approved leaf" in candidate["override_reason"]
+
+
+def _repair_row(*, approved: bool, pinned=COOKWARE_LEAF, category_id=COOKWARE_LEAF):
+    return {
+        "sku": GP_COOKWARE_SKU,
+        "listing_id": "123",
+        "title": "Cast Iron Dutch Oven",
+        "description": "cast iron",
+        "optimization": _cookware_opt(approved=approved, pinned=pinned, category_id=category_id),
+        "attributes": {},
+        "specs": {},
+        "images": [],
+    }
+
+
+def test_repair_override_skips_locked_row_when_live_equals_approved(monkeypatch):
+    monkeypatch.setattr(
+        repair_published_taxonomy,
+        "get_live_offer_info",
+        lambda _client, _sku: {
+            "offer_id": "off-1",
+            "live_category_id": COOKWARE_LEAF,
+            "live_category_name": "Other Cookware",
+        },
+    )
+    candidate = repair_published_taxonomy.audit_candidate(
+        _repair_row(approved=True),
+        _RemapMatcher(),
+        client=None,
+        override_category_lock=True,
+    )
+    assert candidate["action"] == "SKIP"
+    assert candidate["target_category_id"] == COOKWARE_LEAF
+    assert candidate["target_category_id"] != COLLECTIBLES
+
+
+def test_repair_override_revises_locked_row_to_approved_leaf_not_matcher(monkeypatch):
+    monkeypatch.setattr(
+        repair_published_taxonomy,
+        "get_live_offer_info",
+        lambda _client, _sku: {
+            "offer_id": "off-1",
+            "live_category_id": COLLECTIBLES,
+            "live_category_name": "Collectibles",
+        },
+    )
+    candidate = repair_published_taxonomy.audit_candidate(
+        _repair_row(approved=True),
+        _RemapMatcher(),
+        client=None,
+        override_category_lock=True,
+    )
+    assert candidate["action"] == "REVISE_LIVE"
+    assert candidate["target_category_id"] == COOKWARE_LEAF
+    assert candidate["target_category_id"] != COLLECTIBLES
+    assert candidate["completed_aspects"] == _cookware_opt(approved=True)["aspects"]
+
+
+def test_repair_unlocked_rows_still_follow_matcher(monkeypatch):
+    monkeypatch.setattr(
+        repair_published_taxonomy,
+        "get_live_offer_info",
+        lambda _client, _sku: {
+            "offer_id": "off-1",
+            "live_category_id": COOKWARE_LEAF,
+            "live_category_name": "Other Cookware",
+        },
+    )
+    candidate = repair_published_taxonomy.audit_candidate(
+        _repair_row(approved=False),
+        _RemapMatcher(),
+        client=None,
+        override_category_lock=True,
+    )
+    assert candidate["action"] == "REVISE_LIVE"
+    assert candidate["target_category_id"] == COLLECTIBLES
+    assert candidate["override_action"] is None
+
+
+def test_repair_override_blank_pin_skips_without_explicit_target(monkeypatch):
+    monkeypatch.setattr(
+        repair_published_taxonomy,
+        "get_live_offer_info",
+        lambda _client, _sku: {
+            "offer_id": "off-1",
+            "live_category_id": COLLECTIBLES,
+            "live_category_name": "Collectibles",
+        },
+    )
+    row = _repair_row(approved=True, pinned="", category_id="")
+    row["optimization"]["categoryId"] = ""
+    candidate = repair_published_taxonomy.audit_candidate(
+        row,
+        _RemapMatcher(),
+        client=None,
+        override_category_lock=True,
+    )
+    assert candidate["action"] == "SKIP"
+    assert not candidate["target_category_id"]
+    assert "no categoryApprovedId" in candidate["override_reason"]
+
+
+def test_repair_override_explicit_target_restores_approved_leaf(monkeypatch):
+    monkeypatch.setattr(
+        repair_published_taxonomy,
+        "get_live_offer_info",
+        lambda _client, _sku: {
+            "offer_id": "off-1",
+            "live_category_id": COLLECTIBLES,
+            "live_category_name": "Collectibles",
+        },
+    )
+    row = _repair_row(approved=True, pinned="", category_id="")
+    row["optimization"]["categoryId"] = ""
+    candidate = repair_published_taxonomy.audit_candidate(
+        row,
+        _RemapMatcher(),
+        client=None,
+        override_category_lock=True,
+        explicit_targets={GP_COOKWARE_SKU: COOKWARE_LEAF},
+    )
+    assert candidate["action"] == "REVISE_LIVE"
+    assert candidate["target_category_id"] == COOKWARE_LEAF
+
+
+def test_repair_dry_run_shows_override_plan_without_apply_flag(monkeypatch):
+    monkeypatch.setattr(
+        repair_published_taxonomy,
+        "get_live_offer_info",
+        lambda _client, _sku: {
+            "offer_id": "off-1",
+            "live_category_id": COLLECTIBLES,
+            "live_category_name": "Collectibles",
+        },
+    )
+    candidate = repair_published_taxonomy.audit_candidate(
+        _repair_row(approved=True),
+        _RemapMatcher(),
+        client=None,
+        override_category_lock=False,
+    )
+    assert candidate["action"] == "LOCKED"
+    assert candidate["override_action"] == "REVISE_LIVE"
+    assert candidate["target_category_id"] == COOKWARE_LEAF
+    assert COLLECTIBLES not in (candidate["target_category_id"],)
+
+
+def test_plan_locked_override_and_explicit_target_parse():
+    locked = _cookware_opt(approved=True)
+    assert plan_locked_override_revision(locked, COOKWARE_LEAF)["action"] == "SKIP"
+    drifted = plan_locked_override_revision(locked, COLLECTIBLES)
+    assert drifted["action"] == "REVISE_LIVE"
+    assert drifted["target_id"] == COOKWARE_LEAF
+    blank = plan_locked_override_revision({CATEGORY_APPROVED_KEY: True}, COLLECTIBLES)
+    assert blank["action"] == "SKIP"
+    explicit = plan_locked_override_revision(
+        {CATEGORY_APPROVED_KEY: True}, COLLECTIBLES, explicit_target_id=COOKWARE_LEAF
+    )
+    assert explicit["action"] == "REVISE_LIVE"
+    assert explicit["target_id"] == COOKWARE_LEAF
+    parsed = repair_published_taxonomy.parse_explicit_targets([f"{GP_COOKWARE_SKU}={COOKWARE_LEAF}"])
+    assert parsed == {GP_COOKWARE_SKU: COOKWARE_LEAF}
+    with pytest.raises(ValueError):
+        repair_published_taxonomy.parse_explicit_targets(["no-equals"])
 
 
 def test_evaluate_preserves_numeric_cookware_leaf_without_main_cache():

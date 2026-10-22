@@ -26,8 +26,10 @@ from src.services.ebay_category_matcher import create_category_matcher  # noqa: 
 from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP  # noqa: E402
 from src.utils.dimension_helpers import build_package_weight_and_size  # noqa: E402
 from src.utils.approved_category import (  # noqa: E402
+    approved_category_id,
     blocks_automated_category_change,
     locked_category_write_error,
+    plan_locked_override_revision,
 )
 from src.utils.publish_validation import (  # noqa: E402
     category_validation_errors,
@@ -124,6 +126,22 @@ def compute_target(match_row: dict, matcher):
     return title, description, aspects, target_id, target_name, completed_aspects
 
 
+def parse_explicit_targets(values: list[str] | None) -> dict[str, str]:
+    """Parse repeatable ``SKU=categoryId`` override targets."""
+    targets: dict[str, str] = {}
+    for raw in values or []:
+        text = str(raw or "").strip()
+        if not text or "=" not in text:
+            raise ValueError(f"invalid --target-category {raw!r}; expected SKU=categoryId")
+        sku, category_id = text.split("=", 1)
+        sku = sku.strip()
+        category_id = str(category_id or "").strip()
+        if not sku or not category_id:
+            raise ValueError(f"invalid --target-category {raw!r}; expected SKU=categoryId")
+        targets[sku] = category_id
+    return targets
+
+
 def parse_row(row: sqlite3.Row) -> dict:
     data = dict(row)
     for field in ("optimization", "images", "specs", "attributes", "videos", "cost_breakdown", "logs"):
@@ -188,9 +206,18 @@ def prepare_inventory_payload(product_row: dict, description: str, aspects: dict
     return payload
 
 
-def audit_candidate(product_row: dict, matcher, client):
+def audit_candidate(
+    product_row: dict,
+    matcher,
+    client,
+    *,
+    override_category_lock: bool = False,
+    explicit_targets: dict[str, str] | None = None,
+):
     opt = product_row["optimization"]
-    title, description, existing_aspects, target_id, target_name, completed_aspects = compute_target(product_row, matcher)
+    title, description, existing_aspects, matcher_id, matcher_name, matcher_aspects = compute_target(
+        product_row, matcher
+    )
     live_info = get_live_offer_info(client, product_row["sku"])
     local_category_id = normalize_category_id(opt.get("categoryId"))
     local_category_name = opt.get("categoryName")
@@ -212,37 +239,62 @@ def audit_candidate(product_row: dict, matcher, client):
         and matcher.is_category_plausible_for_text(title, live_category_id, live_category_name)
     )
 
-    final_category_id = target_id
-    final_category_name = target_name
-    live_matches_target = bool(target_id and live_category_id == target_id)
-    live_canonical_matches_target = bool(target_id and canonical_live_category_id == target_id)
-    needs_live_revision = bool(
-        target_id
-        and live_category_id
-        and live_category_id != target_id
-        and (live_canonical_matches_target or not live_plausible)
-    )
-    if live_category_id and live_plausible and live_category_id != target_id and not needs_live_revision:
-        final_category_id = live_category_id
-        final_category_name = live_category_name or target_name
-    elif live_matches_target:
-        final_category_id = live_category_id
-        final_category_name = live_category_name or target_name
+    locked = blocks_automated_category_change(opt)
+    explicit_target = (explicit_targets or {}).get(product_row["sku"])
+    override_plan = plan_locked_override_revision(
+        opt,
+        live_category_id,
+        explicit_target_id=explicit_target,
+    ) if locked else {"action": "", "target_id": "", "reason": ""}
 
-    needs_db_sync = bool(
-        final_category_id and (
-            local_category_id != final_category_id
-            or (final_category_name and local_category_name != final_category_name)
-        )
-    )
-
-    action = "OK"
-    if blocks_automated_category_change(opt):
+    if locked:
+        # Never use a fresh matcher rematch for locked rows.
+        target_id = override_plan["target_id"] or None
+        if target_id and str(opt.get("categoryId") or "").strip() == target_id:
+            target_name = local_category_name or f"Category {target_id}"
+        elif target_id:
+            target_name = f"Category {target_id}"
+        else:
+            target_name = None
+        completed_aspects = existing_aspects
+        final_category_id = target_id or live_category_id or local_category_id
+        final_category_name = target_name or live_category_name or local_category_name
+        needs_live_revision = override_plan["action"] == "REVISE_LIVE"
+        needs_db_sync = False
         action = "LOCKED"
-    elif needs_live_revision:
-        action = "REVISE_LIVE"
-    elif needs_db_sync:
-        action = "SYNC_DB"
+        if override_category_lock:
+            action = override_plan["action"]
+    else:
+        target_id = matcher_id
+        target_name = matcher_name
+        completed_aspects = matcher_aspects
+        final_category_id = target_id
+        final_category_name = target_name
+        live_matches_target = bool(target_id and live_category_id == target_id)
+        live_canonical_matches_target = bool(target_id and canonical_live_category_id == target_id)
+        needs_live_revision = bool(
+            target_id
+            and live_category_id
+            and live_category_id != target_id
+            and (live_canonical_matches_target or not live_plausible)
+        )
+        if live_category_id and live_plausible and live_category_id != target_id and not needs_live_revision:
+            final_category_id = live_category_id
+            final_category_name = live_category_name or target_name
+        elif live_matches_target:
+            final_category_id = live_category_id
+            final_category_name = live_category_name or target_name
+        needs_db_sync = bool(
+            final_category_id and (
+                local_category_id != final_category_id
+                or (final_category_name and local_category_name != final_category_name)
+            )
+        )
+        action = "OK"
+        if needs_live_revision:
+            action = "REVISE_LIVE"
+        elif needs_db_sync:
+            action = "SYNC_DB"
 
     return {
         "sku": product_row["sku"],
@@ -263,6 +315,10 @@ def audit_candidate(product_row: dict, matcher, client):
         "live_plausible": live_plausible,
         "final_category_id": final_category_id,
         "final_category_name": final_category_name,
+        "approved_category_id": approved_category_id(opt),
+        "override_action": override_plan["action"] or None,
+        "override_reason": override_plan["reason"] or None,
+        "skip_canonicalize": locked,
         "action": action,
     }
 
@@ -295,7 +351,15 @@ def apply_live_revision(
     title_context = " ".join(part for part in ((product_row.get("title") or "").strip(), candidate["title"]) if part).strip()
     blockers = []
     blockers.extend(measurement_validation_errors(final_aspects))
-    blockers.extend(category_validation_errors(matcher, title_context, candidate["target_category_id"], candidate["target_category_name"]))
+    blockers.extend(
+        category_validation_errors(
+            matcher,
+            title_context,
+            candidate["target_category_id"],
+            candidate["target_category_name"],
+            skip_canonicalize=bool(candidate.get("skip_canonicalize")),
+        )
+    )
     if blockers:
         raise RuntimeError("; ".join(blockers))
 
@@ -372,7 +436,18 @@ def main():
         action="store_true",
         help="Allow revising a listing whose optimization.categoryApproved flag is set",
     )
+    parser.add_argument(
+        "--target-category",
+        action="append",
+        default=[],
+        metavar="SKU=ID",
+        help="Explicit per-SKU lock override target (repeatable). Never inferred from the matcher.",
+    )
     args = parser.parse_args()
+    try:
+        explicit_targets = parse_explicit_targets(args.target_category)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     conn = sqlite3.connect(str(ROOT / "ebay_collection.db"), timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -386,10 +461,16 @@ def main():
 
     logger.info("Published taxonomy repair scan: %s candidates", len(rows))
     for row in rows:
-        candidate = audit_candidate(row, matcher, client)
+        candidate = audit_candidate(
+            row,
+            matcher,
+            client,
+            override_category_lock=args.override_category_lock,
+            explicit_targets=explicit_targets,
+        )
         results.append(candidate)
         logger.info(
-            "%s | action=%s | local=%s/%s | live=%s/%s | target=%s/%s",
+            "%s | action=%s | local=%s/%s | live=%s/%s | target=%s/%s | override=%s (%s)",
             candidate["sku"],
             candidate["action"],
             candidate["local_category_id"],
@@ -398,6 +479,8 @@ def main():
             candidate["live_category_name"],
             candidate["target_category_id"],
             candidate["target_category_name"],
+            candidate.get("override_action") or "-",
+            candidate.get("override_reason") or "n/a",
         )
 
     applied = []
@@ -415,17 +498,12 @@ def main():
                             override_category_lock=args.override_category_lock,
                         )
                     )
-                elif candidate["action"] == "LOCKED" and args.override_category_lock:
-                    applied.append(
-                        apply_live_revision(
-                            conn,
-                            matcher,
-                            client,
-                            row,
-                            candidate,
-                            override_category_lock=True,
-                        )
-                    )
+                elif candidate["action"] == "SKIP":
+                    applied.append({
+                        "sku": candidate["sku"],
+                        "action": "SKIP",
+                        "message": candidate.get("override_reason") or "skipped locked listing",
+                    })
                 elif candidate["action"] == "SYNC_DB":
                     applied.append(
                         apply_db_sync(

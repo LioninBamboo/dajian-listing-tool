@@ -75,6 +75,39 @@ def approved_category_id(optimization: Mapping[str, Any] | None) -> str:
     return str(opt.get(CATEGORY_APPROVED_ID_KEY) or "").strip()
 
 
+def plan_locked_override_revision(
+    optimization: Mapping[str, Any] | None,
+    live_category_id: str | None,
+    *,
+    explicit_target_id: str | None = None,
+) -> dict[str, str]:
+    """What ``--override-category-lock`` may do to a locked listing.
+
+    Target is the operator's explicit per-SKU id, else ``categoryApprovedId``.
+    Never a matcher rematch. Skip when live already equals that leaf, or when
+    no approved / explicit target exists.
+    """
+    target = str(explicit_target_id or approved_category_id(optimization) or "").strip()
+    live = str(live_category_id or "").strip()
+    if not target:
+        return {
+            "action": "SKIP",
+            "target_id": "",
+            "reason": "locked with no categoryApprovedId and no explicit --target-category",
+        }
+    if live == target:
+        return {
+            "action": "SKIP",
+            "target_id": target,
+            "reason": f"live {live} already equals approved leaf {target}",
+        }
+    return {
+        "action": "REVISE_LIVE",
+        "target_id": target,
+        "reason": f"restore approved leaf {target} (live={live or 'blank'})",
+    }
+
+
 def category_approval_flag_set(optimization: Mapping[str, Any] | None) -> bool:
     """True when an operator stamped the approval flag, even if the pin is bad."""
     opt = _as_optimization(optimization)
