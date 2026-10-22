@@ -22,10 +22,10 @@ index 0000000..cf0ce9a
 +    - ops_daily
 +    - order_recheck
 diff --git a/scheduler_daemon.py b/scheduler_daemon.py
-index 907ce43..94f2db6 100644
+index 907ce43..f3df6c8 100644
 --- a/scheduler_daemon.py
 +++ b/scheduler_daemon.py
-@@ -223,11 +223,20 @@ def acquire_lock():
+@@ -223,11 +223,25 @@ def acquire_lock():
  
  
  def _scheduler_profile_name() -> str:
@@ -38,17 +38,22 @@ index 907ce43..94f2db6 100644
  
  def _is_ops_scheduler() -> bool:
 -    return _scheduler_profile_name() == 'ops'
++    """Trust a successfully loaded profile; peek YAML only when load fails.
++
++    A leftover GrovePop ``scheduler_profile: ops`` in STORE_PROFILE_PATH /
++    store_profile.local.yaml must not shrink a Main full/daily cadence that
++    already loaded cleanly.
++    """
 +    try:
-+        if get_store_profile().is_ops_scheduler:
-+            return True
++        profile = get_store_profile()
 +    except Exception:
-+        pass
-+    from src.utils.store_profile import peek_yaml_says_ops
-+    return peek_yaml_says_ops()
++        from src.utils.store_profile import peek_yaml_says_ops
++        return peek_yaml_says_ops()
++    return bool(getattr(profile, 'is_ops_scheduler', False))
  
  
  def _ops_qc_autofix_enabled() -> bool:
-@@ -244,6 +253,43 @@ def _ops_ads_enabled() -> bool:
+@@ -244,6 +258,43 @@ def _ops_ads_enabled() -> bool:
          return False
  
  
@@ -92,7 +97,7 @@ index 907ce43..94f2db6 100644
  def release_lock():
      """释放 PID 锁和 mutex"""
      global _mutex_handle
-@@ -506,6 +552,9 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
+@@ -506,6 +557,9 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
      - 超时自动杀死
      - 返回 (success, message)
      """
@@ -102,7 +107,7 @@ index 907ce43..94f2db6 100644
      cmd_str = ' '.join(cmd_args)
      logger.info(f"{'='*50}")
      logger.info(f"▶ 启动任务: {task_name}")
-@@ -1784,50 +1833,149 @@ def setup_schedule():
+@@ -1784,50 +1838,149 @@ def setup_schedule():
          _setup_schedule_full()
  
  
@@ -290,7 +295,7 @@ index 907ce43..94f2db6 100644
  
  
  def _setup_schedule_full():
-@@ -2005,8 +2153,14 @@ def run_once():
+@@ -2005,8 +2158,14 @@ def run_once():
      logger.info("立即执行全部任务 (--once 模式)")
      logger.info("=" * 60)
  
@@ -307,7 +312,7 @@ index 907ce43..94f2db6 100644
  
      logger.info("全部任务执行完毕")
  
-@@ -2034,6 +2188,9 @@ def recover_missed_tasks(log_when_clean=True):
+@@ -2034,6 +2193,9 @@ def recover_missed_tasks(log_when_clean=True):
  
          for config in ordered_tasks:
              task_name = str(config['name'])
@@ -317,7 +322,7 @@ index 907ce43..94f2db6 100644
              weekday = config.get('weekday')
              if weekday is not None and now.weekday() != int(weekday):
                  continue
-@@ -2112,6 +2269,8 @@ def _get_critical_recovery_tasks():
+@@ -2112,6 +2274,8 @@ def _get_critical_recovery_tasks():
                  'priority': 20,
              },
          ]
@@ -326,7 +331,7 @@ index 907ce43..94f2db6 100644
          if _ops_ads_enabled():
              tasks.extend(
                  [
-@@ -2173,7 +2332,7 @@ def _get_critical_recovery_tasks():
+@@ -2173,7 +2337,7 @@ def _get_critical_recovery_tasks():
                      },
                  ]
              )
@@ -335,7 +340,7 @@ index 907ce43..94f2db6 100644
  
      tasks = [
              {
-@@ -2620,6 +2779,17 @@ def main():
+@@ -2620,6 +2784,17 @@ def main():
              'giga_dropship_push': task_giga_dropship_push,
              'giga_dropship_sync': task_giga_dropship_sync,
          }
@@ -545,7 +550,7 @@ index 008e569..443a3d5 100644
      def test_main_store_return_policy_is_buyer_paid_everywhere(self):
          # The Motors seller-paid return is auto-parts-only. With no Motors return
 diff --git a/tests/test_scheduler_profile_ops.py b/tests/test_scheduler_profile_ops.py
-index a59d1b9..5ee0085 100644
+index a59d1b9..9355758 100644
 --- a/tests/test_scheduler_profile_ops.py
 +++ b/tests/test_scheduler_profile_ops.py
 @@ -1,4 +1,5 @@
@@ -554,7 +559,53 @@ index a59d1b9..5ee0085 100644
  from pathlib import Path
  
  import pytest
-@@ -96,3 +97,191 @@ def test_ops_task_daily_full_dispatches_to_ops_only(monkeypatch):
+@@ -38,10 +39,44 @@ def test_ops_profile_registers_only_inventory_and_order_recheck(monkeypatch):
+     assert frozenset({"recurring", "order_recheck"}) in tags
+ 
+ 
+-def test_full_profile_registers_cro_and_mi_tasks(monkeypatch):
++def _isolate_profile_paths(tmp_path, monkeypatch, *, env_text=None, local_text=None, default_text=None):
++    """Point every peek/load path at tmp_path so leftover GrovePop YAML cannot leak in."""
++    from src.utils import store_profile as sp
++
++    env_path = tmp_path / "env_store_profile.yaml"
++    local_path = tmp_path / "store_profile.local.yaml"
++    default_path = tmp_path / "store_profile.yaml"
++    if env_text is None:
++        monkeypatch.delenv("STORE_PROFILE_PATH", raising=False)
++    else:
++        env_path.write_text(env_text, encoding="utf-8")
++        monkeypatch.setenv("STORE_PROFILE_PATH", str(env_path))
++    if local_text is not None:
++        local_path.write_text(local_text, encoding="utf-8")
++    if default_text is not None:
++        default_path.write_text(default_text, encoding="utf-8")
++    monkeypatch.setattr(sp, "_LOCAL_PROFILE_PATH", local_path)
++    monkeypatch.setattr(sp, "_DEFAULT_PROFILE_PATH", default_path)
++    return env_path, local_path, default_path
++
++
++_OPS_YAML = "server:\n  scheduler_profile: ops\n"
++_FULL_YAML = "server:\n  scheduler_profile: full\n"
++
++
++def _bind_profile(monkeypatch, mod, profile_or_fn):
++    from src.utils import store_profile as sp
++
++    getter = profile_or_fn if callable(profile_or_fn) else (lambda: profile_or_fn)
++    monkeypatch.setattr(sp, "get_store_profile", getter)
++    monkeypatch.setattr(mod, "get_store_profile", getter)
++
++
++def test_full_profile_registers_cro_and_mi_tasks(tmp_path, monkeypatch):
+     from src.utils import store_profile as sp
+     from src.utils.store_profile import StoreProfile
+ 
++    _isolate_profile_paths(tmp_path, monkeypatch, local_text=_OPS_YAML)
+     monkeypatch.setattr(sp, "get_store_profile", lambda: StoreProfile())
+ 
+     mod = _load_scheduler()
+@@ -96,3 +131,319 @@ def test_ops_task_daily_full_dispatches_to_ops_only(monkeypatch):
      assert any(str(arg).endswith("daily_tasks.py") for arg in cmd_args)
      assert "--ops-only" in cmd_args
      assert timeout_sec == mod.TASK_TIMEOUT["ops_daily"]
@@ -602,10 +653,11 @@ index a59d1b9..5ee0085 100644
 +        assert getattr(job, "start_day", None) != "thursday"
 +
 +
-+def test_main_daily_profile_schedule_unchanged(monkeypatch):
++def test_main_daily_profile_schedule_unchanged(tmp_path, monkeypatch):
 +    from src.utils import store_profile as sp
 +    from src.utils.store_profile import StoreProfile
 +
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML, local_text=_OPS_YAML)
 +    monkeypatch.setattr(sp, "get_store_profile", lambda: StoreProfile())
 +    mod = _load_scheduler()
 +    mod.setup_schedule()
@@ -746,11 +798,146 @@ index a59d1b9..5ee0085 100644
 +    ):
 +        assert f"skip {job}" in text
 +        assert "not on ops allowlist" in text
++
++
++def test_full_load_ignores_stray_ops_on_store_profile_path(tmp_path, monkeypatch):
++    """(a) Successful full load must not peek a leftover ops YAML on STORE_PROFILE_PATH."""
++    from src.utils.store_profile import StoreProfile
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, StoreProfile())
++    assert mod._is_ops_scheduler() is False
++    mod.setup_schedule()
++    tags = _job_tags(schedule.get_jobs())
++    assert frozenset({"daily", "full"}) in tags
++    assert len(schedule.get_jobs()) > 10
++
++
++def test_full_load_ignores_stray_ops_in_local_yaml(tmp_path, monkeypatch):
++    """(b) Successful full load must not peek leftover ops in store_profile.local.yaml."""
++    from src.utils.store_profile import StoreProfile
++
++    _isolate_profile_paths(tmp_path, monkeypatch, local_text=_OPS_YAML, default_text=_FULL_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, StoreProfile())
++    assert mod._is_ops_scheduler() is False
++    mod.setup_schedule()
++    tags = _job_tags(schedule.get_jobs())
++    assert frozenset({"daily", "full"}) in tags
++    assert frozenset({"daily", "ops"}) not in tags
++
++
++def test_ops_load_is_ops_even_if_stray_full_yaml_exists(tmp_path, monkeypatch):
++    """(c) Successful ops load -> True and the 2-job table."""
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_FULL_YAML, local_text=_FULL_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, _gp_ops_profile())
++    assert mod._is_ops_scheduler() is True
++    mod.setup_schedule()
++    assert len(schedule.get_jobs()) == 2
++    assert _job_tags(schedule.get_jobs()) == {
++        frozenset({"daily", "ops"}),
++        frozenset({"recurring", "order_recheck"}),
++    }
++
++
++def test_unreadable_profile_peeks_ops_yaml_fail_closed(tmp_path, monkeypatch):
++    """(d) Load raises and YAML says ops -> fail-closed ops."""
++    from src.utils import store_profile as sp
++
++    def boom():
++        raise RuntimeError("cannot read store profile")
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML)
++    monkeypatch.setattr(sp, "get_store_profile", boom)
++    mod = _load_scheduler()
++    monkeypatch.setattr(mod, "get_store_profile", boom)
++    assert mod._is_ops_scheduler() is True
++    mod.setup_schedule()
++    assert len(schedule.get_jobs()) == 2
++
++
++def test_unreadable_profile_peeks_full_yaml_stays_full(tmp_path, monkeypatch):
++    """(e) Load raises and YAML says full -> not ops."""
++    from src.utils import store_profile as sp
++
++    def boom():
++        raise RuntimeError("cannot read store profile")
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_FULL_YAML, local_text=_FULL_YAML, default_text=_FULL_YAML)
++    monkeypatch.setattr(sp, "get_store_profile", boom)
++    mod = _load_scheduler()
++    monkeypatch.setattr(mod, "get_store_profile", boom)
++    assert mod._is_ops_scheduler() is False
++    mod.setup_schedule()
++    tags = _job_tags(schedule.get_jobs())
++    assert frozenset({"daily", "full"}) in tags
++    assert len(schedule.get_jobs()) > 10
++
++
++def test_task_daily_alias_stays_daily_tasks_on_full_despite_stray_ops(tmp_path, monkeypatch):
++    """(f) --task daily maps to daily_tasks under a loaded full profile."""
++    from src.utils.store_profile import StoreProfile
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML, local_text=_OPS_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, StoreProfile())
++    assert mod._is_ops_scheduler() is False
++    alias = "ops_daily" if mod._is_ops_scheduler() else "daily_tasks"
++    assert alias == "daily_tasks"
++
++
++def test_resolved_allowlist_ignores_stray_ops_yaml_on_full_load(tmp_path, monkeypatch):
++    """Successful full load must stay unrestricted even if leftover YAML says ops."""
++    from src.utils.store_profile import StoreProfile
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML, local_text=_OPS_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, StoreProfile())
++    assert mod._resolved_allowed_jobs() is None
++    assert mod._job_is_allowed("smart_reprice") is True
++    assert mod._job_is_allowed("listing_audit") is True
++
++
++def test_empty_scheduler_profile_on_successful_load_does_not_peek(tmp_path, monkeypatch):
++    """Blank scheduler_profile loads as not-ops; stray ops YAML must not flip it."""
++    from src.utils.store_profile import StoreProfile
++
++    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML)
++    mod = _load_scheduler()
++    _bind_profile(monkeypatch, mod, StoreProfile(scheduler_profile=""))
++    assert mod._is_ops_scheduler() is False
++    alias = "ops_daily" if mod._is_ops_scheduler() else "daily_tasks"
++    assert alias == "daily_tasks"
++
++
++def test_unreadable_profile_with_no_yaml_is_not_ops(tmp_path, monkeypatch):
++    """Load raises and isolated paths have no ops marker -> do not fail-closed to ops."""
++    from src.utils import store_profile as sp
++
++    def boom():
++        raise RuntimeError("cannot read store profile")
++
++    _isolate_profile_paths(tmp_path, monkeypatch)
++    monkeypatch.setattr(sp, "get_store_profile", boom)
++    mod = _load_scheduler()
++    monkeypatch.setattr(mod, "get_store_profile", boom)
++    assert mod._is_ops_scheduler() is False
++    assert mod._resolved_allowed_jobs() is None
 diff --git a/tests/test_scheduler_watchdog.py b/tests/test_scheduler_watchdog.py
-index a4e1bba..1c02cc3 100644
+index a4e1bba..4a62a2b 100644
 --- a/tests/test_scheduler_watchdog.py
 +++ b/tests/test_scheduler_watchdog.py
-@@ -507,6 +507,28 @@ def test_watchdog_ops_profile_recovers_only_ops_daily(tmp_path, monkeypatch):
+@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
+ WATCHDOG_SPEC = importlib.util.spec_from_file_location('scheduler_watchdog', ROOT / 'scheduler_watchdog.py')
+ scheduler_watchdog = importlib.util.module_from_spec(WATCHDOG_SPEC)
+ WATCHDOG_SPEC.loader.exec_module(scheduler_watchdog)
++_ORIG_WATCHDOG_IS_OPS = scheduler_watchdog._is_ops_scheduler
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -507,6 +508,50 @@ def test_watchdog_ops_profile_recovers_only_ops_daily(tmp_path, monkeypatch):
      assert 'ad_restore' not in aliases
  
  
@@ -774,6 +961,28 @@ index a4e1bba..1c02cc3 100644
 +    assert 'ad_restore' not in names
 +    assert 'ads_enroll' not in names
 +    assert 'listing_audit' not in names
++
++
++def test_watchdog_full_profile_ignores_stray_ops_yaml(tmp_path, monkeypatch):
++    """Successful full load must keep the Main recovery table despite leftover ops YAML."""
++    from src.utils import store_profile as sp
++    from src.utils.store_profile import StoreProfile
++
++    stray = tmp_path / 'ops.yaml'
++    stray.write_text('server:\n  scheduler_profile: ops\n', encoding='utf-8')
++    monkeypatch.setenv('STORE_PROFILE_PATH', str(stray))
++    monkeypatch.setattr(sp, '_LOCAL_PROFILE_PATH', tmp_path / 'store_profile.local.yaml')
++    monkeypatch.setattr(sp, '_DEFAULT_PROFILE_PATH', tmp_path / 'store_profile.yaml')
++    monkeypatch.setattr(sp, 'get_store_profile', lambda: StoreProfile())
++    monkeypatch.setattr(scheduler_watchdog, '_is_ops_scheduler', _ORIG_WATCHDOG_IS_OPS)
++
++    assert scheduler_watchdog._is_ops_scheduler() is False
++    tasks = scheduler_watchdog._watchdog_critical_tasks()
++    names = [task['health_name'] for task in tasks]
++    assert 'daily_tasks' in names
++    assert 'listing_audit' in names
++    assert 'cro_consume' in names
++    assert names != ['ops_daily']
 +
 +
  def test_watchdog_tick_stops_when_maintenance_starts_between_phases(tmp_path, monkeypatch):

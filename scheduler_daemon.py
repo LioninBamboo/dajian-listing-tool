@@ -230,13 +230,18 @@ def _scheduler_profile_name() -> str:
 
 
 def _is_ops_scheduler() -> bool:
+    """Trust a successfully loaded profile; peek YAML only when load fails.
+
+    A leftover GrovePop ``scheduler_profile: ops`` in STORE_PROFILE_PATH /
+    store_profile.local.yaml must not shrink a Main full/daily cadence that
+    already loaded cleanly.
+    """
     try:
-        if get_store_profile().is_ops_scheduler:
-            return True
+        profile = get_store_profile()
     except Exception:
-        pass
-    from src.utils.store_profile import peek_yaml_says_ops
-    return peek_yaml_says_ops()
+        from src.utils.store_profile import peek_yaml_says_ops
+        return peek_yaml_says_ops()
+    return bool(getattr(profile, 'is_ops_scheduler', False))
 
 
 def _ops_qc_autofix_enabled() -> bool:

@@ -39,10 +39,44 @@ def test_ops_profile_registers_only_inventory_and_order_recheck(monkeypatch):
     assert frozenset({"recurring", "order_recheck"}) in tags
 
 
-def test_full_profile_registers_cro_and_mi_tasks(monkeypatch):
+def _isolate_profile_paths(tmp_path, monkeypatch, *, env_text=None, local_text=None, default_text=None):
+    """Point every peek/load path at tmp_path so leftover GrovePop YAML cannot leak in."""
+    from src.utils import store_profile as sp
+
+    env_path = tmp_path / "env_store_profile.yaml"
+    local_path = tmp_path / "store_profile.local.yaml"
+    default_path = tmp_path / "store_profile.yaml"
+    if env_text is None:
+        monkeypatch.delenv("STORE_PROFILE_PATH", raising=False)
+    else:
+        env_path.write_text(env_text, encoding="utf-8")
+        monkeypatch.setenv("STORE_PROFILE_PATH", str(env_path))
+    if local_text is not None:
+        local_path.write_text(local_text, encoding="utf-8")
+    if default_text is not None:
+        default_path.write_text(default_text, encoding="utf-8")
+    monkeypatch.setattr(sp, "_LOCAL_PROFILE_PATH", local_path)
+    monkeypatch.setattr(sp, "_DEFAULT_PROFILE_PATH", default_path)
+    return env_path, local_path, default_path
+
+
+_OPS_YAML = "server:\n  scheduler_profile: ops\n"
+_FULL_YAML = "server:\n  scheduler_profile: full\n"
+
+
+def _bind_profile(monkeypatch, mod, profile_or_fn):
+    from src.utils import store_profile as sp
+
+    getter = profile_or_fn if callable(profile_or_fn) else (lambda: profile_or_fn)
+    monkeypatch.setattr(sp, "get_store_profile", getter)
+    monkeypatch.setattr(mod, "get_store_profile", getter)
+
+
+def test_full_profile_registers_cro_and_mi_tasks(tmp_path, monkeypatch):
     from src.utils import store_profile as sp
     from src.utils.store_profile import StoreProfile
 
+    _isolate_profile_paths(tmp_path, monkeypatch, local_text=_OPS_YAML)
     monkeypatch.setattr(sp, "get_store_profile", lambda: StoreProfile())
 
     mod = _load_scheduler()
@@ -141,10 +175,11 @@ def test_gp_does_not_schedule_thursday_0935_reprice(monkeypatch):
         assert getattr(job, "start_day", None) != "thursday"
 
 
-def test_main_daily_profile_schedule_unchanged(monkeypatch):
+def test_main_daily_profile_schedule_unchanged(tmp_path, monkeypatch):
     from src.utils import store_profile as sp
     from src.utils.store_profile import StoreProfile
 
+    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML, local_text=_OPS_YAML)
     monkeypatch.setattr(sp, "get_store_profile", lambda: StoreProfile())
     mod = _load_scheduler()
     mod.setup_schedule()
@@ -285,3 +320,130 @@ def test_gp_setup_logs_skip_why_for_apply_jobs(monkeypatch, caplog):
     ):
         assert f"skip {job}" in text
         assert "not on ops allowlist" in text
+
+
+def test_full_load_ignores_stray_ops_on_store_profile_path(tmp_path, monkeypatch):
+    """(a) Successful full load must not peek a leftover ops YAML on STORE_PROFILE_PATH."""
+    from src.utils.store_profile import StoreProfile
+
+    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML)
+    mod = _load_scheduler()
+    _bind_profile(monkeypatch, mod, StoreProfile())
+    assert mod._is_ops_scheduler() is False
+    mod.setup_schedule()
+    tags = _job_tags(schedule.get_jobs())
+    assert frozenset({"daily", "full"}) in tags
+    assert len(schedule.get_jobs()) > 10
+
+
+def test_full_load_ignores_stray_ops_in_local_yaml(tmp_path, monkeypatch):
+    """(b) Successful full load must not peek leftover ops in store_profile.local.yaml."""
+    from src.utils.store_profile import StoreProfile
+
+    _isolate_profile_paths(tmp_path, monkeypatch, local_text=_OPS_YAML, default_text=_FULL_YAML)
+    mod = _load_scheduler()
+    _bind_profile(monkeypatch, mod, StoreProfile())
+    assert mod._is_ops_scheduler() is False
+    mod.setup_schedule()
+    tags = _job_tags(schedule.get_jobs())
+    assert frozenset({"daily", "full"}) in tags
+    assert frozenset({"daily", "ops"}) not in tags
+
+
+def test_ops_load_is_ops_even_if_stray_full_yaml_exists(tmp_path, monkeypatch):
+    """(c) Successful ops load -> True and the 2-job table."""
+    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_FULL_YAML, local_text=_FULL_YAML)
+    mod = _load_scheduler()
+    _bind_profile(monkeypatch, mod, _gp_ops_profile())
+    assert mod._is_ops_scheduler() is True
+    mod.setup_schedule()
+    assert len(schedule.get_jobs()) == 2
+    assert _job_tags(schedule.get_jobs()) == {
+        frozenset({"daily", "ops"}),
+        frozenset({"recurring", "order_recheck"}),
+    }
+
+
+def test_unreadable_profile_peeks_ops_yaml_fail_closed(tmp_path, monkeypatch):
+    """(d) Load raises and YAML says ops -> fail-closed ops."""
+    from src.utils import store_profile as sp
+
+    def boom():
+        raise RuntimeError("cannot read store profile")
+
+    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML)
+    monkeypatch.setattr(sp, "get_store_profile", boom)
+    mod = _load_scheduler()
+    monkeypatch.setattr(mod, "get_store_profile", boom)
+    assert mod._is_ops_scheduler() is True
+    mod.setup_schedule()
+    assert len(schedule.get_jobs()) == 2
+
+
+def test_unreadable_profile_peeks_full_yaml_stays_full(tmp_path, monkeypatch):
+    """(e) Load raises and YAML says full -> not ops."""
+    from src.utils import store_profile as sp
+
+    def boom():
+        raise RuntimeError("cannot read store profile")
+
+    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_FULL_YAML, local_text=_FULL_YAML, default_text=_FULL_YAML)
+    monkeypatch.setattr(sp, "get_store_profile", boom)
+    mod = _load_scheduler()
+    monkeypatch.setattr(mod, "get_store_profile", boom)
+    assert mod._is_ops_scheduler() is False
+    mod.setup_schedule()
+    tags = _job_tags(schedule.get_jobs())
+    assert frozenset({"daily", "full"}) in tags
+    assert len(schedule.get_jobs()) > 10
+
+
+def test_task_daily_alias_stays_daily_tasks_on_full_despite_stray_ops(tmp_path, monkeypatch):
+    """(f) --task daily maps to daily_tasks under a loaded full profile."""
+    from src.utils.store_profile import StoreProfile
+
+    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML, local_text=_OPS_YAML)
+    mod = _load_scheduler()
+    _bind_profile(monkeypatch, mod, StoreProfile())
+    assert mod._is_ops_scheduler() is False
+    alias = "ops_daily" if mod._is_ops_scheduler() else "daily_tasks"
+    assert alias == "daily_tasks"
+
+
+def test_resolved_allowlist_ignores_stray_ops_yaml_on_full_load(tmp_path, monkeypatch):
+    """Successful full load must stay unrestricted even if leftover YAML says ops."""
+    from src.utils.store_profile import StoreProfile
+
+    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML, local_text=_OPS_YAML)
+    mod = _load_scheduler()
+    _bind_profile(monkeypatch, mod, StoreProfile())
+    assert mod._resolved_allowed_jobs() is None
+    assert mod._job_is_allowed("smart_reprice") is True
+    assert mod._job_is_allowed("listing_audit") is True
+
+
+def test_empty_scheduler_profile_on_successful_load_does_not_peek(tmp_path, monkeypatch):
+    """Blank scheduler_profile loads as not-ops; stray ops YAML must not flip it."""
+    from src.utils.store_profile import StoreProfile
+
+    _isolate_profile_paths(tmp_path, monkeypatch, env_text=_OPS_YAML)
+    mod = _load_scheduler()
+    _bind_profile(monkeypatch, mod, StoreProfile(scheduler_profile=""))
+    assert mod._is_ops_scheduler() is False
+    alias = "ops_daily" if mod._is_ops_scheduler() else "daily_tasks"
+    assert alias == "daily_tasks"
+
+
+def test_unreadable_profile_with_no_yaml_is_not_ops(tmp_path, monkeypatch):
+    """Load raises and isolated paths have no ops marker -> do not fail-closed to ops."""
+    from src.utils import store_profile as sp
+
+    def boom():
+        raise RuntimeError("cannot read store profile")
+
+    _isolate_profile_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(sp, "get_store_profile", boom)
+    mod = _load_scheduler()
+    monkeypatch.setattr(mod, "get_store_profile", boom)
+    assert mod._is_ops_scheduler() is False
+    assert mod._resolved_allowed_jobs() is None
