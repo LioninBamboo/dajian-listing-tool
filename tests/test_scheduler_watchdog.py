@@ -507,6 +507,28 @@ def test_watchdog_ops_profile_recovers_only_ops_daily(tmp_path, monkeypatch):
     assert 'ad_restore' not in aliases
 
 
+def test_watchdog_gp_ads_qc_allowlist_never_launches_apply_jobs(monkeypatch):
+    """GrovePop with ads+qc flags still on must not backfill --apply jobs."""
+    monkeypatch.setattr(scheduler_watchdog, '_is_ops_scheduler', lambda: True)
+    monkeypatch.setattr(scheduler_watchdog, '_ops_ads_enabled', lambda: True)
+    monkeypatch.setattr(scheduler_watchdog, '_ops_qc_autofix_enabled', lambda: True)
+    monkeypatch.setattr(
+        scheduler_watchdog,
+        '_job_is_allowed',
+        lambda name: name in {'ops_daily', 'order_recheck'},
+    )
+
+    tasks = scheduler_watchdog._watchdog_critical_tasks()
+    names = [task['health_name'] for task in tasks]
+    aliases = [task['daemon_task'] for task in tasks]
+    assert names == ['ops_daily']
+    assert aliases == ['ops_daily']
+    assert 'smart_reprice' not in names
+    assert 'ad_restore' not in names
+    assert 'ads_enroll' not in names
+    assert 'listing_audit' not in names
+
+
 def test_watchdog_tick_stops_when_maintenance_starts_between_phases(tmp_path, monkeypatch):
     maintenance_file = tmp_path / '_maintenance.lock'
     calls = []

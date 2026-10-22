@@ -223,11 +223,20 @@ def acquire_lock():
 
 
 def _scheduler_profile_name() -> str:
-    return str(getattr(get_store_profile(), 'scheduler_profile', 'full') or 'full').strip().lower()
+    try:
+        return str(getattr(get_store_profile(), 'scheduler_profile', 'full') or 'full').strip().lower()
+    except Exception:
+        return ''
 
 
 def _is_ops_scheduler() -> bool:
-    return _scheduler_profile_name() == 'ops'
+    try:
+        if get_store_profile().is_ops_scheduler:
+            return True
+    except Exception:
+        pass
+    from src.utils.store_profile import peek_yaml_says_ops
+    return peek_yaml_says_ops()
 
 
 def _ops_qc_autofix_enabled() -> bool:
@@ -242,6 +251,43 @@ def _ops_ads_enabled() -> bool:
         return bool(get_store_profile().ops_ads_enabled)
     except Exception:
         return False
+
+
+def _resolved_allowed_jobs():
+    """None = unrestricted (Main/full). frozenset = ops fail-closed allowlist."""
+    from src.utils.store_profile import (
+        DEFAULT_OPS_ALLOWED_JOBS,
+        peek_yaml_says_ops,
+    )
+    try:
+        profile = get_store_profile()
+        return profile.resolved_scheduler_allowed_jobs
+    except Exception as exc:
+        if peek_yaml_says_ops():
+            logger.warning(
+                "store profile unreadable (%s); fail-closed to ops allowlist %s",
+                exc,
+                list(DEFAULT_OPS_ALLOWED_JOBS),
+            )
+            return frozenset(DEFAULT_OPS_ALLOWED_JOBS)
+        return None
+
+
+def _job_is_allowed(job_name: str) -> bool:
+    allow = _resolved_allowed_jobs()
+    if allow is None:
+        return True
+    return str(job_name or '').strip() in allow
+
+
+def _log_skip_disallowed(job_name: str, *, via: str) -> None:
+    allow = _resolved_allowed_jobs()
+    logger.info(
+        "skip %s (%s): not on ops allowlist %s",
+        job_name,
+        via,
+        sorted(allow) if allow is not None else [],
+    )
 
 
 def release_lock():
@@ -506,6 +552,9 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
     - 超时自动杀死
     - 返回 (success, message)
     """
+    if not _job_is_allowed(task_name):
+        _log_skip_disallowed(task_name, via='run_task')
+        return False, f"skipped: not on ops allowlist ({task_name})"
     cmd_str = ' '.join(cmd_args)
     logger.info(f"{'='*50}")
     logger.info(f"▶ 启动任务: {task_name}")
@@ -1784,50 +1833,149 @@ def setup_schedule():
         _setup_schedule_full()
 
 
+def _register_ops_job(job_name: str, register_fn, *, why_candidate: str = "") -> bool:
+    """Register an ops job only when it is on the fail-closed allowlist."""
+    if _job_is_allowed(job_name):
+        register_fn()
+        return True
+    extra = f" ({why_candidate})" if why_candidate else ""
+    _log_skip_disallowed(job_name, via=f"setup_schedule{extra}")
+    return False
+
+
 def _setup_schedule_ops():
-    """子店 lean 档: 库存运营 + 出单源复核; QC/广告切片按 profile 开关叠加."""
-    schedule.every().day.at("09:30").do(task_ops_daily).tag('daily', 'ops')
-    schedule.every(6).hours.do(task_order_recheck).tag('recurring', 'order_recheck')
+    """子店 lean 档: 默认只装 ops_daily + order_recheck.
+
+    Every other ops-catalog job is considered and skipped with a why-line.
+    ads/QC flags cannot register a job that is not on scheduler_allowed_jobs.
+    GrovePop's allowlist is the two ops jobs, so Thursday 09:35 --apply reprice
+    never enters the table.
+    """
+    _register_ops_job(
+        'ops_daily',
+        lambda: schedule.every().day.at("09:30").do(task_ops_daily).tag('daily', 'ops'),
+    )
+    _register_ops_job(
+        'order_recheck',
+        lambda: schedule.every(6).hours.do(task_order_recheck).tag('recurring', 'order_recheck'),
+    )
 
     qc_on = _ops_qc_autofix_enabled()
     ads_on = _ops_ads_enabled()
-    if ads_on:
-        schedule.every().monday.at("09:35").do(task_smart_reprice).tag('weekly', 'smart_reprice')
-        schedule.every().thursday.at("09:35").do(task_smart_reprice).tag('weekly', 'smart_reprice')
-        schedule.every().day.at("09:40").do(task_ad_restore).tag('daily', 'ad_restore')
-        schedule.every().day.at("09:45").do(task_blacklist_cleanup).tag('daily', 'bl_cleanup')
-        schedule.every().day.at("09:50").do(task_guard_anomaly).tag('daily', 'guard_alert')
-        schedule.every().day.at("10:25").do(task_ads_enroll).tag('daily', 'ads_enroll')
-        schedule.every().tuesday.at("10:00").do(task_smart_bid).tag('weekly', 'smart_bid')
-        schedule.every().tuesday.at("11:00").do(task_bid_rollback).tag('weekly', 'bid_rollback')
-        schedule.every(6).hours.do(task_promotion_rotate).tag('recurring', 'promotion')
-    if qc_on:
-        schedule.every().day.at("10:55").do(task_source_refresh).tag('daily', 'source_refresh')
-        schedule.every().day.at("11:30").do(task_listing_audit).tag('daily', 'listing_audit')
-        schedule.every().day.at("12:10").do(task_source_aspect_autofix).tag('daily', 'source_aspect_autofix')
-        schedule.every().day.at("12:30").do(task_semantic_rewrite).tag('daily', 'semantic_rewrite')
-        schedule.every().day.at("13:00").do(task_missing_video_autofix).tag('daily', 'missing_video_autofix')
+    ads_why = "scheduler_enable_ads=true" if ads_on else "ads slice off"
+    qc_why = "scheduler_enable_qc_autofix=true" if qc_on else "qc slice off"
 
-    profile = get_store_profile()
+    optional_jobs = (
+        (
+            'smart_reprice',
+            ads_on,
+            ads_why,
+            lambda: (
+                schedule.every().monday.at("09:35").do(task_smart_reprice).tag('weekly', 'smart_reprice'),
+                schedule.every().thursday.at("09:35").do(task_smart_reprice).tag('weekly', 'smart_reprice'),
+            ),
+        ),
+        (
+            'ad_restore',
+            ads_on,
+            ads_why,
+            lambda: schedule.every().day.at("09:40").do(task_ad_restore).tag('daily', 'ad_restore'),
+        ),
+        (
+            'blacklist_cleanup',
+            ads_on,
+            ads_why,
+            lambda: schedule.every().day.at("09:45").do(task_blacklist_cleanup).tag('daily', 'bl_cleanup'),
+        ),
+        (
+            'guard_anomaly',
+            ads_on,
+            ads_why,
+            lambda: schedule.every().day.at("09:50").do(task_guard_anomaly).tag('daily', 'guard_alert'),
+        ),
+        (
+            'ads_enroll',
+            ads_on,
+            ads_why,
+            lambda: schedule.every().day.at("10:25").do(task_ads_enroll).tag('daily', 'ads_enroll'),
+        ),
+        (
+            'smart_bid',
+            ads_on,
+            ads_why,
+            lambda: schedule.every().tuesday.at("10:00").do(task_smart_bid).tag('weekly', 'smart_bid'),
+        ),
+        (
+            'bid_rollback',
+            ads_on,
+            ads_why,
+            lambda: schedule.every().tuesday.at("11:00").do(task_bid_rollback).tag('weekly', 'bid_rollback'),
+        ),
+        (
+            'promotion_rotate',
+            ads_on,
+            ads_why,
+            lambda: schedule.every(6).hours.do(task_promotion_rotate).tag('recurring', 'promotion'),
+        ),
+        (
+            'source_refresh',
+            qc_on,
+            qc_why,
+            lambda: schedule.every().day.at("10:55").do(task_source_refresh).tag('daily', 'source_refresh'),
+        ),
+        (
+            'listing_audit',
+            qc_on,
+            qc_why,
+            lambda: schedule.every().day.at("11:30").do(task_listing_audit).tag('daily', 'listing_audit'),
+        ),
+        (
+            'source_aspect_autofix',
+            qc_on,
+            qc_why,
+            lambda: schedule.every().day.at("12:10").do(task_source_aspect_autofix).tag('daily', 'source_aspect_autofix'),
+        ),
+        (
+            'semantic_rewrite',
+            qc_on,
+            qc_why,
+            lambda: schedule.every().day.at("12:30").do(task_semantic_rewrite).tag('daily', 'semantic_rewrite'),
+        ),
+        (
+            'missing_video_autofix',
+            qc_on,
+            qc_why,
+            lambda: schedule.every().day.at("13:00").do(task_missing_video_autofix).tag('daily', 'missing_video_autofix'),
+        ),
+    )
+    for job_name, slice_on, slice_why, register_fn in optional_jobs:
+        if not _job_is_allowed(job_name):
+            _log_skip_disallowed(job_name, via=f"setup_schedule ({slice_why})")
+            continue
+        if not slice_on:
+            logger.info(
+                "skip %s (setup_schedule): on allowlist but %s",
+                job_name,
+                slice_why,
+            )
+            continue
+        register_fn()
+
+    allow = _resolved_allowed_jobs() or frozenset()
+    try:
+        profile = get_store_profile()
+        brand = profile.brand_name
+        mutex = profile.resolved_scheduler_mutex_name()
+    except Exception:
+        brand = "(unreadable)"
+        mutex = "(unreadable)"
     logger.info("调度表已配置 (scheduler_profile=ops):")
-    logger.info(f"  店铺: {profile.brand_name} | mutex={profile.resolved_scheduler_mutex_name()}")
-    logger.info("  09:30  库存运营包 (daily_tasks.py --ops-only)")
-    logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 48 --email)")
-    if ads_on:
-        logger.info("  周一/周四 09:35  智能调价 (batch_smart_reprice --apply --email)")
-        logger.info("  09:40  广告恢复审计 (ad_restore_audit --apply --email)")
-        logger.info("  09:45  广告黑名单清理 (ad_blacklist_cleanup)")
-        logger.info("  09:50  守门员异常告警 (guard_anomaly_alert)")
-        logger.info("  10:25  广告入驻 (store_marketing --levers promoted --apply)")
-        logger.info("  周二 10:00  分级 Bid 优化 (batch_smart_bid --apply --email)")
-        logger.info("  周二 11:00  Bid 7 天回溯 (bid_rollback_audit --apply --email)")
-        logger.info("  每 6h  促销轮转 (auto_rotate_promotions.py)")
-    if qc_on:
-        logger.info("  10:55  源内容刷新 (source_content_refresh --email)")
-        logger.info("  11:30  eBay/GIGA live listing 内容审计 (audit --live --email)")
-        logger.info("  12:10  源参数写回 live (白名单 --fix-key, 不含 categoryId)")
-        logger.info("  12:30  语义改写闭环 (需 SEMANTIC_REWRITE_APPLY_ENABLED=1)")
-        logger.info("  13:00  缺视频限量同步 (limit 80)")
+    logger.info(f"  店铺: {brand} | mutex={mutex}")
+    logger.info(f"  allowlist: {sorted(allow)}")
+    if _job_is_allowed('ops_daily'):
+        logger.info("  09:30  库存运营包 (daily_tasks.py --ops-only)")
+    if _job_is_allowed('order_recheck'):
+        logger.info("  每 6h  出单源复核 (order_source_recheck --hours-back 48 --email)")
 
 
 def _setup_schedule_full():
@@ -2005,8 +2153,14 @@ def run_once():
     logger.info("立即执行全部任务 (--once 模式)")
     logger.info("=" * 60)
 
-    task_listing_audit()
-    task_daily_full()  # 已包含库存同步 + 智能调价
+    if _job_is_allowed('listing_audit'):
+        task_listing_audit()
+    else:
+        _log_skip_disallowed('listing_audit', via='--once')
+    if _job_is_allowed('ops_daily') or _job_is_allowed('daily_tasks'):
+        task_daily_full()  # 已包含库存同步 + 智能调价
+    else:
+        _log_skip_disallowed('daily_tasks', via='--once')
 
     logger.info("全部任务执行完毕")
 
@@ -2034,6 +2188,9 @@ def recover_missed_tasks(log_when_clean=True):
 
         for config in ordered_tasks:
             task_name = str(config['name'])
+            if not _job_is_allowed(task_name):
+                _log_skip_disallowed(task_name, via='检查是否有遗漏的定时任务')
+                continue
             weekday = config.get('weekday')
             if weekday is not None and now.weekday() != int(weekday):
                 continue
@@ -2112,6 +2269,8 @@ def _get_critical_recovery_tasks():
                 'priority': 20,
             },
         ]
+        # Ads/QC recovery entries exist only when the job is also allowlisted.
+        # GrovePop's default allowlist never includes these --apply jobs.
         if _ops_ads_enabled():
             tasks.extend(
                 [
@@ -2173,7 +2332,7 @@ def _get_critical_recovery_tasks():
                     },
                 ]
             )
-        return tasks
+        return [task for task in tasks if _job_is_allowed(str(task['name']))]
 
     tasks = [
             {
@@ -2620,6 +2779,17 @@ def main():
             'giga_dropship_push': task_giga_dropship_push,
             'giga_dropship_sync': task_giga_dropship_sync,
         }
+        alias_to_job = {
+            'daily': 'ops_daily' if _is_ops_scheduler() else 'daily_tasks',
+            'reprice': 'smart_reprice',
+            'health': 'health_check',
+            'promotion': 'promotion_rotate',
+            'cro_ops': 'cro_ops_snapshot',
+        }
+        job_name = alias_to_job.get(args.task, args.task)
+        if not _job_is_allowed(job_name):
+            _log_skip_disallowed(job_name, via=f'--task {args.task}')
+            return
         task_map[args.task]()
         return
 
