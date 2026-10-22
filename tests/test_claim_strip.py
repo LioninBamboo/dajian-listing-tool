@@ -57,6 +57,7 @@ def plan_for(
     rows=None,
     extra_rows=None,
     required=(),
+    required_available=True,
     mutate_inv=None,
     mutate_offer=None,
     extra_report=None,
@@ -76,6 +77,7 @@ def plan_for(
         offer,
         cs.issues_for_sku(report_covering(manifest, extra_report), sku),
         required_aspect_names=required,
+        required_aspects_available=required_available,
     )
 
 
@@ -485,7 +487,7 @@ def test_edge_absent_appears_in_token_is_already_absent_or_not_found():
     result = result_for(plan, "matte black powder-coated")
     statuses = {action.token: action.status for action in result.actions}
     assert statuses[cs.TOKEN_INV_DESC] == cs.STATUS_ALREADY_ABSENT
-    assert statuses["aspect:DoesNotExist"] == cs.STATUS_NOT_FOUND
+    assert statuses["aspect:DoesNotExist"] == cs.STATUS_ALREADY_ABSENT
     assert plan.offer_description_after == plan.offer_description_before
 
 
@@ -568,3 +570,139 @@ def test_token_boundary_examples_from_spec():
         "energy efficient",
     )
     assert hit.after_aspects["Features"] == ["Energy Efficient Motor"]
+
+
+def test_missing_aspect_key_is_already_absent_on_rerun():
+    hit = cs.strip_claim_from_aspects({"Features": ["Quiet"]}, "Fuel Type", "propane")
+    assert hit.status == cs.STATUS_ALREADY_ABSENT
+    plan = plan_for("W3131P380454")
+    assert "Fuel Type" not in plan.aspects_after
+    inv, offer = load_before("W3131P380454")
+    inv["product"]["aspects"] = plan.aspects_after
+    rerun = cs.plan_sku_claim_strip(
+        "W3131P380454",
+        load_manifest(),
+        inv,
+        offer,
+        cs.issues_for_sku(report_covering(load_manifest()), "W3131P380454"),
+    )
+    assert result_for(rerun, "propane").status == cs.STATUS_ALREADY_ABSENT
+
+
+def test_taxonomy_unavailable_keeps_real_non_features_keys():
+    fuel = plan_for("W3131P380454", required_available=False)
+    assert result_for(fuel, "propane").status == cs.STATUS_REQUIRED_ASPECTS_UNAVAILABLE
+    assert fuel.aspects_after["Fuel Type"] == ["Propane"]
+
+    energy = plan_for("W3596P577884", required_available=False)
+    energy_actions = {
+        action.token: action.status for action in result_for(energy, "energy saving").actions
+    }
+    assert energy_actions["aspect:Energy Efficiency"] == cs.STATUS_REQUIRED_ASPECTS_UNAVAILABLE
+    assert energy.aspects_after["Energy Efficiency"] == ["Energy Saving"]
+    assert result_for(energy, "energy efficient").status == cs.STATUS_WILL_STRIP
+
+    extra = [
+        cs.ManifestRow(
+            sku="W465130444",
+            listing_id="366000000001",
+            claim="wall",
+            appears_in=["aspect:Mounting Type"],
+            live_snippet="Mounting Type Wall",
+            recommendation=cs.STRIP_NOW,
+            raw_appears_in="aspect:Mounting Type",
+        )
+    ]
+    inv = {
+        "product": {
+            "title": "Outdoor Pedestal Fan",
+            "aspects": {"Mounting Type": ["Wall"], "Features": ["Quiet"]},
+        }
+    }
+    offer = {
+        "listingDescription": "fan",
+        "listing": {"listingId": "366000000001"},
+        "categoryId": "",
+    }
+    plan = cs.plan_sku_claim_strip(
+        "W465130444",
+        extra,
+        inv,
+        offer,
+        [{"type": "semantic_feature", "detail": "wall"}],
+        required_aspects_available=False,
+    )
+    assert result_for(plan, "wall").status == cs.STATUS_REQUIRED_ASPECTS_UNAVAILABLE
+    assert plan.aspects_after["Mounting Type"] == ["Wall"]
+
+
+def test_w5368_protected_zone_readback_allows_package_includes():
+    plan = plan_for("W5368P517794", required=("Type",))
+    before_inv, before_offer = load_before("W5368P517794")
+    after_inv = deepcopy(before_inv)
+    after_offer = deepcopy(before_offer)
+    after_inv["product"]["description"] = plan.inventory_description_after
+    after_inv["product"]["aspects"] = plan.aspects_after
+    after_offer["listingDescription"] = plan.offer_description_after
+    checks = cs.verify_readback(plan, after_inv, after_offer, before_inv, before_offer)
+    assert checks["claims_gone"] is True
+    assert checks["invariants_hold"] is True
+    assert "1 x Storage Ottoman" in after_offer["listingDescription"]
+    assert cs.claim_matches_unprotected("storage ottoman", after_offer["listingDescription"]) is False
+    assert cs.claim_matches_text("storage ottoman", after_offer["listingDescription"]) is True
+
+
+def test_offer_description_only_payload_keeps_map_and_strips_get_only():
+    live = {
+        "offerId": "1",
+        "status": "PUBLISHED",
+        "listing": {"listingId": "9"},
+        "warnings": [{"message": "x"}],
+        "sku": "W1",
+        "availableQuantity": 2,
+        "categoryId": "123",
+        "storeCategoryNames": ["Home"],
+        "tax": {"applyTax": True},
+        "quantityLimitPerBuyer": 4,
+        "regulatory": {"hazmat": "NO"},
+        "secondaryCategoryId": "456",
+        "lotSize": 1,
+        "listingPolicies": {"fulfillmentPolicyId": "F1"},
+        "merchantLocationKey": "warehouse-1",
+        "pricingSummary": {
+            "price": {"value": "99.00", "currency": "USD"},
+            "minimumAdvertisedPrice": {"value": "120.00", "currency": "USD"},
+            "originallySoldForRetailPriceOn": "ON_EBAY",
+            "strikethroughPrice": {"value": "149.00", "currency": "USD"},
+        },
+        "listingDescription": "BEFORE",
+    }
+    payload = cs.offer_description_only_put_payload(live, "AFTER")
+    assert payload["listingDescription"] == "AFTER"
+    assert payload["availableQuantity"] == 2
+    assert payload["pricingSummary"] == live["pricingSummary"]
+    assert payload["listingPolicies"] == live["listingPolicies"]
+    assert payload["merchantLocationKey"] == "warehouse-1"
+    assert payload["storeCategoryNames"] == ["Home"]
+    assert payload["tax"] == {"applyTax": True}
+    assert payload["quantityLimitPerBuyer"] == 4
+    assert payload["regulatory"] == {"hazmat": "NO"}
+    assert payload["secondaryCategoryId"] == "456"
+    assert payload["lotSize"] == 1
+    assert "offerId" not in payload
+    assert "listing" not in payload
+    assert "status" not in payload
+    assert "warnings" not in payload
+    live["availableQuantity"] = 99
+    assert payload["availableQuantity"] == 2
+
+
+def test_fetches_price_or_qty_changed_detects_both():
+    inv_a, offer_a = load_before("W46538540")
+    inv_b, offer_b = load_before("W46538540")
+    assert cs.fetches_price_or_qty_changed(inv_a, offer_a, inv_b, offer_b) is False
+    inv_b["availability"]["shipToLocationAvailability"]["quantity"] = 3
+    assert cs.fetches_price_or_qty_changed(inv_a, offer_a, inv_b, offer_b) is True
+    inv_b, offer_b = load_before("W46538540")
+    offer_b["pricingSummary"]["price"]["value"] = "1.00"
+    assert cs.fetches_price_or_qty_changed(inv_a, offer_a, inv_b, offer_b) is True

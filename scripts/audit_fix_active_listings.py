@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import time
 import io
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -2809,6 +2810,8 @@ def _inventory_snapshot_put_payload(live_inventory: dict) -> dict:
     payload = {}
     for key in (
         "condition",
+        "conditionDescription",
+        "conditionDescriptors",
         "product",
         "availability",
         "packageWeightAndSize",
@@ -2817,7 +2820,7 @@ def _inventory_snapshot_put_payload(live_inventory: dict) -> dict:
     ):
         value = live_inventory.get(key)
         if value is not None:
-            payload[key] = value
+            payload[key] = deepcopy(value)
     return payload
 
 
@@ -4496,15 +4499,180 @@ def fix_listing_on_ebay(
     return results
 
 
-def _claim_strip_required_aspect_names(category_id: str | None) -> list[str]:
+def _claim_strip_required_aspect_names(category_id: str | None):
+    """Return required aspect names, or None when the taxonomy cannot be trusted.
+
+    None (missing category, throw, or empty lookup) is fail-closed: every
+    non-Features aspect is treated as required.
+    """
     if not category_id:
-        return []
+        return None
     try:
         matcher = get_category_matcher()
         required_aspects, _ = matcher._get_category_aspects(str(category_id))
-        return [aspect.get("name") for aspect in required_aspects if aspect.get("name")]
+        names = [aspect.get("name") for aspect in required_aspects if aspect.get("name")]
+        if not names:
+            return None
+        return names
     except Exception:
-        return []
+        return None
+
+
+def _resolve_claim_strip_required(loader, category_id: str | None) -> tuple[list[str], bool]:
+    try:
+        loaded = loader(category_id) if loader else _claim_strip_required_aspect_names(category_id)
+    except Exception:
+        return [], False
+    if loaded is None:
+        return [], False
+    return list(loaded), True
+
+
+def _update_offer_description_only(ebay_client, offer_id: str, listing_description: str):
+    """GET the full offer, change only listingDescription, PUT the body back.
+
+    Does not look up suppliers, recalculate availableQuantity, or rebuild
+    pricingSummary. Any exception (including SupplierOutOfStockError if a
+    client hook raises it) propagates to the caller for inventory restore.
+    """
+    from src.utils import claim_strip as cs
+
+    live = ebay_client.get_offer(str(offer_id))
+    if not live:
+        raise RuntimeError(f"offer {offer_id} GET returned empty")
+    payload = cs.offer_description_only_put_payload(live, listing_description)
+    token = ebay_client.oauth.get_valid_token()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Content-Language": "en-US",
+        "Accept": "application/json",
+    }
+    url = f"{ebay_client.base_url}/sell/inventory/v1/offer/{offer_id}"
+    response = ebay_client.session.put(url, headers=headers, json=payload, timeout=120)
+    if getattr(response, "status_code", 200) not in (200, 204):
+        raise RuntimeError(
+            f"offer description PUT failed {getattr(response, 'status_code', '?')}: "
+            f"{getattr(response, 'text', '')[:200]}"
+        )
+    return response
+
+
+def _publish_offer_checked(ebay_client, offer_id: str):
+    if not hasattr(ebay_client, "publish_offer"):
+        raise RuntimeError(f"offer {offer_id}: client has no publish_offer")
+    result = ebay_client.publish_offer(offer_id)
+    if not result or not result.get("listingId"):
+        raise RuntimeError(f"publish_offer({offer_id}) returned {result!r}")
+    return result
+
+
+def _restore_claim_strip_snapshot(
+    *,
+    sku: str,
+    plan,
+    ebay_client,
+    offer_id,
+    expected_listing_id: str,
+):
+    """Fresh GET, put back only snapshot description/aspects, republish, read back."""
+    from src.utils import claim_strip as cs
+
+    try:
+        fresh_inventory, fresh_offer = _fetch_live_listing_context(
+            ebay_client,
+            sku,
+            expected_listing_id=expected_listing_id,
+        )
+    except Exception as exc:
+        return False, {"error": f"restore GET failed: {exc}"}, {}
+    if not fresh_inventory or not fresh_offer:
+        return False, {"error": "restore GET returned empty inventory/offer"}, {}
+
+    inventory_payload = cs.replace_inventory_product_fields(
+        fresh_inventory,
+        description=plan.inventory_description_before,
+        aspects=plan.aspects_before,
+    )
+    try:
+        put_response = _put_inventory_snapshot(ebay_client, sku, inventory_payload)
+        if getattr(put_response, "status_code", 200) not in (200, 204):
+            raise RuntimeError(
+                f"restore inventory PUT failed {getattr(put_response, 'status_code', '?')}: "
+                f"{getattr(put_response, 'text', '')[:200]}"
+            )
+    except Exception as exc:
+        return False, {"error": f"restore inventory PUT failed: {exc}"}, {}
+
+    restore_offer_id = offer_id or (fresh_offer or {}).get("offerId")
+    if restore_offer_id:
+        try:
+            _update_offer_description_only(
+                ebay_client,
+                restore_offer_id,
+                plan.offer_description_before,
+            )
+        except Exception as exc:
+            return False, {"error": f"restore offer PUT failed: {exc}"}, {}
+        try:
+            _publish_offer_checked(ebay_client, restore_offer_id)
+        except Exception as exc:
+            return False, {"error": f"restore publish failed: {exc}"}, {}
+
+    try:
+        read_inventory, read_offer = _fetch_live_listing_context(
+            ebay_client,
+            sku,
+            expected_listing_id=expected_listing_id,
+        )
+    except Exception as exc:
+        return False, {"error": f"restore readback GET failed: {exc}"}, {}
+
+    restore_plan = cs.SkuPlan(
+        sku=plan.sku,
+        listing_id=plan.listing_id,
+        title=plan.title,
+        offer_description_before=plan.offer_description_before,
+        offer_description_after=plan.offer_description_before,
+        inventory_description_before=plan.inventory_description_before,
+        inventory_description_after=plan.inventory_description_before,
+        aspects_before=deepcopy(plan.aspects_before),
+        aspects_after=deepcopy(plan.aspects_before),
+    )
+    expected_inventory = cs.replace_inventory_product_fields(
+        fresh_inventory,
+        description=plan.inventory_description_before,
+        aspects=plan.aspects_before,
+    )
+    expected_offer = deepcopy(fresh_offer)
+    expected_offer["listingDescription"] = plan.offer_description_before
+    read_product = (read_inventory or {}).get("product") or {}
+    snapshot_ok = (
+        str((read_offer or {}).get("listingDescription") or "") == plan.offer_description_before
+        and str(read_product.get("description") or "") == plan.inventory_description_before
+        and {
+            str(key): cs.aspect_values(value)
+            for key, value in dict(read_product.get("aspects") or {}).items()
+        }
+        == plan.aspects_before
+    )
+    checks = cs.verify_readback(
+        restore_plan,
+        read_inventory,
+        read_offer,
+        expected_inventory,
+        expected_offer,
+    )
+    if not snapshot_ok or not all(checks.values()):
+        return (
+            False,
+            {
+                "error": f"restore readback mismatch: snapshot_ok={snapshot_ok} checks={checks}",
+                "readback": checks,
+            },
+            checks,
+        )
+    return True, {"readback": checks}, checks
 
 
 def _claim_strip_store_label() -> str:
@@ -4548,17 +4716,6 @@ def _sync_optimization_claim_strip(db_conn, sku: str, plan) -> bool:
     return True
 
 
-def _offer_price_value(offer: dict | None):
-    summary = (offer or {}).get("pricingSummary") or {}
-    price = summary.get("price") or {}
-    if isinstance(price, dict) and price.get("value") not in (None, ""):
-        try:
-            return float(price.get("value"))
-        except (TypeError, ValueError):
-            return price.get("value")
-    return None
-
-
 def apply_claim_strip_live(
     *,
     sku: str,
@@ -4600,15 +4757,30 @@ def apply_claim_strip_live(
             "plan": plan,
         }
 
+    expected_listing_id = cs.live_listing_id(before_offer)
     try:
         live_inventory, live_offer = _fetch_live_listing_context(
             ebay_client,
             sku,
-            expected_listing_id=cs.live_listing_id(before_offer),
+            expected_listing_id=expected_listing_id,
         )
     except Exception as exc:
         return {"status": "drift", "error": f"recheck fetch failed: {exc}", "plan": plan}
 
+    if cs.fetches_price_or_qty_changed(before_inventory, before_offer, live_inventory, live_offer):
+        for result in plan.results:
+            if result.status == cs.STATUS_WILL_STRIP:
+                result.status = cs.STATUS_LIVE_CHANGED_BETWEEN_FETCHES
+        return {
+            "status": cs.STATUS_LIVE_CHANGED_BETWEEN_FETCHES,
+            "error": "price or quantity changed between first fetch and recheck",
+            "plan": plan,
+        }
+
+    required_names, required_available = _resolve_claim_strip_required(
+        required_aspect_loader or _claim_strip_required_aspect_names,
+        cs.live_category_id(live_offer),
+    )
     recheck = cs.plan_sku_claim_strip(
         sku,
         manifest_rows or [],
@@ -4616,9 +4788,8 @@ def apply_claim_strip_live(
         live_offer,
         source_report_issues or [],
         location=location,
-        required_aspect_names=(required_aspect_loader or _claim_strip_required_aspect_names)(
-            cs.live_category_id(live_offer)
-        ),
+        required_aspect_names=required_names,
+        required_aspects_available=required_available,
     )
     if not cs.plans_equivalent(plan, recheck):
         for result in plan.results:
@@ -4626,15 +4797,21 @@ def apply_claim_strip_live(
                 result.status = cs.STATUS_DRIFT
         return {"status": cs.STATUS_DRIFT, "plan": plan}
 
+    # Inventory PUT is built from the recheck fetch, never the first snapshot.
     inventory_payload = cs.replace_inventory_product_fields(
-        before_inventory,
+        live_inventory,
         description=(
             plan.inventory_description_after
             if plan.inventory_description_after != plan.inventory_description_before
-            else (before_inventory.get("product") or {}).get("description")
+            else (live_inventory.get("product") or {}).get("description")
         ),
-        aspects=plan.aspects_after if plan.aspects_after != plan.aspects_before else (before_inventory.get("product") or {}).get("aspects"),
+        aspects=(
+            plan.aspects_after
+            if plan.aspects_after != plan.aspects_before
+            else (live_inventory.get("product") or {}).get("aspects")
+        ),
     )
+    inventory_written = False
     try:
         put_response = _put_inventory_snapshot(ebay_client, sku, inventory_payload)
         if getattr(put_response, "status_code", 200) not in (200, 204):
@@ -4642,74 +4819,86 @@ def apply_claim_strip_live(
                 f"inventory PUT failed {getattr(put_response, 'status_code', '?')}: "
                 f"{getattr(put_response, 'text', '')[:200]}"
             )
+        inventory_written = True
     except Exception as exc:
-        return {"status": "write_failed", "error": str(exc), "plan": plan}
+        return {"status": cs.STATUS_WRITE_FAILED, "error": str(exc), "plan": plan}
 
-    offer_id = (before_offer or {}).get("offerId")
-    offer_updated = False
-    if offer_id and plan.offer_description_after != plan.offer_description_before:
-        live_category = cs.live_category_id(before_offer)
-        live_price = _offer_price_value(before_offer)
-        offer_updated = bool(
-            ebay_client.update_offer_category(
-                offer_id,
-                live_category,
-                price=live_price,
-                listing_description=plan.offer_description_after,
-            )
+    offer_id = (live_offer or {}).get("offerId") or (before_offer or {}).get("offerId")
+    offer_desc_changed = plan.offer_description_after != plan.offer_description_before
+    aspects_changed = plan.aspects_after != plan.aspects_before
+    wrote_offer = False
+
+    def _fail_and_restore(status, error, readback=None):
+        restored, restore_info, restore_checks = _restore_claim_strip_snapshot(
+            sku=sku,
+            plan=plan,
+            ebay_client=ebay_client,
+            offer_id=offer_id,
+            expected_listing_id=expected_listing_id,
         )
-        if not offer_updated:
-            try:
-                _put_inventory_snapshot(ebay_client, sku, before_inventory)
-            except Exception:
-                pass
-            return {"status": "write_failed", "error": "offer update failed", "plan": plan}
-        # Existing description-change flow republishes after update_offer_category.
-        if hasattr(ebay_client, "publish_offer"):
-            try:
-                ebay_client.publish_offer(offer_id)
-            except Exception:
-                pass
+        if not restored:
+            loud = cs.STATUS_RESTORE_FAILED
+            for result in plan.results:
+                if result.status in {cs.STATUS_WILL_STRIP, cs.STATUS_STRIPPED}:
+                    result.status = loud
+                    result.readback = restore_checks or readback
+            return {
+                "status": loud,
+                "error": f"{error}; RESTORE_FAILED: {restore_info.get('error', restore_info)}",
+                "readback": restore_checks or readback,
+                "plan": plan,
+            }
+        for result in plan.results:
+            if result.status == cs.STATUS_WILL_STRIP:
+                result.status = status
+                result.readback = readback
+        return {
+            "status": status,
+            "error": error,
+            "readback": readback,
+            "restored": True,
+            "plan": plan,
+        }
+
+    if offer_id and offer_desc_changed:
+        try:
+            _update_offer_description_only(
+                ebay_client,
+                offer_id,
+                plan.offer_description_after,
+            )
+            wrote_offer = True
+        except Exception as exc:
+            if inventory_written:
+                return _fail_and_restore(cs.STATUS_WRITE_FAILED, f"offer update failed: {exc}")
+            return {"status": cs.STATUS_WRITE_FAILED, "error": str(exc), "plan": plan}
+
+    if offer_id and (offer_desc_changed or aspects_changed):
+        try:
+            _publish_offer_checked(ebay_client, offer_id)
+        except Exception as exc:
+            return _fail_and_restore(cs.STATUS_WRITE_FAILED, f"publish_offer failed: {exc}")
 
     try:
         read_inventory, read_offer = _fetch_live_listing_context(
             ebay_client,
             sku,
-            expected_listing_id=cs.live_listing_id(before_offer),
+            expected_listing_id=expected_listing_id,
         )
     except Exception as exc:
-        read_inventory, read_offer = {}, {}
-        readback_error = str(exc)
-    else:
-        readback_error = ""
+        return _fail_and_restore(
+            cs.STATUS_WRITE_FAILED,
+            f"readback fetch failed: {exc}",
+            readback={},
+        )
 
-    checks = cs.verify_readback(plan, read_inventory, read_offer, before_inventory, before_offer)
-    if readback_error or not all(checks.values()):
-        try:
-            _put_inventory_snapshot(ebay_client, sku, before_inventory)
-            if offer_id and offer_updated:
-                ebay_client.update_offer_category(
-                    offer_id,
-                    cs.live_category_id(before_offer),
-                    price=_offer_price_value(before_offer),
-                    listing_description=str((before_offer or {}).get("listingDescription") or ""),
-                )
-        except Exception as restore_exc:
-            return {
-                "status": cs.STATUS_FAILED_RESTORED,
-                "error": f"readback failed ({readback_error or checks}); restore error: {restore_exc}",
-                "readback": checks,
-                "plan": plan,
-            }
-        for result in plan.results:
-            if result.status == cs.STATUS_WILL_STRIP:
-                result.status = cs.STATUS_FAILED_RESTORED
-                result.readback = checks
-        return {
-            "status": cs.STATUS_FAILED_RESTORED,
-            "readback": checks,
-            "plan": plan,
-        }
+    checks = cs.verify_readback(plan, read_inventory, read_offer, live_inventory, live_offer)
+    if not all(checks.values()):
+        return _fail_and_restore(
+            cs.STATUS_WRITE_FAILED,
+            f"readback mismatch: {checks}",
+            readback=checks,
+        )
 
     if db_conn is not None:
         _sync_optimization_claim_strip(db_conn, sku, plan)
@@ -4717,7 +4906,12 @@ def apply_claim_strip_live(
         if result.status == cs.STATUS_WILL_STRIP:
             result.status = cs.STATUS_STRIPPED
         result.readback = checks
-    return {"status": cs.STATUS_STRIPPED, "readback": checks, "plan": plan}
+    return {
+        "status": cs.STATUS_STRIPPED,
+        "readback": checks,
+        "plan": plan,
+        "offer_updated": wrote_offer,
+    }
 
 
 def run_manifest_claim_strip(
@@ -4768,12 +4962,20 @@ def run_manifest_claim_strip(
             seen.add(row.sku)
             sku_order.append(row.sku)
 
+    environment = os.getenv("EBAY_ENVIRONMENT")
+    if args.fix and environment != "PRODUCTION":
+        print(
+            f"REFUSE --fix: EBAY_ENVIRONMENT={environment!r} "
+            f"(required explicit PRODUCTION; unset is refused)",
+            file=out,
+        )
+        return 2
+
     if ebay_client is None:
         try:
             from src.clients.real_ebay_client import create_real_ebay_client
 
-            environment = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION")
-            ebay_client = create_real_ebay_client(environment)
+            ebay_client = create_real_ebay_client(environment or "PRODUCTION")
             if not ebay_client.oauth.is_authorized():
                 print("❌ eBay not authorized! Run: python tools/refresh_token.py", file=out)
                 return 1
@@ -4786,16 +4988,6 @@ def run_manifest_claim_strip(
         db_conn = sqlite3.connect(str(DB_PATH))
         db_conn.row_factory = sqlite3.Row
         own_db = True
-
-    environment = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION")
-    if args.fix and environment != "PRODUCTION":
-        print(
-            f"REFUSE --fix: EBAY_ENVIRONMENT={environment!r} (required PRODUCTION)",
-            file=out,
-        )
-        if own_db:
-            db_conn.close()
-        return 2
 
     print(f"{'=' * 60}", file=out)
     print("  Claim strip from reviewed manifest", file=out)
@@ -4815,17 +5007,50 @@ def run_manifest_claim_strip(
     status_counts: dict[str, int] = {}
     wrote_any = False
     loader = required_aspect_loader or _claim_strip_required_aspect_names
+    results_name = f"{'live' if args.fix else 'dryrun'}_{timestamp}.json"
+    results_path = log_dir / results_name
+    stop_batch = False
+    exit_code = 0
+
+    def _flush_results() -> None:
+        results_path.write_text(
+            json.dumps(
+                {
+                    "mode": "live" if args.fix else "dryrun",
+                    "created_at": datetime.now().isoformat(),
+                    "manifest_counts": manifest_counts,
+                    "status_counts": status_counts,
+                    "entries": all_entries,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    def _record_status(status: str) -> None:
+        status_counts[status] = status_counts.get(status, 0) + 1
 
     for sku in sku_order:
         try:
             inventory, offer = _fetch_live_listing_context(ebay_client, sku)
         except Exception as exc:
             print(f"{sku}: skip fetch_failed ({exc})", file=out)
+            all_entries.append(cs.sku_event_entry(sku, cs.STATUS_FETCH_FAILED, error=str(exc)))
+            _record_status(cs.STATUS_FETCH_FAILED)
+            _flush_results()
             continue
         if not inventory or not offer:
             print(f"{sku}: skip live_listing_missing", file=out)
+            all_entries.append(cs.sku_event_entry(sku, cs.STATUS_LIVE_LISTING_MISSING))
+            _record_status(cs.STATUS_LIVE_LISTING_MISSING)
+            _flush_results()
             continue
         issues = cs.issues_for_sku(report, sku)
+        required_names, required_available = _resolve_claim_strip_required(
+            loader,
+            cs.live_category_id(offer),
+        )
         plan = cs.plan_sku_claim_strip(
             sku,
             manifest_rows,
@@ -4833,14 +5058,15 @@ def run_manifest_claim_strip(
             offer,
             issues,
             location=getattr(args, "claims_location", "all"),
-            required_aspect_names=loader(cs.live_category_id(offer)),
+            required_aspect_names=required_names,
+            required_aspects_available=required_available,
         )
         for chunk in cs.unified_field_diffs(plan):
             if chunk:
                 print(chunk, file=out)
         for result in plan.results:
             print(f"{sku}\t{result.claim}\t{result.status}", file=out)
-            status_counts[result.status] = status_counts.get(result.status, 0) + 1
+            _record_status(result.status)
 
         apply_status = None
         readback = None
@@ -4862,37 +5088,37 @@ def run_manifest_claim_strip(
             apply_status = applied.get("status")
             readback = applied.get("readback")
             wrote_any = wrote_any or apply_status == cs.STATUS_STRIPPED
-            if apply_status == cs.STATUS_FAILED_RESTORED:
-                print(f"FAILED_RESTORED {sku} readback={readback}", file=out)
+            if apply_status == cs.STATUS_RESTORE_FAILED:
+                print(f"RESTORE_FAILED {sku} readback={readback} error={applied.get('error')}", file=out)
+                stop_batch = True
+                exit_code = 1
+            elif apply_status == cs.STATUS_LIVE_CHANGED_BETWEEN_FETCHES:
+                print(f"{sku}: skip live_changed_between_fetches", file=out)
             elif apply_status == cs.STATUS_DRIFT:
                 print(f"{sku}: skip drift", file=out)
+            elif apply_status == cs.STATUS_WRITE_FAILED:
+                print(f"{sku}: write_failed error={applied.get('error')}", file=out)
         elif args.fix and not plan.has_changes:
             apply_status = "no_write"
 
-        for result in plan.results:
-            extra = {}
-            if readback is not None:
-                extra["readback"] = readback
-            if apply_status:
-                extra["apply_status"] = apply_status
-            all_entries.append(cs.result_entry(result, extra))
+        if plan.results:
+            for result in plan.results:
+                extra = {}
+                if readback is not None:
+                    extra["readback"] = readback
+                if apply_status:
+                    extra["apply_status"] = apply_status
+                all_entries.append(cs.result_entry(result, extra))
+        elif apply_status:
+            all_entries.append(
+                cs.sku_event_entry(sku, apply_status, extra={"apply_status": apply_status})
+            )
+        _flush_results()
+        if stop_batch:
+            print(f"STOP BATCH after {sku}: restore_failed", file=out)
+            break
 
-    results_name = f"{'live' if args.fix else 'dryrun'}_{timestamp}.json"
-    results_path = log_dir / results_name
-    results_path.write_text(
-        json.dumps(
-            {
-                "mode": "live" if args.fix else "dryrun",
-                "created_at": datetime.now().isoformat(),
-                "manifest_counts": manifest_counts,
-                "status_counts": status_counts,
-                "entries": all_entries,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    _flush_results()
     print(f"Results: {results_path}", file=out)
     print(
         "Summary: "
@@ -4901,7 +5127,7 @@ def run_manifest_claim_strip(
     )
     if own_db:
         db_conn.close()
-    return 0
+    return exit_code
 
 
 def main(argv=None):

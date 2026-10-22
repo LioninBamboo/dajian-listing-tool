@@ -48,12 +48,29 @@ STATUS_IN_TITLE = "in_title"
 STATUS_CLAIM_NOT_IN_REPORT = "claim_not_in_report"
 STATUS_LISTING_ID_MISMATCH = "listing_id_mismatch"
 STATUS_REQUIRED_ASPECT = "required_aspect_would_empty"
+STATUS_REQUIRED_ASPECTS_UNAVAILABLE = "required_aspects_unavailable"
 STATUS_SECTION_EMPTY = "section_empty"
 STATUS_LOCATION_FILTERED = "location_filtered"
 STATUS_DRIFT = "drift"
 STATUS_FAILED_RESTORED = "failed_restored"
+STATUS_RESTORE_FAILED = "restore_failed"
+STATUS_LIVE_CHANGED_BETWEEN_FETCHES = "live_changed_between_fetches"
+STATUS_FETCH_FAILED = "fetch_failed"
+STATUS_LIVE_LISTING_MISSING = "live_listing_missing"
+STATUS_WRITE_FAILED = "write_failed"
 STATUS_STRIPPED = "stripped"
 STATUS_IGNORED = "ignored"
+
+# GET /offer returns these; Inventory offer PUT rejects them.
+OFFER_GET_ONLY_KEYS = (
+    "offerId",
+    "listing",
+    "listingId",
+    "status",
+    "warnings",
+    "errors",
+    "href",
+)
 
 _WS_RE = re.compile(r"\s+")
 _SEP_NORMALIZE_RE = re.compile(r"[\s\-_]+")
@@ -637,6 +654,10 @@ def is_required_aspect(name: str, required_names: Iterable[str]) -> bool:
     return any(str(item or "").strip().casefold() == want for item in required_names)
 
 
+def is_features_aspect(name: str) -> bool:
+    return str(name or "").strip().casefold() == "features"
+
+
 @dataclass
 class AspectHit:
     status: str
@@ -649,6 +670,8 @@ def strip_claim_from_aspects(
     aspect_name: str,
     claim: str,
     required_names: Iterable[str] = (),
+    *,
+    required_aspects_available: bool = True,
 ) -> AspectHit:
     current = {
         str(key): aspect_values(value)
@@ -656,15 +679,18 @@ def strip_claim_from_aspects(
     }
     key = find_aspect_key(current, aspect_name)
     if key is None:
-        return AspectHit(status=STATUS_NOT_FOUND, after_aspects=current)
+        # Re-run after a successful strip: the key is already gone.
+        return AspectHit(status=STATUS_ALREADY_ABSENT, after_aspects=current)
     values = current[key]
     target = normalize_claim_value(claim)
     kept = [value for value in values if normalize_claim_value(value) != target]
     removed = [value for value in values if normalize_claim_value(value) == target]
     if not removed:
         return AspectHit(status=STATUS_ALREADY_ABSENT, after_aspects=current)
+    if not is_features_aspect(key) and not required_aspects_available:
+        return AspectHit(status=STATUS_REQUIRED_ASPECTS_UNAVAILABLE, after_aspects=current)
     if not kept:
-        if key.casefold() != "features" and is_required_aspect(key, required_names):
+        if not is_features_aspect(key) and is_required_aspect(key, required_names):
             return AspectHit(status=STATUS_REQUIRED_ASPECT, after_aspects=current)
         current = dict(current)
         current.pop(key, None)
@@ -825,6 +851,43 @@ def live_quantity(inventory: Mapping[str, Any] | None, offer: Mapping[str, Any] 
     return None
 
 
+def inventory_availability_quantity(inventory: Mapping[str, Any] | None) -> Any:
+    availability = ((inventory or {}).get("availability") or {}) if inventory else {}
+    return (availability.get("shipToLocationAvailability") or {}).get("quantity")
+
+
+def offer_available_quantity(offer: Mapping[str, Any] | None) -> Any:
+    if not offer:
+        return None
+    return offer.get("availableQuantity")
+
+
+def fetches_price_or_qty_changed(
+    first_inventory: Mapping[str, Any] | None,
+    first_offer: Mapping[str, Any] | None,
+    recheck_inventory: Mapping[str, Any] | None,
+    recheck_offer: Mapping[str, Any] | None,
+) -> bool:
+    return (
+        inventory_availability_quantity(first_inventory)
+        != inventory_availability_quantity(recheck_inventory)
+        or offer_available_quantity(first_offer) != offer_available_quantity(recheck_offer)
+        or (first_offer or {}).get("pricingSummary") != (recheck_offer or {}).get("pricingSummary")
+    )
+
+
+def offer_description_only_put_payload(
+    live_offer: Mapping[str, Any] | None,
+    listing_description: str,
+) -> dict[str, Any]:
+    """Deep-copy a GET offer and change only listingDescription for PUT."""
+    payload = deepcopy(dict(live_offer or {}))
+    for key in OFFER_GET_ONLY_KEYS:
+        payload.pop(key, None)
+    payload["listingDescription"] = listing_description
+    return payload
+
+
 def live_image_urls(inventory: Mapping[str, Any] | None) -> list[str]:
     product = ((inventory or {}).get("product") or {}) if inventory else {}
     urls = product.get("imageUrls") or []
@@ -929,9 +992,13 @@ def _aggregate_status(actions: list[TokenAction]) -> str:
         STATUS_SECTION_EMPTY,
         STATUS_LISTING_ID_MISMATCH,
         STATUS_DRIFT,
+        STATUS_RESTORE_FAILED,
         STATUS_FAILED_RESTORED,
+        STATUS_LIVE_CHANGED_BETWEEN_FETCHES,
+        STATUS_WRITE_FAILED,
         STATUS_CLAIM_NOT_IN_REPORT,
         STATUS_PROTECTED_ZONE,
+        STATUS_REQUIRED_ASPECTS_UNAVAILABLE,
         STATUS_REQUIRED_ASPECT,
         STATUS_AMBIGUOUS,
         STATUS_NO_SNIPPET,
@@ -955,6 +1022,7 @@ def plan_sku_claim_strip(
     *,
     location: str = LOCATION_ALL,
     required_aspect_names: Iterable[str] = (),
+    required_aspects_available: bool = True,
 ) -> SkuPlan:
     product = ((inventory or {}).get("product") or {}) if inventory else {}
     offer_desc = str((offer or {}).get("listingDescription") or "")
@@ -1108,6 +1176,7 @@ def plan_sku_claim_strip(
                     aspect_name,
                     row.claim,
                     required_aspect_names,
+                    required_aspects_available=required_aspects_available,
                 )
                 action = TokenAction(
                     sku=sku,
@@ -1228,6 +1297,29 @@ def claim_still_in_field(claim: str, field_text: str) -> bool:
     return claim_matches_text(claim, strip_html_to_text(field_text) if "<" in (field_text or "") else field_text)
 
 
+def claim_matches_unprotected(claim: str, html_src: str) -> bool:
+    """True when *claim* appears outside tables, headings, PACKAGE INCLUDES, etc."""
+    source = html_src or ""
+    if "<" not in source:
+        return claim_matches_text(claim, source)
+    index = build_html_index(source)
+    occurrences = _iter_claim_occurrences(index, claim)
+    if not occurrences:
+        return False
+    zones = protected_ranges(source)
+    for start, end in occurrences:
+        html_start, html_end = _match_html_span(index, start, end)
+        if not is_protected(source, html_start, html_end, zones):
+            return True
+    return False
+
+
+def claim_still_in_unprotected(claim: str, field_text: str) -> bool:
+    if "<" in (field_text or ""):
+        return claim_matches_unprotected(claim, field_text)
+    return claim_matches_text(claim, field_text)
+
+
 def verify_readback(
     plan: SkuPlan,
     inventory: Mapping[str, Any] | None,
@@ -1271,12 +1363,12 @@ def verify_readback(
             if action.field == TOKEN_OFFER_DESC:
                 if action.removed_unit_html and action.removed_unit_html in offer_desc:
                     units_gone = False
-                if claim_still_in_field(result.claim, offer_desc):
+                if claim_still_in_unprotected(result.claim, offer_desc):
                     claims_gone = False
             elif action.field == TOKEN_INV_DESC:
                 if action.removed_unit_html and action.removed_unit_html in inv_desc:
                     units_gone = False
-                if claim_still_in_field(result.claim, inv_desc):
+                if claim_still_in_unprotected(result.claim, inv_desc):
                     claims_gone = False
             else:
                 aspect_name = _aspect_name_from_token(action.token)
@@ -1293,9 +1385,17 @@ def verify_readback(
     if plan.inventory_description_after != plan.inventory_description_before:
         description_matches = description_matches and inv_desc == plan.inventory_description_after
 
+    offer_invariants = (
+        offer_available_quantity(offer) == offer_available_quantity(before_offer)
+        and (offer or {}).get("pricingSummary") == (before_offer or {}).get("pricingSummary")
+        and (offer or {}).get("listingPolicies") == (before_offer or {}).get("listingPolicies")
+        and (offer or {}).get("merchantLocationKey") == (before_offer or {}).get("merchantLocationKey")
+        and (offer or {}).get("storeCategoryNames") == (before_offer or {}).get("storeCategoryNames")
+    )
     invariants = (
-        live_price(offer) == live_price(before_offer)
-        and live_quantity(inventory, offer) == live_quantity(before_inventory, before_offer)
+        offer_invariants
+        and inventory_availability_quantity(inventory)
+        == inventory_availability_quantity(before_inventory)
         and live_category_id(offer) == live_category_id(before_offer)
         and live_title(inventory, offer) == live_title(before_inventory, before_offer)
         and live_image_urls(inventory) == live_image_urls(before_inventory)
@@ -1380,6 +1480,29 @@ def result_entry(result: ClaimResult, extra: Mapping[str, Any] | None = None) ->
     }
     if result.readback is not None:
         payload["readback"] = result.readback
+    if extra:
+        payload.update(dict(extra))
+    return payload
+
+
+def sku_event_entry(
+    sku: str,
+    status: str,
+    *,
+    error: str = "",
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "sku": sku,
+        "claim": "",
+        "token": "",
+        "status": status,
+        "removed_unit_text": "",
+        "before_sha": "",
+        "after_sha": "",
+    }
+    if error:
+        payload["error"] = error
     if extra:
         payload.update(dict(extra))
     return payload
