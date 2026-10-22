@@ -12,7 +12,20 @@ import requests
 import logging
 from typing import Dict, List, Optional, Any, Tuple
 
-from src.utils.product_context_signals import mentions_cooler_product, outdoor_context
+from src.utils.product_context_signals import (
+    has_any_phrase,
+    has_phrase,
+    mentions_cooler_product,
+    outdoor_context,
+    primary_product_noun,
+    strip_mixed_indoor_outdoor,
+    strip_room_location_lists,
+    title_allows_outdoor_chair_remap,
+    title_has_clear_outdoor_word,
+    title_has_mixed_indoor_outdoor,
+    title_is_chair_accessory,
+    title_is_dining_set_bundle,
+)
 from src.services.ebay_auth import EbayOAuthService
 from src.utils.category_tree_cache import build_category_path
 from src.utils.store_profile import get_store_profile
@@ -101,20 +114,31 @@ class EbayCategoryMatcher:
             or "console table" in title_lower
             or re.search(r"\bbehind\s+(?:the\s+)?(?:couch|sofa)\b", title_lower) is not None
         )
-        has_sofa = not has_sofa_accessory_table and (
-            any(
-                kw in title_lower
-                for kw in (
-                    "sectional sofa",
-                    "l-shaped sectional",
-                    "l-shaped sofa",
-                    "sleeper sofa",
-                    "sofa bed",
-                    "pull out sofa",
-                    "loveseat",
+        primary_noun = primary_product_noun(title_lower)
+        has_sofa = (
+            not has_sofa_accessory_table
+            and primary_noun not in {"storage_ottoman", "ottoman_bench", "ottoman", "workbench"}
+            and (
+                any(
+                    has_phrase(title_lower, kw)
+                    for kw in (
+                        "sectional sofa",
+                        "l-shaped sectional",
+                        "l-shaped sofa",
+                        "sleeper sofa",
+                        "sofa bed",
+                        "pull out sofa",
+                        "loveseat",
+                    )
+                )
+                or (
+                    re.search(r"\b(?:sofa|couch)\b", title_lower) is not None
+                    and not has_any_phrase(
+                        title_lower,
+                        ("storage ottoman", "ottoman bench", "storage bench"),
+                    )
                 )
             )
-            or re.search(r"\b(?:sofa|couch)\b", title_lower) is not None
         )
         has_bunk_bed = any(
             kw in title_lower
@@ -135,13 +159,16 @@ class EbayCategoryMatcher:
             re.search(rf"\b{kw}\b", title_lower)
             for kw in ("platform bed", "bed frame", "house bed", "floor bed", "montessori bed", "storage bed")
         )
-        has_storage_ottoman = any(
-            kw in text_lower
-            for kw in ("storage ottoman", "ottoman bench", "lift top ottoman", "storage footstool")
+        # Storage-ottoman remaps must read the TITLE only. A description that
+        # mentions a storage ottoman as an accessory must not move a sofa/chair
+        # off 38208.
+        has_storage_ottoman = has_any_phrase(
+            title_lower,
+            ("storage ottoman", "ottoman bench", "lift top ottoman", "storage footstool"),
         )
-        has_storage_ottoman_only = has_storage_ottoman and not any(
-            kw in title_lower
-            for kw in (
+        has_storage_ottoman_only = has_storage_ottoman and not has_any_phrase(
+            title_lower,
+            (
                 "sectional sofa",
                 "l-shaped sectional",
                 "l-shaped sofa",
@@ -156,7 +183,7 @@ class EbayCategoryMatcher:
                 "reading chair",
                 "club chair",
                 "chaise lounge",
-            )
+            ),
         )
         has_bean_bag = "bean bag" in title_lower
         has_bar_stool = any(
@@ -188,10 +215,7 @@ class EbayCategoryMatcher:
             and not any(kw in title_lower for kw in ("dog treadmill", "pet treadmill"))
         )
         has_potting_bench = any(kw in text_lower for kw in ("potting bench", "garden workstation"))
-        has_outdoor_context = any(
-            kw in text_lower
-            for kw in ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "balcony", "porch")
-        )
+        has_outdoor_context = outdoor_context(title_lower, text_lower)
         has_porch_swing = (
             "porch swing" in text_lower
             or "porch swing bed" in text_lower
@@ -264,7 +288,7 @@ class EbayCategoryMatcher:
             )
         )
         has_outdoor_chair = (
-            has_outdoor_context
+            title_allows_outdoor_chair_remap(title_lower)
             and not has_outdoor_daybed
             and not any(kw in title_lower for kw in ("sofa", "couch", "loveseat", "sectional"))
             and re.search(r"\btable\b", title_lower) is None
@@ -308,27 +332,26 @@ class EbayCategoryMatcher:
         )
         has_game_table = any(kw in title_lower for kw in ("board game table", "gaming table", "game table"))
         has_shade_sail = any(kw in title_lower for kw in ("shade sail", "sun shade sail", "sunshade sail"))
-        has_dining_set = not has_bar_stool and not has_patio_furniture_set and (
-            any(
-                kw in title_lower
-                for kw in (
-                    "dining set",
-                    "dining table set",
-                    "piece dining set",
-                    "5-piece dining",
-                    "5 piece dining",
-                    "6-piece dining",
-                    "6 piece dining",
-                )
+        has_explicit_dining_set = not has_bar_stool and not has_patio_furniture_set and any(
+            kw in title_lower
+            for kw in (
+                "dining set",
+                "dining table set",
+                "piece dining set",
+                "5-piece dining",
+                "5 piece dining",
+                "6-piece dining",
+                "6 piece dining",
+                "7-piece dining",
+                "7 piece dining",
             )
-            or any(
-                kw in text_lower
-                for kw in (
-                    "dining table and chair",
-                    "dining table with chair",
-                    "table and chair set",
-                    "table with chair set",
-                )
+        )
+        has_dining_set_bundle = title_is_dining_set_bundle(title_lower)
+        has_dining_set = has_explicit_dining_set or (
+            has_dining_set_bundle
+            and has_any_phrase(
+                title_lower,
+                ("dining set", "dining table set", "piece dining", "table and chair set"),
             )
         )
         pantry_markers = (
@@ -384,16 +407,23 @@ class EbayCategoryMatcher:
         has_hall_tree = any(
             kw in product_text_lower for kw in ("hall tree", "coat rack bench", "hall stand")
         )
+        has_nightstand_or_dresser = has_any_phrase(
+            title_lower,
+            ("nightstand", "bedside table", "dresser", "chest of drawers"),
+        )
+        has_workbench = has_any_phrase(title_lower, ("workbench", "work bench"))
         has_pantry_cabinet = (
             not (has_bunk_bed or has_bed_frame)
             and not has_wine_storage
             and not has_hall_tree
             and not has_tool_storage_cabinet
+            and not has_nightstand_or_dresser
+            and not has_workbench
             and (
-                any(kw in text_lower for kw in pantry_markers)
+                any(has_phrase(text_lower, kw) for kw in pantry_markers)
                 or (
-                    "hutch" in text_lower
-                    and any(kw in text_lower for kw in ("kitchen", "pantry", "microwave"))
+                    has_phrase(text_lower, "hutch")
+                    and has_any_phrase(text_lower, ("kitchen", "pantry", "microwave"))
                 )
             )
         )
@@ -428,16 +458,20 @@ class EbayCategoryMatcher:
                 )
             )
         )
-        has_indoor_bench = not excluded_bench_context and any(
-            kw in text_lower
-            for kw in (
-                "dining bench",
-                "long bench",
-                "upholstered bench",
-                "mid century bench",
-                "bench with",
-                "end of bed",
-                "footrest stool",
+        has_indoor_bench = (
+            not excluded_bench_context
+            and not has_workbench
+            and any(
+                has_phrase(text_lower, kw)
+                for kw in (
+                    "dining bench",
+                    "long bench",
+                    "upholstered bench",
+                    "mid century bench",
+                    "bench with",
+                    "end of bed",
+                    "footrest stool",
+                )
             )
         )
         indoor_table_markers = (
@@ -466,9 +500,28 @@ class EbayCategoryMatcher:
                 "table and chair set for toddlers",
             )
         )
-        has_outdoor_table = any(
-            kw in text_lower
-            for kw in ("patio dining table", "outdoor dining table", "bistro table", "garden table", "outdoor table", "patio table")
+        title_core = strip_mixed_indoor_outdoor(strip_room_location_lists(title_lower))
+        has_outdoor_table = (not title_has_mixed_indoor_outdoor(title_lower)) and (
+            any(
+                kw in title_core
+                for kw in (
+                    "patio dining table",
+                    "outdoor dining table",
+                    "bistro table",
+                    "garden table",
+                    "outdoor table",
+                    "patio table",
+                    "outdoor side table",
+                    "outdoor end table",
+                    "patio side table",
+                    "patio end table",
+                )
+            )
+            or (
+                any(kw in title_core for kw in ("outdoor", "patio", "garden"))
+                and any(kw in title_core for kw in ("side table", "end table", "dining table"))
+                and not any(kw in title_core for kw in ("coffee table", "nesting table", "cocktail table"))
+            )
         )
         # has_wine_storage / has_hall_tree already computed above (before pantry)
         has_explicit_table = any(
@@ -565,7 +618,12 @@ class EbayCategoryMatcher:
         if has_game_table and cid != "38204":
             return "38204", "Tables"
 
-        if has_dining_set and cid != "107578":
+        if (has_explicit_dining_set or has_dining_set_bundle) and title_has_clear_outdoor_word(title_lower):
+            if cid != "139849":
+                return "139849", "Patio & Garden Furniture Sets"
+            return cid, category_name
+
+        if has_explicit_dining_set and cid != "107578":
             return "107578", "Dining Sets"
 
         # Wine/bar liquor cabinets and hall trees must win over generic pantry remap.
@@ -589,7 +647,7 @@ class EbayCategoryMatcher:
         if has_display_cabinet and cid != "20493":
             return "20493", "Display Cabinets"
 
-        if has_patio_furniture_set and not has_outdoor_chair and not has_dining_set and cid != "139849":
+        if has_patio_furniture_set and not has_outdoor_chair and not has_explicit_dining_set and cid != "139849":
             return "139849", "Patio & Garden Furniture Sets"
 
         if has_cooler and cid != "79691":
@@ -599,24 +657,29 @@ class EbayCategoryMatcher:
             return "48319", "Bean Bags & Inflatables"
 
         if has_explicit_table and not has_sofa and not has_patio_furniture_set and cid == "38208":
+            if has_outdoor_table:
+                return "112590", "Patio & Garden Tables"
             return "38204", "Tables"
 
         if has_sofa and not has_bean_bag and not has_patio_furniture_set and not (has_bunk_bed or has_bed_frame) and cid != "38208":
             return "38208", "Sofas, Armchairs & Couches"
 
-        if has_storage_ottoman_only and cid != "20490":
+        if has_storage_ottoman_only and cid not in {"20490", "262980"}:
             return "20490", "Ottomans, Footstools & Poufs"
 
-        if has_indoor_bench and not has_dining_set and cid != "262980":
+        if has_indoor_bench and not has_dining_set and cid not in {"262980", "20490"}:
             return "262980", "Benches"
 
         if has_kids_table_set and cid != "66743":
             return "66743", "Play Table & Chair Sets"
 
+        if has_outdoor_table and not has_dining_set_bundle and cid in {"38199", "38200", "38204"}:
+            return "112590", "Patio & Garden Tables"
         if (
             has_outdoor_table
-            and not has_dining_set
-            and cid in {"38204", "79686", "107578"}
+            and not has_explicit_dining_set
+            and not has_dining_set_bundle
+            and cid in {"79686"}
             and not any(kw in title_lower for kw in indoor_table_markers)
         ):
             return "112590", "Patio & Garden Tables"
@@ -942,20 +1005,20 @@ class EbayCategoryMatcher:
         outdoor_chair_categories = {"79682", "79684", "138996"}
         porch_swing_categories = {"79694"}
         sofa_categories = {"38208"}
-        ottoman_categories = {"20490"}
+        ottoman_categories = {"20490", "262980"}
         bean_bag_categories = {"48319"}
         trellis_categories = {"43538"}
         arbor_categories = {"180993"}
         luggage_categories = {"16080"}
         arcade_game_categories = {"36278", "20270", "13716", "2540"}
         kids_table_set_categories = {"66743"}
-        outdoor_table_categories = {"112590"}
+        outdoor_table_categories = {"112590", "107578", "139849", "79686", "38204"}
         wine_storage_categories = {"20689"}
         hall_tree_categories = {"261263"}
         patio_furniture_set_categories = {"139849"}
         dining_set_categories = {"107578"}
         cooler_categories = {"79691"}
-        indoor_bench_categories = {"262980"}
+        indoor_bench_categories = {"262980", "20490"}
         desk_categories = {"88057", "25290"}
         table_categories = {"38204", "107578"}
         game_table_categories = {"38204"}
@@ -1138,6 +1201,7 @@ class EbayCategoryMatcher:
         outdoor_table_markers = (
             "patio dining table", "outdoor dining table", "bistro table", "garden table",
             "outdoor table", "patio table",
+            "outdoor side table", "outdoor end table", "patio side table", "patio end table",
         )
         wine_storage_markers = ("wine rack", "wine cabinet", "stemware rack")
         hall_tree_markers = ("hall tree", "coat rack bench", "hall stand")
@@ -1188,13 +1252,14 @@ class EbayCategoryMatcher:
             if cid not in bean_bag_categories:
                 return False
 
+        title_core = strip_room_location_lists(title_lower)
         has_outdoor_chair_title = (
-            any(kw in title_lower for kw in ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "balcony"))
-            and not any(kw in title_lower for kw in ("sofa", "couch", "loveseat", "sectional"))
-            and re.search(r"\btable\b", title_lower) is None
-            and any(
-                kw in title_lower
-                for kw in (
+            title_allows_outdoor_chair_remap(title_core)
+            and not has_any_phrase(title_core, ("sofa", "couch", "loveseat", "sectional"))
+            and re.search(r"\btable\b", title_core) is None
+            and has_any_phrase(
+                title_core,
+                (
                     "outdoor chair",
                     "patio chair",
                     "club chair",
@@ -1211,7 +1276,7 @@ class EbayCategoryMatcher:
                     "sun lounger",
                     "camping chair",
                     "camping chairs",
-                )
+                ),
             )
         )
         if any(marker in title_lower for marker in patio_furniture_set_markers) and not has_outdoor_chair_title and not any(
@@ -1244,10 +1309,16 @@ class EbayCategoryMatcher:
         if any(marker in title_lower for marker in bar_stool_markers):
             return cid == "103431"
 
-        if any(marker in title_lower for marker in dining_set_markers) and not any(
+        if (
+            any(marker in title_lower for marker in dining_set_markers)
+            or title_is_dining_set_bundle(title_lower)
+        ) and not any(
             marker in title_lower for marker in non_dining_table_set_markers
         ) and not any(marker in title_lower for marker in bar_stool_markers):
-            return cid in dining_set_categories
+            if title_has_clear_outdoor_word(title_lower):
+                return cid in {"107578", "139849"}
+            if any(marker in title_lower for marker in dining_set_markers):
+                return cid in dining_set_categories
 
         if any(marker in title_lower for marker in cooler_markers) or re.search(r"\bcooler\b", title_lower):
             if cid not in cooler_categories:
@@ -1259,9 +1330,11 @@ class EbayCategoryMatcher:
         if has_ottoman_title:
             return cid in ottoman_categories
 
-        has_indoor_bench_context = not any(
-            marker in title_lower for marker in excluded_bench_markers
-        ) and any(marker in title_lower for marker in indoor_bench_markers)
+        has_indoor_bench_context = (
+            not any(has_phrase(title_lower, marker) for marker in excluded_bench_markers)
+            and not has_any_phrase(title_lower, ("workbench", "work bench"))
+            and any(has_phrase(title_lower, marker) for marker in indoor_bench_markers)
+        )
         if has_indoor_bench_context and cid not in indoor_bench_categories:
             return False
 
@@ -1495,6 +1568,8 @@ class EbayCategoryMatcher:
         if any(kw in title_lower for kw in ("outdoor chair", "patio chair", "egg chair", "hanging egg chair", "hanging swing chair")):
             if any(kw in title_lower for kw in ("cat", "dog", "pet")):
                 return cid in pet_categories
+            if title_is_chair_accessory(title_lower) or title_has_mixed_indoor_outdoor(title_lower):
+                return True
             if cid not in outdoor_chair_categories:
                 return False
 
@@ -1615,7 +1690,49 @@ class EbayCategoryMatcher:
         # Combine title and description for better matching
         title_lower = self._normalize_keyword_text(title)
         desc_lower = self._normalize_keyword_text((description or "")[:3000])
-        
+        outdoor_title = title_has_clear_outdoor_word(title_lower)
+        if title_is_dining_set_bundle(title_lower):
+            if outdoor_title:
+                return "139849", "Patio & Garden Furniture Sets"
+            if any(
+                kw in title_lower
+                for kw in (
+                    "dining set",
+                    "dining table set",
+                    "piece dining set",
+                    "5-piece dining",
+                    "5 piece dining",
+                    "6-piece dining",
+                    "6 piece dining",
+                    "7-piece dining",
+                    "7 piece dining",
+                )
+            ):
+                return "107578", "Dining Sets"
+            return None, None
+        if title_is_chair_accessory(title_lower) and has_any_phrase(title_lower, ("chair", "chairs")):
+            return None, None
+        if title_has_mixed_indoor_outdoor(title_lower):
+            return None, None
+        if any(
+            kw in title_lower
+            for kw in (
+                "patio furniture set",
+                "patio set",
+                "patio conversation",
+                "outdoor conversation set",
+                "outdoor furniture set",
+                "outdoor sectional",
+            )
+        ):
+            return "139849", "Patio & Garden Furniture Sets"
+        if outdoor_title and "dining chair" in title_lower and title_allows_outdoor_chair_remap(title_lower):
+            return "79684", "Outdoor Chairs"
+        if outdoor_title and any(
+            kw in title_lower for kw in ("side table", "end table", "dining table")
+        ) and not any(kw in title_lower for kw in ("coffee table", "nesting table", "cocktail table")):
+            return "112590", "Patio & Garden Tables"
+
         mappings = [
             # ==================== MOTORS ====================
             (["running board", "running boards", "nerf bar", "nerf bars", "side step", "side steps", "step bar", "truck step"], "262210", "Running Boards & Nerf Bars"),

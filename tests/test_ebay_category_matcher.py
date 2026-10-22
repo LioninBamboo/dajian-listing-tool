@@ -85,6 +85,27 @@ def test_real_sofa_still_remapped_to_sofas():
     assert category_name == "Sofas, Armchairs & Couches"
 
 
+def test_sofa_with_storage_ottoman_stays_on_sofa_leaf():
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    title = "Velvet Sofa Couch with Storage Ottoman"
+
+    category_id, _ = matcher.canonicalize_category(
+        title, "38208", "Sofas, Armchairs & Couches"
+    )
+    assert category_id == "38208"
+
+
+def test_accent_chair_description_ottoman_does_not_remap():
+    matcher = EbayCategoryMatcher(_DummyOauth())
+    title = "Upholstered Accent Chair"
+    description = "Includes a matching storage ottoman for extra seating and hidden storage."
+
+    category_id, _ = matcher.canonicalize_category(
+        title, "38208", "Sofas, Armchairs & Couches", description
+    )
+    assert category_id == "38208"
+
+
 def test_indoor_rocking_chair_category_uses_rockers_gliders_leaf():
     matcher = EbayCategoryMatcher(_DummyOauth())
     title = "Upholstered Nursery Rocking Chair Glider for Living Room Reading"

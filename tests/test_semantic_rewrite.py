@@ -1099,12 +1099,35 @@ def test_pick_latest_full_corpus_audit_prefers_newest_mtime(tmp_path):
 def test_from_daily_audit_empty_queue_exits_zero(monkeypatch, capsys):
     import scripts.semantic_rewrite as cli
 
+    monkeypatch.setattr(
+        cli,
+        "pick_latest_daily_live_audit",
+        lambda files, *, max_age_hours=36, now=None: (
+            __import__("pathlib").Path("listing_audit_fix_today.json"),
+            {"issues": [{"sku": "X1"}]},
+        ),
+    )
     monkeypatch.setattr(cli, "derive_queue_from_latest_audit", lambda limit=None: ["X1", "X2"])
     monkeypatch.setattr(cli, "_exclude_done_and_human", lambda skus: [])
     code = cli.main(["--from-daily-audit", "--limit", "40"])
     assert code == 0
     out = capsys.readouterr().out
     assert "nothing to do" in out.lower()
+
+
+def test_from_daily_audit_no_fresh_report_records_skip(monkeypatch, capsys):
+    import scripts.semantic_rewrite as cli
+
+    monkeypatch.setattr(cli, "pick_latest_daily_live_audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        cli,
+        "derive_queue_from_latest_audit",
+        lambda limit=None: (_ for _ in ()).throw(AssertionError("must not derive from stale/empty")),
+    )
+    code = cli.main(["--from-daily-audit", "--limit", "40"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "SKIP: no fresh daily live_audit" in out
 
 
 def test_semantic_execution_status_marks_all_human_queue_as_review_required():

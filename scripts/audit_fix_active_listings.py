@@ -855,9 +855,9 @@ def audit_single_product(
 
     # Also check the optimized title
     opt_title = opt.get("title", "") if isinstance(opt, dict) else ""
-    combined_title = f"{title} {opt_title}".lower()
+    combined_title = f"{opt_title} {title}".lower()
     matcher = get_category_matcher()
-    title_context = " ".join(part for part in (title, opt_title) if part).strip()
+    title_context = " ".join(part for part in (opt_title, title) if part).strip()
     db_images = parse_image_list(images_raw)
     db_videos = parse_image_list(videos_raw)
     local_video_status = str(opt.get("video_status") or opt.get("videoStatus") or "").strip().upper()
@@ -955,7 +955,12 @@ def audit_single_product(
     # ── 1. Category Check — deterministic product profile wins over taxonomy drift ──
     # A human-approved stored category is not remapped by profile or canonicalize.
     skip_category_remap = is_category_approved(opt) and bool(stored_category)
-    profile = classify_listing_profile(title_context or title, live_description, stored_category)
+    profile = classify_listing_profile(
+        opt_title or title,
+        live_description,
+        stored_category,
+        source_title=title if opt_title else "",
+    )
     if not skip_category_remap and profile.category_id:
         if stored_category != profile.category_id:
             issues.append({
@@ -1979,6 +1984,15 @@ def create_parser():
 
 def is_full_published_scope(args) -> bool:
     return not args.sku and not args.sku_file and not args.source_report
+
+
+def audit_report_scope(args) -> str:
+    """Persist how this report was scoped so later jobs can fail closed."""
+    if getattr(args, "sku", None) or getattr(args, "sku_file", None):
+        return "sku"
+    if getattr(args, "source_report", None):
+        return "source_report"
+    return "full"
 
 
 def get_report_source(args) -> str:
@@ -4856,6 +4870,7 @@ def main(argv=None):
     report = {
         "generated_at": datetime.now().isoformat(),
         "mode": "fix" if args.fix else ("live_audit" if args.live else "audit"),
+        "scope": audit_report_scope(args),
         "source": report_source,
         "total_published": len(rows),
         "total_with_issues": len(all_issues),
