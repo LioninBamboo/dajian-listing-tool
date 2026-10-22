@@ -88,6 +88,7 @@ def test_sync_restocks_after_hold_expires(monkeypatch):
     from src.plugins.inventory_sync.sync_service import InventorySyncService
     import src.plugins.inventory_sync.sync_service as sync_mod
 
+    monkeypatch.setenv("EBAY_LISTING_QUANTITY_CAP", "1")
     monkeypatch.setattr(sync_mod, "is_restock_held", lambda sku: False)
 
     service = InventorySyncService.__new__(InventorySyncService)
