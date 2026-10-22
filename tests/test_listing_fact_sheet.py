@@ -666,6 +666,30 @@ def test_explicit_dimensions_keep_hall_tree_title_height_axis():
     assert values == {"length": 15.7, "width": 59.0, "height": 76.7}
 
 
+def test_strip_diameter_misread_wheel_counts():
+    from src.utils.listing_fact_sheet import _strip_diameter_misread_counts
+
+    text = "cutting width of 16” and durable 8-inch polymer wheels"
+    assert _strip_diameter_misread_counts({"wheels": 8, "blades": 5}, text) == {"blades": 5}
+    assert _strip_diameter_misread_counts({"wheels": 2}, "dual-wheel design with 2 wheels") == {"wheels": 2}
+
+
+def test_fact_sheet_for_content_drops_inch_wheel_diameter_counts(cache_conn, monkeypatch):
+    extracted = dict(SOURCE_SHEET, counts={"wheels": 8, "blades": 5})
+    monkeypatch.setattr(
+        "src.utils.listing_fact_sheet.extract_fact_sheet",
+        lambda *args, **kwargs: extracted,
+    )
+    sheet = fact_sheet_for_content(
+        cache_conn,
+        "16-Inch Push Reel Lawn Mower",
+        "durable 8-inch polymer wheels for a precise cut",
+        {},
+    )
+    assert sheet["counts"].get("wheels") is None
+    assert sheet["counts"].get("blades") == 5
+
+
 def test_zero_cached_source_counts_are_treated_as_missing():
     source = dict(SOURCE_SHEET, counts={"shelves": 0, "drawers": 0})
     live = dict(SOURCE_SHEET, counts={"shelves": 3, "drawers": 2})

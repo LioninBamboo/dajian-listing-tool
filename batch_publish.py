@@ -578,35 +578,77 @@ def calculate_smart_final_price(product: dict, market_price: float | None = None
     - COMPETITIVE: 5% below market, 10-25% margin  
     - CEILING_PRICE: high market price, ~26% margin
     - STANDARD: no market data, 15% margin
+
+    Hard floor: fee-aware 15% after refreshing live DaJian price+shippingFee.
+    Collection often stored shipping=0; without the refresh, smart pricing
+    understates landed cost and publishes near break-even.
     """
-    cb = product.get('cost_breakdown', {})
+    cb = product.get('cost_breakdown', {}) or {}
     total_cost = cb.get('total_dajian_cost', 0)
     current_price = product.get('suggested_price', 0) or product.get('price', 0)
-    
-    if not total_cost:
-        # Recalculate cost if missing
-        price = product.get('price', 0)
-        shipping = product.get('shipping', 0)
-        if price > 0:
-            cost_data = PricingEngine.calculate_dajian_cost(price, shipping, is_oversize=True)
-            total_cost = cost_data['total_dajian_cost']
-        else:
-            return current_price  # Can't recalculate
-    
+    product_price = float(product.get('price', 0) or 0)
+    shipping = float(product.get('shipping', 0) or 0)
+
+    # Refresh live supplier price + freight before pricing.
+    try:
+        from src.clients.dajian_client import DaJianClient
+        key = os.getenv("DAJIAN_API_KEY")
+        secret = os.getenv("DAJIAN_API_SECRET")
+        if key and secret:
+            info = DaJianClient(key, secret).get_stock_info(product.get("sku") or "")
+            live_price = info.get("price")
+            live_ship = info.get("shipping_fee")
+            if live_price is not None:
+                product_price = float(live_price)
+                product["price"] = product_price
+            if live_ship is not None:
+                shipping = float(live_ship)
+                product["shipping"] = shipping
+            logger.info(
+                f"  [PRICE] Live supplier cost: price=${product_price:.2f} "
+                f"ship=${shipping:.2f}"
+            )
+    except Exception as exc:
+        logger.warning(f"  [PRICE] Live supplier cost refresh failed: {exc}")
+
+    if product_price > 0:
+        attrs = product.get("attributes") or {}
+        specs = product.get("specs") or {}
+        is_oversize = "Dimensions" in attrs or "Dimensions" in specs
+        cost_data = PricingEngine.calculate_dajian_cost(
+            product_price, shipping, is_oversize=is_oversize
+        )
+        total_cost = cost_data["total_dajian_cost"]
+        product["cost_breakdown"] = cost_data
+    elif not total_cost:
+        return current_price  # Can't recalculate
+
+    # Fee-aware 15% hard floor (pipeline requirement).
+    safe_15 = PricingEngine.calculate_selling_price(float(total_cost), 0.15)["selling_price"]
+
     if market_price and market_price > 0:
         smart = PricingEngine.calculate_smart_price(total_cost, market_price)
         final = smart['final_price']
         strategy = smart['strategy']
         margin = smart['margin']
-        logger.info(f"  [PRICE] Smart: ${final:.2f} (strategy={strategy}, margin={margin:.1%}, "
-                    f"market=${market_price:.2f}, cost=${total_cost:.2f})")
+        if final < safe_15:
+            logger.info(
+                f"  [PRICE] Raise smart ${final:.2f} -> safe15 ${safe_15:.2f} "
+                f"(was strategy={strategy}, margin={margin:.1%}, "
+                f"market=${market_price:.2f}, cost=${total_cost:.2f})"
+            )
+            final = safe_15
+            strategy = "SAFE_15_FLOOR"
+        else:
+            logger.info(
+                f"  [PRICE] Smart: ${final:.2f} (strategy={strategy}, margin={margin:.1%}, "
+                f"market=${market_price:.2f}, cost=${total_cost:.2f})"
+            )
         return final
     else:
-        # Standard 15% margin
-        result = PricingEngine.calculate_selling_price(total_cost, 0.15)
-        final = result['selling_price']
-        logger.info(f"  [PRICE] Standard: ${final:.2f} (15% margin, cost=${total_cost:.2f})")
-        return final
+        # Standard 15% margin (= safe15 when no market data)
+        logger.info(f"  [PRICE] Standard: ${safe_15:.2f} (15% margin, cost=${total_cost:.2f})")
+        return safe_15
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -736,6 +778,13 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     sku = product['sku']
     environment = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION")
     publish_image_limit = _publish_image_limit(sku)
+
+    # Publish gate: never live-list blacklisted GIGA sellers (N735*/W1706*/ZL*).
+    from src.utils.copy_skip_gate import seller_is_blacklisted
+    if seller_is_blacklisted(sku):
+        msg = f"Blocked seller prefix (blacklist_seller): {sku}"
+        record_error(sku, msg)
+        return {"status": "error", "message": msg, "copy_skip_reasons": ["blacklist_seller"]}
 
     # ── Step 0: Enrich missing dimensions from Dajian API ──
     enrich_product_dimensions(product)

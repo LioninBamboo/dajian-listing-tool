@@ -50,20 +50,45 @@ CRITICAL_OPS_DAILY_TASKS = [
 ]
 
 
-def _is_ops_scheduler():
-    """Match daemon scheduler_profile=ops so substores never recover the full catalog."""
+def _store_profile():
     try:
         sys.path.insert(0, str(PROJECT_ROOT))
         from src.utils.store_profile import get_store_profile
-        return bool(get_store_profile().is_ops_scheduler)
+        return get_store_profile()
     except Exception:
-        return False
+        return None
+
+
+def _is_ops_scheduler():
+    """Match daemon scheduler_profile=ops so substores never recover the full catalog."""
+    profile = _store_profile()
+    return bool(getattr(profile, 'is_ops_scheduler', False)) if profile is not None else False
+
+
+def _ops_qc_autofix_enabled():
+    profile = _store_profile()
+    return bool(getattr(profile, 'ops_qc_autofix_enabled', False)) if profile is not None else False
+
+
+def _ops_ads_enabled():
+    profile = _store_profile()
+    return bool(getattr(profile, 'ops_ads_enabled', False)) if profile is not None else False
 
 
 def _watchdog_critical_tasks():
-    if _is_ops_scheduler():
-        return CRITICAL_OPS_DAILY_TASKS
-    return CRITICAL_DAILY_TASKS
+    if not _is_ops_scheduler():
+        return CRITICAL_DAILY_TASKS
+    tasks = list(CRITICAL_OPS_DAILY_TASKS)
+    if _ops_ads_enabled():
+        tasks.extend([
+            {'health_name': 'smart_reprice', 'deadline': '09:55', 'daemon_task': 'reprice', 'weekday': 0},
+            {'health_name': 'smart_reprice', 'deadline': '09:55', 'daemon_task': 'reprice', 'weekday': 3},
+            {'health_name': 'ad_restore', 'deadline': '09:50', 'daemon_task': 'ad_restore'},
+            {'health_name': 'ads_enroll', 'deadline': '10:40', 'daemon_task': 'ads_enroll'},
+        ])
+    if _ops_qc_autofix_enabled():
+        tasks.append({'health_name': 'listing_audit', 'deadline': '11:45', 'daemon_task': 'listing_audit'})
+    return tasks
 
 
 def _daemon_task_command(task_alias):
@@ -344,6 +369,16 @@ def check_overdue_critical_tasks():
     health = read_health()
     today = datetime.now().date()
     now = datetime.now()
+    # Full-profile daily_tasks occupies the synchronous daemon main loop.
+    # While it is running/recovering today, short overdue recoveries would pile
+    # on top of a blocked scheduler — skip the whole overdue pass (ops profile
+    # has no daily_tasks entry and uses CRITICAL_OPS_DAILY_TASKS instead).
+    if (
+        not _is_ops_scheduler()
+        and _task_in_progress_today(health, 'daily_tasks', today)
+    ):
+        log('daily_tasks in progress; skip overdue recovery')
+        return
     for task in _watchdog_critical_tasks():
         name = str(task['health_name'])
         task_alias = str(task['daemon_task'])
@@ -365,6 +400,15 @@ def check_overdue_critical_tasks():
         if _task_succeeded_today(health, name, today):
             continue
         if _task_in_progress_today(health, name, today):
+            continue
+        # mi_snapshot occupies the main loop after daily_tasks; recovering
+        # mi_self_check mid-snapshot yields a false "no snapshot" alert.
+        # Failed snapshot still allows recovery (true missing digest).
+        if (
+            name == 'mi_self_check'
+            and _task_in_progress_today(health, 'mi_snapshot', today)
+        ):
+            log('mi_snapshot in progress; skip mi_self_check recovery')
             continue
         if task.get('skip_if_started_today') and _task_already_started_today(health, name, today):
             continue

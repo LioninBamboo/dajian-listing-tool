@@ -110,7 +110,13 @@ def infer_set_includes(title: str) -> Optional[str]:
         return "Dining Table & Stools" if "dining" in title_lower else "Table & Stools"
     if "sofa" in title_lower or "couch" in title_lower or "sectional" in title_lower:
         return "Sofa Set"
-    if any(keyword in title_lower for keyword in SET_INCLUDE_KEYWORDS):
+    # "piece"/"set of" alone is NOT furniture evidence: "7-Piece Wrench Set" must
+    # never become Set Includes=Table Set (AquaRides W465P451141 regression).
+    furniture_ctx = any(
+        word in title_lower
+        for word in ("table", "dining", "patio", "bistro", "pub set", "conversation set")
+    )
+    if furniture_ctx and any(keyword in title_lower for keyword in SET_INCLUDE_KEYWORDS):
         return "Table Set"
     if any(keyword in title_lower for keyword in ("coffee table", "side table", "end table", "console table", "bistro table", "patio table", "dining table")):
         return "Table"

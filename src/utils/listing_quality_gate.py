@@ -1768,6 +1768,27 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
         )
 
+    # Camping cook stations advertise "4 Side Tables" as fold-out wings — that
+    # must NOT trigger the indoor End Tables (54235) profile (W465P439797).
+    if any(
+        marker in title_text
+        for marker in (
+            "camping kitchen",
+            "cook station",
+            "cooking station",
+            "camping table",
+            "outdoor cooking",
+        )
+    ):
+        return ListingProfile(
+            kind="camping_kitchen_table",
+            category_id="112590",
+            category_name="Patio & Garden Tables",
+            type_value="Camping Table",
+            indoor_outdoor="Outdoor",
+            remove_aspects=frozenset({"Room", "Upholstery Material", "Upholstery Fabric"}),
+        )
+
     if any(marker in title_text for marker in ("side table", "end table", "accent table", "lamp table")):
         # End/side/accent tables are eBay End Tables (54235), not Coffee/Dining
         # Tables (38204). Mapping to 38204 caused live CRITICAL false pressure
@@ -2354,6 +2375,410 @@ def ensure_store_description_template(
     return wrapped or desc
 
 
+_SET_WORD_RE = re.compile(r"\bsets?\b", re.IGNORECASE)
+_PKG_QTY_RE = re.compile(r"(\d+)\s*[x\u00d7]\s*([^,;<]+)", re.IGNORECASE)
+_PKG_ACCESSORY_TOKENS = ("hardware", "assembly", "instruction", "pillow", "screw", "bolt")
+
+
+def _parse_piece_count(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    match = re.match(r"\s*(\d+)\b", str(raw).strip())
+    if not match:
+        return None
+    try:
+        count = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return count if count > 1 else None
+
+
+def _claimed_set_or_pieces_qty(
+    title: str,
+    aspects: Mapping[str, Any] | None = None,
+) -> int | None:
+    """Set-of-N from Number of Items in Set, Number of Pieces, or the title."""
+    aspects = aspects or {}
+    for key in ("Number of Items in Set", "Number of Pieces"):
+        count = _parse_piece_count(first_aspect_text(aspects, key))
+        if count:
+            return count
+    return _parse_piece_count(infer_number_of_items_in_set(title or ""))
+
+
+def _text_claims_set(title: str, aspects: Mapping[str, Any] | None = None) -> bool:
+    if _SET_WORD_RE.search(title or ""):
+        return True
+    for value in (aspects or {}).values():
+        if isinstance(value, (list, tuple)):
+            blob = " ".join(str(item) for item in value)
+        else:
+            blob = str(value or "")
+        if _SET_WORD_RE.search(blob):
+            return True
+    return False
+
+
+def expected_package_includes_main_qty(
+    title: str,
+    aspects: Mapping[str, Any] | None = None,
+) -> int | None:
+    """Expected main-product qty in PACKAGE INCLUDES for singular Type listings.
+
+    Returns None when Type already denotes a set product, or when no set count
+    is stated in aspects/title. Number of Pieces is read the same way as
+    Number of Items in Set. Used by the quality gate and tests.
+    """
+    aspects = aspects or {}
+    type_name = first_aspect_text(aspects, "Type") or ""
+    if _SET_WORD_RE.search(type_name):
+        return None
+    return _claimed_set_or_pieces_qty(title, aspects)
+
+
+def _package_includes_blob(description: str) -> str | None:
+    if not description:
+        return None
+    match = re.search(
+        r"PACKAGE\s+INCLUDES</h3>\s*<p[^>]*>\s*([^<]+)",
+        description,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        return html_lib.unescape(match.group(1)).strip()
+    match = re.search(
+        r"PACKAGE\s+INCLUDES\s*[:\n]\s*([^\n<]+)",
+        description,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return html_lib.unescape(match.group(1)).strip()
+    loose = re.search(
+        r"PACKAGE\s+INCLUDES\b(.{0,500})",
+        description,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not loose:
+        return None
+    chunk = re.sub(r"<[^>]+>", " ", loose.group(1))
+    chunk = html_lib.unescape(chunk)
+    chunk = re.sub(r"\s+", " ", chunk).strip(" :-")
+    return chunk or None
+
+
+def parse_package_includes_main_item(description: str) -> tuple[int, str] | None:
+    """First non-accessory ``N x name`` pair in the PACKAGE INCLUDES block."""
+    pkg_text = _package_includes_blob(description)
+    if not pkg_text:
+        return None
+    for qm in _PKG_QTY_RE.finditer(pkg_text):
+        name = qm.group(2).strip()
+        if any(token in name.lower() for token in _PKG_ACCESSORY_TOKENS):
+            continue
+        try:
+            return int(qm.group(1)), name
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def parse_package_includes_main_qty(description: str) -> int | None:
+    """Parse the first non-accessory Nx item from the PACKAGE INCLUDES block."""
+    parsed = parse_package_includes_main_item(description)
+    if parsed is None:
+        return None
+    return parsed[0]
+
+
+def find_package_includes_set_qty_mismatch(
+    title: str,
+    description: str,
+    aspects: Mapping[str, Any] | None = None,
+) -> ListingQualityIssue | None:
+    """Flag title/aspect Set or Number of Pieces vs PACKAGE INCLUDES qty.
+
+    A Type that already names a set product still passes when the box line is
+    ``1 x {that set}`` (one set ships). ``1 x`` of the singular piece, or any
+    other qty that disagrees with Set / Number of Pieces / Number of Items in
+    Set, is a blocker. Motors QC calls this directly so universal-fit parts
+    are not exempt.
+    """
+    aspects = aspects or {}
+    parsed = parse_package_includes_main_item(description)
+    if parsed is None:
+        return None
+    actual, item_name = parsed
+    expected = _claimed_set_or_pieces_qty(title, aspects)
+    if expected and actual == expected:
+        return None
+
+    type_name = first_aspect_text(aspects, "Type") or ""
+    # One named set in the box: "1 x Wood Chisel Set" / "1 x Socket Set".
+    # The piece count describes what is inside that set, not extra sets.
+    if (
+        actual == 1
+        and _SET_WORD_RE.search(type_name)
+        and _SET_WORD_RE.search(item_name)
+    ):
+        return None
+
+    if expected and actual != expected:
+        return ListingQualityIssue(
+            "package_includes_set_qty_mismatch",
+            f"PACKAGE INCLUDES main qty is {actual} but title/aspects say set of {expected}",
+            field="description",
+        )
+
+    if actual == 1 and not _SET_WORD_RE.search(item_name) and _text_claims_set(title, aspects):
+        return ListingQualityIssue(
+            "package_includes_set_qty_mismatch",
+            "PACKAGE INCLUDES main qty is 1 but title/aspects say Set",
+            field="description",
+        )
+    return None
+
+
+
+_KIT_SIZE_CLAIM_RE = re.compile(
+    r"\b(\d{1,3})\s*[- ]?\s*(?:pieces?|pcs?|packs?|pk)\b|\bset\s+of\s+(\d{1,3})\b",
+    re.IGNORECASE,
+)
+_SOURCE_KIT_CN_RE = re.compile(r"(?:套装|件套|组合|共)\D{0,6}(\d{1,3})")
+
+
+def _extract_kit_size_claims(text: str) -> set[int]:
+    """N from N-piece / N pc / N pack / set of N (N>=2)."""
+    claims: set[int] = set()
+    plain = html_lib.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    for match in _KIT_SIZE_CLAIM_RE.finditer(plain):
+        for group in match.groups():
+            if not group:
+                continue
+            try:
+                value = int(group)
+            except ValueError:
+                continue
+            if 2 <= value <= 999:
+                claims.add(value)
+    return claims
+
+
+def _source_kit_size_evidence(
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+) -> set[int]:
+    parts = [source_title or "", source_description or ""]
+    for mapping in (attributes, specs):
+        if isinstance(mapping, Mapping):
+            for key, value in mapping.items():
+                parts.append(f"{key}: {value}")
+    blob = " ".join(parts)
+    evidence = _extract_kit_size_claims(blob)
+    for match in _SOURCE_KIT_CN_RE.finditer(blob):
+        try:
+            value = int(match.group(1))
+        except ValueError:
+            continue
+        if 2 <= value <= 999:
+            evidence.add(value)
+    return evidence
+
+
+def find_invented_kit_size(
+    title: str,
+    description: str = "",
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+) -> ListingQualityIssue | None:
+    """Block N-piece/pack/set claims that GIGA/source never states.
+
+    Catches LLM SEO invents like ``108-Piece`` on a kit whose BOM only lists
+    ``27pc`` first-aid contents. Severity is BLOCKER so analyze/publish and
+    motors QC cannot ship or revise the invent.
+    """
+    live_claims = _extract_kit_size_claims(f"{title or ''}\n{description or ''}")
+    if not live_claims:
+        return None
+    evidence = _source_kit_size_evidence(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    invented = sorted(n for n in live_claims if n not in evidence)
+    if not invented:
+        return None
+    shown = ", ".join(str(n) for n in invented[:5])
+    return ListingQualityIssue(
+        "invented_kit_size",
+        (
+            f"Title/description claims {shown}-piece/pack/set but GIGA/source "
+            "has no matching qty evidence"
+        ),
+        field="title",
+    )
+
+
+
+# --- soft3 content gates (2026-10-12): Table Set on tools / generic 1 x box / cut Source Spec ---
+_SOFT3_FURNITURE_SET_INCLUDES = frozenset({
+    "table set", "table", "dining table & chairs", "dining table and chairs",
+    "table & chairs", "table and chairs", "sofa set", "chairs",
+    "dining table & stools", "dining table and stools", "table & stools", "table and stools",
+})
+_SOFT3_FURNITURE_HINTS = (
+    "dining", "table", "sofa", "couch", "sectional", "chair", "stool", "bistro",
+    "patio set", "conversation set", "bed ", "mattress", "ottoman", "loveseat",
+)
+_SOFT3_BOX_HEADS = ("WHAT'S IN THE BOX", "WHAT&#39;S IN THE BOX", "PACKAGE INCLUDES")
+_SOFT3_SECTION_ENDS = ("Specifications", "KEY FEATURES", "Ships from", "WHAT'S IN THE BOX", "PACKAGE INCLUDES")
+
+
+def _soft3_plain(text: str) -> str:
+    raw = html_lib.unescape(str(text or ""))
+    raw = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>|</h\d>", "\n", raw)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = re.sub(r"[ \t]+", " ", raw)
+    return re.sub(r"\n\s*\n+", "\n", raw).strip()
+
+
+def _soft3_section(plain: str, heads, ends) -> str | None:
+    low = plain.lower()
+    best = None
+    for h in heads:
+        i = low.find(h.lower())
+        if i >= 0 and (best is None or i < best[0]):
+            best = (i, len(h))
+    if best is None:
+        return None
+    rest = plain[best[0] + best[1]:]
+    end = len(rest)
+    for e in ends:
+        j = rest.lower().find(e.lower())
+        if j > 0:
+            end = min(end, j)
+    return rest[:end].strip(" :\n\t")
+
+
+def is_furniture_context(title: str, aspects: Mapping[str, Any] | None = None) -> bool:
+    blob = f"{title or ''} {first_aspect_text(aspects or {}, 'Type') or ''}".lower()
+    for tool_word in ("router table", "work table", "table saw", "workbench", "setup block"):
+        blob = blob.replace(tool_word, " ")
+    return any(h in blob for h in _SOFT3_FURNITURE_HINTS)
+
+
+def find_wrong_domain_set_includes(title: str, aspects: Mapping[str, Any] | None) -> ListingQualityIssue | None:
+    value = (first_aspect_text(aspects or {}, "Set Includes") or "").strip()
+    if not value or value.casefold() not in _SOFT3_FURNITURE_SET_INCLUDES:
+        return None
+    if is_furniture_context(title, aspects):
+        return None
+    return ListingQualityIssue(
+        "wrong_domain_set_includes",
+        f"Set Includes={value!r} is a furniture value on a non-furniture listing",
+        field="Set Includes",
+    )
+
+
+def _soft3_claimed_pieces(title: str, aspects: Mapping[str, Any] | None) -> int | None:
+    for key in ("Number of Pieces", "Number of Items in Set"):
+        m = re.search(r"\d+", first_aspect_text(aspects or {}, key) or "")
+        if m and int(m.group()) >= 2:
+            return int(m.group())
+    for pat in (r"\b(\d+)\s*-?\s*(?:piece|pcs?)\b", r"\bset\s+of\s+(\d+)\b"):
+        m = re.search(pat, title or "", re.I)
+        if m and int(m.group(1)) >= 2:
+            return int(m.group(1))
+    return None
+
+
+def _soft3_norm(s: str) -> str:
+    s = html_lib.unescape(re.sub(r"<[^>]+>", " ", s or "")).replace("\u00d7", "x").replace("\u2011", "")  # mirror ascii_safe
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def find_generic_package_box(title: str, description: str, aspects: Mapping[str, Any] | None, source_text: str = "") -> ListingQualityIssue | None:
+    """Auto-template box collapsed to one ``1 x {Type}`` / ``Mixed Set`` line on a multi-piece/Set listing."""
+    plain = _soft3_plain(description)
+    if "source spec" not in plain.lower() and "what's in the box" not in plain.lower():
+        return None  # only the deterministic AquaRides/auto template
+    box = _soft3_section(plain, _SOFT3_BOX_HEADS, ("Specifications", "KEY FEATURES", "Ships from"))
+    if not box:
+        return None
+    lines = [ln.strip() for ln in re.split(r"[\n;]", box) if ln.strip()]
+    if len(lines) != 1:
+        return None
+    line = re.sub(r"\s+", " ", lines[0])
+    m = re.fullmatch(r"1\s*x\s+(.+)", line, re.I)
+    if not m:
+        return None
+    mixed = "mixed set" in line.lower()
+    # GIGA-verbatim box line (e.g. '1 x <GIGA product name> Kit') is allowed: it is the
+    # supplier's own wording, not a collapsed '1 x {Type}' template.
+    literal = _soft3_norm(m.group(1))
+    if not mixed and source_text and len(literal) >= 12 and literal in _soft3_norm(source_text):
+        return None
+    pieces = _soft3_claimed_pieces(title, aspects)
+    has_set = bool(re.search(r"\b(set|kit)\b", title or "", re.I))
+    if mixed or pieces or has_set:
+        return ListingQualityIssue(
+            "package_includes_generic",
+            f"box is generic {line!r} but listing is multi-piece/Set (pieces={pieces})",
+            field="description",
+        )
+    return None
+
+
+def is_truncated_snippet(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    if re.search(r"[.!?)\]\"']$", s):
+        return False
+    if re.search(r"\d\s*(?:in|mm|cm|ft|lbs?|kg|oz|pcs?|v|w|a)$", s, re.I):
+        return False
+    last = re.search(r"([A-Za-z]+)$", s)
+    if last and len(last.group(1)) <= 2 and not last.group(1).isupper():
+        return True
+    return 180 <= len(s) <= 260
+
+
+def find_truncated_source_spec(description: str) -> ListingQualityIssue | None:
+    plain = _soft3_plain(description)
+    m = re.search(r"Source Spec:\s*(.+)", plain)
+    if not m:
+        return None
+    snippet = m.group(1).split("\n")[0]
+    for e in _SOFT3_SECTION_ENDS:
+        j = snippet.find(e)
+        if j > 0:
+            snippet = snippet[:j]
+    if is_truncated_snippet(snippet):
+        return ListingQualityIssue(
+            "source_spec_truncated",
+            f"Source Spec ends mid-sentence: ...{snippet.strip()[-40:]!r}",
+            field="description",
+        )
+    return None
+
+
+def find_soft3_content_issues(title: str, description: str, aspects: Mapping[str, Any] | None, source_text: str = "") -> list[ListingQualityIssue]:
+    out = []
+    for issue in (
+        find_wrong_domain_set_includes(title, aspects),
+        find_generic_package_box(title, description, aspects, source_text),
+        find_truncated_source_spec(description),
+    ):
+        if issue is not None:
+            out.append(issue)
+    return out
+
+
 def validate_listing_quality(
     optimization: Mapping[str, Any] | None,
     *,
@@ -2424,6 +2849,22 @@ def validate_listing_quality(
                     field="description",
                 )
             )
+
+    pkg_mismatch = find_package_includes_set_qty_mismatch(title, description, aspects)
+    if pkg_mismatch:
+        issues.append(pkg_mismatch)
+    issues.extend(find_soft3_content_issues(title, description, aspects, f"{source_title or ''}\n{source_description or ''}"))
+
+    invented_kit = find_invented_kit_size(
+        title,
+        description,
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    if invented_kit:
+        issues.append(invented_kit)
     if image_count < MIN_READY_IMAGE_COUNT:
         issues.append(
             ListingQualityIssue(
@@ -2672,3 +3113,5 @@ def validate_listing_quality(
 
 def blocking_issue_messages(issues: list[ListingQualityIssue]) -> list[str]:
     return [issue.message for issue in issues if issue.severity == "BLOCKER"]
+
+

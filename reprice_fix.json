@@ -1,0 +1,1514 @@
+[
+ {
+  "sku": "W2505P485972",
+  "listing_id": "318695837913",
+  "live": 115.57,
+  "real_cost": 110.84,
+  "ship": 27.83,
+  "old_margin": 4.1,
+  "new_price": 158.34
+ },
+ {
+  "sku": "W2505P485973",
+  "listing_id": "318695838781",
+  "live": 61.47,
+  "real_cost": 62.42,
+  "ship": 18.19,
+  "old_margin": -1.5,
+  "new_price": 89.17
+ },
+ {
+  "sku": "W5230P536980",
+  "listing_id": "318695839663",
+  "live": 101.16,
+  "real_cost": 90.24,
+  "ship": 17.99,
+  "old_margin": 10.8,
+  "new_price": 128.91
+ },
+ {
+  "sku": "W1687S00005",
+  "listing_id": "318695840984",
+  "live": 254.29,
+  "real_cost": 260.62,
+  "ship": 76.7,
+  "old_margin": -2.5,
+  "new_price": 372.31
+ },
+ {
+  "sku": "W3131P380454",
+  "listing_id": "318695846201",
+  "live": 180.68,
+  "real_cost": 171.49,
+  "ship": 41.67,
+  "old_margin": 5.1,
+  "new_price": 244.99
+ },
+ {
+  "sku": "W3387S00001",
+  "listing_id": "318695848914",
+  "live": 225.59,
+  "real_cost": 217.27,
+  "ship": 64.83,
+  "old_margin": 3.7,
+  "new_price": 310.39
+ },
+ {
+  "sku": "W2505P485974",
+  "listing_id": "318696869805",
+  "live": 80.0,
+  "real_cost": 81.28,
+  "ship": 23.64,
+  "old_margin": -1.6,
+  "new_price": 116.11
+ },
+ {
+  "sku": "W5230P536986",
+  "listing_id": "318696877544",
+  "live": 121.25,
+  "real_cost": 122.9,
+  "ship": 35.42,
+  "old_margin": -1.4,
+  "new_price": 175.57
+ },
+ {
+  "sku": "W2699P504463",
+  "listing_id": "318696953842",
+  "live": 102.55,
+  "real_cost": 90.45,
+  "ship": 17.27,
+  "old_margin": 11.8,
+  "new_price": 129.21
+ },
+ {
+  "sku": "W2505P485975",
+  "listing_id": "318696959170",
+  "live": 146.1,
+  "real_cost": 147.08,
+  "ship": 41.67,
+  "old_margin": -0.7,
+  "new_price": 210.11
+ },
+ {
+  "sku": "N765P324556G",
+  "listing_id": "318696970276",
+  "live": 183.68,
+  "real_cost": 166.98,
+  "ship": 35.42,
+  "old_margin": 9.1,
+  "new_price": 238.54
+ },
+ {
+  "sku": "W2932P439429",
+  "listing_id": "318697077676",
+  "live": 108.26,
+  "real_cost": 105.25,
+  "ship": 27.42,
+  "old_margin": 2.8,
+  "new_price": 150.36
+ },
+ {
+  "sku": "W3912P516710",
+  "listing_id": "318696978557",
+  "live": 72.51,
+  "real_cost": 67.98,
+  "ship": 16.09,
+  "old_margin": 6.2,
+  "new_price": 97.11
+ },
+ {
+  "sku": "W2699P504462",
+  "listing_id": "318696983014",
+  "live": 102.55,
+  "real_cost": 90.45,
+  "ship": 17.27,
+  "old_margin": 11.8,
+  "new_price": 129.21
+ },
+ {
+  "sku": "W5230P502080",
+  "listing_id": "318696984613",
+  "live": 151.29,
+  "real_cost": 148.93,
+  "ship": 39.96,
+  "old_margin": 1.6,
+  "new_price": 212.76
+ },
+ {
+  "sku": "W5230P451370",
+  "listing_id": "318696995798",
+  "live": 136.16,
+  "real_cost": 124.0,
+  "ship": 32.57,
+  "old_margin": 8.9,
+  "new_price": 177.14
+ },
+ {
+  "sku": "W5727P464540",
+  "listing_id": "318697022823",
+  "live": 509.7,
+  "real_cost": 466.1,
+  "ship": 100.41,
+  "old_margin": 8.6,
+  "new_price": 665.86
+ },
+ {
+  "sku": "N765P324559G",
+  "listing_id": "318697026453",
+  "live": 237.4,
+  "real_cost": 232.84,
+  "ship": 87.51,
+  "old_margin": 1.9,
+  "new_price": 332.63
+ },
+ {
+  "sku": "W3912P516696",
+  "listing_id": "318697028814",
+  "live": 51.46,
+  "real_cost": 54.19,
+  "ship": 17.09,
+  "old_margin": -5.3,
+  "new_price": 77.41
+ },
+ {
+  "sku": "W5230P451371",
+  "listing_id": "318697031979",
+  "live": 128.79,
+  "real_cost": 126.8,
+  "ship": 36.93,
+  "old_margin": 1.5,
+  "new_price": 181.14
+ },
+ {
+  "sku": "N752P395027D",
+  "listing_id": "318697033691",
+  "live": 256.49,
+  "real_cost": 220.99,
+  "ship": 53.34,
+  "old_margin": 13.8,
+  "new_price": 315.7
+ },
+ {
+  "sku": "W347P465319",
+  "listing_id": "318705896456",
+  "live": 143.12,
+  "real_cost": 141.4,
+  "ship": 38.3,
+  "old_margin": 1.2,
+  "new_price": 202.0
+ },
+ {
+  "sku": "W5727P464547",
+  "listing_id": "318700817725",
+  "live": 509.7,
+  "real_cost": 466.1,
+  "ship": 100.41,
+  "old_margin": 8.6,
+  "new_price": 665.86
+ },
+ {
+  "sku": "W3912P516701",
+  "listing_id": "318700851595",
+  "live": 87.52,
+  "real_cost": 80.71,
+  "ship": 18.09,
+  "old_margin": 7.8,
+  "new_price": 115.3
+ },
+ {
+  "sku": "W1586P278425",
+  "listing_id": "318700857348",
+  "live": 153.62,
+  "real_cost": 144.06,
+  "ship": 33.81,
+  "old_margin": 6.2,
+  "new_price": 205.8
+ },
+ {
+  "sku": "N711P410549D",
+  "listing_id": "318700858560",
+  "live": 509.7,
+  "real_cost": 469.11,
+  "ship": 103.25,
+  "old_margin": 8.0,
+  "new_price": 670.16
+ },
+ {
+  "sku": "N707P228274B",
+  "listing_id": "318700861146",
+  "live": 263.31,
+  "real_cost": 233.36,
+  "ship": 45.0,
+  "old_margin": 11.4,
+  "new_price": 333.37
+ },
+ {
+  "sku": "W3912P516706",
+  "listing_id": "318700865297",
+  "live": 198.71,
+  "real_cost": 180.07,
+  "ship": 37.76,
+  "old_margin": 9.4,
+  "new_price": 257.24
+ },
+ {
+  "sku": "N762P455540D",
+  "listing_id": "318700906740",
+  "live": 240.78,
+  "real_cost": 208.41,
+  "ship": 36.48,
+  "old_margin": 13.4,
+  "new_price": 297.73
+ },
+ {
+  "sku": "N711P410549E",
+  "listing_id": "318700909349",
+  "live": 509.7,
+  "real_cost": 469.11,
+  "ship": 103.25,
+  "old_margin": 8.0,
+  "new_price": 670.16
+ },
+ {
+  "sku": "W3912P516709",
+  "listing_id": "318700912918",
+  "live": 86.02,
+  "real_cost": 79.7,
+  "ship": 18.14,
+  "old_margin": 7.3,
+  "new_price": 113.86
+ },
+ {
+  "sku": "W2699P504458",
+  "listing_id": "318700914212",
+  "live": 80.02,
+  "real_cost": 74.54,
+  "ship": 17.27,
+  "old_margin": 6.8,
+  "new_price": 106.49
+ },
+ {
+  "sku": "N762P455581D",
+  "listing_id": "318700932107",
+  "live": 256.49,
+  "real_cost": 221.1,
+  "ship": 38.44,
+  "old_margin": 13.8,
+  "new_price": 315.86
+ },
+ {
+  "sku": "W1162P407684",
+  "listing_id": "318700954306",
+  "live": 125.08,
+  "real_cost": 131.34,
+  "ship": 40.82,
+  "old_margin": -5.0,
+  "new_price": 187.63
+ },
+ {
+  "sku": "N711P410549A",
+  "listing_id": "318700956145",
+  "live": 509.7,
+  "real_cost": 469.11,
+  "ship": 103.25,
+  "old_margin": 8.0,
+  "new_price": 670.16
+ },
+ {
+  "sku": "N717P229024D",
+  "listing_id": "318705698271",
+  "live": 404.54,
+  "real_cost": 381.08,
+  "ship": 90.26,
+  "old_margin": 5.8,
+  "new_price": 544.4
+ },
+ {
+  "sku": "W2699P504456",
+  "listing_id": "318700958191",
+  "live": 67.99,
+  "real_cost": 65.08,
+  "ship": 16.35,
+  "old_margin": 4.3,
+  "new_price": 92.97
+ },
+ {
+  "sku": "N769P445009L",
+  "listing_id": "318700960100",
+  "live": 260.31,
+  "real_cost": 224.94,
+  "ship": 39.06,
+  "old_margin": 13.6,
+  "new_price": 321.34
+ },
+ {
+  "sku": "W1586P268018",
+  "listing_id": "318705747298",
+  "live": 102.55,
+  "real_cost": 91.27,
+  "ship": 18.04,
+  "old_margin": 11.0,
+  "new_price": 130.39
+ },
+ {
+  "sku": "W1162P407685",
+  "listing_id": "318700967672",
+  "live": 125.08,
+  "real_cost": 131.34,
+  "ship": 40.82,
+  "old_margin": -5.0,
+  "new_price": 187.63
+ },
+ {
+  "sku": "N717P425859A",
+  "listing_id": "318701013088",
+  "live": 248.28,
+  "real_cost": 216.21,
+  "ship": 38.83,
+  "old_margin": 12.9,
+  "new_price": 308.87
+ },
+ {
+  "sku": "W1586P268006",
+  "listing_id": "318705770172",
+  "live": 102.55,
+  "real_cost": 90.45,
+  "ship": 17.27,
+  "old_margin": 11.8,
+  "new_price": 129.21
+ },
+ {
+  "sku": "N770P396234T",
+  "listing_id": "318701027758",
+  "live": 306.68,
+  "real_cost": 272.17,
+  "ship": 86.59,
+  "old_margin": 11.3,
+  "new_price": 388.81
+ },
+ {
+  "sku": "W1586P268062",
+  "listing_id": "318705808647",
+  "live": 117.58,
+  "real_cost": 101.98,
+  "ship": 18.14,
+  "old_margin": 13.3,
+  "new_price": 145.69
+ },
+ {
+  "sku": "W1586P268059",
+  "listing_id": "318705835245",
+  "live": 99.55,
+  "real_cost": 88.33,
+  "ship": 17.27,
+  "old_margin": 11.3,
+  "new_price": 126.19
+ },
+ {
+  "sku": "W1586P268060",
+  "listing_id": "318714444273",
+  "live": 62.6,
+  "real_cost": 57.54,
+  "ship": 15.25,
+  "old_margin": 8.1,
+  "new_price": 82.2
+ },
+ {
+  "sku": "W2660P369120",
+  "listing_id": "318701195566",
+  "live": 99.55,
+  "real_cost": 89.14,
+  "ship": 18.04,
+  "old_margin": 10.5,
+  "new_price": 127.34
+ },
+ {
+  "sku": "W1586P268045",
+  "listing_id": "318714439577",
+  "live": 62.6,
+  "real_cost": 57.54,
+  "ship": 15.25,
+  "old_margin": 8.1,
+  "new_price": 82.2
+ },
+ {
+  "sku": "N711P410554B",
+  "listing_id": "318701251352",
+  "live": 503.7,
+  "real_cost": 461.51,
+  "ship": 100.09,
+  "old_margin": 8.4,
+  "new_price": 659.3
+ },
+ {
+  "sku": "N770P358870T",
+  "listing_id": "318701255065",
+  "live": 297.86,
+  "real_cost": 258.67,
+  "ship": 45.86,
+  "old_margin": 13.2,
+  "new_price": 369.53
+ },
+ {
+  "sku": "W347P465313",
+  "listing_id": "318714624274",
+  "live": 120.58,
+  "real_cost": 109.93,
+  "ship": 23.64,
+  "old_margin": 8.8,
+  "new_price": 157.04
+ },
+ {
+  "sku": "W1586P268043",
+  "listing_id": "318714436541",
+  "live": 117.58,
+  "real_cost": 102.03,
+  "ship": 18.19,
+  "old_margin": 13.2,
+  "new_price": 145.76
+ },
+ {
+  "sku": "N711P410554E",
+  "listing_id": "318701257206",
+  "live": 503.7,
+  "real_cost": 461.51,
+  "ship": 100.09,
+  "old_margin": 8.4,
+  "new_price": 659.3
+ },
+ {
+  "sku": "W2500P479541",
+  "listing_id": "318701276365",
+  "live": 154.35,
+  "real_cost": 134.27,
+  "ship": 36.58,
+  "old_margin": 13.0,
+  "new_price": 191.81
+ },
+ {
+  "sku": "W5230P449932",
+  "listing_id": "318701283330",
+  "live": 107.05,
+  "real_cost": 97.6,
+  "ship": 21.01,
+  "old_margin": 8.8,
+  "new_price": 139.43
+ },
+ {
+  "sku": "W1586P268040",
+  "listing_id": "318714434754",
+  "live": 62.6,
+  "real_cost": 57.93,
+  "ship": 15.61,
+  "old_margin": 7.5,
+  "new_price": 82.76
+ },
+ {
+  "sku": "N711P410554A",
+  "listing_id": "318701305378",
+  "live": 503.7,
+  "real_cost": 461.51,
+  "ship": 100.09,
+  "old_margin": 8.4,
+  "new_price": 659.3
+ },
+ {
+  "sku": "W5230P449938",
+  "listing_id": "318701332650",
+  "live": 134.6,
+  "real_cost": 131.17,
+  "ship": 35.93,
+  "old_margin": 2.5,
+  "new_price": 187.39
+ },
+ {
+  "sku": "W1586P268039",
+  "listing_id": "318714432750",
+  "live": 111.56,
+  "real_cost": 97.74,
+  "ship": 18.14,
+  "old_margin": 12.4,
+  "new_price": 139.63
+ },
+ {
+  "sku": "N767P441911B",
+  "listing_id": "318701335140",
+  "live": 526.23,
+  "real_cost": 470.11,
+  "ship": 93.19,
+  "old_margin": 10.7,
+  "new_price": 671.59
+ },
+ {
+  "sku": "W1586P455882",
+  "listing_id": "318701338688",
+  "live": 164.15,
+  "real_cost": 156.1,
+  "ship": 38.16,
+  "old_margin": 4.9,
+  "new_price": 223.0
+ },
+ {
+  "sku": "W1586P268034",
+  "listing_id": "318714430382",
+  "live": 63.49,
+  "real_cost": 61.62,
+  "ship": 16.09,
+  "old_margin": 2.9,
+  "new_price": 88.03
+ },
+ {
+  "sku": "N767P389773T",
+  "listing_id": "318701354510",
+  "live": 225.75,
+  "real_cost": 200.68,
+  "ship": 39.19,
+  "old_margin": 11.1,
+  "new_price": 286.69
+ },
+ {
+  "sku": "N711P406660E",
+  "listing_id": "318713928840",
+  "live": 149.12,
+  "real_cost": 140.82,
+  "ship": 33.76,
+  "old_margin": 5.6,
+  "new_price": 201.17
+ },
+ {
+  "sku": "W2640P470154",
+  "listing_id": "318701380277",
+  "live": 119.69,
+  "real_cost": 107.79,
+  "ship": 25.63,
+  "old_margin": 9.9,
+  "new_price": 153.99
+ },
+ {
+  "sku": "W3131P277188",
+  "listing_id": "318701386846",
+  "live": 55.7,
+  "real_cost": 49.16,
+  "ship": 16.35,
+  "old_margin": 11.7,
+  "new_price": 70.23
+ },
+ {
+  "sku": "N711P406660B",
+  "listing_id": "318713918397",
+  "live": 149.12,
+  "real_cost": 140.82,
+  "ship": 33.76,
+  "old_margin": 5.6,
+  "new_price": 201.17
+ },
+ {
+  "sku": "W1586P151254",
+  "listing_id": "318714423628",
+  "live": 120.58,
+  "real_cost": 104.1,
+  "ship": 18.14,
+  "old_margin": 13.7,
+  "new_price": 148.71
+ },
+ {
+  "sku": "W2505P285238",
+  "listing_id": "318701397909",
+  "live": 70.98,
+  "real_cost": 71.79,
+  "ship": 20.69,
+  "old_margin": -1.1,
+  "new_price": 102.56
+ },
+ {
+  "sku": "W1586P151252",
+  "listing_id": "318714421000",
+  "live": 120.58,
+  "real_cost": 104.1,
+  "ship": 18.14,
+  "old_margin": 13.7,
+  "new_price": 148.71
+ },
+ {
+  "sku": "W2505P285237",
+  "listing_id": "318701436744",
+  "live": 65.18,
+  "real_cost": 61.29,
+  "ship": 19.12,
+  "old_margin": 6.0,
+  "new_price": 87.56
+ },
+ {
+  "sku": "W1586P147448",
+  "listing_id": "318714417294",
+  "live": 53.86,
+  "real_cost": 46.53,
+  "ship": 14.87,
+  "old_margin": 13.6,
+  "new_price": 66.47
+ },
+ {
+  "sku": "WY000485AAE",
+  "listing_id": "318701446248",
+  "live": 449.61,
+  "real_cost": 399.03,
+  "ship": 77.18,
+  "old_margin": 11.2,
+  "new_price": 570.04
+ },
+ {
+  "sku": "N704G201207E",
+  "listing_id": "318701447846",
+  "live": 751.59,
+  "real_cost": 652.98,
+  "ship": 115.59,
+  "old_margin": 13.1,
+  "new_price": 932.83
+ },
+ {
+  "sku": "W1586P147428",
+  "listing_id": "318714382700",
+  "live": 62.41,
+  "real_cost": 54.36,
+  "ship": 15.25,
+  "old_margin": 12.9,
+  "new_price": 77.66
+ },
+ {
+  "sku": "WY000485AAA",
+  "listing_id": "318701449958",
+  "live": 449.61,
+  "real_cost": 399.03,
+  "ship": 77.18,
+  "old_margin": 11.2,
+  "new_price": 570.04
+ },
+ {
+  "sku": "N770PS33132A",
+  "listing_id": "318714329848",
+  "live": 521.72,
+  "real_cost": 488.25,
+  "ship": 113.3,
+  "old_margin": 6.4,
+  "new_price": 697.5
+ },
+ {
+  "sku": "W1586138699",
+  "listing_id": "318701451411",
+  "live": 59.65,
+  "real_cost": 54.18,
+  "ship": 15.08,
+  "old_margin": 9.2,
+  "new_price": 77.4
+ },
+ {
+  "sku": "N770PS23132A",
+  "listing_id": "318701473612",
+  "live": 347.44,
+  "real_cost": 324.84,
+  "ship": 75.24,
+  "old_margin": 6.5,
+  "new_price": 464.06
+ },
+ {
+  "sku": "W1586135968",
+  "listing_id": "318714379385",
+  "live": 117.58,
+  "real_cost": 102.03,
+  "ship": 18.19,
+  "old_margin": 13.2,
+  "new_price": 145.76
+ },
+ {
+  "sku": "W1586135960",
+  "listing_id": "318714377807",
+  "live": 62.6,
+  "real_cost": 57.93,
+  "ship": 15.61,
+  "old_margin": 7.5,
+  "new_price": 82.76
+ },
+ {
+  "sku": "N704P448452A",
+  "listing_id": "318701486759",
+  "live": 114.71,
+  "real_cost": 106.06,
+  "ship": 37.99,
+  "old_margin": 7.5,
+  "new_price": 151.51
+ },
+ {
+  "sku": "W1586135958",
+  "listing_id": "318714375764",
+  "live": 95.04,
+  "real_cost": 85.91,
+  "ship": 17.99,
+  "old_margin": 9.6,
+  "new_price": 122.73
+ },
+ {
+  "sku": "N770PS331L32G",
+  "listing_id": "318701492193",
+  "live": 521.72,
+  "real_cost": 488.25,
+  "ship": 113.3,
+  "old_margin": 6.4,
+  "new_price": 697.5
+ },
+ {
+  "sku": "N770P358872T",
+  "listing_id": "318701494331",
+  "live": 598.34,
+  "real_cost": 516.3,
+  "ship": 88.74,
+  "old_margin": 13.7,
+  "new_price": 737.57
+ },
+ {
+  "sku": "N770PS33132L",
+  "listing_id": "318701495777",
+  "live": 521.72,
+  "real_cost": 488.25,
+  "ship": 113.3,
+  "old_margin": 6.4,
+  "new_price": 697.5
+ },
+ {
+  "sku": "W1586135449",
+  "listing_id": "318714372248",
+  "live": 95.04,
+  "real_cost": 85.91,
+  "ship": 17.99,
+  "old_margin": 9.6,
+  "new_price": 122.73
+ },
+ {
+  "sku": "N770PS33132W",
+  "listing_id": "318701502236",
+  "live": 521.72,
+  "real_cost": 488.25,
+  "ship": 113.3,
+  "old_margin": 6.4,
+  "new_price": 697.5
+ },
+ {
+  "sku": "W158681135",
+  "listing_id": "318701771864",
+  "live": 102.55,
+  "real_cost": 91.48,
+  "ship": 18.24,
+  "old_margin": 10.8,
+  "new_price": 130.69
+ },
+ {
+  "sku": "N767P365575E",
+  "listing_id": "318701839239",
+  "live": 255.79,
+  "real_cost": 220.22,
+  "ship": 37.61,
+  "old_margin": 13.9,
+  "new_price": 314.6
+ },
+ {
+  "sku": "N767P365575A",
+  "listing_id": "318702879260",
+  "live": 255.79,
+  "real_cost": 220.22,
+  "ship": 37.61,
+  "old_margin": 13.9,
+  "new_price": 314.6
+ },
+ {
+  "sku": "N770P347932B",
+  "listing_id": "318714312730",
+  "live": 186.05,
+  "real_cost": 162.48,
+  "ship": 37.18,
+  "old_margin": 12.7,
+  "new_price": 232.11
+ },
+ {
+  "sku": "N715P428435D",
+  "listing_id": "318702885114",
+  "live": 255.79,
+  "real_cost": 220.47,
+  "ship": 37.85,
+  "old_margin": 13.8,
+  "new_price": 314.96
+ },
+ {
+  "sku": "N715P428435V",
+  "listing_id": "318702892814",
+  "live": 255.79,
+  "real_cost": 220.47,
+  "ship": 37.85,
+  "old_margin": 13.8,
+  "new_price": 314.96
+ },
+ {
+  "sku": "W2803P446570",
+  "listing_id": "318702907347",
+  "live": 167.19,
+  "real_cost": 145.51,
+  "ship": 37.18,
+  "old_margin": 13.0,
+  "new_price": 207.87
+ },
+ {
+  "sku": "N719P445623F",
+  "listing_id": "318702953515",
+  "live": 346.82,
+  "real_cost": 298.8,
+  "ship": 91.69,
+  "old_margin": 13.8,
+  "new_price": 426.86
+ },
+ {
+  "sku": "N719P445623D",
+  "listing_id": "318702968204",
+  "live": 346.82,
+  "real_cost": 298.8,
+  "ship": 91.69,
+  "old_margin": 13.8,
+  "new_price": 426.86
+ },
+ {
+  "sku": "N719P445623A",
+  "listing_id": "318702997664",
+  "live": 346.82,
+  "real_cost": 298.8,
+  "ship": 91.69,
+  "old_margin": 13.8,
+  "new_price": 426.86
+ },
+ {
+  "sku": "TM000031AAE",
+  "listing_id": "318703007546",
+  "live": 526.23,
+  "real_cost": 453.06,
+  "ship": 77.12,
+  "old_margin": 13.9,
+  "new_price": 647.23
+ },
+ {
+  "sku": "N770P345264L",
+  "listing_id": "318703012519",
+  "live": 147.48,
+  "real_cost": 145.35,
+  "ship": 39.13,
+  "old_margin": 1.4,
+  "new_price": 207.64
+ },
+ {
+  "sku": "N770P234486F_N770P205570L",
+  "listing_id": "318703020161",
+  "live": 718.54,
+  "real_cost": 635.55,
+  "ship": 121.16,
+  "old_margin": 11.5,
+  "new_price": 907.93
+ },
+ {
+  "sku": "N770P234486F_N770P205570T",
+  "listing_id": "318703024002",
+  "live": 718.54,
+  "real_cost": 635.55,
+  "ship": 121.16,
+  "old_margin": 11.5,
+  "new_price": 907.93
+ },
+ {
+  "sku": "N770P234486F_N770P205570A",
+  "listing_id": "318703060359",
+  "live": 718.54,
+  "real_cost": 635.55,
+  "ship": 121.16,
+  "old_margin": 11.5,
+  "new_price": 907.93
+ },
+ {
+  "sku": "W3131P336102",
+  "listing_id": "318703063504",
+  "live": 59.38,
+  "real_cost": 51.29,
+  "ship": 16.35,
+  "old_margin": 13.6,
+  "new_price": 73.27
+ },
+ {
+  "sku": "N770P234486F_N770P205570B",
+  "listing_id": "318703066230",
+  "live": 718.54,
+  "real_cost": 635.55,
+  "ship": 121.16,
+  "old_margin": 11.5,
+  "new_price": 907.93
+ },
+ {
+  "sku": "WY000476AAC",
+  "listing_id": "318703068315",
+  "live": 494.68,
+  "real_cost": 429.58,
+  "ship": 75.98,
+  "old_margin": 13.2,
+  "new_price": 613.69
+ },
+ {
+  "sku": "N762P377143E",
+  "listing_id": "318703081847",
+  "live": 391.01,
+  "real_cost": 371.42,
+  "ship": 90.15,
+  "old_margin": 5.0,
+  "new_price": 530.6
+ },
+ {
+  "sku": "N704P383163A",
+  "listing_id": "318703123380",
+  "live": 248.28,
+  "real_cost": 214.63,
+  "ship": 37.34,
+  "old_margin": 13.6,
+  "new_price": 306.61
+ },
+ {
+  "sku": "N770S372B98B99B",
+  "listing_id": "318714342100",
+  "live": 518.71,
+  "real_cost": 537.26,
+  "ship": 161.5,
+  "old_margin": -3.6,
+  "new_price": 767.51
+ },
+ {
+  "sku": "N770P264304T_57501.00ACA",
+  "listing_id": "318703127361",
+  "live": 595.64,
+  "real_cost": 529.37,
+  "ship": 102.86,
+  "old_margin": 11.1,
+  "new_price": 756.24
+ },
+ {
+  "sku": "N770P264304G_57501.00ACA",
+  "listing_id": "318703131769",
+  "live": 595.64,
+  "real_cost": 529.37,
+  "ship": 102.86,
+  "old_margin": 11.1,
+  "new_price": 756.24
+ },
+ {
+  "sku": "N770P264304G_N770P261552T",
+  "listing_id": "318703135509",
+  "live": 599.55,
+  "real_cost": 530.9,
+  "ship": 101.7,
+  "old_margin": 11.5,
+  "new_price": 758.43
+ },
+ {
+  "sku": "N770P291198B",
+  "listing_id": "318703138617",
+  "live": 180.68,
+  "real_cost": 168.55,
+  "ship": 38.9,
+  "old_margin": 6.7,
+  "new_price": 240.79
+ },
+ {
+  "sku": "N770P264304B_57501.00ACA",
+  "listing_id": "318703142816",
+  "live": 595.64,
+  "real_cost": 529.37,
+  "ship": 102.86,
+  "old_margin": 11.1,
+  "new_price": 756.24
+ },
+ {
+  "sku": "N770P264304T_N770P261552T",
+  "listing_id": "318703145715",
+  "live": 599.55,
+  "real_cost": 530.9,
+  "ship": 101.7,
+  "old_margin": 11.5,
+  "new_price": 758.43
+ },
+ {
+  "sku": "N711P389502G",
+  "listing_id": "318713843574",
+  "live": 248.28,
+  "real_cost": 216.4,
+  "ship": 39.01,
+  "old_margin": 12.8,
+  "new_price": 309.14
+ },
+ {
+  "sku": "W465P456644",
+  "listing_id": "318714261839",
+  "live": 112.31,
+  "real_cost": 118.25,
+  "ship": 36.98,
+  "old_margin": -5.3,
+  "new_price": 168.93
+ },
+ {
+  "sku": "W465P456647",
+  "listing_id": "318714304160",
+  "live": 128.69,
+  "real_cost": 128.19,
+  "ship": 39.35,
+  "old_margin": 0.4,
+  "new_price": 183.13
+ },
+ {
+  "sku": "W465P456639",
+  "listing_id": "318714312697",
+  "live": 54.78,
+  "real_cost": 48.95,
+  "ship": 16.65,
+  "old_margin": 10.6,
+  "new_price": 69.93
+ },
+ {
+  "sku": "W465P466767",
+  "listing_id": "318714316313",
+  "live": 36.33,
+  "real_cost": 37.75,
+  "ship": 16.09,
+  "old_margin": -3.9,
+  "new_price": 53.93
+ },
+ {
+  "sku": "W465P466796",
+  "listing_id": "318714319593",
+  "live": 45.56,
+  "real_cost": 41.76,
+  "ship": 14.87,
+  "old_margin": 8.3,
+  "new_price": 59.66
+ },
+ {
+  "sku": "W465P439457",
+  "listing_id": "318714323337",
+  "live": 92.78,
+  "real_cost": 82.9,
+  "ship": 16.65,
+  "old_margin": 10.6,
+  "new_price": 118.43
+ },
+ {
+  "sku": "W3835P484082",
+  "listing_id": "318714357920",
+  "live": 134.11,
+  "real_cost": 118.87,
+  "ship": 23.06,
+  "old_margin": 11.4,
+  "new_price": 169.81
+ },
+ {
+  "sku": "W773P506125",
+  "listing_id": "318714366536",
+  "live": 188.18,
+  "real_cost": 178.6,
+  "ship": 43.37,
+  "old_margin": 5.1,
+  "new_price": 255.14
+ },
+ {
+  "sku": "W465P498276",
+  "listing_id": "318714637143",
+  "live": 94.59,
+  "real_cost": 85.59,
+  "ship": 17.99,
+  "old_margin": 9.5,
+  "new_price": 122.27
+ },
+ {
+  "sku": "W3835P484072",
+  "listing_id": "318714378080",
+  "live": 134.11,
+  "real_cost": 118.87,
+  "ship": 23.06,
+  "old_margin": 11.4,
+  "new_price": 169.81
+ },
+ {
+  "sku": "W5870P523985",
+  "listing_id": "318714382942",
+  "live": 88.9,
+  "real_cost": 75.99,
+  "ship": 23.64,
+  "old_margin": 14.5,
+  "new_price": 108.56
+ },
+ {
+  "sku": "W5870P523986",
+  "listing_id": "318714411684",
+  "live": 81.74,
+  "real_cost": 76.52,
+  "ship": 24.14,
+  "old_margin": 6.4,
+  "new_price": 109.31
+ },
+ {
+  "sku": "W773P506142",
+  "listing_id": "318714421773",
+  "live": 188.18,
+  "real_cost": 178.6,
+  "ship": 43.37,
+  "old_margin": 5.1,
+  "new_price": 255.14
+ },
+ {
+  "sku": "W5870P523983",
+  "listing_id": "318714426400",
+  "live": 88.9,
+  "real_cost": 75.99,
+  "ship": 23.64,
+  "old_margin": 14.5,
+  "new_price": 108.56
+ },
+ {
+  "sku": "W5870P523984",
+  "listing_id": "318714431478",
+  "live": 88.9,
+  "real_cost": 75.99,
+  "ship": 23.64,
+  "old_margin": 14.5,
+  "new_price": 108.56
+ },
+ {
+  "sku": "W2326P508785",
+  "listing_id": "318714434113",
+  "live": 203.21,
+  "real_cost": 186.5,
+  "ship": 40.82,
+  "old_margin": 8.2,
+  "new_price": 266.43
+ },
+ {
+  "sku": "W465P476933",
+  "listing_id": "318714441741",
+  "live": 117.58,
+  "real_cost": 104.92,
+  "ship": 20.91,
+  "old_margin": 10.8,
+  "new_price": 149.89
+ },
+ {
+  "sku": "W465P476929",
+  "listing_id": "318714448200",
+  "live": 117.58,
+  "real_cost": 104.92,
+  "ship": 20.91,
+  "old_margin": 10.8,
+  "new_price": 149.89
+ },
+ {
+  "sku": "W465P469693",
+  "listing_id": "318714461482",
+  "live": 30.81,
+  "real_cost": 30.32,
+  "ship": 12.08,
+  "old_margin": 1.6,
+  "new_price": 43.31
+ },
+ {
+  "sku": "W465P469692",
+  "listing_id": "318714477359",
+  "live": 30.81,
+  "real_cost": 30.32,
+  "ship": 12.08,
+  "old_margin": 1.6,
+  "new_price": 43.31
+ },
+ {
+  "sku": "W465P282072",
+  "listing_id": "318714483442",
+  "live": 170.15,
+  "real_cost": 144.94,
+  "ship": 23.64,
+  "old_margin": 14.8,
+  "new_price": 207.06
+ },
+ {
+  "sku": "W5398P463790",
+  "listing_id": "318714486575",
+  "live": 37.95,
+  "real_cost": 39.8,
+  "ship": 12.52,
+  "old_margin": -4.9,
+  "new_price": 56.86
+ },
+ {
+  "sku": "W465P340409",
+  "listing_id": "318714494063",
+  "live": 56.73,
+  "real_cost": 58.86,
+  "ship": 17.99,
+  "old_margin": -3.8,
+  "new_price": 84.09
+ },
+ {
+  "sku": "W465P340410",
+  "listing_id": "318714496037",
+  "live": 79.26,
+  "real_cost": 76.02,
+  "ship": 19.17,
+  "old_margin": 4.1,
+  "new_price": 108.6
+ },
+ {
+  "sku": "W2326P512086",
+  "listing_id": "318714500109",
+  "live": 209.22,
+  "real_cost": 192.93,
+  "ship": 42.88,
+  "old_margin": 7.8,
+  "new_price": 275.61
+ },
+ {
+  "sku": "W2326P512070",
+  "listing_id": "318714502800",
+  "live": 209.22,
+  "real_cost": 192.93,
+  "ship": 42.88,
+  "old_margin": 7.8,
+  "new_price": 275.61
+ },
+ {
+  "sku": "W465P370172",
+  "listing_id": "318714507321",
+  "live": 102.72,
+  "real_cost": 94.0,
+  "ship": 33.12,
+  "old_margin": 8.5,
+  "new_price": 134.29
+ },
+ {
+  "sku": "N767P389773L",
+  "listing_id": "318714532891",
+  "live": 270.82,
+  "real_cost": 232.5,
+  "ship": 39.19,
+  "old_margin": 14.1,
+  "new_price": 332.14
+ },
+ {
+  "sku": "W5398P463791",
+  "listing_id": "318714554026",
+  "live": 33.57,
+  "real_cost": 32.96,
+  "ship": 13.07,
+  "old_margin": 1.8,
+  "new_price": 47.09
+ },
+ {
+  "sku": "W5398P463801",
+  "listing_id": "318714622512",
+  "live": 37.26,
+  "real_cost": 34.49,
+  "ship": 12.52,
+  "old_margin": 7.4,
+  "new_price": 49.27
+ },
+ {
+  "sku": "N770P200252C",
+  "listing_id": "318714837665",
+  "live": 108.56,
+  "real_cost": 111.66,
+  "ship": 33.27,
+  "old_margin": -2.9,
+  "new_price": 159.51
+ },
+ {
+  "sku": "N770P358871T",
+  "listing_id": "318714842973",
+  "live": 299.37,
+  "real_cost": 256.57,
+  "ship": 42.88,
+  "old_margin": 14.3,
+  "new_price": 366.53
+ },
+ {
+  "sku": "W1408P451416",
+  "listing_id": "318714848239",
+  "live": 79.67,
+  "real_cost": 69.11,
+  "ship": 22.15,
+  "old_margin": 13.3,
+  "new_price": 98.73
+ },
+ {
+  "sku": "W1422P412933",
+  "listing_id": "318714852566",
+  "live": 246.78,
+  "real_cost": 231.45,
+  "ship": 54.2,
+  "old_margin": 6.2,
+  "new_price": 330.64
+ },
+ {
+  "sku": "W1706P372249",
+  "listing_id": "318714865025",
+  "live": 104.05,
+  "real_cost": 99.88,
+  "ship": 25.16,
+  "old_margin": 4.0,
+  "new_price": 142.69
+ },
+ {
+  "sku": "W2286P432000",
+  "listing_id": "318714906526",
+  "live": 98.03,
+  "real_cost": 88.02,
+  "ship": 17.99,
+  "old_margin": 10.2,
+  "new_price": 125.74
+ },
+ {
+  "sku": "W2326P410095",
+  "listing_id": "318714910966",
+  "live": 209.22,
+  "real_cost": 191.64,
+  "ship": 41.67,
+  "old_margin": 8.4,
+  "new_price": 273.77
+ },
+ {
+  "sku": "W2326P477430",
+  "listing_id": "318714914550",
+  "live": 209.22,
+  "real_cost": 191.64,
+  "ship": 41.67,
+  "old_margin": 8.4,
+  "new_price": 273.77
+ },
+ {
+  "sku": "W2326P481095",
+  "listing_id": "318714920887",
+  "live": 209.22,
+  "real_cost": 190.74,
+  "ship": 40.82,
+  "old_margin": 8.8,
+  "new_price": 272.49
+ },
+ {
+  "sku": "W2326P486262",
+  "listing_id": "318714928132",
+  "live": 203.21,
+  "real_cost": 186.5,
+  "ship": 40.82,
+  "old_margin": 8.2,
+  "new_price": 266.43
+ },
+ {
+  "sku": "W2326P486267",
+  "listing_id": "318714934065",
+  "live": 203.21,
+  "real_cost": 186.5,
+  "ship": 40.82,
+  "old_margin": 8.2,
+  "new_price": 266.43
+ },
+ {
+  "sku": "W2326P500591",
+  "listing_id": "318714936488",
+  "live": 209.22,
+  "real_cost": 191.64,
+  "ship": 41.67,
+  "old_margin": 8.4,
+  "new_price": 273.77
+ },
+ {
+  "sku": "W2640P400927",
+  "listing_id": "318714960420",
+  "live": 119.69,
+  "real_cost": 110.97,
+  "ship": 25.63,
+  "old_margin": 7.3,
+  "new_price": 158.53
+ },
+ {
+  "sku": "W2640P470152",
+  "listing_id": "318714966667",
+  "live": 98.03,
+  "real_cost": 90.88,
+  "ship": 20.69,
+  "old_margin": 7.3,
+  "new_price": 129.83
+ },
+ {
+  "sku": "W2641P460034",
+  "listing_id": "318714970997",
+  "live": 102.55,
+  "real_cost": 92.52,
+  "ship": 19.22,
+  "old_margin": 9.8,
+  "new_price": 132.17
+ },
+ {
+  "sku": "W3081P440608",
+  "listing_id": "318714998884",
+  "live": 403.04,
+  "real_cost": 377.65,
+  "ship": 88.03,
+  "old_margin": 6.3,
+  "new_price": 539.5
+ },
+ {
+  "sku": "W311P504501",
+  "listing_id": "318715015732",
+  "live": 57.85,
+  "real_cost": 53.31,
+  "ship": 17.27,
+  "old_margin": 7.8,
+  "new_price": 76.16
+ },
+ {
+  "sku": "W3166P455683",
+  "listing_id": "318715022949",
+  "live": 189.69,
+  "real_cost": 176.95,
+  "ship": 40.82,
+  "old_margin": 6.7,
+  "new_price": 252.79
+ },
+ {
+  "sku": "W3166P506394",
+  "listing_id": "318715032933",
+  "live": 225.75,
+  "real_cost": 201.83,
+  "ship": 40.27,
+  "old_margin": 10.6,
+  "new_price": 288.33
+ },
+ {
+  "sku": "W3166S00001",
+  "listing_id": "318715035544",
+  "live": 263.31,
+  "real_cost": 254.66,
+  "ship": 65.08,
+  "old_margin": 3.3,
+  "new_price": 363.8
+ },
+ {
+  "sku": "W3921S00002",
+  "listing_id": "318715053279",
+  "live": 206.22,
+  "real_cost": 249.71,
+  "ship": 98.41,
+  "old_margin": -21.1,
+  "new_price": 356.73
+ },
+ {
+  "sku": "W3921S00003",
+  "listing_id": "318715056257",
+  "live": 209.22,
+  "real_cost": 221.22,
+  "ship": 69.55,
+  "old_margin": -5.7,
+  "new_price": 316.03
+ }
+]

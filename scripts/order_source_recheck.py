@@ -469,26 +469,29 @@ def main() -> int:
             )
             conn.commit()
 
-    # Mail on every order actually checked, not only on conflicts. Silence used
-    # to mean three different things — "checked, clean", "never checked", and
-    # "the task is broken" — and on 2026-07-27..29 three orders shipped with no
-    # mail at all: one run was skipped, another died on a DNS failure, and the
-    # clean one sent nothing by design. A clean run must be visibly clean.
+    # 2026-10 email simplification: clean rechecks stay local / digest-only.
+    # SMTP only when a CRITICAL mismatch needs immediate attention. Task failure
+    # still alerts via scheduler_daemon._notify_failure.
     if targets and args.email and not args.dry_run:
         from src.utils.email_sender import send_email
+        from src.utils.email_policy import should_smtp
 
         if alerts:
             send_email(
                 _branded_email_subject(f"⚠ 出单源复核: {len(alerts)} 个订单的 listing 与源不符"),
                 build_alert_html(alerts),
+                send_smtp=should_smtp(has_issues=True),
             )
         else:
+            # Local archive only (no inbox noise).
             send_email(
                 _branded_email_subject(
                     f"✅ 出单源复核: {len(targets)} 个新订单已复核，未发现与源不符"
                 ),
                 build_clean_html(targets),
+                send_smtp=should_smtp(has_issues=False),
             )
+            print(f"clean recheck archived locally ({len(targets)} order(s); SMTP silenced)")
     elif alerts:
         print(f"{len(alerts)} critical alert(s) (email suppressed: use --email without --dry-run)")
 

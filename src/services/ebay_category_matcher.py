@@ -205,32 +205,68 @@ class EbayCategoryMatcher:
                 "outdoor sectional",
             )
         )
+        # Porch/outdoor rockers are patio seating, not indoor Rockers & Gliders
+        # (66690). Keyword "rocking chair" alone used to win and leave GrovePop
+        # W465P255396 stuck in 66690 (2026-09-29).
+        has_outdoor_rocker = (
+            not has_porch_swing
+            and any(
+                kw in title_lower
+                for kw in (
+                    "outdoor rocking",
+                    "outdoor rocker",
+                    "patio rocking",
+                    "patio rocker",
+                    "porch rocker",
+                    "porch rocking",
+                    "garden rocking",
+                    "garden rocker",
+                    "rockers for outside",
+                    "rocker for outside",
+                    "rocking chair for outside",
+                    "outdoor rocking chair",
+                    "patio rocking chair",
+                    "porch rocking chair",
+                )
+            )
+        ) or (
+            has_outdoor_context
+            and not has_porch_swing
+            and any(kw in title_lower for kw in ("rocking chair", "rocker", "rockers", "glider"))
+            and not any(
+                kw in title_lower
+                for kw in ("nursery", "living room", "bedroom", "indoor", "office")
+            )
+        )
         has_outdoor_chair = (
             has_outdoor_context
             and not has_outdoor_daybed
             and not any(kw in title_lower for kw in ("sofa", "couch", "loveseat", "sectional"))
             and re.search(r"\btable\b", title_lower) is None
-            and any(
-                kw in title_lower
-                for kw in (
-                    "outdoor chair",
-                    "patio chair",
-                    "club chair",
-                    "club chairs",
-                    "armchair",
-                    "armchairs",
-                    "patio armchair",
-                    "patio armchairs",
-                    "outdoor dining chair",
-                    "outdoor dining chairs",
-                    "patio dining chair",
-                    "patio dining chairs",
-                    "outdoor lounge chair",
-                    "outdoor lounge chairs",
-                    "patio lounge",
-                    "sun lounger",
-                    "camping chair",
-                    "camping chairs",
+            and (
+                has_outdoor_rocker
+                or any(
+                    kw in title_lower
+                    for kw in (
+                        "outdoor chair",
+                        "patio chair",
+                        "club chair",
+                        "club chairs",
+                        "armchair",
+                        "armchairs",
+                        "patio armchair",
+                        "patio armchairs",
+                        "outdoor dining chair",
+                        "outdoor dining chairs",
+                        "patio dining chair",
+                        "patio dining chairs",
+                        "outdoor lounge chair",
+                        "outdoor lounge chairs",
+                        "patio lounge",
+                        "sun lounger",
+                        "camping chair",
+                        "camping chairs",
+                    )
                 )
             )
         )
@@ -415,6 +451,10 @@ class EbayCategoryMatcher:
                 "game table",
             )
         )
+
+        # Outdoor rockers must win over the retired 20877→66690 leaf remap.
+        if has_outdoor_rocker and cid != "79684":
+            return "79684", "Outdoor Chairs"
 
         direct_replacements = {
             "116363": ("100411", "Litter Boxes"),
@@ -982,6 +1022,11 @@ class EbayCategoryMatcher:
             "patio dining table", "outdoor dining table", "bistro table", "garden table",
             "outdoor table", "patio table",
         )
+        camping_kitchen_markers = (
+            "camping kitchen", "cook station", "cooking station", "camping table",
+            "outdoor cooking station",
+        )
+        camping_kitchen_categories = {"112590", "16038"}
         wine_storage_markers = ("wine rack", "wine cabinet", "stemware rack")
         hall_tree_markers = ("hall tree", "coat rack bench", "hall stand")
 
@@ -1105,9 +1150,13 @@ class EbayCategoryMatcher:
             if cid not in kids_table_set_categories:
                 return False
 
+        if any(marker in title_lower for marker in camping_kitchen_markers):
+            if cid not in camping_kitchen_categories:
+                return False
+
         if any(marker in title_lower for marker in outdoor_table_markers) and not any(
             marker in title_lower for marker in dining_set_markers
-        ):
+        ) and not any(marker in title_lower for marker in camping_kitchen_markers):
             if cid not in outdoor_table_categories:
                 return False
 
@@ -1275,6 +1324,31 @@ class EbayCategoryMatcher:
 
         if "adirondack" in title_lower and cid != "79684":
             return False
+
+        outdoor_rocker_markers = (
+            "outdoor rocking",
+            "outdoor rocker",
+            "patio rocking",
+            "patio rocker",
+            "porch rocker",
+            "porch rocking",
+            "garden rocking",
+            "garden rocker",
+            "rockers for outside",
+            "rocker for outside",
+            "rocking chair for outside",
+            "outdoor rocking chair",
+            "patio rocking chair",
+            "porch rocking chair",
+        )
+        if any(kw in title_lower for kw in outdoor_rocker_markers) or (
+            any(kw in title_lower for kw in ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "porch"))
+            and any(kw in title_lower for kw in ("rocking chair", "rocker", "rockers"))
+            and "porch swing" not in title_lower
+            and not any(kw in title_lower for kw in ("nursery", "living room", "bedroom", "indoor", "office"))
+        ):
+            if cid not in outdoor_chair_categories:
+                return False
 
         has_outdoor_daybed_title = any(kw in title_lower for kw in ("outdoor daybed", "patio daybed", "sunbed")) or (
             "daybed" in title_lower
@@ -1539,6 +1613,8 @@ class EbayCategoryMatcher:
             (["gaming chair"], "22513", "Gaming Chairs"),
             (["round chair", "cushioned backrest", "compressible chair"], "54235", "Chairs"),
             (["accent chair", "arm chair", "lounge chair", "club chair"], "54235", "Chairs"),
+            # Outdoor rockers before indoor Rockers/Gliders — see has_outdoor_rocker.
+            (["outdoor rocking chair", "outdoor rocker", "patio rocking chair", "patio rocker", "porch rocker", "porch rocking chair", "garden rocker", "rockers for outside"], "79684", "Outdoor Chairs"),
             (["rocking chair", "glider"], "66690", "Rockers, Gliders"),
             (["ottoman", "footstool", "pouf"], "20490", "Ottomans, Footstools & Poufs"),
             
@@ -1660,6 +1736,7 @@ class EbayCategoryMatcher:
             (["room divider", "partition", "screen"], "175764", "Room Dividers"),
             
             # ==================== TABLES (GENERAL) ====================
+            (["camping kitchen", "cook station", "cooking station", "camping table", "outdoor cooking station"], "112590", "Patio & Garden Tables"),
             (["folding table", "card table", "utility table"], "98044", "Folding Tables"),
             (["spinner wheel luggage", "spinner luggage", "hard shell luggage", "luggage set", "carry on suitcase", "travel suitcase", "checked luggage", "travel luggage"], "16080", "Luggage"),
             

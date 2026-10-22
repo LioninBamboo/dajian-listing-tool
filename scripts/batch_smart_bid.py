@@ -77,7 +77,7 @@ def _fetch_cost_map() -> Dict[str, Dict[str, Any]]:
             continue
         try:
             cb = json.loads(cost_json) if cost_json else {}
-            tc = float(cb.get('total_cost') or 0)
+            tc = float(cb.get('total_dajian_cost') or cb.get('total_cost') or 0)
         except Exception:
             tc = 0.0
         out[sku] = {'total_cost': tc, 'listing_id': str(lid)}
@@ -112,18 +112,35 @@ def _load_active_experiments() -> List[Dict[str, Any]]:
         return []
 
 
-def _fetch_live_price(sku: str, real_client) -> Optional[float]:
+def _fetch_live_price(sku: str, real_client, listing_id: Optional[str] = None) -> Optional[float]:
+    offer = None
     try:
-        offer = real_client.get_offer_by_sku(sku)
+        getter = getattr(real_client, "get_offer_by_sku", None)
+        if callable(getter):
+            offer = getter(sku)
+        if not offer:
+            list_getter = getattr(real_client, "get_offers_by_sku", None)
+            if callable(list_getter):
+                offers = list_getter(sku) or []
+                offer = offers[0] if offers else None
     except Exception as exc:
         logger.warning(f"获取 offer {sku} 失败: {exc}")
-        return None
-    if not offer:
-        return None
-    try:
-        return float(offer.get('pricingSummary', {}).get('price', {}).get('value') or 0)
-    except Exception:
-        return None
+        offer = None
+    price = 0.0
+    if offer:
+        try:
+            price = float(offer.get('pricingSummary', {}).get('price', {}).get('value') or 0)
+        except Exception:
+            price = 0.0
+    if price > 0:
+        return price
+    if listing_id:
+        try:
+            from src.services.ebay_ad_service import _trading_live_price
+            return _trading_live_price(listing_id)
+        except Exception as exc:
+            logger.warning(f"Trading GetItem {listing_id} 现价回退失败: {exc}")
+    return None
 
 
 def classify(impressions: int, ctr: float, sold_qty: int) -> str:
@@ -205,7 +222,7 @@ def build_plan(products_with_perf: List[Dict[str, Any]],
         total_cost = cost_info.get('total_cost', 0.0)
         live_price = 0.0
         if real_client and total_cost > 0:
-            lp = _fetch_live_price(sku, real_client)
+            lp = _fetch_live_price(sku, real_client, listing_id=lid)
             if lp:
                 live_price = lp
 
@@ -394,9 +411,15 @@ def run(apply: bool = False, send_email: bool = False) -> Dict[str, Any]:
     if send_email:
         try:
             from src.utils.email_sender import send_email as _send
+            from src.utils.email_policy import should_smtp
             subject = (f"🎯 Smart Bid {'应用' if apply else '预览'} - "
                        f"调整{summary['by_decision'].get('adjust', 0)} / 总{summary['total']}")
-            _send(subject, render_email_html(report))
+            n_adjust = int(summary['by_decision'].get('adjust', 0) or 0)
+            _send(
+                subject,
+                render_email_html(report),
+                send_smtp=should_smtp(has_issues=bool(n_adjust or summary.get('errors'))),
+            )
         except Exception as exc:
             logger.warning(f"邮件发送失败: {exc}")
 

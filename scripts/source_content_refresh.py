@@ -165,9 +165,13 @@ def main() -> int:
 
     if args.email:
         from src.utils.email_sender import send_email
+        from src.utils.email_policy import should_smtp
 
         subject = f"源内容刷新: {len(alerts)} 个卖家变更 / {summary['checked']} 检查"
-        send_email(subject, build_email_html(summary))
+        has_issues = bool(alerts) or bool(summary.get("fetch_failed")) or bool(summary.get("unavailable"))
+        send_email(subject, build_email_html(summary), send_smtp=should_smtp(has_issues=has_issues))
+        if not has_issues:
+            print("no seller drift; report archived locally (SMTP silenced)")
 
     return 0
 

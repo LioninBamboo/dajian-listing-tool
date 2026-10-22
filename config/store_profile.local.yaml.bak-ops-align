@@ -1,0 +1,62 @@
+# ⚠️ GrovePop（实例C）店铺画像 —— 未跟踪文件，优先于 config/store_profile.yaml 生效。
+# 2026-08-07 转型：放弃盲盒/中国直邮，改为 GIGA 采集 + 美国本地仓发货的
+#   **户外·庭院 & 宠物家具**（通用货，无 IP/仿冒风险）。分阶段：先户外·庭院，后宠物。
+#   与 AquaVerve（家具主店）区隔靠采集插件按店选目标；与 AquaRides（汽配/工具）品类不重叠。
+# 加载优先级：STORE_PROFILE_PATH env > store_profile.local.yaml > store_profile.yaml > 内置默认。
+#
+# ⚠️ 所有 CHANGEME 必须在首次刊登前填好（需先在 GrovePop 的美国仓 eBay 账号完成 OAuth 授权、
+#    opt-in Business Policies、建三条政策与 inventory location，再用 tools/get_policy_ids.py 回填）。
+
+store:
+  store_kind: "furniture"                       # 家居类（户外/庭院/宠物家具）——采集路由安全网用
+  brand_name: "GrovePop"
+  brand_tagline: "OUTDOOR LIVING · GARDEN · PET"
+  description_footer_line1: "✦ Ships from US Warehouse ✦"
+  description_footer_line2: "Quality Guaranteed • Fast US Shipping • Trusted Seller"
+  promotion_prefix: "GrovePop Sale"
+
+ebay:
+  # ⚠️ 普通站（EBAY_US / 树 0），不是 Motors。户外储物箱/种植箱/庭院套装/宠物笼具都在树 0。
+  marketplace_id: "EBAY_US"
+  category_tree_id: "0"
+  listing_channel: "inventory"                  # 树 0 走 Inventory API（与主店同路径）
+  ebay_site_id: "0"
+  warehouse_location: "Los Angeles, CA"
+  warehouse_postal: "90001"
+  # 2026-08-07 已建/回填(GrovePop 账号 UserID=grovepop, HK 注册, 美国仓发货)。
+  # 旧的深圳仓 GROVEPOP_CN_WAREHOUSE + SpeedPAK 政策保留未删,GrovePop 改用下面这套美国仓。
+  merchant_location_key: "GROVEPOP_US_WAREHOUSE"          # 新建:Los Angeles CA 90001 / WAREHOUSE / ENABLED
+  fallback_fulfillment_policy_id: "265229324017"         # 新建:免邮 ShippingMethodStandard / 处理2天 / 只发美国本土
+  fallback_return_policy_id: "264935682017"              # 复用:GrovePop 30-Day Returns / 买家付退货 / MONEY_BACK
+  fallback_payment_policy_id: "264935681017"             # 复用:GrovePop Payment (Managed Payments)
+  # 非 Motors，无 motors_return_policy_id：按规则"除汽配外一律 30 天买家付退货运费"。
+
+quality_gate:
+  banner_marker: "grovepop"                     # 与 brand_name 小写一致
+  footer_marker: "ships from"                    # 取 footer 里稳定片段（与 AquaRides/主店同模式）
+
+# 户外/宠物家具是家居通用货：用家具模板 + 店铺品牌盖为 Brand + 成本加价（非 undercut）。
+# 盲盒时期的 arttoy_hype / banned_terms / footer_html / undercut 全部移除。
+listing:
+  # garden_lifestyle：沿用主店成熟版式(build_description_from_source：KEY FEATURES/
+  # PERFECT FOR/SPECIFICATIONS/PACKAGE INCLUDES 全量转化文案),仅通过下方 theme_* 把
+  # 主店 navy/gold 改成 GrovePop 绿色系。LLM 只出 80 字标题 + aspects,描述确定性生成,
+  # 不再有截断/巨型 headline/图序错乱。(2026-08-08 改)
+  template_style: "garden_lifestyle"
+  force_house_brand: true                       # 通用货：Brand 统一盖为 GrovePop
+  # 绿色系主题(复用主店版式,换配色)
+  theme_banner_from: "#2e5d43"                   # banner/footer 渐变起(园艺绿)
+  theme_banner_to: "#1c3b2b"                     # banner/footer 渐变止(深绿)
+  theme_accent: "#cbab6b"                        # 品牌名/强调(暖沙色)
+  theme_ink: "#25302a"                           # 正文
+  theme_section_bg: "#f3f7f2"                    # 标题条/包装块底色(奶白)
+  theme_perfectfor_bg: "#eef4ee"                 # PERFECT FOR 块底色(浅绿)
+
+pricing:
+  pricing_strategy: "cost_plus"                 # 靠美国仓时效取胜，不靠压价
+  price_ends_99: true                           # 心理定价 .99 结尾
+
+server:
+  port: 8002
+  scheduler_profile: ops
+  scheduler_mutex_name: "Global\\GrovePopSchedulerDaemonMutex"

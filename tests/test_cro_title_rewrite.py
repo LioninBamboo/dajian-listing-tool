@@ -12,6 +12,7 @@ from scripts.cro_title_rewrite import (
     build_enriched_title, recently_rewritten_skus, load_candidates, run,
     default_candidate_skus, _snapshot_fallback_skus,
     title_aspect_conflicts, render_email_html, _send_email, main,
+    should_email_cro_title_report,
 )
 
 
@@ -395,6 +396,62 @@ def test_send_email_returns_false_when_delivery_fails(monkeypatch, tmp_path):
     delivered = _send_email({'input_skus': 0, 'apply': False, 'rows': []}, report_path)
 
     assert delivered is False
+
+
+def test_should_email_cro_title_report_skips_empty_queue():
+    assert should_email_cro_title_report({
+        'input_skus': 0,
+        'rows': [],
+    }) is False
+    assert should_email_cro_title_report({
+        'input_skus': 0,
+        'rows': [{'status': 'skipped'}],
+    }) is False
+    assert should_email_cro_title_report({
+        'input_skus': 3,
+        'rows': [],
+    }) is True
+    assert should_email_cro_title_report({
+        'input_skus': 0,
+        'rows': [{'status': 'done'}],
+    }) is True
+
+
+def test_cli_skips_email_when_zero_candidates(monkeypatch, tmp_path):
+    import sys
+    import scripts.cro_title_rewrite as cli
+
+    report_path = tmp_path / 'cro_title_rewrite_report.json'
+    monkeypatch.setattr(
+        sys,
+        'argv',
+        ['cro_title_rewrite.py', '--skus', 'X', '--email', '--out', str(report_path)],
+    )
+    monkeypatch.setattr(
+        cli,
+        'run',
+        lambda *args, **kwargs: {
+            'input_skus': 0,
+            'cooldown_skipped': 0,
+            'proposed': [],
+            'done': [],
+            'failed': [],
+            'skipped': [],
+            'rows': [],
+            'apply': False,
+        },
+    )
+    called = {'n': 0}
+
+    def fake_send(*args, **kwargs):
+        called['n'] += 1
+        return True
+
+    monkeypatch.setattr(cli, '_send_email', fake_send)
+
+    assert cli.main() == 0
+    assert called['n'] == 0
+    assert report_path.exists()
 
 
 def test_cli_returns_nonzero_when_completion_email_is_not_delivered(monkeypatch, tmp_path):

@@ -2179,3 +2179,49 @@ def test_assembly_conflict_still_fires_when_aspect_missing():
         attributes=attrs, specs=specs,
     )
     assert _has_conflict(issues)
+
+def test_invented_kit_size_flags_108_piece_not_in_source():
+    from src.utils.listing_quality_gate import find_invented_kit_size, validate_listing_quality
+
+    title = "Emergency Car Kit with Portable Air Compressor - 108-Piece Auto Safety & Roadsid"
+    description = (
+        '<div style="max-width:900px">'
+        "<div>AQUARIDES</div>"
+        "<p>Emergency Car Kit with Portable Air Compressor - 108-Piece Auto Safety &amp; Roadsid.</p>"
+        "<h2>KEY FEATURES</h2><ul><li>27-piece first aid kit</li></ul>"
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Auto Safety Emergency Kit</p>"
+        "<div>Thoughtfully curated for modern living</div>"
+        "</div>"
+    )
+    source_description = (
+        "1pc air compressor 12V; 1pc booster cable; 27pc first aid kit; hard shell case"
+    )
+    issue = find_invented_kit_size(
+        title,
+        description,
+        source_title="Auto Safety Emergency Kit",
+        source_description=source_description,
+    )
+    assert issue is not None
+    assert issue.code == "invented_kit_size"
+    assert "108" in issue.message
+
+    issues = validate_listing_quality(
+        {"title": title, "description": description, "aspects": {"Type": ["Safety Kits"]}},
+        source_title="Auto Safety Emergency Kit",
+        source_description=source_description,
+        images=["https://example.com/a.jpg", "https://example.com/b.jpg"],
+    )
+    assert any(i.code == "invented_kit_size" for i in issues)
+
+
+def test_invented_kit_size_allows_source_backed_piece_count():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "20-Piece Paintless Dent Repair Kit Stainless Steel Rods",
+        "PACKAGE INCLUDES: 1 x Paintless Dent Repair Rods Set",
+        source_title="20 Pcs Paintless Dent Repair Rods Kit",
+        source_description="20 Pcs stainless steel rods kit",
+    )
+    assert issue is None

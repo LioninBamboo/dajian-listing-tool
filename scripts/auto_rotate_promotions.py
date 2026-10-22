@@ -181,8 +181,13 @@ def format_promotion_created_subject(brand: str, pct: float = DISCOUNT_PCT, days
 
 
 def notify_promotion_created(result: dict) -> None:
-    """Email the operator whenever a new 2-day 5% period is created."""
+    """Archive promo creation; SMTP only if EMAIL_FORCE_ROUTINE=1.
+
+    2026-10 email simplification: routine promo-created mail was inbox noise;
+    the combined daily digest covers it. Failures still surface via daemon.
+    """
     from src.utils.email_sender import send_email
+    from src.utils.email_policy import should_smtp
 
     brand = get_store_profile().brand_name
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -217,9 +222,16 @@ def notify_promotion_created(result: dict) -> None:
                 </table>
                 <p style="color:#999;font-size:12px;">此邮件由 auto_rotate_promotions.py 在新建一期时发送</p>
                 """
-    sent = send_email(format_promotion_created_subject(brand), html)
-    if not sent:
-        logger.warning("促销通知邮件未送达，已保留本地 reports 副本")
+    sent = send_email(
+        format_promotion_created_subject(brand),
+        html,
+        send_smtp=should_smtp(has_issues=False),
+    )
+    if should_smtp(has_issues=False):
+        if not sent:
+            logger.warning("promo notify SMTP failed; local report kept")
+    else:
+        logger.info("promo success email silenced (local report only; digest covers it)")
 
 
 def rotate():

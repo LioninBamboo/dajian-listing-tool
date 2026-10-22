@@ -22,7 +22,7 @@
 
 - 调度：`Dajian Scheduler Daemon`（`scheduler_daemon.py`）
 - Mutex：`Global\DajianSchedulerDaemonMutex`
-- 日程：11:30 audit → 12:10 source_aspect（白名单+email）→ 12:30 semantic → 13:00 missing_video（limit 30）
+- 日程：11:30 audit → 12:10 source_aspect（白名单+email）→ 12:30 semantic → 13:00 missing_video（limit 80）
 - 次日验收：`python scripts/verify_listing_audit_pipeline_acceptance.py`
 
 ### GrovePop

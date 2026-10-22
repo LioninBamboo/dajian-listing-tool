@@ -208,36 +208,108 @@ def analyze_collected_products(
         
         success = 0
         failed = 0
+        skipped = 0
+        skip_reasons: dict[str, list[str]] = {}
         prepared_skus: list[str] = []
         
         for i, product in enumerate(products, 1):
             logger.info(f"[{i}/{len(products)}] 处理 {product.sku}...")
             
             try:
-                # 1. 计算价格
+                # 1. 计算价格 — live cargo recheck when the supplier API is up,
+                #    then cheap publishability gates BEFORE any title/desc LLM.
+                from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+                from src.utils.copy_skip_gate import (
+                    apply_copy_skip,
+                    apply_live_supplier_quote,
+                    cargo_gate_applies,
+                    evaluate_copy_skip,
+                    lookup_live_supplier_quote,
+                    market_advisory_log_line,
+                    market_median_from_intel,
+                )
+
                 specs = product.specs or {}
                 attributes = product.attributes or {}
                 is_oversize = 'Dimensions' in specs or 'Dimensions' in attributes
-                
+
+                live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(product.sku))
+                if live_applied:
+                    logger.info(
+                        f"  Live supplier quote: price=${product.price} ship=${product.shipping}"
+                    )
+                apply_cargo = cargo_gate_applies(specs, live_quote_applied=live_applied)
+
                 dajian_costs = PricingEngine.calculate_dajian_cost(
                     product_price=product.price,
                     shipping_cost=product.shipping,
                     is_oversize=is_oversize
                 )
-                
+
                 safe_price = PricingEngine.calculate_selling_price(
                     dajian_costs["total_dajian_cost"], 0.15
                 )
-                
-                # 2. AI 优化 (with market intelligence)
+
+                local_skip = evaluate_copy_skip(
+                    sku=product.sku,
+                    product_price=product.price,
+                    shipping=product.shipping,
+                    is_oversize=is_oversize,
+                    attributes=attributes,
+                    specs=specs,
+                    description=product.description or "",
+                    title=product.title or "",
+                    include_market=False,
+                    dims_mode="require",
+                    apply_cargo=apply_cargo,
+                )
+                if local_skip.skip:
+                    apply_copy_skip(product, local_skip, cost_breakdown=dajian_costs)
+                    _flag_modified(product, "logs")
+                    _flag_modified(product, "cost_breakdown")
+                    db.commit()
+                    logger.info(f"  copy_skip {','.join(local_skip.reasons)} (no LLM)")
+                    skipped += 1
+                    skip_reasons[product.sku] = list(local_skip.reasons)
+                    continue
+
+                # 2. Market median then far-above. No median → SAFE_15_NO_MARKET.
                 market_intel = None
                 try:
                     market_intel = qwen.fetch_market_intelligence(product.title)
                     if market_intel:
-                        logger.info(f"  📊 Market intel: {market_intel.get('total_listings', 0)} listings")
+                        logger.info(f"  Market intel: {market_intel.get('total_listings', 0)} listings")
                 except Exception as mi_err:
-                    logger.warning(f"  ⚠️ Market intel failed: {mi_err}")
-                
+                    logger.warning(f"  Market intel failed: {mi_err}")
+
+                market_skip = evaluate_copy_skip(
+                    sku=product.sku,
+                    product_price=product.price,
+                    shipping=product.shipping,
+                    is_oversize=is_oversize,
+                    attributes=attributes,
+                    specs=specs,
+                    description=product.description or "",
+                    title=product.title or "",
+                    market_median=market_median_from_intel(market_intel),
+                    include_market=True,
+                    dims_mode="require",
+                    apply_cargo=apply_cargo,
+                )
+                advisory_line = market_advisory_log_line(market_skip.detail)
+                if advisory_line:
+                    logger.info(f"  {advisory_line}")
+                if market_skip.skip:
+                    apply_copy_skip(product, market_skip, cost_breakdown=dajian_costs)
+                    _flag_modified(product, "logs")
+                    _flag_modified(product, "cost_breakdown")
+                    db.commit()
+                    logger.info(f"  copy_skip {','.join(market_skip.reasons)} (no LLM)")
+                    skipped += 1
+                    skip_reasons[product.sku] = list(market_skip.reasons)
+                    continue
+
+                # 3. AI optimize — only SKUs that can still near-or-SAFE publish.
                 max_retries = 2
                 previous_errors = None
                 for attempt in range(max_retries):
@@ -344,6 +416,8 @@ def analyze_collected_products(
         return {
             'success': success,
             'failed': failed,
+            'skipped': skipped,
+            'skip_reasons': skip_reasons,
             'requested': len(normalized_skus) if normalized_skus else len(products),
             'matched': len(products),
             'prepared_skus': prepared_skus,
@@ -1290,7 +1364,11 @@ def send_ops_summary_email(results: dict):
         f"全量审核{full_oos_audit.get('checked_count', 0)}个 "
         f"恢复{full_oos_audit.get('restocked_count', 0)}个"
     )
-    return send_email(subject, html)
+    from src.utils.email_policy import should_smtp
+    # 2026-10: ops summary folded into daily_ops_digest unless issues
+    inv = results.get('inventory', {}) or {}
+    has_issues = bool(inv.get('error') or inv.get('ghost_restock_error'))
+    return send_email(subject, html, send_smtp=should_smtp(has_issues=has_issues))
 
 
 def send_daily_summary_email(results: dict):
@@ -1646,7 +1724,14 @@ def send_daily_summary_email(results: dict):
                f"调价{smart_reprice_count} "
                f"{health_icon}健康{health_problems}问题 "
                f"🎯CRO {cro_summary.get('avg_cro_score', 0):.0f}分/P1队{cro.get('p1_queued', 0)}")
-    return send_email(subject, html)
+    from src.utils.email_policy import should_smtp
+    has_issues = bool(
+        (results.get('inventory') or {}).get('error')
+        or (results.get('health_check') or {}).get('error')
+        or (results.get('finance') or {}).get('error')
+        or str((results.get('smart_reprice') or {}).get('status') or '').lower() in {'failed', 'error'}
+    )
+    return send_email(subject, html, send_smtp=should_smtp(has_issues=has_issues))
 
 
 def run_cro_diagnose(enqueue_p1: bool = True) -> dict:
@@ -2325,6 +2410,8 @@ def _send_mi_daily_digest(opportunities: list, kpi: dict, snap_name: str,
         </body></html>
         """
         subject = format_mi_digest_subject(brand, len(opportunities))
+        digest_path = (PROJECT_ROOT / "reports" / f"mi_digest_{datetime.now():%Y%m%d}.html")
+        already_archived_today = digest_path.is_file()
         # F25 — 归档 HTML 到 reports/，保留 3 天
         try:
             _archive_mi_digest_html(html, keep_days=3)
@@ -2333,7 +2420,15 @@ def _send_mi_daily_digest(opportunities: list, kpi: dict, snap_name: str,
         if not opportunities:
             logger.info("[MI DIGEST] 无机会，已归档日报，不发送空日报邮件")
             return False
-        return send_email(subject, html)
+        if already_archived_today:
+            logger.info(
+                "[MI DIGEST] 今日已有归档 %s，跳过重复 SMTP（一日一封）",
+                digest_path.name,
+            )
+            return True
+        from src.utils.email_policy import should_smtp
+        # 2026-10: MI digest folded into daily_ops_digest; F18 alerts still SMTP
+        return send_email(subject, html, send_smtp=should_smtp(has_issues=False))  # MI digest SMTP silenced
     except Exception as e:
         logger.error(f"MI 日报邮件发送失败: {e}")
         return False
@@ -2544,17 +2639,19 @@ def main():
     
     logger.info(f"日志已保存到: {log_file}")
     
-    # 发送汇总邮件（全量任务模式下）— --mi-only / --ops-only 各自发专用邮件
+    # 2026-10: routine summaries archive locally; combined digest @11:45 sends SMTP.
+    # send_* helpers still write reports/; SMTP only when email_policy says issues
+    # or EMAIL_FORCE_ROUTINE=1.
     if args.ops_only:
         try:
             send_ops_summary_email(results)
         except Exception as e:
-            logger.error(f"ops 汇总邮件发送失败: {e}")
+            logger.error(f"ops summary email failed: {e}")
     elif not (args.analyze_only or args.sync_only or args.mi_only):
         try:
             send_daily_summary_email(results)
         except Exception as e:
-            logger.error(f"汇总邮件发送失败: {e}")
+            logger.error(f"daily summary email failed: {e}")
     
     return results
 
