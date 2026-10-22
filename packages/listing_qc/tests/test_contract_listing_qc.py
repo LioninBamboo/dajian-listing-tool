@@ -49,6 +49,13 @@ def test_assembly_key_matches_package_conflict():
     assert fix_key_matches_issue("Assembly Required", "assembly_package_conflict")
 
 
+def test_strip_claims_key_matches_semantic_only():
+    assert fix_key_matches_issue("__strip_claims_from_manifest__", "semantic_feature")
+    assert fix_key_matches_issue("__strip_claims_from_manifest__", "semantic_material")
+    assert not fix_key_matches_issue("__strip_claims_from_manifest__", "claim_capacity")
+    assert not fix_key_matches_issue("__strip_claims_from_manifest__", "category_mismatch")
+
+
 def test_category_policy_skips_gabion_allows_chairs():
     assert category_allows_assembly_auto_yes("54235")
     assert category_allows_assembly_auto_yes(79684)

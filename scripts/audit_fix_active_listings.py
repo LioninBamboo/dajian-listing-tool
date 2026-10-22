@@ -1974,6 +1974,16 @@ def create_parser():
         choices=["Yes"],
         help="Operator override: emit Assembly Required=Yes for assembly_package_conflict. Requires --sku or --sku-file.",
     )
+    parser.add_argument(
+        "--claims-manifest",
+        help="CSV of reviewed claims for --fix-key __strip_claims_from_manifest__",
+    )
+    parser.add_argument(
+        "--claims-location",
+        choices=["description", "features", "aspects", "all"],
+        default="all",
+        help="Limit __strip_claims_from_manifest__ to description, Features, other aspects, or all",
+    )
     return parser
 
 
@@ -1985,8 +1995,39 @@ def get_report_source(args) -> str:
     return "live_ebay" if args.live else "local_db_optimization"
 
 
+def _selected_fix_keys(args) -> list[str]:
+    return [str(key) for key in (getattr(args, "fix_keys", None) or []) if str(key).strip()]
+
+
+def is_claim_strip_run(args) -> bool:
+    from src.utils.claim_strip import STRIP_FIX_KEY
+
+    return STRIP_FIX_KEY in _selected_fix_keys(args) or bool(getattr(args, "claims_manifest", None))
+
+
 def validate_fix_scope(args, parser) -> None:
-    if args.source_report and (args.sku or args.sku_file):
+    from src.utils.claim_strip import STRIP_FIX_KEY, VALID_LOCATIONS
+
+    selected = _selected_fix_keys(args)
+    has_strip = STRIP_FIX_KEY in selected
+    has_manifest = bool(getattr(args, "claims_manifest", None))
+    if has_manifest and not has_strip:
+        parser.error("--claims-manifest requires --fix-key __strip_claims_from_manifest__")
+    if has_strip and not has_manifest:
+        parser.error("--fix-key __strip_claims_from_manifest__ requires --claims-manifest")
+    if has_strip:
+        others = [key for key in selected if key != STRIP_FIX_KEY]
+        if others:
+            parser.error(
+                "--fix-key __strip_claims_from_manifest__ cannot be combined with other fix keys: "
+                + ", ".join(others)
+            )
+        if not args.source_report:
+            parser.error("--fix-key __strip_claims_from_manifest__ requires --source-report")
+        location = str(getattr(args, "claims_location", "all") or "all")
+        if location not in VALID_LOCATIONS:
+            parser.error(f"invalid --claims-location {location}")
+    elif args.source_report and (args.sku or args.sku_file):
         parser.error("--source-report cannot be combined with --sku or --sku-file")
     if args.source_report and not args.issue_types:
         parser.error("--source-report requires at least one --issue-type")
@@ -4455,12 +4496,422 @@ def fix_listing_on_ebay(
     return results
 
 
+def _claim_strip_required_aspect_names(category_id: str | None) -> list[str]:
+    if not category_id:
+        return []
+    try:
+        matcher = get_category_matcher()
+        required_aspects, _ = matcher._get_category_aspects(str(category_id))
+        return [aspect.get("name") for aspect in required_aspects if aspect.get("name")]
+    except Exception:
+        return []
+
+
+def _claim_strip_store_label() -> str:
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        profile = get_store_profile()
+        return f"{profile.brand_name} (Main)"
+    except Exception:
+        return "Main (Dajian)"
+
+
+def _sync_optimization_claim_strip(db_conn, sku: str, plan) -> bool:
+    """Update only optimization.description / optimization.aspects after a successful strip."""
+    if db_conn is None:
+        return False
+    try:
+        row = db_conn.execute(
+            "SELECT optimization FROM collected_products WHERE sku = ?",
+            (sku,),
+        ).fetchone()
+    except Exception:
+        return False
+    if not row:
+        return False
+    raw = row["optimization"] if isinstance(row, sqlite3.Row) else row[0]
+    opt = parse_json(raw) if not isinstance(raw, dict) else dict(raw)
+    if not isinstance(opt, dict):
+        opt = {}
+    if plan.offer_description_after != plan.offer_description_before:
+        opt["description"] = plan.offer_description_after
+    elif plan.inventory_description_after != plan.inventory_description_before:
+        opt["description"] = plan.inventory_description_after
+    if plan.aspects_after != plan.aspects_before:
+        opt["aspects"] = plan.aspects_after
+    db_conn.execute(
+        "UPDATE collected_products SET optimization = ? WHERE sku = ?",
+        (json.dumps(opt, ensure_ascii=False), sku),
+    )
+    db_conn.commit()
+    return True
+
+
+def _offer_price_value(offer: dict | None):
+    summary = (offer or {}).get("pricingSummary") or {}
+    price = summary.get("price") or {}
+    if isinstance(price, dict) and price.get("value") not in (None, ""):
+        try:
+            return float(price.get("value"))
+        except (TypeError, ValueError):
+            return price.get("value")
+    return None
+
+
+def apply_claim_strip_live(
+    *,
+    sku: str,
+    plan,
+    ebay_client,
+    before_inventory: dict,
+    before_offer: dict,
+    db_conn=None,
+    log_dir: Path,
+    timestamp: str,
+    required_aspect_loader=None,
+    source_report_issues=None,
+    location: str = "all",
+    manifest_rows=None,
+):
+    from src.utils import claim_strip as cs
+
+    before_dir = log_dir / "before"
+    before_dir.mkdir(parents=True, exist_ok=True)
+    before_path = before_dir / f"{sku}_{timestamp}.json"
+    try:
+        before_path.write_text(
+            json.dumps(
+                {
+                    "sku": sku,
+                    "created_at": datetime.now().isoformat(),
+                    "inventory": before_inventory,
+                    "offer": before_offer,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return {
+            "status": "before_image_failed",
+            "error": str(exc),
+            "plan": plan,
+        }
+
+    try:
+        live_inventory, live_offer = _fetch_live_listing_context(
+            ebay_client,
+            sku,
+            expected_listing_id=cs.live_listing_id(before_offer),
+        )
+    except Exception as exc:
+        return {"status": "drift", "error": f"recheck fetch failed: {exc}", "plan": plan}
+
+    recheck = cs.plan_sku_claim_strip(
+        sku,
+        manifest_rows or [],
+        live_inventory,
+        live_offer,
+        source_report_issues or [],
+        location=location,
+        required_aspect_names=(required_aspect_loader or _claim_strip_required_aspect_names)(
+            cs.live_category_id(live_offer)
+        ),
+    )
+    if not cs.plans_equivalent(plan, recheck):
+        for result in plan.results:
+            if result.status == cs.STATUS_WILL_STRIP:
+                result.status = cs.STATUS_DRIFT
+        return {"status": cs.STATUS_DRIFT, "plan": plan}
+
+    inventory_payload = cs.replace_inventory_product_fields(
+        before_inventory,
+        description=(
+            plan.inventory_description_after
+            if plan.inventory_description_after != plan.inventory_description_before
+            else (before_inventory.get("product") or {}).get("description")
+        ),
+        aspects=plan.aspects_after if plan.aspects_after != plan.aspects_before else (before_inventory.get("product") or {}).get("aspects"),
+    )
+    try:
+        put_response = _put_inventory_snapshot(ebay_client, sku, inventory_payload)
+        if getattr(put_response, "status_code", 200) not in (200, 204):
+            raise RuntimeError(
+                f"inventory PUT failed {getattr(put_response, 'status_code', '?')}: "
+                f"{getattr(put_response, 'text', '')[:200]}"
+            )
+    except Exception as exc:
+        return {"status": "write_failed", "error": str(exc), "plan": plan}
+
+    offer_id = (before_offer or {}).get("offerId")
+    offer_updated = False
+    if offer_id and plan.offer_description_after != plan.offer_description_before:
+        live_category = cs.live_category_id(before_offer)
+        live_price = _offer_price_value(before_offer)
+        offer_updated = bool(
+            ebay_client.update_offer_category(
+                offer_id,
+                live_category,
+                price=live_price,
+                listing_description=plan.offer_description_after,
+            )
+        )
+        if not offer_updated:
+            try:
+                _put_inventory_snapshot(ebay_client, sku, before_inventory)
+            except Exception:
+                pass
+            return {"status": "write_failed", "error": "offer update failed", "plan": plan}
+        # Existing description-change flow republishes after update_offer_category.
+        if hasattr(ebay_client, "publish_offer"):
+            try:
+                ebay_client.publish_offer(offer_id)
+            except Exception:
+                pass
+
+    try:
+        read_inventory, read_offer = _fetch_live_listing_context(
+            ebay_client,
+            sku,
+            expected_listing_id=cs.live_listing_id(before_offer),
+        )
+    except Exception as exc:
+        read_inventory, read_offer = {}, {}
+        readback_error = str(exc)
+    else:
+        readback_error = ""
+
+    checks = cs.verify_readback(plan, read_inventory, read_offer, before_inventory, before_offer)
+    if readback_error or not all(checks.values()):
+        try:
+            _put_inventory_snapshot(ebay_client, sku, before_inventory)
+            if offer_id and offer_updated:
+                ebay_client.update_offer_category(
+                    offer_id,
+                    cs.live_category_id(before_offer),
+                    price=_offer_price_value(before_offer),
+                    listing_description=str((before_offer or {}).get("listingDescription") or ""),
+                )
+        except Exception as restore_exc:
+            return {
+                "status": cs.STATUS_FAILED_RESTORED,
+                "error": f"readback failed ({readback_error or checks}); restore error: {restore_exc}",
+                "readback": checks,
+                "plan": plan,
+            }
+        for result in plan.results:
+            if result.status == cs.STATUS_WILL_STRIP:
+                result.status = cs.STATUS_FAILED_RESTORED
+                result.readback = checks
+        return {
+            "status": cs.STATUS_FAILED_RESTORED,
+            "readback": checks,
+            "plan": plan,
+        }
+
+    if db_conn is not None:
+        _sync_optimization_claim_strip(db_conn, sku, plan)
+    for result in plan.results:
+        if result.status == cs.STATUS_WILL_STRIP:
+            result.status = cs.STATUS_STRIPPED
+        result.readback = checks
+    return {"status": cs.STATUS_STRIPPED, "readback": checks, "plan": plan}
+
+
+def run_manifest_claim_strip(
+    args,
+    parser,
+    *,
+    ebay_client=None,
+    db_conn=None,
+    log_dir: Path | None = None,
+    timestamp: str | None = None,
+    required_aspect_loader=None,
+    stdout=None,
+):
+    """Dedicated path for ``__strip_claims_from_manifest__``.
+
+    Dry-run makes zero eBay writes and zero SQLite writes.
+    """
+    from src.utils import claim_strip as cs
+
+    out = stdout or sys.stdout
+    timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = Path(log_dir) if log_dir else (LOG_DIR / "claim_strip")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        report = json.loads(Path(args.source_report).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        parser.error(f"cannot read source report {args.source_report}: {exc}")
+
+    try:
+        manifest_rows, manifest_counts = cs.load_claims_manifest(args.claims_manifest)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+
+    strip_rows = [row for row in manifest_rows if row.recommendation == cs.STRIP_NOW]
+    sku_filter = None
+    if args.sku:
+        sku_filter = {args.sku}
+    elif args.sku_file:
+        sku_filter = set(_load_skus_from_file(args.sku_file))
+    if sku_filter is not None:
+        strip_rows = [row for row in strip_rows if row.sku in sku_filter]
+
+    sku_order = []
+    seen = set()
+    for row in strip_rows:
+        if row.sku and row.sku not in seen:
+            seen.add(row.sku)
+            sku_order.append(row.sku)
+
+    if ebay_client is None:
+        try:
+            from src.clients.real_ebay_client import create_real_ebay_client
+
+            environment = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION")
+            ebay_client = create_real_ebay_client(environment)
+            if not ebay_client.oauth.is_authorized():
+                print("❌ eBay not authorized! Run: python tools/refresh_token.py", file=out)
+                return 1
+        except Exception as exc:
+            print(f"❌ Failed to initialize eBay client: {exc}", file=out)
+            return 1
+
+    own_db = False
+    if db_conn is None and args.fix:
+        db_conn = sqlite3.connect(str(DB_PATH))
+        db_conn.row_factory = sqlite3.Row
+        own_db = True
+
+    environment = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    if args.fix and environment != "PRODUCTION":
+        print(
+            f"REFUSE --fix: EBAY_ENVIRONMENT={environment!r} (required PRODUCTION)",
+            file=out,
+        )
+        if own_db:
+            db_conn.close()
+        return 2
+
+    print(f"{'=' * 60}", file=out)
+    print("  Claim strip from reviewed manifest", file=out)
+    print(f"  Mode: {'LIVE --fix' if args.fix else 'DRY-RUN (no eBay/SQLite writes)'}", file=out)
+    print(f"  Manifest strip_now={manifest_counts['strip_now']} keep={manifest_counts['keep']} needs_look={manifest_counts['needs_look']}", file=out)
+    print(f"  SKUs: {len(sku_order)}  location={getattr(args, 'claims_location', 'all')}", file=out)
+    print(f"{'=' * 60}", file=out)
+
+    if args.fix:
+        print(
+            f"  store={_claim_strip_store_label()} repo={ROOT} "
+            f"EBAY_ENVIRONMENT={environment} db={DB_PATH}",
+            file=out,
+        )
+
+    all_entries = []
+    status_counts: dict[str, int] = {}
+    wrote_any = False
+    loader = required_aspect_loader or _claim_strip_required_aspect_names
+
+    for sku in sku_order:
+        try:
+            inventory, offer = _fetch_live_listing_context(ebay_client, sku)
+        except Exception as exc:
+            print(f"{sku}: skip fetch_failed ({exc})", file=out)
+            continue
+        if not inventory or not offer:
+            print(f"{sku}: skip live_listing_missing", file=out)
+            continue
+        issues = cs.issues_for_sku(report, sku)
+        plan = cs.plan_sku_claim_strip(
+            sku,
+            manifest_rows,
+            inventory,
+            offer,
+            issues,
+            location=getattr(args, "claims_location", "all"),
+            required_aspect_names=loader(cs.live_category_id(offer)),
+        )
+        for chunk in cs.unified_field_diffs(plan):
+            if chunk:
+                print(chunk, file=out)
+        for result in plan.results:
+            print(f"{sku}\t{result.claim}\t{result.status}", file=out)
+            status_counts[result.status] = status_counts.get(result.status, 0) + 1
+
+        apply_status = None
+        readback = None
+        if args.fix and plan.has_changes and plan.skip_reason is None:
+            applied = apply_claim_strip_live(
+                sku=sku,
+                plan=plan,
+                ebay_client=ebay_client,
+                before_inventory=inventory,
+                before_offer=offer,
+                db_conn=db_conn,
+                log_dir=log_dir,
+                timestamp=timestamp,
+                required_aspect_loader=loader,
+                source_report_issues=issues,
+                location=getattr(args, "claims_location", "all"),
+                manifest_rows=manifest_rows,
+            )
+            apply_status = applied.get("status")
+            readback = applied.get("readback")
+            wrote_any = wrote_any or apply_status == cs.STATUS_STRIPPED
+            if apply_status == cs.STATUS_FAILED_RESTORED:
+                print(f"FAILED_RESTORED {sku} readback={readback}", file=out)
+            elif apply_status == cs.STATUS_DRIFT:
+                print(f"{sku}: skip drift", file=out)
+        elif args.fix and not plan.has_changes:
+            apply_status = "no_write"
+
+        for result in plan.results:
+            extra = {}
+            if readback is not None:
+                extra["readback"] = readback
+            if apply_status:
+                extra["apply_status"] = apply_status
+            all_entries.append(cs.result_entry(result, extra))
+
+    results_name = f"{'live' if args.fix else 'dryrun'}_{timestamp}.json"
+    results_path = log_dir / results_name
+    results_path.write_text(
+        json.dumps(
+            {
+                "mode": "live" if args.fix else "dryrun",
+                "created_at": datetime.now().isoformat(),
+                "manifest_counts": manifest_counts,
+                "status_counts": status_counts,
+                "entries": all_entries,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"Results: {results_path}", file=out)
+    print(
+        "Summary: "
+        + " ".join(f"{key}={value}" for key, value in sorted(status_counts.items())),
+        file=out,
+    )
+    if own_db:
+        db_conn.close()
+    return 0
+
+
 def main(argv=None):
     parser = create_parser()
     args = parser.parse_args(argv)
     if args.sku and args.sku_file:
         parser.error("--sku and --sku-file cannot be used together")
     validate_fix_scope(args, parser)
+    if "__strip_claims_from_manifest__" in set(args.fix_keys or []):
+        return run_manifest_claim_strip(args, parser)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = Path(args.report) if args.report else LOG_DIR / f"listing_audit_fix_{timestamp}.json"
