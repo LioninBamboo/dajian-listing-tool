@@ -22,6 +22,11 @@ PARSE_ROWS = (
     ("Double Glass Doors", "door", 2, 1),
     ("47 Inch Chairs", "chair", None, 47),
     ("8-inch wheels", "wheel", None, 8),
+    ("8-in wheels", "wheel", None, 8),
+    ("3-in-1 drawers", "drawer", None, 1),
+    ("3-in-1 drawer", "drawer", None, 1),
+    ("3–in–1 drawers", "drawer", None, 1),
+    ("4 drawers, 3-in-1 design", "drawer", 4, 1),
     ("two glass-door compartments", "door", None, 3),
     ("stable base", "table", None, None),
     ("eleven shelves", "shelf", 11, 1),
@@ -141,10 +146,34 @@ def test_none_inputs_do_not_crash():
 
 def test_dimension_units_are_not_count_claims():
     assert _count_claim_in_text(8, "wheel", "8-inch wheels") is False
+    assert _count_claim_in_text(8, "wheel", "8-in wheels") is False
     assert _count_claim_in_text(47, "chair", "47 Inch Chairs") is False
     assert _count_claim_in_text(1, "shelf", "one of the shelves") is False
     assert _count_claim_in_text(2, "panel", "2-sided panel") is False
     assert _count_claim_in_text(2, "bed", "Double Bed with Storage") is False
+    assert _count_claim_in_text(1, "drawer", "3-in-1 drawers") is False
+    assert _count_claim_in_text(3, "drawer", "3-in-1 drawers") is False
+    assert _count_claim_in_text(1, "drawer", "3–in–1 drawers") is False
+    assert _count_claim_in_text(4, "drawer", "4 drawers, 3-in-1 design") is True
+
+
+def test_n_in_1_does_not_raise_semantic_count():
+    source = {"materials": [], "features": [], "counts": {"drawers": 4}, "capacity": None, "certifications": [], "dimensions": {}}
+    live_sheet_one = dict(source, counts={"drawers": 1})
+    live_sheet_real = dict(source, counts={"drawers": 4})
+    for live_text, live in (
+        ("3-in-1 drawers", live_sheet_one),
+        ("3-in-1 drawer", live_sheet_real),
+        ("3–in–1 drawers", live_sheet_real),
+        ("Convertible 3-in-1 drawer chest", live_sheet_one),
+    ):
+        violations = compare_fact_sheets(
+            source,
+            live,
+            source_text="Dresser with 4 drawers",
+            live_text=live_text,
+        )
+        assert not any(v["claim_type"] == "semantic_count" for v in violations)
 
 
 def test_cached_sheet_one_without_text_corroboration_is_skipped():

@@ -741,12 +741,23 @@ def _noun_count_terms(noun: str) -> tuple[str, ...]:
     }.get(noun_key, (noun_key, noun_key + "s"))
 
 
+def _is_n_in_one_number(text: str, start: int, end: int) -> bool:
+    """True when the number at ``text[start:end]`` is the N or M in ``N-in-M``.
+
+    Convertible copy such as ``3-in-1 drawers`` is not three drawers and not
+    one drawer. Hyphen and en-dash both count; ``8-in`` / ``8-inch`` do not.
+    """
+    if re.match(r"\s*[-–]\s*in\s*[-–]\s*\d", text[end:], re.IGNORECASE):
+        return True
+    return re.search(r"\d+\s*[-–]\s*in\s*[-–]\s*$", text[:start], re.IGNORECASE) is not None
+
+
 def parse_noun_count(text: str, noun: str) -> int | None:
     """Extract an explicit count for ``noun``, or None when unknown/ambiguous.
 
     Plural with no number is unknown, never 1. Dimensions next to a noun are
     not counts (``47 Inch Chairs``). Hyphenated compounds like ``glass-door``
-    do not count as doors.
+    do not count as doors. ``3-in-1`` is a configuration, not a count.
     """
     hay = str(text or "")
     terms = _noun_count_terms(noun)
@@ -770,6 +781,8 @@ def parse_noun_count(text: str, noun: str) -> int | None:
         if re.search(rf"\bof\b", between, re.IGNORECASE):
             continue
         if re.search(r"\bsided\b", between, re.IGNORECASE):
+            continue
+        if _is_n_in_one_number(hay, match.start("n"), match.end("n")):
             continue
         values.append(int(match.group("n")))
 
@@ -842,6 +855,15 @@ def parse_noun_count(text: str, noun: str) -> int | None:
         singular_alt = "|".join(re.escape(term) for term in singulars)
         if re.search(rf"\bsided\s+(?:{singular_alt})\b", hay, re.IGNORECASE):
             return None
+        # "3-in-1 drawer" names a configuration, not one drawer.
+        bare_singular = False
+        for match in singular_pat.finditer(hay):
+            if re.search(r"\d+\s*[-–]\s*in\s*[-–]\s*\d+\s*$", hay[:match.start()], re.IGNORECASE):
+                continue
+            bare_singular = True
+            break
+        if not bare_singular:
+            return None
         return 1
     return None
 
@@ -886,6 +908,8 @@ def _count_claim_in_text(count: int, noun: str, text: str) -> bool:
         re.IGNORECASE,
     )
     for match in compact.finditer(hay):
+        if _is_n_in_one_number(hay, match.start("n"), match.end("n")):
+            continue
         after_number = hay[match.end("n"):]
         if re.match(rf"[\s\-–]*{_COUNT_DIMENSION_UNIT}\b", after_number, re.IGNORECASE):
             continue
@@ -904,6 +928,8 @@ def _count_claim_in_text(count: int, noun: str, text: str) -> bool:
         re.IGNORECASE,
     )
     for match in qualified.finditer(hay):
+        if _is_n_in_one_number(hay, match.start("n"), match.end("n")):
+            continue
         if _non_count_gap(match.group("gap")):
             continue
         return True
