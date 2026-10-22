@@ -123,6 +123,22 @@ def blocks_automated_category_change(
     return category_approval_flag_set(optimization)
 
 
+def should_auto_remap_invalid_category(
+    optimization: Mapping[str, Any] | None,
+    *,
+    preserve: bool = False,
+    override: bool = False,
+) -> bool:
+    """Invalid-category publish retry may rematch only when unlocked.
+
+    ``preserve=True`` is the approved-leaf path. A truthy flag with a blank
+    or mismatched pin also blocks rematch (fail closed).
+    """
+    if preserve:
+        return False
+    return not blocks_automated_category_change(optimization, override=override)
+
+
 def locked_category_write_error(
     optimization: Mapping[str, Any] | None,
     *,

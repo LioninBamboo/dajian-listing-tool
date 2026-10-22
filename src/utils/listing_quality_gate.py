@@ -2037,6 +2037,7 @@ def normalize_generated_listing(
 
     title_context = " ".join(part for part in (source_title, opt.get("title")) if part).strip()
     profile = classify_listing_profile(title_context or opt.get("title", ""), opt.get("description", ""), opt.get("categoryId", ""))
+    # Any approval flag blocks a remap, including a blank or mismatched pin.
     preserve_category = blocks_automated_category_change(opt)
 
     if category_matcher and opt.get("categoryId") and not preserve_category:

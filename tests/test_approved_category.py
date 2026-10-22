@@ -41,6 +41,7 @@ from src.utils.approved_category import (
     is_category_approved,
     locked_category_write_error,
     mark_category_approved,
+    should_auto_remap_invalid_category,
 )
 from src.utils.listing_quality_gate import (
     ListingProfile,
@@ -163,6 +164,35 @@ def test_normalize_preserves_locked_cookware_leaf():
         category_matcher=_RemapMatcher(),
     )
     assert out["categoryId"] == COOKWARE_LEAF
+
+
+def test_normalize_keeps_leaf_when_lock_pin_mismatches():
+    opt = _cookware_opt(approved=True, pinned=COLLECTIBLES, category_id=COOKWARE_LEAF)
+    out = normalize_generated_listing(
+        opt,
+        source_title=opt["title"],
+        source_description=opt["description"],
+        category_matcher=_RemapMatcher(),
+    )
+    assert out["categoryId"] == COOKWARE_LEAF
+    assert out["categoryName"] == "Other Cookware"
+
+
+def test_normalize_does_not_invent_category_for_blank_lock():
+    opt = {
+        "title": "Modern Sectional Sofa",
+        "description": "<html><h2>KEY FEATURES</h2><ul><li>Sofa</li></ul></html>",
+        "categoryId": "",
+        "aspects": {"Brand": ["GrovePop"]},
+        CATEGORY_APPROVED_KEY: True,
+        CATEGORY_APPROVED_ID_KEY: "",
+    }
+    out = normalize_generated_listing(
+        opt,
+        source_title=opt["title"],
+        source_description=opt["description"],
+    )
+    assert str(out.get("categoryId") or "") == ""
 
 
 def test_normalize_unlocked_cookware_may_remap():
@@ -476,3 +506,30 @@ def test_inventory_pin_missing_category_does_not_invent_a_leaf():
     apply_pinned_offer_category(live, pinned)
     assert "categoryId" not in live
     assert "categoryId" not in live["listing"]
+
+
+def test_publish_retry_does_not_rematch_locked_cookware_leaf():
+    """GP 975->20632: invalid-category retry must not write a new leaf."""
+    locked = _cookware_opt(approved=True)
+    assert should_auto_remap_invalid_category(locked, preserve=True) is False
+    assert should_auto_remap_invalid_category(locked, preserve=False) is False
+
+    mismatched = _cookware_opt(approved=True, pinned=COLLECTIBLES, category_id=COOKWARE_LEAF)
+    assert should_auto_remap_invalid_category(mismatched, preserve=False) is False
+
+    blank = {CATEGORY_APPROVED_KEY: True, "categoryId": ""}
+    assert should_auto_remap_invalid_category(blank, preserve=False) is False
+
+    unlocked = _cookware_opt(approved=False)
+    assert should_auto_remap_invalid_category(unlocked, preserve=False) is True
+
+
+def test_locked_live_readback_must_not_overwrite_category_id():
+    """Successful publish must not persist a different live leaf over the lock."""
+    opt = _cookware_opt(approved=True)
+    live_category_id = COLLECTIBLES
+    if not blocks_automated_category_change(opt):
+        opt["categoryId"] = live_category_id
+    assert opt["categoryId"] == COOKWARE_LEAF
+    opt["liveCategoryId"] = live_category_id
+    assert opt["categoryId"] == COOKWARE_LEAF

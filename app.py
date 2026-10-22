@@ -681,12 +681,15 @@ def publish_to_ebay(product: dict) -> dict:
         title = opt_data.get("title", product.get('title', ''))[:80]
         description = opt_data.get("description", product.get('description', ''))
         category_id = remap_legacy_category_id(opt_data.get("categoryId", ""))
-        from src.utils.approved_category import evaluate_approved_category
+        from src.utils.approved_category import (
+            blocks_automated_category_change,
+            evaluate_approved_category,
+            should_auto_remap_invalid_category,
+        )
 
         approved_decision = evaluate_approved_category(category_id, opt_data)
         if approved_decision.approved and approved_decision.error:
             return {"status": "error", "message": approved_decision.error}
-        from src.utils.approved_category import blocks_automated_category_change
 
         if not approved_decision.preserve and blocks_automated_category_change(opt_data):
             return {
@@ -965,12 +968,15 @@ def publish_with_auto_category(product: dict) -> dict:
             )
             category_id = remap_legacy_category_id(category_id)
             stored_cat = remap_legacy_category_id(opt_data.get("categoryId", ""))
-            from src.utils.approved_category import evaluate_approved_category
+            from src.utils.approved_category import (
+                blocks_automated_category_change,
+                evaluate_approved_category,
+                should_auto_remap_invalid_category,
+            )
 
             approved_decision = evaluate_approved_category(stored_cat, opt_data)
             if approved_decision.approved and approved_decision.error:
                 return {"status": "error", "message": approved_decision.error}
-            from src.utils.approved_category import blocks_automated_category_change
 
             if not approved_decision.preserve and blocks_automated_category_change(opt_data):
                 return {
@@ -1124,7 +1130,9 @@ def publish_with_auto_category(product: dict) -> dict:
                     print(f"[重试 {attempt + 1}/{max_retries}] 已应用属性自动修复，准备重试")
                     continue
 
-                if is_invalid_category_error(error_msg) and not approved_decision.preserve:
+                if is_invalid_category_error(error_msg) and should_auto_remap_invalid_category(
+                    opt_data, preserve=approved_decision.preserve
+                ):
                     remapped = remap_legacy_category_id(category_id)
                     if remapped and remapped != category_id and is_sellable_leaf_category(oauth, remapped):
                         print(f"[AUTO-FIX] 类目重映射: {category_id} -> {remapped}")

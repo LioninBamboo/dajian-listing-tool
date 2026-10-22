@@ -67,6 +67,7 @@ from src.utils.approved_category import (
     evaluate_approved_category,
     is_category_approved,
     mark_category_approved,
+    should_auto_remap_invalid_category,
 )
 from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP, PROTECTED_STORED_CATEGORY_IDS
 from src.utils.dimension_helpers import (
@@ -1430,8 +1431,9 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                     if (
                         category_id not in protected_stored_categories
                         and not category_reselected
-                        and not preserve_approved_category
-                        and not blocks_automated_category_change(opt)
+                        and should_auto_remap_invalid_category(
+                            opt, preserve=preserve_approved_category
+                        )
                     ):
                         new_id, new_name, new_aspects = category_matcher.get_category_and_aspects(
                             title, completed_aspects, description
