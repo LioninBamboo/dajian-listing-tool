@@ -110,6 +110,12 @@ class InventorySyncService:
         self.last_coverage_report: Optional[CoverageReport] = None
         self._init_sync_table()
 
+    def _connect(self) -> sqlite3.Connection:
+        """Open SQLite with a busy wait so a concurrent scheduler task does not skip OOS writes."""
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+
     def _get_dajian_client(self):
         """Lazily create a single Dajian client so one sync run can reuse HTTP sessions."""
         if self._dajian_client is not None:
@@ -203,7 +209,7 @@ class InventorySyncService:
     
     def _init_sync_table(self):
         """初始化同步记录表"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cur = conn.cursor()
         
         cur.execute("""
@@ -224,7 +230,7 @@ class InventorySyncService:
     
     def get_last_sync_time(self, sku: str) -> Optional[str]:
         """获取 SKU 上次同步时间"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cur = conn.cursor()
         
         cur.execute("""
@@ -239,7 +245,7 @@ class InventorySyncService:
     
     def record_sync(self, result: 'SyncResult'):
         """记录同步结果"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cur = conn.cursor()
         
         cur.execute("""
@@ -252,7 +258,7 @@ class InventorySyncService:
     
     def get_last_sync_action(self, sku: str) -> Optional[str]:
         """获取 SKU 上次同步的操作类型 (out_of_stock, price_updated, no_change, etc.)"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cur = conn.cursor()
         
         cur.execute("""
@@ -269,7 +275,7 @@ class InventorySyncService:
     
     def _get_consecutive_skip_count(self, sku: str) -> int:
         """获取 SKU 连续 'skipped' (API 异常) 的天数"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cur = conn.cursor()
         
         cur.execute("""
@@ -296,7 +302,7 @@ class InventorySyncService:
         """更新数据库中的 cost_breakdown 和 suggested_price"""
         from src.services.pricing_engine import PricingEngine
         
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cur = conn.cursor()
         
         # 重新计算完整成本分解
@@ -321,7 +327,7 @@ class InventorySyncService:
         被 update_ebay_price 守门员调用. 数据缺失返回 None, 不阻拦改价.
         """
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._connect()
             cur = conn.cursor()
             cur.execute("SELECT cost_breakdown FROM collected_products WHERE sku = ?", (sku,))
             row = cur.fetchone()
@@ -336,7 +342,7 @@ class InventorySyncService:
 
     def get_skus_synced_today(self) -> set:
         """获取今日已同步的 SKU 列表"""
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         cur = conn.cursor()
         
         today = datetime.now().strftime('%Y-%m-%d')
@@ -359,7 +365,7 @@ class InventorySyncService:
         qty=0 stock gate must not use this alone — call
         ``load_live_sync_products`` / ``sync_all`` so coverage follows eBay.
         """
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         
@@ -554,7 +560,7 @@ class InventorySyncService:
     
     def _lookup_listing_id(self, sku: str) -> Optional[str]:
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = self._connect()
             row = conn.execute(
                 """
                 SELECT listing_id FROM collected_products
@@ -573,7 +579,7 @@ class InventorySyncService:
         return str(row[0]).strip() or None
 
     def _persist_listing_id(self, sku: str, listing_id: str) -> None:
-        conn = sqlite3.connect(self.db_path)
+        conn = self._connect()
         conn.execute(
             "UPDATE collected_products SET listing_id = ? WHERE sku = ?",
             (str(listing_id), sku),
