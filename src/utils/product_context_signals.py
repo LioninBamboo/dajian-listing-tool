@@ -107,6 +107,140 @@ _OTTOMAN_COMPOUND_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Dual-use copy is not an outdoor product signal. "Outdoor Indoor" is the
+# reverse of the usual indoor/outdoor pair and must be stripped the same way.
+_MIXED_INDOOR_OUTDOOR_RE = re.compile(
+    r"\b(?:"
+    r"indoor\s*(?:&\s*|and\s*|/\s*|-\s*)outdoor"
+    r"|outdoor\s*(?:&\s*|and\s*|/\s*|-\s*)indoor"
+    r"|indoor\s+outdoor"
+    r"|outdoor\s+indoor"
+    r"|for\s+indoor\s+and\s+outdoor"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_TABLE_AND_CHAIRS_RE = re.compile(
+    r"\b(?:dining\s+table|bistro\s+table|patio\s+table|outdoor\s+table|"
+    r"kitchen\s+table|table)"
+    r".{0,48}\b(?:and|with|&)\b.{0,32}\b(?:dining\s+)?chairs?\b",
+    re.IGNORECASE,
+)
+
+_N_PIECE_DINING_RE = re.compile(
+    r"\b\d+\s*-?\s*piece\b.{0,48}\bdining\b",
+    re.IGNORECASE,
+)
+
+_CHAIR_ACCESSORY_PHRASES: tuple[str, ...] = (
+    "cushion",
+    "cushions",
+    "cover",
+    "covers",
+    "pad",
+    "pads",
+    "pillow",
+    "pillows",
+    "slipcover",
+    "slipcovers",
+)
+
+
+def title_has_mixed_indoor_outdoor(text: str) -> bool:
+    """True for indoor & outdoor / indoor/outdoor / Outdoor Indoor dual-use titles."""
+    hay = str(text or "")
+    if not hay:
+        return False
+    return _MIXED_INDOOR_OUTDOOR_RE.search(hay) is not None
+
+
+def strip_mixed_indoor_outdoor(text: str) -> str:
+    cleaned = _MIXED_INDOOR_OUTDOOR_RE.sub(" ", str(text or ""))
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def title_has_clear_outdoor_word(text: str) -> bool:
+    """TITLE outdoor/patio/garden after rejecting mixed indoor/outdoor wording."""
+    hay = str(text or "")
+    if not hay or title_has_mixed_indoor_outdoor(hay):
+        return False
+    return has_any_phrase(strip_mixed_indoor_outdoor(hay), ("outdoor", "patio", "garden"))
+
+
+def title_is_chair_accessory(text: str) -> bool:
+    """Chair cushions/covers/pads are the product. 'Chair with cushion' is still a chair."""
+    hay = str(text or "")
+    if not hay or not has_any_phrase(hay, _CHAIR_ACCESSORY_PHRASES):
+        return False
+    if not has_any_phrase(hay, ("chair", "chairs")):
+        return False
+    if re.search(
+        r"\b(?:with|includes?)\b.{0,24}\b(?:cushions?|covers?|pads?|pillows?|slipcovers?)\b",
+        hay,
+        re.IGNORECASE,
+    ):
+        return False
+    return True
+
+
+def title_is_dining_set_bundle(text: str) -> bool:
+    """Table+chairs or an N-piece dining set is a SET, not a chair SKU."""
+    hay = str(text or "")
+    if not hay:
+        return False
+    if has_any_phrase(
+        hay,
+        (
+            "kids table",
+            "kids activity table",
+            "children table",
+            "children's table",
+            "childrens table",
+            "toddler table",
+            "play table",
+            "activity table",
+        ),
+    ):
+        return False
+    if has_any_phrase(
+        hay,
+        (
+            "dining set",
+            "dining table set",
+            "patio dining set",
+            "outdoor dining set",
+            "table and chair set",
+            "table and chairs set",
+        ),
+    ):
+        return True
+    if _N_PIECE_DINING_RE.search(hay) and has_any_phrase(hay, ("set",)):
+        return True
+    if _TABLE_AND_CHAIRS_RE.search(hay):
+        return True
+    if has_any_phrase(
+        hay,
+        ("dining table", "bistro table", "patio table", "outdoor table", "kitchen table"),
+    ) and has_any_phrase(hay, ("chair", "chairs", "dining chair", "dining chairs")):
+        return True
+    return False
+
+
+def title_allows_outdoor_chair_remap(text: str) -> bool:
+    """79684 may fire only on a title outdoor word, never mixed or a set/accessory."""
+    hay = str(text or "")
+    if not hay:
+        return False
+    if not title_has_clear_outdoor_word(hay):
+        return False
+    if title_has_mixed_indoor_outdoor(hay):
+        return False
+    if title_is_chair_accessory(hay):
+        return False
+    if title_is_dining_set_bundle(hay):
+        return False
+    return True
+
 
 def has_compound_product_signal(text: str) -> bool:
     """True when the title is a set/bundle/compound, not a single product noun."""
@@ -114,6 +248,8 @@ def has_compound_product_signal(text: str) -> bool:
     if not hay:
         return False
     if has_any_phrase(hay, _COMPOUND_PHRASES):
+        return True
+    if title_is_dining_set_bundle(hay):
         return True
     if has_phrase(hay, "desk"):
         return True

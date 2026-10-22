@@ -387,6 +387,20 @@ STAY_ON_LEAF_CASES = (
         {"20490"},
         {"262980", "38208"},
     ),
+    (
+        "N779P269291N",
+        "Acacia Wood Outdoor Dining Table",
+        "112590",
+        {"112590"},
+        {"38200", "38204", "79684", "54235"},
+    ),
+    (
+        "W3316P540349",
+        "Round Dining Table, Sintered Stone, Outdoor Indoor",
+        "38204",
+        {"38204"},
+        {"112590", "79684", "139849"},
+    ),
 )
 
 
@@ -420,3 +434,95 @@ def test_w2105_accent_armchair_still_remaps_off_dining_chairs():
     assert profile.category_id == "38208"
     assert canon in {None, "54235", "38208"}
     assert "38208" in {profile.category_id, canon}
+
+
+def test_n770p269704w_outdoor_dining_chair_still_remaps_to_79684():
+    title = "Acacia Wood Outdoor Dining Chair, Rope Seat"
+    profile, canon = _proposed_leaves(title, "54235")
+    assert profile.kind == "outdoor_chair"
+    assert profile.category_id == "79684"
+    assert profile.category_id != "54235"
+    assert canon in {None, "54235", "79684"}
+    assert "79684" in {profile.category_id, canon}
+
+
+BUGBOT_R3_DINING_SET_CASES = (
+    ("Outdoor Dining Table and Chairs", "79684"),
+    ("Patio Dining Table and 4 Dining Chairs", "54235"),
+    ("7-Piece Patio Dining Set", "107578"),
+    ("4 Piece Patio Dining Set with Chairs", "79684"),
+)
+
+
+@pytest.mark.parametrize("title,stored", BUGBOT_R3_DINING_SET_CASES, ids=[row[0][:40] for row in BUGBOT_R3_DINING_SET_CASES])
+def test_bugbot_r3_outdoor_dining_sets_go_to_patio_set_never_chairs(title, stored):
+    profile, canon = _proposed_leaves(title, stored)
+    assert profile.kind == "dining_set"
+    assert profile.category_id == "139849"
+    assert profile.category_id not in {"79684", "54235"}
+    assert canon in {None, stored, "139849"}
+    assert canon not in {"79684", "54235"}
+
+
+def test_bugbot_r3_indoor_dining_table_with_chairs_is_unknown():
+    title = "dining table with chairs"
+    profile, canon = _proposed_leaves(title, "54235")
+    assert profile.kind == "unknown"
+    assert not profile.category_id
+    assert canon in {None, "54235"}
+    assert canon not in {"79684", "139849"}
+
+
+def test_bugbot_r3_description_only_patio_does_not_remap_dining_chair():
+    title = "Upholstered Dining Chair Set of 2"
+    description = "Perfect for the patio, garden, and backyard entertaining."
+    profile, canon = _proposed_leaves(title, "54235", description)
+    assert profile.kind == "dining_chair"
+    assert profile.category_id == "54235"
+    assert profile.category_id != "79684"
+    assert canon in {None, "54235"}
+    assert canon != "79684"
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Indoor/Outdoor Dining Chairs Set of 2",
+        "Indoor & Outdoor Dining Chairs",
+        "Indoor-Outdoor Dining Chair",
+        "Dining Chairs Outdoor Indoor",
+        "Dining Chair for indoor and outdoor",
+    ],
+)
+def test_bugbot_r3_mixed_indoor_outdoor_dining_chair_keeps_stored(title):
+    profile, canon = _proposed_leaves(title, "54235")
+    assert not profile.category_id or profile.category_id == "54235"
+    assert profile.category_id != "79684"
+    assert canon in {None, "54235"}
+    assert canon != "79684"
+
+
+def test_edge_bistro_table_and_chairs_set_is_not_chairs():
+    title = "Bistro Table and 2 Chairs Set"
+    profile, canon = _proposed_leaves(title, "54235")
+    assert profile.kind == "unknown"
+    assert profile.category_id not in {"79684", "54235"}
+    assert canon in {None, "54235"}
+    assert canon not in {"79684", "139849"}
+
+
+def test_edge_indoor_outdoor_folding_chairs_keep_stored():
+    title = "Indoor/Outdoor Folding Chairs Set of 4"
+    profile, canon = _proposed_leaves(title, "79684")
+    assert profile.kind == "unknown" or profile.category_id in {None, "79684"}
+    assert profile.category_id != "54235"
+    assert canon in {None, "79684"}
+    assert canon not in {"54235", "139849"}
+
+
+def test_edge_patio_chair_cushions_are_not_chairs():
+    title = "Patio Chair Cushions"
+    profile, canon = _proposed_leaves(title, "177788")
+    assert profile.kind != "outdoor_chair"
+    assert profile.category_id not in {"79684", "54235"}
+    assert canon not in {"79684", "54235"}

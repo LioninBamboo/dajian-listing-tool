@@ -368,10 +368,14 @@ def test_ready_draft_category_regressions_from_may_18_batch():
 
     dining_set_title = "5-Piece Outdoor Acacia Wood Round Dining Set Solid Wood Patio Table with 4 Barrel Chairs"
     assert matcher.canonicalize_category(dining_set_title, "139849", "Patio & Garden Furniture Sets") == (
-        "107578",
-        "Dining Sets",
+        "139849",
+        "Patio & Garden Furniture Sets",
     )
-    assert matcher.is_category_plausible_for_text(dining_set_title, "107578", "Dining Sets")
+    assert matcher.canonicalize_category(dining_set_title, "107578", "Dining Sets") == (
+        "139849",
+        "Patio & Garden Furniture Sets",
+    )
+    assert matcher.is_category_plausible_for_text(dining_set_title, "139849", "Patio & Garden Furniture Sets")
 
     putting_green_title = "12x5 FT Golf Putting Green Golf Training Mat with Ball Return"
     assert matcher.canonicalize_category(putting_green_title, "20740", "Furniture & Scratchers") == (
