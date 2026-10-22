@@ -1231,6 +1231,17 @@ class EbayPublisher:
                     
                     # 更新 offer 类目与 buyer-facing 描述
                     current_category = existing_offer.get("categoryId", "")
+                    from src.utils.approved_category import blocks_automated_category_change
+
+                    if (
+                        current_category
+                        and current_category != category_id
+                        and blocks_automated_category_change(product.get("optimization"))
+                    ):
+                        self.logger.warning(
+                            f"[CATEGORY] lock set; keeping live offer category {current_category}"
+                        )
+                        category_id = current_category
                     if current_category != category_id:
                         self.logger.info(f"[INFO] Updating offer category: {current_category} -> {category_id}")
                     self.ebay_client.update_offer_category(
@@ -1589,7 +1600,37 @@ class EbayPublisher:
         suggested_id: Optional[str] = None
     ) -> Tuple[str, str, Dict[str, List[str]]]:
         """获取类目和完整的 Item Specifics"""
-        
+        opt = product.get("optimization") if isinstance(product, dict) else {}
+        if isinstance(opt, str):
+            try:
+                opt = json.loads(opt)
+            except Exception:
+                opt = {}
+        if not isinstance(opt, dict):
+            opt = {}
+        from src.utils.approved_category import blocks_automated_category_change
+        from src.utils.motors_category_tree import listing_category_rejection
+
+        if blocks_automated_category_change(opt):
+            # Fail closed: never inherit suggested_id / rematch when the flag is
+            # set. A blank or invalid stored leaf must not publish a new leaf,
+            # and a Motors lock must not fall through to a tree-0 id.
+            locked_id = str(opt.get("categoryId") or "").strip()
+            if locked_id and listing_category_rejection(locked_id):
+                self.logger.warning(
+                    f"[CATEGORY] locked category {locked_id} is not a Motors tree-100 leaf; refusing rematch"
+                )
+                return "", str(opt.get("categoryName") or ""), existing_aspects
+            if locked_id:
+                self.logger.info(f"[CATEGORY] Preserving locked category {locked_id}")
+                cat_name = str(opt.get("categoryName") or f"Category {locked_id}")
+                aspects = self._ensure_required_aspects(locked_id, existing_aspects, title, product)
+                return locked_id, cat_name, aspects
+            self.logger.warning(
+                "[CATEGORY] lock set but categoryId is blank; refusing rematch"
+            )
+            return "", str(opt.get("categoryName") or ""), existing_aspects
+
         # Collect all known category IDs from our verified maps
         known_ids = set(self.CATEGORY_REQUIRED_ASPECTS.keys())
         for rule in self.CATEGORY_RULES:
@@ -1598,7 +1639,12 @@ class EbayPublisher:
         # 1. 优先使用建议的 ID (来自 AI 优化), but validate it first
         if suggested_id:
             suggested_id = str(suggested_id).strip()
-            if suggested_id in known_ids:
+            motors_leaf = bool(get_store_profile().is_motors) and not listing_category_rejection(suggested_id)
+            if listing_category_rejection(suggested_id):
+                self.logger.warning(
+                    f"[CATEGORY] suggested_id {suggested_id} is not a Motors tree-100 leaf; refusing it"
+                )
+            elif suggested_id in known_ids or motors_leaf:
                 self.logger.info(f"[CATEGORY] Using validated suggested ID: {suggested_id}")
                 cat_name = f"Category {suggested_id}"
                 aspects = self._ensure_required_aspects(suggested_id, existing_aspects, title, product)
@@ -1613,14 +1659,27 @@ class EbayPublisher:
             matcher = EbayCategoryMatcher(self.oauth)
             cat_id, cat_name, aspects = matcher.get_category_and_aspects(title, existing_aspects)
             
-            if cat_id:
+            if cat_id and not listing_category_rejection(cat_id):
                 aspects = self._ensure_required_aspects(cat_id, aspects, title, product)
                 return cat_id, cat_name, aspects
+            if cat_id:
+                self.logger.warning(
+                    f"[CATEGORY] matcher category {cat_id} is not a Motors tree-100 leaf; refusing it"
+                )
         except Exception as e:
             self.logger.warning(f"[WARN] Category matcher failed: {e}")
         
-        # 3. Fallback: 基于关键词匹配
+        # 3. Fallback: 基于关键词匹配. Motors must not inherit a keyword id.
+        # Tree-0 rules include numbers that also exist in tree 100 under a
+        # different name (174020 is Trailer Hitches here and Brake Pad Wear
+        # Sensors there). Reject the whole keyword map on Motors, including
+        # ids that happen to be numeric leaves.
         cat_id, cat_name = self._fallback_category_match(title)
+        if get_store_profile().is_motors or listing_category_rejection(cat_id):
+            self.logger.warning(
+                f"[CATEGORY] refusing keyword fallback {cat_id} ({cat_name}) for a Motors listing"
+            )
+            return "", cat_name or "", existing_aspects
         aspects = self._ensure_required_aspects(cat_id, existing_aspects, title, product)
         
         return cat_id, cat_name, aspects

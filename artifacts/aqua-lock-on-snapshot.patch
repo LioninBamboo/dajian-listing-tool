@@ -1,0 +1,6283 @@
+diff --git a/app.py b/app.py
+index 4a46133..6c7626a 100644
+--- a/app.py
++++ b/app.py
+@@ -175,7 +175,7 @@ def remap_legacy_category_id(category_id: str) -> str:
+ 
+ 
+ def is_sellable_leaf_category(oauth, category_id: str) -> bool:
+-    """Validate category ID against EBAY_US taxonomy tree 0 and ensure it's a leaf."""
++    """Validate a category id against this store's taxonomy tree and require a leaf."""
+     cid = remap_legacy_category_id(category_id)
+     if not cid:
+         return False
+@@ -188,8 +188,11 @@ def is_sellable_leaf_category(oauth, category_id: str) -> bool:
+             "Authorization": f"Bearer {token}",
+             "Accept": "application/json",
+         }
++        from src.utils.store_profile import get_store_profile
++
++        tree_id = get_store_profile().category_tree_id or "0"
+         resp = requests.get(
+-            f"{oauth.api_base}/commerce/taxonomy/v1/category_tree/0/get_category_subtree",
++            f"{oauth.api_base}/commerce/taxonomy/v1/category_tree/{tree_id}/get_category_subtree",
+             headers=headers,
+             params={"category_id": cid},
+             timeout=30,
+@@ -676,7 +679,24 @@ def publish_to_ebay(product: dict) -> dict:
+         title = opt_data.get("title", product.get('title', ''))[:80]
+         description = opt_data.get("description", product.get('description', ''))
+         category_id = remap_legacy_category_id(opt_data.get("categoryId", ""))
+-        if not is_sellable_leaf_category(oauth, category_id):
++        from src.utils.approved_category import (
++            blocks_automated_category_change,
++            evaluate_approved_category,
++            should_auto_remap_invalid_category,
++        )
++        from src.utils.motors_category_tree import listing_category_rejection
++
++        approved_decision = evaluate_approved_category(category_id, opt_data)
++        if approved_decision.approved and approved_decision.error:
++            return {"status": "error", "message": approved_decision.error}
++        if not approved_decision.preserve and blocks_automated_category_change(opt_data):
++            return {
++                "status": "error",
++                "message": approved_decision.error or "invalid_or_blank_category_id",
++            }
++        if listing_category_rejection(category_id) and not approved_decision.preserve:
++            return {"status": "error", "message": listing_category_rejection(category_id)}
++        if not approved_decision.preserve and not is_sellable_leaf_category(oauth, category_id):
+             from src.services.ebay_category_matcher import EbayCategoryMatcher
+             matcher = EbayCategoryMatcher(oauth)
+             matched_id, _, _ = matcher.get_category_and_aspects(
+@@ -685,7 +705,9 @@ def publish_to_ebay(product: dict) -> dict:
+                 description,
+             )
+             category_id = remap_legacy_category_id(matched_id)
+-        if not is_sellable_leaf_category(oauth, category_id):
++            if listing_category_rejection(category_id):
++                return {"status": "error", "message": listing_category_rejection(category_id)}
++        if not approved_decision.preserve and not is_sellable_leaf_category(oauth, category_id):
+             return {"status": "error", "message": f"类目无效: {category_id or '空'}"}
+         aspects = apply_compatibility_aspects(
+             category_id,
+@@ -909,11 +931,11 @@ def publish_with_auto_category(product: dict) -> dict:
+         if fallback_category_id:
+             opt_data["publishedCategoryId"] = str(fallback_category_id)
+         if live_category_id:
+-            opt_data["liveCategoryId"] = live_category_id
+-            opt_data["liveCategoryName"] = live_category_name
+-            # For already-published listings, prefer showing the actual live category next time.
+-            opt_data["categoryId"] = live_category_id
++            from src.utils.approved_category import apply_live_category_readback
++
++            apply_live_category_readback(opt_data, live_category_id, live_category_name)
+ 
++    approved_decision = None
+     for attempt in range(max_retries):
+         try:
+             policy_manager = EbayPolicyManager(oauth)
+@@ -948,10 +970,32 @@ def publish_with_auto_category(product: dict) -> dict:
+             )
+             category_id = remap_legacy_category_id(category_id)
+             stored_cat = remap_legacy_category_id(opt_data.get("categoryId", ""))
+-            if stored_cat and not is_sellable_leaf_category(oauth, stored_cat):
++            from src.utils.approved_category import (
++                blocks_automated_category_change,
++                evaluate_approved_category,
++                should_auto_remap_invalid_category,
++            )
++            from src.utils.motors_category_tree import listing_category_rejection
++
++            approved_decision = evaluate_approved_category(stored_cat, opt_data)
++            if approved_decision.approved and approved_decision.error:
++                return {"status": "error", "message": approved_decision.error}
++            if not approved_decision.preserve and blocks_automated_category_change(opt_data):
++                return {
++                    "status": "error",
++                    "message": approved_decision.error or "invalid_or_blank_category_id",
++                }
++            if stored_cat and not approved_decision.preserve and not is_sellable_leaf_category(oauth, stored_cat):
+                 print(f"[AUTO] Stored category {stored_cat} is invalid in current taxonomy, ignoring")
+                 stored_cat = ""
+-            if category_id and not is_sellable_leaf_category(oauth, category_id):
++            if approved_decision.preserve and stored_cat:
++                category_id = stored_cat
++                category_name = opt_data.get("categoryName") or f"Category {stored_cat}"
++                completed_aspects = existing_aspects
++                print(f"[AUTO] Preserving human-approved category {stored_cat}")
++            if category_id and not approved_decision.preserve and (
++                listing_category_rejection(category_id) or not is_sellable_leaf_category(oauth, category_id)
++            ):
+                 print(f"[AUTO] Matched category {category_id} is invalid in current taxonomy, ignoring")
+                 category_id = ""
+ 
+@@ -1000,6 +1044,9 @@ def publish_with_auto_category(product: dict) -> dict:
+             )
+             completed_aspects = apply_compatibility_aspects(category_id, completed_aspects, compatibility)
+             sanitize_single_value_aspects(completed_aspects, log=print)
++            rejection = listing_category_rejection(category_id)
++            if rejection:
++                return {"status": "error", "message": rejection}
+             opt_data["categoryId"] = category_id
+             opt_data["aspects"] = completed_aspects
+             opt_data["motorsCompatibility"] = serialize_compatibility_analysis(compatibility)
+@@ -1090,8 +1137,13 @@ def publish_with_auto_category(product: dict) -> dict:
+                     print(f"[重试 {attempt + 1}/{max_retries}] 已应用属性自动修复，准备重试")
+                     continue
+ 
+-                if is_invalid_category_error(error_msg):
++                if is_invalid_category_error(error_msg) and should_auto_remap_invalid_category(
++                    opt_data,
++                    preserve=bool(approved_decision and approved_decision.preserve),
++                ):
+                     remapped = remap_legacy_category_id(category_id)
++                    if remapped and listing_category_rejection(remapped):
++                        remapped = ""
+                     if remapped and remapped != category_id and is_sellable_leaf_category(oauth, remapped):
+                         print(f"[AUTO-FIX] 类目重映射: {category_id} -> {remapped}")
+                         category_id = remapped
+diff --git a/batch_publish.py b/batch_publish.py
+index 2d8c4f0..4455d49 100644
+--- a/batch_publish.py
++++ b/batch_publish.py
+@@ -62,6 +62,14 @@ from src.utils.publish_autofix import (
+     try_fix_publish_error,
+ )
+ from src.utils.publish_aspect_completion import complete_publish_aspects
++from src.utils.approved_category import (
++    blocks_automated_category_change,
++    evaluate_approved_category,
++    is_category_approved,
++    mark_category_approved,
++    should_auto_remap_invalid_category,
++)
++from src.utils.motors_category_tree import listing_category_rejection
+ from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP, PROTECTED_STORED_CATEGORY_IDS
+ from src.utils.dimension_helpers import (
+     extract_all_dimensions, find_dimension,
+@@ -250,8 +258,15 @@ def _persist_prepared_listing(
+     description: str,
+     aspects: dict,
+     compatibility=None,
++    *,
++    dry_run: bool = False,
+ ):
+-    """Persist prepared title/description/category/aspects into the local optimization record."""
++    """Persist prepared title/description/category/aspects into the local optimization record.
++
++    A dry run may append compatibility lines to the log column only. It must
++    not write optimization or category fields — that path previously saved the
++    whole optimization back and overwrote an approved leaf with a bad id.
++    """
+     from src.db.collection_db import SessionLocal
+     from src.db.collection_models import CollectedProduct
+ 
+@@ -261,34 +276,47 @@ def _persist_prepared_listing(
+         if not product:
+             return
+ 
+-        optimization = dict(product.optimization or {})
+-        optimization["categoryId"] = category_id
+-        if category_name:
+-            optimization["categoryName"] = category_name
+-        optimization["title"] = title
+-        optimization["description"] = description
+-        optimization["aspects"] = aspects
+-        if compatibility is not None:
+-            new_mc = serialize_compatibility_analysis(compatibility)
+-            prior_cp = (optimization.get("motorsCompatibility") or {}).get("compatibleProducts") or []
+-            new_cp = (new_mc or {}).get("compatibleProducts") or []
+-            # Never overwrite authoritative structured fitment (77 Year/Make/Model
+-            # from GIGA) with a poorer text re-derivation (0). This runs on BOTH
+-            # dry-run and live, so a clobber here silently poisons the next publish.
+-            if len(new_cp) >= len(prior_cp):
+-                optimization["motorsCompatibility"] = new_mc
+-        product.optimization = optimization
+-        flag_modified(product, "optimization")
+-
+-        log_entries = product.logs or []
++        if not dry_run:
++            optimization = dict(product.optimization or {})
++            optimization["categoryId"] = category_id
++            if category_name:
++                optimization["categoryName"] = category_name
++            optimization["title"] = title
++            optimization["description"] = description
++            optimization["aspects"] = aspects
++            if compatibility is not None:
++                new_mc = serialize_compatibility_analysis(compatibility)
++                prior_cp = (optimization.get("motorsCompatibility") or {}).get("compatibleProducts") or []
++                new_cp = (new_mc or {}).get("compatibleProducts") or []
++                # Never overwrite authoritative structured fitment (77 Year/Make/Model
++                # from GIGA) with a poorer text re-derivation (0).
++                if len(new_cp) >= len(prior_cp):
++                    optimization["motorsCompatibility"] = new_mc
++            product.optimization = optimization
++            flag_modified(product, "optimization")
++
++        log_entries = list(product.logs or [])
++        appended = False
+         if compatibility is not None:
+             compat_summary = f"[COMPAT {datetime.now(timezone.utc).isoformat()}] {compatibility.summary}"
+             if compat_summary not in log_entries:
+                 log_entries.append(compat_summary)
++                appended = True
+             for issue in compatibility.issues:
+                 msg = f"[COMPAT-WARN {datetime.now(timezone.utc).isoformat()}] {issue}"
+                 if msg not in log_entries:
+                     log_entries.append(msg)
++                    appended = True
++
++        if dry_run:
++            # Logging may append to the log column. Optimization stays untouched,
++            # and a dry run with nothing to log does not write the row at all.
++            if appended:
++                product.logs = log_entries
++                flag_modified(product, "logs")
++                db.commit()
++            return
++
+         product.logs = log_entries
+         flag_modified(product, "logs")
+         db.commit()
+@@ -736,6 +764,15 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+     sku = product['sku']
+     environment = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION")
+     publish_image_limit = _publish_image_limit(sku)
++    opt_raw = product.get('optimization', {})
++    if isinstance(opt_raw, str):
++        try:
++            opt_raw = json.loads(opt_raw)
++        except ValueError:
++            opt_raw = {}
++    if not isinstance(opt_raw, dict):
++        opt_raw = {}
++    product['optimization'] = opt_raw
+ 
+     # Publish gate: never live-list blacklisted GIGA sellers (N735*/W1706*/ZL*).
+     from src.utils.copy_skip_gate import seller_is_blacklisted
+@@ -803,21 +840,43 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+     title_context = title or source_title
+     stored_cat = str(opt.get('categoryId') or '').strip() or None
+     stored_cat_name = opt.get('categoryName')
+-    if stored_cat in INVALID_CATEGORY_REMAP:
++    approved_decision = evaluate_approved_category(
++        stored_cat or "",
++        opt,
++        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
++    )
++    if approved_decision.approved and approved_decision.error:
++        record_error(sku, approved_decision.error)
++        return {"status": "error", "message": approved_decision.error}
++    preserve_approved_category = approved_decision.preserve
++    if (
++        not preserve_approved_category
++        and blocks_automated_category_change(opt)
++    ):
++        err = approved_decision.error or "invalid_or_blank_category_id"
++        record_error(sku, err)
++        return {"status": "error", "message": err}
++    if stored_cat in INVALID_CATEGORY_REMAP and not preserve_approved_category:
+         remapped = INVALID_CATEGORY_REMAP[stored_cat]
+         logger.warning(f"  [CAT] Remapping legacy invalid stored category {stored_cat} -> {remapped}")
+         stored_cat = remapped
+-    if stored_cat:
++    if stored_cat and not preserve_approved_category:
+         canonical_cat, canonical_name = category_matcher.canonicalize_category(
+             title_context,
+             stored_cat,
+             stored_cat_name,
+             product.get('description', ''),
+         )
+-        if canonical_cat != stored_cat:
+-            logger.warning(f"  [CAT] Canonicalizing stored category {stored_cat} -> {canonical_cat}")
+-        stored_cat, stored_cat_name = canonical_cat, canonical_name
+-    if stored_cat and not _is_sellable_leaf_category(oauth, stored_cat):
++        if canonical_cat and listing_category_rejection(canonical_cat):
++            logger.warning(
++                f"  [CAT] Canonical category {canonical_cat} is not a Motors tree-100 leaf; "
++                f"keeping stored {stored_cat}"
++            )
++        else:
++            if canonical_cat != stored_cat:
++                logger.warning(f"  [CAT] Canonicalizing stored category {stored_cat} -> {canonical_cat}")
++            stored_cat, stored_cat_name = canonical_cat, canonical_name
++    if stored_cat and not preserve_approved_category and not _is_sellable_leaf_category(oauth, stored_cat):
+         logger.warning(f"  [CAT] Stored category {stored_cat} is not a sellable leaf in EBAY_US; ignoring stored category")
+         stored_cat = None
+         stored_cat_name = None
+@@ -838,14 +897,17 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+             api_cat_name,
+             product.get('description', ''),
+         )
+-        if not _is_sellable_leaf_category(oauth, api_cat_id):
+-            logger.warning(f"  [CAT] Auto category {api_cat_id} is not a sellable leaf in EBAY_US; ignoring auto category")
++        if listing_category_rejection(api_cat_id) or not _is_sellable_leaf_category(oauth, api_cat_id):
++            logger.warning(
++                f"  [CAT] Auto category {api_cat_id} is not a sellable Motors/US leaf; ignoring auto category"
++            )
+             api_cat_id, api_cat_name = None, None
+ 
+     protected_stored_categories = PROTECTED_STORED_CATEGORY_IDS
+     stored_plausible = bool(
+         stored_cat and (
+-            stored_cat in protected_stored_categories
++            preserve_approved_category
++            or stored_cat in protected_stored_categories
+             or category_matcher.is_category_plausible_for_text(title_context, stored_cat, stored_cat_name)
+         )
+     )
+@@ -865,6 +927,9 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+         if stored_cat in protected_stored_categories and api_cat_id and api_cat_id != stored_cat:
+             completed_aspects = existing_aspects
+             logger.warning(f"  [CAT] Preserving stored protected category {stored_cat}; ignoring fallback/API={api_cat_id}")
++        elif preserve_approved_category:
++            completed_aspects = existing_aspects
++            logger.info(f"  [CAT] Preserving human-approved category {stored_cat}")
+         elif api_cat_id and api_cat_id != stored_cat:
+             required_aspects, recommended_aspects = category_matcher._get_category_aspects(stored_cat)
+             completed_aspects = category_matcher._complete_aspects(
+@@ -907,14 +972,17 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+         log=lambda message: logger.info(f"  {message}"),
+     )
+ 
++    quality_listing = {
++        "title": title,
++        "description": description,
++        "categoryId": category_id,
++        "categoryName": category_name,
++        "aspects": completed_aspects,
++    }
++    if is_category_approved(opt, opt.get("categoryId")):
++        mark_category_approved(quality_listing, opt.get("categoryId"))
+     quality_opt = _normalize_generated_listing(
+-        {
+-            "title": title,
+-            "description": description,
+-            "categoryId": category_id,
+-            "categoryName": category_name,
+-            "aspects": completed_aspects,
+-        },
++        quality_listing,
+         source_title=source_title or product.get('title', ''),
+         source_description=product.get('description', ''),
+         attributes=product.get('attributes', {}) or {},
+@@ -955,9 +1023,22 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+         for issue in compatibility.issues:
+             logger.warning(f"  [COMPAT] {issue}")
+ 
++    category_rejection = listing_category_rejection(category_id)
++    if category_rejection:
++        record_error(sku, category_rejection)
++        return {"status": "error", "message": category_rejection}
++
+     publish_blockers = []
+     publish_blockers.extend(_measurement_validation_errors(completed_aspects))
+-    publish_blockers.extend(_category_validation_errors(category_matcher, title_context, category_id, category_name))
++    publish_blockers.extend(
++        _category_validation_errors(
++            category_matcher,
++            title_context,
++            category_id,
++            category_name,
++            skip_canonicalize=preserve_approved_category,
++        )
++    )
+     qc_candidate = {
+         "title": title,
+         "description": description,
+@@ -965,6 +1046,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+         "categoryName": category_name,
+         "aspects": completed_aspects,
+     }
++    if is_category_approved(opt, opt.get("categoryId")):
++        mark_category_approved(qc_candidate, opt.get("categoryId"))
+     fs_conn = None
+     try:
+         fs_conn = sqlite3.connect(str(PROJECT_ROOT / "ebay_collection.db"), timeout=30)
+@@ -1004,6 +1087,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+         description=description,
+         aspects=completed_aspects,
+         compatibility=compatibility if compatibility.mode != "not_applicable" else None,
++        dry_run=dry_run,
+     )
+ 
+     logger.info(f"  Category: {category_id} ({category_name})")
+@@ -1339,15 +1423,21 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+                     if deleted:
+                         logger.info(f"  [FIX] Deleted {deleted} stale offer(s) after category error")
+ 
+-                    if category_id not in protected_stored_categories and not category_reselected:
++                    if (
++                        category_id not in protected_stored_categories
++                        and not category_reselected
++                        and should_auto_remap_invalid_category(
++                            opt, preserve=preserve_approved_category
++                        )
++                    ):
+                         new_id, new_name, new_aspects = category_matcher.get_category_and_aspects(
+                             title, completed_aspects, description
+                         )
+                         if new_id:
+                             new_id = str(new_id).strip()
+                             new_id = INVALID_CATEGORY_REMAP.get(new_id, new_id)
+-                            if not _is_sellable_leaf_category(oauth, new_id):
+-                                logger.warning(f"  [FIX] Auto reselected category {new_id} is not sellable leaf; keeping current category")
++                            if listing_category_rejection(new_id) or not _is_sellable_leaf_category(oauth, new_id):
++                                logger.warning(f"  [FIX] Auto reselected category {new_id} is not a sellable tree-100/US leaf; keeping current category")
+                                 new_id = None
+                         if new_id and new_id != category_id:
+                             logger.info(f"  [FIX] Category {category_id} invalid, switching to API-suggested: {new_id} ({new_name})")
+diff --git a/data/motors_category_tree_100_leaves.json b/data/motors_category_tree_100_leaves.json
+new file mode 100644
+index 0000000..7edb141
+--- /dev/null
++++ b/data/motors_category_tree_100_leaves.json
+@@ -0,0 +1,3107 @@
++[
++"1295",
++"5331",
++"5332",
++"5333",
++"5334",
++"5335",
++"5336",
++"5337",
++"5338",
++"5339",
++"5345",
++"5348",
++"5349",
++"5350",
++"5352",
++"5356",
++"5358",
++"5360",
++"5364",
++"5365",
++"5366",
++"5367",
++"6003",
++"6004",
++"6005",
++"6007",
++"6008",
++"6009",
++"6011",
++"6012",
++"6015",
++"6017",
++"6019",
++"6021",
++"6025",
++"6026",
++"6027",
++"6032",
++"6055",
++"6056",
++"6057",
++"6058",
++"6059",
++"6060",
++"6118",
++"6126",
++"6129",
++"6130",
++"6131",
++"6136",
++"6137",
++"6138",
++"6139",
++"6140",
++"6141",
++"6142",
++"6143",
++"6144",
++"6145",
++"6146",
++"6147",
++"6148",
++"6149",
++"6151",
++"6152",
++"6153",
++"6154",
++"6155",
++"6156",
++"6157",
++"6158",
++"6159",
++"6160",
++"6161",
++"6162",
++"6163",
++"6164",
++"6166",
++"6167",
++"6168",
++"6169",
++"6170",
++"6171",
++"6172",
++"6173",
++"6174",
++"6175",
++"6176",
++"6177",
++"6178",
++"6179",
++"6180",
++"6181",
++"6185",
++"6187",
++"6188",
++"6190",
++"6192",
++"6193",
++"6194",
++"6195",
++"6196",
++"6197",
++"6198",
++"6199",
++"6200",
++"6201",
++"6202",
++"6203",
++"6204",
++"6205",
++"6206",
++"6207",
++"6209",
++"6210",
++"6212",
++"6216",
++"6219",
++"6220",
++"6221",
++"6222",
++"6223",
++"6224",
++"6225",
++"6226",
++"6227",
++"6229",
++"6230",
++"6231",
++"6232",
++"6233",
++"6234",
++"6235",
++"6236",
++"6237",
++"6238",
++"6239",
++"6240",
++"6244",
++"6246",
++"6247",
++"6248",
++"6249",
++"6250",
++"6251",
++"6253",
++"6254",
++"6255",
++"6256",
++"6257",
++"6258",
++"6259",
++"6260",
++"6262",
++"6264",
++"6265",
++"6267",
++"6268",
++"6269",
++"6270",
++"6271",
++"6273",
++"6274",
++"6275",
++"6276",
++"6277",
++"6278",
++"6280",
++"6281",
++"6282",
++"6283",
++"6284",
++"6285",
++"6286",
++"6289",
++"6290",
++"6294",
++"6295",
++"6296",
++"6298",
++"6299",
++"6300",
++"6301",
++"6303",
++"6304",
++"6305",
++"6306",
++"6312",
++"6313",
++"6314",
++"6315",
++"6316",
++"6317",
++"6318",
++"6319",
++"6320",
++"6321",
++"6322",
++"6323",
++"6324",
++"6325",
++"6326",
++"6327",
++"6328",
++"6329",
++"6330",
++"6331",
++"6332",
++"6333",
++"6334",
++"6335",
++"6336",
++"6337",
++"6338",
++"6339",
++"6340",
++"6341",
++"6342",
++"6343",
++"6344",
++"6349",
++"6350",
++"6351",
++"6352",
++"6353",
++"6354",
++"6355",
++"6382",
++"6383",
++"6384",
++"6386",
++"6387",
++"6389",
++"6391",
++"6392",
++"6393",
++"6394",
++"6395",
++"6396",
++"6397",
++"6398",
++"6399",
++"6400",
++"6401",
++"6402",
++"6403",
++"6404",
++"6405",
++"6406",
++"6407",
++"6408",
++"6409",
++"6410",
++"6411",
++"6412",
++"6413",
++"6414",
++"6415",
++"6416",
++"6417",
++"6418",
++"6419",
++"6420",
++"6421",
++"6422",
++"6424",
++"6425",
++"6426",
++"6427",
++"6428",
++"6429",
++"6430",
++"6431",
++"6432",
++"6433",
++"6434",
++"6435",
++"6437",
++"6438",
++"6439",
++"6440",
++"6442",
++"6443",
++"6444",
++"6445",
++"6446",
++"6447",
++"6448",
++"6458",
++"6459",
++"6460",
++"6461",
++"6462",
++"6463",
++"6464",
++"6465",
++"6466",
++"6467",
++"6468",
++"6469",
++"6470",
++"6472",
++"6703",
++"6704",
++"6705",
++"6707",
++"6708",
++"6709",
++"6710",
++"6711",
++"6713",
++"6714",
++"6715",
++"6716",
++"6717",
++"6718",
++"6719",
++"6720",
++"6723",
++"6728",
++"6737",
++"6753",
++"6755",
++"6778",
++"6781",
++"6882",
++"6947",
++"7244",
++"7251",
++"9886",
++"9887",
++"10062",
++"10156",
++"11304",
++"11305",
++"11306",
++"12476",
++"12478",
++"13473",
++"13474",
++"13478",
++"13481",
++"13484",
++"13487",
++"13488",
++"14240",
++"14262",
++"14268",
++"14273",
++"14769",
++"15282",
++"15284",
++"15285",
++"15287",
++"15288",
++"15289",
++"15291",
++"15292",
++"15293",
++"15294",
++"15295",
++"15296",
++"16120",
++"16124",
++"21647",
++"21669",
++"25621",
++"25644",
++"25645",
++"26428",
++"26434",
++"26436",
++"26437",
++"26438",
++"26439",
++"26440",
++"26441",
++"26442",
++"26444",
++"26446",
++"26447",
++"26448",
++"26449",
++"26450",
++"26451",
++"26453",
++"26455",
++"26456",
++"31270",
++"31275",
++"31276",
++"31277",
++"31278",
++"31280",
++"31281",
++"31283",
++"31284",
++"31285",
++"31286",
++"31827",
++"31828",
++"31830",
++"31831",
++"31832",
++"31833",
++"31834",
++"31835",
++"31836",
++"31837",
++"31838",
++"31839",
++"31840",
++"31841",
++"31842",
++"31843",
++"31844",
++"31846",
++"31847",
++"31848",
++"31849",
++"31850",
++"31851",
++"31852",
++"31853",
++"31854",
++"31855",
++"31856",
++"31857",
++"31858",
++"31859",
++"31861",
++"31863",
++"31864",
++"31865",
++"31866",
++"31867",
++"31868",
++"31869",
++"31870",
++"31871",
++"31872",
++"31873",
++"31874",
++"31875",
++"31876",
++"31877",
++"31878",
++"31879",
++"31880",
++"33543",
++"33544",
++"33545",
++"33546",
++"33547",
++"33550",
++"33551",
++"33553",
++"33554",
++"33555",
++"33556",
++"33557",
++"33558",
++"33560",
++"33561",
++"33563",
++"33564",
++"33565",
++"33566",
++"33568",
++"33570",
++"33571",
++"33575",
++"33577",
++"33578",
++"33580",
++"33581",
++"33582",
++"33585",
++"33586",
++"33587",
++"33588",
++"33589",
++"33590",
++"33592",
++"33593",
++"33596",
++"33600",
++"33601",
++"33602",
++"33603",
++"33604",
++"33606",
++"33607",
++"33610",
++"33613",
++"33614",
++"33615",
++"33616",
++"33617",
++"33619",
++"33620",
++"33621",
++"33622",
++"33623",
++"33624",
++"33626",
++"33627",
++"33629",
++"33630",
++"33632",
++"33633",
++"33634",
++"33636",
++"33638",
++"33639",
++"33640",
++"33643",
++"33644",
++"33645",
++"33646",
++"33647",
++"33648",
++"33650",
++"33651",
++"33653",
++"33654",
++"33655",
++"33656",
++"33659",
++"33660",
++"33661",
++"33662",
++"33665",
++"33666",
++"33668",
++"33675",
++"33684",
++"33685",
++"33690",
++"33691",
++"33692",
++"33696",
++"33697",
++"33698",
++"33699",
++"33700",
++"33701",
++"33702",
++"33704",
++"33705",
++"33706",
++"33708",
++"33709",
++"33710",
++"33712",
++"33715",
++"33716",
++"33717",
++"33722",
++"33725",
++"33727",
++"33728",
++"33729",
++"33732",
++"33733",
++"33736",
++"33741",
++"33742",
++"33744",
++"33746",
++"33747",
++"33749",
++"34210",
++"34429",
++"34430",
++"34999",
++"35000",
++"35560",
++"35561",
++"35562",
++"35563",
++"35567",
++"35568",
++"35625",
++"36468",
++"36469",
++"36470",
++"36474",
++"36475",
++"36655",
++"38627",
++"38628",
++"38629",
++"38630",
++"38631",
++"38632",
++"38642",
++"38643",
++"38657",
++"38658",
++"38659",
++"38728",
++"38759",
++"38770",
++"38771",
++"38776",
++"38789",
++"38790",
++"39409",
++"39410",
++"39411",
++"39412",
++"39413",
++"39414",
++"39415",
++"39416",
++"39417",
++"39418",
++"40014",
++"40015",
++"40016",
++"40019",
++"40020",
++"40021",
++"40022",
++"42595",
++"42600",
++"42601",
++"42604",
++"42605",
++"42609",
++"43901",
++"43902",
++"43903",
++"43904",
++"43905",
++"43906",
++"43907",
++"43908",
++"43909",
++"43912",
++"43913",
++"43915",
++"43916",
++"43917",
++"43918",
++"43919",
++"43920",
++"43921",
++"43922",
++"43923",
++"43924",
++"43925",
++"43946",
++"43951",
++"43961",
++"43964",
++"43965",
++"43966",
++"43971",
++"43972",
++"43973",
++"43975",
++"43976",
++"43977",
++"43978",
++"43980",
++"43982",
++"43984",
++"43986",
++"43987",
++"43991",
++"43994",
++"43995",
++"43998",
++"46092",
++"46093",
++"46094",
++"46095",
++"46096",
++"46097",
++"46101",
++"46102",
++"46103",
++"46104",
++"46105",
++"47588",
++"49762",
++"49763",
++"49766",
++"49767",
++"49782",
++"49831",
++"49973",
++"49975",
++"49976",
++"49977",
++"49978",
++"49979",
++"49980",
++"49982",
++"49983",
++"49984",
++"49985",
++"49986",
++"49988",
++"49989",
++"49990",
++"49991",
++"49993",
++"49994",
++"49995",
++"49996",
++"49997",
++"49999",
++"50000",
++"50001",
++"50002",
++"50003",
++"50004",
++"50005",
++"50006",
++"50007",
++"50008",
++"50009",
++"50010",
++"50011",
++"50012",
++"50013",
++"50015",
++"50016",
++"50017",
++"50018",
++"50019",
++"50020",
++"50022",
++"50023",
++"50024",
++"50026",
++"50027",
++"50028",
++"50029",
++"50030",
++"50031",
++"50032",
++"50033",
++"50034",
++"50036",
++"50037",
++"50038",
++"50039",
++"50040",
++"50042",
++"50043",
++"50044",
++"50045",
++"50046",
++"50047",
++"50048",
++"50049",
++"50050",
++"50051",
++"50052",
++"50053",
++"50056",
++"50058",
++"50059",
++"50061",
++"50062",
++"50063",
++"50064",
++"50065",
++"50071",
++"50072",
++"50426",
++"50427",
++"50431",
++"50437",
++"50441",
++"50442",
++"50443",
++"50445",
++"50453",
++"50454",
++"50455",
++"50456",
++"50457",
++"50458",
++"50459",
++"50468",
++"52638",
++"53908",
++"56421",
++"56422",
++"57290",
++"57357",
++"60999",
++"61012",
++"61117",
++"61259",
++"61265",
++"61304",
++"61338",
++"61523",
++"61739",
++"61864",
++"61941",
++"61960",
++"62250",
++"63276",
++"63677",
++"63678",
++"63679",
++"63680",
++"63684",
++"63685",
++"63686",
++"63688",
++"63689",
++"63690",
++"63691",
++"63692",
++"63695",
++"63696",
++"63698",
++"63699",
++"63700",
++"63722",
++"63724",
++"63725",
++"63726",
++"63727",
++"63729",
++"63730",
++"63731",
++"63733",
++"63734",
++"63735",
++"63738",
++"63739",
++"63740",
++"63741",
++"63742",
++"63743",
++"66467",
++"66469",
++"66470",
++"72531",
++"75208",
++"75329",
++"76069",
++"76072",
++"79067",
++"80647",
++"80648",
++"80649",
++"80650",
++"80651",
++"80652",
++"80653",
++"80731",
++"80732",
++"80733",
++"80734",
++"80742",
++"80743",
++"80744",
++"80745",
++"80746",
++"80747",
++"80748",
++"80749",
++"80750",
++"80751",
++"80752",
++"80753",
++"80755",
++"80756",
++"80757",
++"80759",
++"80760",
++"80762",
++"80763",
++"80764",
++"80765",
++"80766",
++"80767",
++"80768",
++"80769",
++"80770",
++"82198",
++"82219",
++"82456",
++"84151",
++"84152",
++"84153",
++"84154",
++"84155",
++"84156",
++"84157",
++"84158",
++"84159",
++"84160",
++"84161",
++"84162",
++"84163",
++"84164",
++"84165",
++"84166",
++"84167",
++"86878",
++"88533",
++"90965",
++"90966",
++"90967",
++"90968",
++"90969",
++"90970",
++"90971",
++"90973",
++"90974",
++"90975",
++"90976",
++"90977",
++"90978",
++"90979",
++"90980",
++"90981",
++"90982",
++"90984",
++"90985",
++"90986",
++"96370",
++"96371",
++"98058",
++"98059",
++"98061",
++"98062",
++"98063",
++"98064",
++"99404",
++"99485",
++"100446",
++"100449",
++"100450",
++"100451",
++"100452",
++"100453",
++"100454",
++"100455",
++"100456",
++"100457",
++"100458",
++"100459",
++"100460",
++"100461",
++"100462",
++"100463",
++"100464",
++"100465",
++"100466",
++"100467",
++"100468",
++"100469",
++"100470",
++"106999",
++"107001",
++"107002",
++"107003",
++"107004",
++"107006",
++"107007",
++"107008",
++"107009",
++"107010",
++"107011",
++"107058",
++"107060",
++"107062",
++"107063",
++"107064",
++"107066",
++"107067",
++"107070",
++"111099",
++"111100",
++"111101",
++"111102",
++"111103",
++"111104",
++"111105",
++"111106",
++"111107",
++"111108",
++"111109",
++"111110",
++"111111",
++"111112",
++"111113",
++"111114",
++"111115",
++"111116",
++"111117",
++"111118",
++"111119",
++"111120",
++"116476",
++"116477",
++"116478",
++"116479",
++"116481",
++"116482",
++"116484",
++"116485",
++"116486",
++"119142",
++"119143",
++"119144",
++"119147",
++"119148",
++"119378",
++"119379",
++"121983",
++"121984",
++"121985",
++"121986",
++"122154",
++"122188",
++"123703",
++"124102",
++"124103",
++"124104",
++"124105",
++"124106",
++"124109",
++"124110",
++"124111",
++"124112",
++"124113",
++"124114",
++"124115",
++"124116",
++"124117",
++"124118",
++"124119",
++"124120",
++"124121",
++"124122",
++"124123",
++"124124",
++"124125",
++"124126",
++"124127",
++"124128",
++"124129",
++"124130",
++"124131",
++"124313",
++"133175",
++"133176",
++"133177",
++"133178",
++"133179",
++"133180",
++"133181",
++"133182",
++"133183",
++"133184",
++"133185",
++"133186",
++"133188",
++"133189",
++"133190",
++"133192",
++"133193",
++"133194",
++"133197",
++"133198",
++"133199",
++"133200",
++"133202",
++"133203",
++"133204",
++"133205",
++"133206",
++"133207",
++"133209",
++"133210",
++"133211",
++"133212",
++"133213",
++"133214",
++"133215",
++"133216",
++"133217",
++"133218",
++"133219",
++"133220",
++"135893",
++"135895",
++"135896",
++"135897",
++"135898",
++"135899",
++"138855",
++"138856",
++"138857",
++"139838",
++"140211",
++"140212",
++"140213",
++"140678",
++"147117",
++"147118",
++"147119",
++"147699",
++"147900",
++"147901",
++"147902",
++"147903",
++"147904",
++"147905",
++"147906",
++"149411",
++"149412",
++"149413",
++"149414",
++"149415",
++"149416",
++"149417",
++"149418",
++"149419",
++"149420",
++"149421",
++"149422",
++"149423",
++"149424",
++"150107",
++"150108",
++"150109",
++"150110",
++"150111",
++"150112",
++"150113",
++"150114",
++"150115",
++"150116",
++"150117",
++"157037",
++"157038",
++"157039",
++"157040",
++"157041",
++"157042",
++"157043",
++"157044",
++"157045",
++"157046",
++"157047",
++"157048",
++"157049",
++"157050",
++"157051",
++"157053",
++"157055",
++"157056",
++"157057",
++"157058",
++"157060",
++"157061",
++"157062",
++"157063",
++"157065",
++"157066",
++"157068",
++"157069",
++"157070",
++"157072",
++"157073",
++"157074",
++"157075",
++"157076",
++"157077",
++"158468",
++"158469",
++"158470",
++"158471",
++"158472",
++"158473",
++"158474",
++"158475",
++"158476",
++"158477",
++"158478",
++"158479",
++"158480",
++"158481",
++"158940",
++"158941",
++"158942",
++"158943",
++"159586",
++"159587",
++"159588",
++"159589",
++"159590",
++"159591",
++"159592",
++"159593",
++"159594",
++"159595",
++"159596",
++"159597",
++"159598",
++"159599",
++"159600",
++"159601",
++"162291",
++"162292",
++"162293",
++"162294",
++"162296",
++"162297",
++"162298",
++"162299",
++"162300",
++"162301",
++"162302",
++"162303",
++"162304",
++"162305",
++"162306",
++"162307",
++"162308",
++"162309",
++"162310",
++"162311",
++"162312",
++"162314",
++"162315",
++"165170",
++"166650",
++"166651",
++"166652",
++"166653",
++"166654",
++"166655",
++"166656",
++"166657",
++"166867",
++"168650",
++"168651",
++"168652",
++"168693",
++"169317",
++"169318",
++"169319",
++"169324",
++"169335",
++"169338",
++"169339",
++"169340",
++"169341",
++"169342",
++"169347",
++"169350",
++"169357",
++"169358",
++"169367",
++"169368",
++"169370",
++"169374",
++"169375",
++"169382",
++"169389",
++"169391",
++"169395",
++"169473",
++"169480",
++"169481",
++"169482",
++"170138",
++"170141",
++"170142",
++"170143",
++"170144",
++"170145",
++"170146",
++"170147",
++"170148",
++"170149",
++"170150",
++"170151",
++"170152",
++"170153",
++"170154",
++"170155",
++"170156",
++"170157",
++"170159",
++"170160",
++"170161",
++"170162",
++"170163",
++"170164",
++"170270",
++"170271",
++"171078",
++"171079",
++"171080",
++"171081",
++"171082",
++"171083",
++"171084",
++"171085",
++"171086",
++"171087",
++"171088",
++"171089",
++"171090",
++"171091",
++"171092",
++"171093",
++"171094",
++"171103",
++"171104",
++"171106",
++"171108",
++"171111",
++"171113",
++"171115",
++"171117",
++"171119",
++"171121",
++"171571",
++"171572",
++"171993",
++"171994",
++"171995",
++"171996",
++"171997",
++"171999",
++"172000",
++"172001",
++"172002",
++"172003",
++"172004",
++"172517",
++"172519",
++"172520",
++"172522",
++"172523",
++"172524",
++"172525",
++"172526",
++"173511",
++"173524",
++"173525",
++"173526",
++"173527",
++"173649",
++"173650",
++"173651",
++"173652",
++"173654",
++"173655",
++"173656",
++"173657",
++"173658",
++"173659",
++"173660",
++"173661",
++"173662",
++"173663",
++"173664",
++"173665",
++"173666",
++"173667",
++"173669",
++"173670",
++"173671",
++"173672",
++"173673",
++"173675",
++"173676",
++"173677",
++"173678",
++"173679",
++"173680",
++"173681",
++"173682",
++"173712",
++"173713",
++"173830",
++"173831",
++"173832",
++"173863",
++"173950",
++"174020",
++"174021",
++"174028",
++"174030",
++"174044",
++"174062",
++"174065",
++"174070",
++"174072",
++"174077",
++"174078",
++"174079",
++"174080",
++"174084",
++"174087",
++"174090",
++"174091",
++"174093",
++"174106",
++"174112",
++"174113",
++"174118",
++"174119",
++"174120",
++"174121",
++"174122",
++"174593",
++"175531",
++"175532",
++"175533",
++"175534",
++"175535",
++"175536",
++"175537",
++"175538",
++"175539",
++"175540",
++"175541",
++"175542",
++"175543",
++"175545",
++"175546",
++"175547",
++"175548",
++"175549",
++"175550",
++"175551",
++"175552",
++"175553",
++"175554",
++"175555",
++"175556",
++"175557",
++"175558",
++"175559",
++"175560",
++"175561",
++"175562",
++"175563",
++"175564",
++"175565",
++"175566",
++"175567",
++"175568",
++"175569",
++"175570",
++"175572",
++"175573",
++"175574",
++"175575",
++"175576",
++"175577",
++"175579",
++"175580",
++"175581",
++"175582",
++"175583",
++"175584",
++"175585",
++"175586",
++"175587",
++"175589",
++"175590",
++"175591",
++"175592",
++"175593",
++"175594",
++"175595",
++"175596",
++"175597",
++"175598",
++"175599",
++"175600",
++"175601",
++"175602",
++"175603",
++"175604",
++"175605",
++"175606",
++"175608",
++"175609",
++"175610",
++"175611",
++"175612",
++"175613",
++"175614",
++"175615",
++"175616",
++"175617",
++"175618",
++"175620",
++"175621",
++"175622",
++"175623",
++"175624",
++"175625",
++"175851",
++"175852",
++"175853",
++"175854",
++"175855",
++"175856",
++"175857",
++"175859",
++"175860",
++"175861",
++"175862",
++"175863",
++"175864",
++"175865",
++"175866",
++"175867",
++"175868",
++"175869",
++"175870",
++"175871",
++"175872",
++"175873",
++"175874",
++"175875",
++"175876",
++"175877",
++"175878",
++"175879",
++"175880",
++"175883",
++"175884",
++"175885",
++"175887",
++"175888",
++"176932",
++"177076",
++"177077",
++"177078",
++"177079",
++"177080",
++"177081",
++"177083",
++"177084",
++"177085",
++"177100",
++"177101",
++"177106",
++"177107",
++"177110",
++"177114",
++"177115",
++"177116",
++"177117",
++"177119",
++"177120",
++"177121",
++"177125",
++"177622",
++"177667",
++"177668",
++"177669",
++"177670",
++"177671",
++"177672",
++"177674",
++"177675",
++"177676",
++"177677",
++"177678",
++"177679",
++"177680",
++"177681",
++"177682",
++"177683",
++"177684",
++"177685",
++"177686",
++"177687",
++"177688",
++"177689",
++"177690",
++"177691",
++"177692",
++"177693",
++"177695",
++"177696",
++"177697",
++"177698",
++"177699",
++"177700",
++"177702",
++"177703",
++"177705",
++"177706",
++"177707",
++"177708",
++"177709",
++"177710",
++"177711",
++"177712",
++"177714",
++"177715",
++"177716",
++"177717",
++"177718",
++"177719",
++"177720",
++"177721",
++"177722",
++"177723",
++"177724",
++"177725",
++"177726",
++"177727",
++"177728",
++"177729",
++"177730",
++"177771",
++"177772",
++"177773",
++"177775",
++"177776",
++"177777",
++"177778",
++"177779",
++"177780",
++"177781",
++"177782",
++"177783",
++"177919",
++"177920",
++"177921",
++"177922",
++"177923",
++"177924",
++"177925",
++"177926",
++"177927",
++"177928",
++"177929",
++"177931",
++"177932",
++"177933",
++"177934",
++"177935",
++"177936",
++"177937",
++"177939",
++"177940",
++"177941",
++"177942",
++"177943",
++"177944",
++"177945",
++"177946",
++"177947",
++"177948",
++"177949",
++"177951",
++"177952",
++"177953",
++"177954",
++"177955",
++"177956",
++"177957",
++"177958",
++"177959",
++"177960",
++"177961",
++"177963",
++"177964",
++"177965",
++"177966",
++"177967",
++"177969",
++"177970",
++"177971",
++"177972",
++"177973",
++"177974",
++"177975",
++"177976",
++"177977",
++"177978",
++"177979",
++"177980",
++"177981",
++"177982",
++"177983",
++"177984",
++"177985",
++"177986",
++"177987",
++"177988",
++"177990",
++"177991",
++"177992",
++"177993",
++"177994",
++"177995",
++"177996",
++"177997",
++"177998",
++"177999",
++"178000",
++"178001",
++"178002",
++"178003",
++"178004",
++"178005",
++"178006",
++"178007",
++"178008",
++"178009",
++"178011",
++"178012",
++"178018",
++"178019",
++"178021",
++"178022",
++"178023",
++"178024",
++"178025",
++"178026",
++"178027",
++"178031",
++"178032",
++"178033",
++"178034",
++"178036",
++"178037",
++"178038",
++"178039",
++"178040",
++"178041",
++"178042",
++"178882",
++"178883",
++"178884",
++"178899",
++"178900",
++"178916",
++"178917",
++"178918",
++"178920",
++"178921",
++"178923",
++"178924",
++"178925",
++"178926",
++"178927",
++"178929",
++"178930",
++"178931",
++"178932",
++"178933",
++"178935",
++"178936",
++"178937",
++"178938",
++"178939",
++"178940",
++"178941",
++"178942",
++"178943",
++"178944",
++"178945",
++"178949",
++"178950",
++"178951",
++"178952",
++"178953",
++"178954",
++"178955",
++"178956",
++"178957",
++"178958",
++"178995",
++"179412",
++"179414",
++"179415",
++"179416",
++"179417",
++"179418",
++"179419",
++"179420",
++"179422",
++"179424",
++"179425",
++"179426",
++"179427",
++"179428",
++"179429",
++"179430",
++"179431",
++"179432",
++"179434",
++"179435",
++"179436",
++"179437",
++"179438",
++"179439",
++"179440",
++"179441",
++"179442",
++"179444",
++"179445",
++"179446",
++"179447",
++"179449",
++"179450",
++"179451",
++"179452",
++"179453",
++"179454",
++"179455",
++"179456",
++"179457",
++"179458",
++"179459",
++"179460",
++"179461",
++"179462",
++"179464",
++"179465",
++"179466",
++"179467",
++"179468",
++"179470",
++"179471",
++"179472",
++"179473",
++"179475",
++"179476",
++"179477",
++"179478",
++"179479",
++"179480",
++"179481",
++"179482",
++"179483",
++"179484",
++"179485",
++"179486",
++"179488",
++"179489",
++"179490",
++"179491",
++"179492",
++"179493",
++"179494",
++"179495",
++"179496",
++"179497",
++"179498",
++"179499",
++"179500",
++"179501",
++"179502",
++"179503",
++"179504",
++"179505",
++"179506",
++"179507",
++"179508",
++"179509",
++"179510",
++"179511",
++"179512",
++"179513",
++"179514",
++"179515",
++"179516",
++"179517",
++"179518",
++"179519",
++"179520",
++"179521",
++"179522",
++"179523",
++"179524",
++"179525",
++"179526",
++"179527",
++"179528",
++"179529",
++"179655",
++"179656",
++"179657",
++"179658",
++"179659",
++"179660",
++"179661",
++"179662",
++"179663",
++"179664",
++"179665",
++"179667",
++"179668",
++"179669",
++"179670",
++"179671",
++"179673",
++"179675",
++"179676",
++"179677",
++"179678",
++"179679",
++"179680",
++"179681",
++"179684",
++"179696",
++"179719",
++"179721",
++"179722",
++"179724",
++"179725",
++"179726",
++"179727",
++"179728",
++"179732",
++"179733",
++"179734",
++"179736",
++"179737",
++"179739",
++"179740",
++"179741",
++"179743",
++"179747",
++"179753",
++"179843",
++"179844",
++"179846",
++"179847",
++"179848",
++"179850",
++"179851",
++"179852",
++"179854",
++"179855",
++"179856",
++"179857",
++"179858",
++"179859",
++"179860",
++"179861",
++"179862",
++"179863",
++"179865",
++"179866",
++"179867",
++"179868",
++"179869",
++"179870",
++"179871",
++"179872",
++"179873",
++"179874",
++"179875",
++"179876",
++"179877",
++"179878",
++"179879",
++"179880",
++"179881",
++"179882",
++"179883",
++"179884",
++"179885",
++"179886",
++"179887",
++"179888",
++"179889",
++"179890",
++"179891",
++"179892",
++"179893",
++"179894",
++"179895",
++"179896",
++"179897",
++"179898",
++"179899",
++"179900",
++"179901",
++"179902",
++"179903",
++"179904",
++"179905",
++"179906",
++"179907",
++"179908",
++"179909",
++"179910",
++"179911",
++"179912",
++"179913",
++"179914",
++"179915",
++"179916",
++"179917",
++"179918",
++"179919",
++"179920",
++"179921",
++"179922",
++"179923",
++"179924",
++"179925",
++"179926",
++"179927",
++"179928",
++"179929",
++"179931",
++"179932",
++"179933",
++"179934",
++"179935",
++"179936",
++"179937",
++"179938",
++"179939",
++"179940",
++"179942",
++"179943",
++"179945",
++"180024",
++"180025",
++"180026",
++"180030",
++"180031",
++"180032",
++"180036",
++"180037",
++"180038",
++"180039",
++"180040",
++"180042",
++"180043",
++"180044",
++"180045",
++"180047",
++"180048",
++"180049",
++"180050",
++"180051",
++"180053",
++"180054",
++"180055",
++"180056",
++"180064",
++"180065",
++"180066",
++"180068",
++"180069",
++"180070",
++"180072",
++"180073",
++"180074",
++"180079",
++"180080",
++"180081",
++"180082",
++"180083",
++"180086",
++"180087",
++"180089",
++"180090",
++"180117",
++"180120",
++"180123",
++"180138",
++"180140",
++"180142",
++"180144",
++"180145",
++"180159",
++"180241",
++"180242",
++"180243",
++"180514",
++"180515",
++"180516",
++"180518",
++"180519",
++"180521",
++"180522",
++"180523",
++"180895",
++"180896",
++"180897",
++"180898",
++"181458",
++"181459",
++"181460",
++"181462",
++"181463",
++"181464",
++"181465",
++"181466",
++"181467",
++"181468",
++"181470",
++"181471",
++"181472",
++"181473",
++"181474",
++"181475",
++"181476",
++"182218",
++"182235",
++"182236",
++"182237",
++"182238",
++"182370",
++"182371",
++"182372",
++"183505",
++"183506",
++"183507",
++"183508",
++"183509",
++"183510",
++"183511",
++"183512",
++"183513",
++"183514",
++"183518",
++"183520",
++"183521",
++"183522",
++"183523",
++"183524",
++"183525",
++"183527",
++"183528",
++"183529",
++"183531",
++"183532",
++"183533",
++"183534",
++"183535",
++"183540",
++"183541",
++"183542",
++"183543",
++"183556",
++"183557",
++"183558",
++"183569",
++"183570",
++"183571",
++"183572",
++"183573",
++"183574",
++"183575",
++"183576",
++"183577",
++"183578",
++"183579",
++"183580",
++"183581",
++"183718",
++"183719",
++"183720",
++"183721",
++"183723",
++"183725",
++"183727",
++"183728",
++"183729",
++"183730",
++"184384",
++"184385",
++"184386",
++"184387",
++"184388",
++"184389",
++"184390",
++"184391",
++"184392",
++"184393",
++"184394",
++"184395",
++"184396",
++"184397",
++"184399",
++"184400",
++"184401",
++"184402",
++"184403",
++"184404",
++"184405",
++"184406",
++"184407",
++"184408",
++"184409",
++"184410",
++"184411",
++"184412",
++"184413",
++"184414",
++"184415",
++"184416",
++"184417",
++"184418",
++"184419",
++"184420",
++"184421",
++"184422",
++"184423",
++"184424",
++"184425",
++"184426",
++"184476",
++"184478",
++"184479",
++"184616",
++"184619",
++"184624",
++"184625",
++"184626",
++"184627",
++"184628",
++"184629",
++"184630",
++"184633",
++"184634",
++"184635",
++"184636",
++"184651",
++"184652",
++"184669",
++"184670",
++"184672",
++"184673",
++"184674",
++"184675",
++"184676",
++"184678",
++"184679",
++"184680",
++"184681",
++"184683",
++"184684",
++"184685",
++"184686",
++"184687",
++"184688",
++"184689",
++"184690",
++"184691",
++"184692",
++"184693",
++"184695",
++"184696",
++"184697",
++"184698",
++"184699",
++"184700",
++"184701",
++"184702",
++"184703",
++"184704",
++"184705",
++"184706",
++"184707",
++"184708",
++"184709",
++"184710",
++"184711",
++"184712",
++"184713",
++"184714",
++"184715",
++"184717",
++"184718",
++"184719",
++"184720",
++"184721",
++"184722",
++"184724",
++"184725",
++"184726",
++"184728",
++"184729",
++"184730",
++"184731",
++"184732",
++"184733",
++"184734",
++"184736",
++"184737",
++"184738",
++"184740",
++"184741",
++"184742",
++"184743",
++"184744",
++"184745",
++"184746",
++"184747",
++"184748",
++"184749",
++"184750",
++"184751",
++"184752",
++"184753",
++"184754",
++"184755",
++"184756",
++"184757",
++"184758",
++"184759",
++"184760",
++"184761",
++"184762",
++"184764",
++"184765",
++"184766",
++"184767",
++"184768",
++"184790",
++"184791",
++"184793",
++"184794",
++"184795",
++"184796",
++"184797",
++"184798",
++"184799",
++"184800",
++"184801",
++"184802",
++"184803",
++"184804",
++"184805",
++"184806",
++"184807",
++"184808",
++"184809",
++"184810",
++"184811",
++"184812",
++"184813",
++"184814",
++"184815",
++"184816",
++"184817",
++"184818",
++"184820",
++"184821",
++"184822",
++"184823",
++"184824",
++"184826",
++"184827",
++"184828",
++"184829",
++"184830",
++"184831",
++"184832",
++"184833",
++"184834",
++"184835",
++"184837",
++"184838",
++"184839",
++"184840",
++"184841",
++"184842",
++"184844",
++"184845",
++"184846",
++"184847",
++"184848",
++"184849",
++"184850",
++"184851",
++"184853",
++"184854",
++"184855",
++"184856",
++"184857",
++"184858",
++"184859",
++"184860",
++"184861",
++"184863",
++"184864",
++"184865",
++"184866",
++"184867",
++"184868",
++"184869",
++"184870",
++"184871",
++"184872",
++"184873",
++"184874",
++"184875",
++"184877",
++"184878",
++"184879",
++"184880",
++"184881",
++"184882",
++"184883",
++"184884",
++"184885",
++"184886",
++"184887",
++"184888",
++"184889",
++"184890",
++"184891",
++"184893",
++"184894",
++"184895",
++"184896",
++"184897",
++"184898",
++"184899",
++"184900",
++"184901",
++"184902",
++"184903",
++"184904",
++"184905",
++"184907",
++"184908",
++"184909",
++"184910",
++"184911",
++"184912",
++"184913",
++"184914",
++"184915",
++"184916",
++"184917",
++"184918",
++"184920",
++"184921",
++"184922",
++"184923",
++"184924",
++"184925",
++"184926",
++"184927",
++"184928",
++"184929",
++"184977",
++"184978",
++"184979",
++"184980",
++"185012",
++"185017",
++"185019",
++"185021",
++"185031",
++"258035",
++"258038",
++"261084",
++"261085",
++"261088",
++"261089",
++"261094",
++"261096",
++"261112",
++"261115",
++"261116",
++"261154",
++"261155",
++"261162",
++"261168",
++"261173",
++"261175",
++"261177",
++"261182",
++"261183",
++"261268",
++"261271",
++"261275",
++"261280",
++"261281",
++"261282",
++"261283",
++"261284",
++"261285",
++"261286",
++"261287",
++"261396",
++"261412",
++"261413",
++"261414",
++"261415",
++"261418",
++"261419",
++"261420",
++"261421",
++"261422",
++"261425",
++"261427",
++"261431",
++"261432",
++"261434",
++"261435",
++"261436",
++"261437",
++"261438",
++"261439",
++"261441",
++"261443",
++"261444",
++"261445",
++"261446",
++"261461",
++"261462",
++"261467",
++"261474",
++"261482",
++"261483",
++"261484",
++"261485",
++"261486",
++"261487",
++"261488",
++"261489",
++"261490",
++"261512",
++"261526",
++"261527",
++"261530",
++"261531",
++"261532",
++"261533",
++"261534",
++"261897",
++"261898",
++"261899",
++"261953",
++"261954",
++"262060",
++"262061",
++"262062",
++"262063",
++"262065",
++"262066",
++"262067",
++"262068",
++"262069",
++"262071",
++"262072",
++"262073",
++"262074",
++"262075",
++"262076",
++"262078",
++"262079",
++"262080",
++"262081",
++"262082",
++"262083",
++"262084",
++"262085",
++"262086",
++"262087",
++"262088",
++"262089",
++"262090",
++"262091",
++"262092",
++"262093",
++"262095",
++"262096",
++"262097",
++"262099",
++"262100",
++"262102",
++"262103",
++"262104",
++"262105",
++"262106",
++"262108",
++"262109",
++"262110",
++"262112",
++"262113",
++"262114",
++"262115",
++"262116",
++"262117",
++"262118",
++"262119",
++"262120",
++"262121",
++"262122",
++"262123",
++"262124",
++"262125",
++"262127",
++"262128",
++"262129",
++"262131",
++"262132",
++"262133",
++"262134",
++"262135",
++"262136",
++"262137",
++"262139",
++"262140",
++"262141",
++"262142",
++"262143",
++"262144",
++"262146",
++"262148",
++"262149",
++"262150",
++"262152",
++"262154",
++"262156",
++"262157",
++"262158",
++"262159",
++"262161",
++"262162",
++"262163",
++"262164",
++"262166",
++"262167",
++"262168",
++"262170",
++"262171",
++"262172",
++"262173",
++"262174",
++"262176",
++"262177",
++"262178",
++"262179",
++"262180",
++"262181",
++"262182",
++"262183",
++"262184",
++"262185",
++"262186",
++"262188",
++"262189",
++"262191",
++"262192",
++"262193",
++"262194",
++"262196",
++"262197",
++"262198",
++"262200",
++"262201",
++"262203",
++"262204",
++"262205",
++"262206",
++"262207",
++"262208",
++"262209",
++"262210",
++"262213",
++"262214",
++"262216",
++"262217",
++"262218",
++"262219",
++"262220",
++"262221",
++"262222",
++"262223",
++"262224",
++"262225",
++"262226",
++"262227",
++"262228",
++"262229",
++"262230",
++"262231",
++"262234",
++"262235",
++"262236",
++"262237",
++"262238",
++"262240",
++"262241",
++"262242",
++"262243",
++"262245",
++"262246",
++"262247",
++"262248",
++"262249",
++"262251",
++"262252",
++"262253",
++"262254",
++"262255",
++"262256",
++"262257",
++"262258",
++"262259",
++"262260",
++"262261",
++"262265",
++"262985",
++"262986",
++"263021",
++"263023",
++"263024",
++"263025",
++"263026",
++"263028",
++"263029",
++"263031",
++"263033",
++"263034",
++"263035",
++"263036",
++"263037",
++"263038",
++"263039",
++"263040",
++"263041",
++"263043",
++"263044",
++"263045",
++"263046",
++"263047",
++"263048",
++"263049",
++"263051",
++"263052",
++"263053",
++"263054",
++"263055",
++"263056",
++"263057",
++"263058",
++"263059",
++"263060",
++"263061",
++"263062",
++"263064",
++"263065",
++"263066",
++"263067",
++"263068",
++"263069",
++"263070",
++"263071",
++"263072",
++"263073",
++"263074",
++"263075",
++"263087",
++"263088",
++"263089",
++"263090",
++"263091",
++"263092",
++"263095",
++"263096",
++"263098",
++"263099",
++"263100",
++"263101",
++"263102",
++"263104",
++"263105",
++"263106",
++"263107",
++"263108",
++"263109",
++"263110",
++"263112",
++"263113",
++"263114",
++"263115",
++"263116",
++"263117",
++"263118",
++"263120",
++"263121",
++"263122",
++"263123",
++"263125",
++"263126",
++"263128",
++"263129",
++"263130",
++"263131",
++"263132",
++"263133",
++"263135",
++"263136",
++"263137",
++"263138",
++"263139",
++"263140",
++"263142",
++"263143",
++"263145",
++"263146",
++"263147",
++"263148",
++"263149",
++"263150",
++"263151",
++"263152",
++"263154",
++"263156",
++"263157",
++"263158",
++"263159",
++"263160",
++"263161",
++"263162",
++"263163",
++"263164",
++"263165",
++"263166",
++"263167",
++"263169",
++"263170",
++"263171",
++"263172",
++"263173",
++"263174",
++"263175",
++"263176",
++"263177",
++"263178",
++"263180",
++"263181",
++"263182",
++"263183",
++"263190",
++"263191",
++"263192",
++"263195",
++"263196",
++"263197",
++"263198",
++"263199",
++"263200",
++"263202",
++"263203",
++"263204",
++"263205",
++"263206",
++"263207",
++"263208",
++"263209",
++"263210",
++"263212",
++"263213",
++"263214",
++"263216",
++"263217",
++"263218",
++"263219",
++"263220",
++"263221",
++"263222",
++"263223",
++"263224",
++"263225",
++"263226",
++"263229",
++"263230",
++"263231",
++"263232",
++"263233",
++"263234",
++"263235",
++"263237",
++"263238",
++"263239",
++"263241",
++"263242",
++"263243",
++"263244",
++"263245",
++"263246",
++"263247",
++"263248",
++"263249",
++"263250",
++"263251",
++"263254",
++"263255",
++"263256",
++"263257",
++"263258",
++"263259",
++"263261",
++"263262",
++"263263",
++"263264",
++"263265",
++"263266",
++"263267",
++"263268",
++"263269",
++"263271",
++"263272",
++"263273",
++"263275",
++"263276",
++"263277",
++"263278",
++"263279",
++"263280",
++"263281",
++"263283",
++"263284",
++"263285",
++"263286",
++"263287",
++"263288",
++"263289",
++"263290",
++"263291",
++"263292",
++"263294",
++"263296",
++"263297",
++"263299",
++"263300",
++"263301",
++"263302",
++"263303",
++"263304",
++"263305",
++"263306",
++"263307",
++"263309",
++"263310",
++"263311",
++"263312",
++"263313",
++"263314",
++"263315",
++"263316",
++"263317",
++"263318",
++"263319",
++"263320",
++"263322",
++"263323",
++"263324",
++"263325",
++"263326",
++"263327",
++"263329",
++"263330",
++"263331",
++"263332",
++"263333",
++"263334",
++"263335",
++"263336",
++"263337",
++"263338",
++"263339",
++"263341",
++"263342",
++"263343",
++"263344",
++"263346",
++"263347",
++"263348",
++"263349",
++"263350",
++"263351",
++"263352",
++"263353",
++"263354",
++"263355",
++"263356",
++"263357",
++"263358",
++"263359",
++"263360",
++"263361",
++"263363",
++"263364",
++"263365",
++"263366",
++"263367",
++"263368",
++"263369",
++"263370",
++"263371",
++"263372",
++"263373",
++"263374",
++"263376",
++"263377",
++"263378",
++"263379",
++"263380",
++"263381",
++"263382",
++"263383",
++"263384",
++"263385",
++"263386",
++"263387",
++"263388",
++"263389",
++"263390",
++"263391",
++"263392",
++"263393",
++"263394",
++"263395",
++"263396",
++"263397",
++"263398",
++"263400",
++"263401",
++"263402",
++"263403",
++"263404",
++"263406",
++"263407",
++"263408",
++"263409",
++"263410",
++"263411",
++"263412",
++"263413",
++"263415",
++"263416",
++"263418",
++"263419",
++"263420",
++"263421",
++"263423",
++"263424",
++"263426",
++"263428",
++"263430",
++"263431",
++"263432",
++"263433",
++"263434",
++"263435",
++"263436",
++"263437",
++"263438",
++"263439",
++"263441",
++"263442",
++"263444",
++"263445",
++"263446",
++"263447",
++"263448",
++"263449",
++"263450",
++"263451",
++"263452",
++"263454",
++"263455",
++"263456",
++"263457",
++"263458",
++"263459",
++"263460",
++"263461",
++"263462",
++"263463",
++"263465",
++"263466",
++"263468",
++"263469",
++"263470",
++"263471",
++"263472",
++"263473"
++]
+diff --git a/scripts/apply_approved_fixes.py b/scripts/apply_approved_fixes.py
+index 7c04635..83ffdaf 100644
+--- a/scripts/apply_approved_fixes.py
++++ b/scripts/apply_approved_fixes.py
+@@ -13,15 +13,33 @@ itself — the operator never composes `--fix-key` by hand and cannot widen it.
+ 
+ Manifest format (CSV, header required):
+ 
+-    sku,fix_keys,note
+-    W1234,Assembly Required,source says Yes
+-    W5678,categoryId|Item Length,approved by <name> 2026-07-28
+-
+-`fix_keys` is `|`-separated. `categoryId` additionally requires
+-`--allow-category`, because category changes are the single most damaging
+-class of wrong fix in this codebase's history (indoor bench -> Outdoor
+-Daybeds; nightstand -> Bed Frames; console table -> Sofas; bell tent ->
+-Ice Chests & Coolers).
++    sku,fix_keys,category_id,note
++    W1234,Assembly Required,,source says Yes
++    W5678,categoryId,176991,approved by <name> 2026-07-28
++    W808,categoryApproved,20748,already on the right leaf
++
++`fix_keys` is `|`-separated. `categoryId` / `categoryName` /
++`categoryApproved` additionally require `--allow-category`, because
++category changes are the single most damaging class of wrong fix in this
++codebase's history (indoor bench -> Outdoor Daybeds; nightstand -> Bed
++Frames; console table -> Sofas; bell tent -> Ice Chests & Coolers).
++
++Approval is always tied to an explicit `category_id`. A missing target is
++never inferred from the stored leaf, and never stamped. With
++`--mark-category-approved` those rows are rejected before the audit.
++
++A remap row (`categoryId` / `categoryName`) always goes through audit.
++`--mark-category-approved --apply` then stamps only when the audit exits
++0, reported no apply errors, actually offered the category fix, and the
++stored leaf equals the explicit `category_id`. Dry-run remap rows print
++`would stamp <category_id> after remap` and continue — they do not
++compare stored vs target.
++
++An approve-only row (sole key `categoryApproved` + `category_id`) never
++remaps. It stamps only when the stored leaf already equals `category_id`.
++
++    python scripts/apply_approved_fixes.py manifest.csv --allow-category --mark-category-approved
++    python scripts/apply_approved_fixes.py manifest.csv --allow-category --mark-category-approved --apply
+ 
+     python scripts/apply_approved_fixes.py manifest.csv            # dry run
+     python scripts/apply_approved_fixes.py manifest.csv --apply
+@@ -32,15 +50,27 @@ from __future__ import annotations
+ import argparse
+ import csv
+ import json
++import sqlite3
+ import subprocess
+ import sys
+ from pathlib import Path
+ 
+ ROOT = Path(__file__).resolve().parent.parent
++if str(ROOT) not in sys.path:
++    sys.path.insert(0, str(ROOT))
++
++from src.utils.approved_category import (
++    locked_category_write_error,
++    mark_category_approved,
++)
++
+ AUDIT = ROOT / "scripts" / "audit_fix_active_listings.py"
++DEFAULT_DB = ROOT / "ebay_collection.db"
+ 
+ # Fix keys that may never be applied from a manifest without an extra opt-in.
+-GUARDED_KEYS = {"categoryId", "categoryName"}
++GUARDED_KEYS = {"categoryId", "categoryName", "categoryApproved"}
++REMAP_KEYS = frozenset({"categoryId", "categoryName"})
++STAMPABLE_KEYS = frozenset(GUARDED_KEYS)
+ 
+ 
+ def load_manifest(path: Path) -> list[dict]:
+@@ -57,7 +87,17 @@ def load_manifest(path: Path) -> list[dict]:
+             keys = [k.strip() for k in (raw.get("fix_keys") or "").split("|") if k.strip()]
+             if not keys:
+                 raise SystemExit(f"[ERROR] line {lineno}: {sku} has no fix_keys")
+-            rows.append({"sku": sku, "fix_keys": keys, "note": (raw.get("note") or "").strip()})
++            row = {
++                "sku": sku,
++                "fix_keys": keys,
++                "note": (raw.get("note") or "").strip(),
++            }
++            # Older manifests have no category_id column. Keep that row shape
++            # so existing callers compare equal. A present column, even blank,
++            # is the explicit target and is never inferred from the stored leaf.
++            if "category_id" in (reader.fieldnames or []):
++                row["category_id"] = str(raw.get("category_id") or "").strip()
++            rows.append(row)
+     if not rows:
+         raise SystemExit("[ERROR] manifest is empty")
+     return rows
+@@ -74,7 +114,149 @@ def check_guarded(rows: list[dict], allow_category: bool) -> None:
+         raise SystemExit(2)
+ 
+ 
+-def build_command(sku: str, fix_keys: list[str], apply: bool) -> list[str]:
++def _parse_optimization(raw: object) -> dict:
++    if isinstance(raw, str) and raw.strip():
++        try:
++            parsed = json.loads(raw)
++        except ValueError:
++            return {}
++        return parsed if isinstance(parsed, dict) else {}
++    if isinstance(raw, dict):
++        return dict(raw)
++    return {}
++
++
++def _row_keys(row: dict) -> list[str]:
++    return [str(k).strip() for k in (row.get("fix_keys") or []) if str(k).strip()]
++
++
++def requested_category_id(row: dict) -> str:
++    return str(row.get("category_id") or "").strip()
++
++
++def is_remap_row(row: dict) -> bool:
++    return any(key in REMAP_KEYS for key in _row_keys(row))
++
++
++def is_approve_only_row(row: dict) -> bool:
++    keys = _row_keys(row)
++    return bool(keys) and all(key == "categoryApproved" for key in keys)
++
++
++def wants_approval_stamp(row: dict, mark_category_approved: bool) -> bool:
++    return bool(mark_category_approved) and any(key in STAMPABLE_KEYS for key in _row_keys(row))
++
++
++def can_stamp_after_remap(
++    *,
++    requested_id: str,
++    returncode: int,
++    apply_errors: list[str] | None,
++    remap_offered: bool,
++    stored_category_id: str = "",
++    apply: bool = True,
++) -> tuple[bool, str]:
++    """Stamp a remap row only after an explicit target is verified."""
++    requested = str(requested_id or "").strip()
++    if not requested:
++        return False, "refusing to stamp without explicit category_id"
++    if returncode != 0:
++        return False, f"audit exited {returncode}"
++    if apply_errors:
++        return False, "audit reported apply errors"
++    if not remap_offered:
++        return False, "audit did not produce a categoryId fix"
++    if not apply:
++        return True, ""
++    stored = str(stored_category_id or "").strip()
++    if stored != requested:
++        return False, (
++            f"stored categoryId={stored} != category_id={requested}; "
++            "remap was not applied"
++        )
++    return True, ""
++
++
++def load_stored_optimization(sku: str, db_path: Path | None = None) -> dict:
++    path = Path(db_path) if db_path is not None else DEFAULT_DB
++    if not path.is_file():
++        return {}
++    conn = sqlite3.connect(path)
++    try:
++        row = conn.execute(
++            "SELECT optimization FROM collected_products WHERE sku=?",
++            (sku,),
++        ).fetchone()
++        if not row:
++            return {}
++        return _parse_optimization(row[0])
++    finally:
++        conn.close()
++
++
++def load_stored_category_id(sku: str, db_path: Path | None = None) -> str:
++    return str(load_stored_optimization(sku, db_path=db_path).get("categoryId") or "").strip()
++
++
++def stamp_local_category_approved(
++    sku: str,
++    *,
++    approved_category_id: str,
++    apply: bool,
++    db_path: Path | None = None,
++) -> dict:
++    """Pin ``approved_category_id`` as the approved leaf.
++
++    The target is required. This never infers an id from the stored leaf,
++    and never writes a different ``categoryApprovedId``.
++    """
++    target = str(approved_category_id or "").strip()
++    if not target:
++        return {"ok": False, "error": "refusing to stamp without explicit category_id"}
++    from src.utils.motors_category_tree import listing_category_rejection
++
++    rejection = listing_category_rejection(target)
++    if rejection:
++        return {"ok": False, "error": rejection}
++    path = Path(db_path) if db_path is not None else DEFAULT_DB
++    if not path.is_file():
++        return {"ok": False, "error": f"database not found: {path}"}
++    conn = sqlite3.connect(path)
++    try:
++        row = conn.execute(
++            "SELECT optimization FROM collected_products WHERE sku=?",
++            (sku,),
++        ).fetchone()
++        if not row:
++            return {"ok": False, "error": f"SKU {sku} not found"}
++        opt = _parse_optimization(row[0])
++        stored = str(opt.get("categoryId") or "").strip()
++        if not stored:
++            return {"ok": False, "error": f"{sku} has no stored categoryId to approve"}
++        if stored != target:
++            return {
++                "ok": False,
++                "error": f"stored categoryId={stored} != category_id={target}",
++            }
++        if not apply:
++            return {"ok": True, "dry_run": True, "category_id": target}
++        mark_category_approved(opt, target)
++        conn.execute(
++            "UPDATE collected_products SET optimization=? WHERE sku=?",
++            (json.dumps(opt, ensure_ascii=False), sku),
++        )
++        conn.commit()
++        return {"ok": True, "applied": True, "category_id": target}
++    finally:
++        conn.close()
++
++
++def build_command(
++    sku: str,
++    fix_keys: list[str],
++    apply: bool,
++    override_category_lock: bool = False,
++) -> list[str]:
+     # --ignore-clean-freeze is not optional here: a listing fixed earlier gets
+     # frozen as "clean" and the audit then skips it entirely, so a scoped repair
+     # run silently finds nothing to do (2026-07-28, W3098P470268).
+@@ -83,6 +265,10 @@ def build_command(sku: str, fix_keys: list[str], apply: bool) -> list[str]:
+         cmd += ["--fix-key", key]
+     if apply:
+         cmd.append("--fix")
++    if override_category_lock:
++        cmd.append("--override-category-lock")
++    # The runner stamps categoryApprovedId itself after verifying the
++    # explicit target. Do not let the audit infer and pin the stored leaf.
+     return cmd
+ 
+ 
+@@ -146,6 +332,23 @@ def main() -> int:
+         action="store_true",
+         help="permit categoryId/categoryName rows (each must be human-approved)",
+     )
++    parser.add_argument(
++        "--mark-category-approved",
++        action="store_true",
++        help=(
++            "stamp categoryApproved + categoryApprovedId to the row's "
++            "explicit category_id after a successful remap, or on an "
++            "approve-only row whose stored leaf already matches"
++        ),
++    )
++    parser.add_argument(
++        "--override-category-lock",
++        action="store_true",
++        help=(
++            "Required to remap a listing whose optimization.categoryApproved "
++            "flag is already set. Stamp-only approve rows do not need this."
++        ),
++    )
+     parser.add_argument("--stop-on-error", action="store_true", default=True)
+     parser.add_argument(
+         "--max-consecutive-errors",
+@@ -177,35 +380,190 @@ def main() -> int:
+     print(f"mode    : {'APPLY (writes to eBay)' if args.apply else 'DRY RUN'}")
+     print()
+ 
++    return process_rows(
++        rows,
++        apply=args.apply,
++        mark_category_approved=args.mark_category_approved,
++        stop_on_error=args.stop_on_error,
++        max_consecutive_errors=args.max_consecutive_errors,
++        override_category_lock=args.override_category_lock,
++    )
++
++
++def _default_run_audit(sku: str, keys: list[str], apply: bool, override_category_lock: bool = False):
++    cmd = build_command(sku, keys, apply, override_category_lock=override_category_lock)
++    # encoding is explicit: the audit prints the store footer (✦) and Chinese
++    # summaries, and Windows' default cp936 decode raised inside subprocess's
++    # reader thread — the output was lost and every row still reported OK.
++    return subprocess.run(
++        cmd, cwd=str(ROOT), capture_output=True, text=True,
++        encoding="utf-8", errors="replace",
++    )
++
++
++def _stamp_or_fail(
++    sku: str,
++    *,
++    approved_category_id: str,
++    apply: bool,
++    db_path: Path | None,
++) -> tuple[dict, bool]:
++    stamped = stamp_local_category_approved(
++        sku,
++        approved_category_id=approved_category_id,
++        apply=apply,
++        db_path=db_path,
++    )
++    if not stamped.get("ok"):
++        print(f"      ! {stamped.get('error')}")
++        return stamped, False
++    cid = stamped.get("category_id")
++    if stamped.get("dry_run"):
++        print(f"      would stamp categoryApprovedId={cid}")
++    else:
++        print(f"      stamped categoryApprovedId={cid}")
++    return stamped, True
++
++
++def _fail_row(
++    sku: str,
++    *,
++    failures: int,
++    stop_on_error: bool,
++    message: str,
++    stop_label: str,
++) -> tuple[int, bool]:
++    """Increment failures; return (failures, should_stop)."""
++    print(f"      ! {message}")
++    if stop_on_error:
++        print(f"\n[STOP] {sku}: {stop_label}")
++        return failures + 1, True
++    return failures + 1, False
++
++
++def process_rows(
++    rows: list[dict],
++    *,
++    apply: bool,
++    mark_category_approved: bool,
++    stop_on_error: bool = True,
++    max_consecutive_errors: int = 3,
++    db_path: Path | None = None,
++    run_audit=None,
++    override_category_lock: bool = False,
++) -> int:
++    run_audit = run_audit or _default_run_audit
+     failures = 0
+     consecutive = 0
+     item_errors: list[str] = []
+     for index, row in enumerate(rows, start=1):
+-        sku, keys = row["sku"], row["fix_keys"]
+-        print(f"[{index}/{len(rows)}] {sku}  keys={keys}" + (f"  # {row['note']}" if row["note"] else ""))
+-        cmd = build_command(sku, keys, args.apply)
+-        # encoding is explicit: the audit prints the store footer (✦) and Chinese
+-        # summaries, and Windows' default cp936 decode raised inside subprocess's
+-        # reader thread — the output was lost and every row still reported OK.
+-        result = subprocess.run(
+-            cmd, cwd=str(ROOT), capture_output=True, text=True,
+-            encoding="utf-8", errors="replace",
+-        )
+-        tail = (result.stdout or "").strip().splitlines()[-6:]
++        sku, keys = row["sku"], list(row["fix_keys"])
++        requested = requested_category_id(row)
++        wants_stamp = wants_approval_stamp(row, mark_category_approved)
++        print(f"[{index}/{len(rows)}] {sku}  keys={keys}" + (f"  # {row['note']}" if row.get("note") else ""))
++
++        if is_remap_row(row):
++            stored_opt = load_stored_optimization(sku, db_path=db_path)
++            lock_error = locked_category_write_error(
++                stored_opt, override=override_category_lock
++            )
++            if lock_error:
++                failures, should_stop = _fail_row(
++                    sku,
++                    failures=failures,
++                    stop_on_error=stop_on_error,
++                    message=lock_error,
++                    stop_label="category lock blocked remap.",
++                )
++                if should_stop:
++                    return 1
++                print()
++                continue
++
++        if wants_stamp and not requested:
++            failures, should_stop = _fail_row(
++                sku,
++                failures=failures,
++                stop_on_error=stop_on_error,
++                message=(
++                    "--mark-category-approved requires an explicit category_id; "
++                    "refusing to infer approval from the stored leaf"
++                ),
++                stop_label="missing category_id, nothing stamped.",
++            )
++            if should_stop:
++                return 1
++            print()
++            continue
++
++        if wants_stamp and is_approve_only_row(row):
++            stored = load_stored_category_id(sku, db_path=db_path)
++            if stored != requested:
++                failures, should_stop = _fail_row(
++                    sku,
++                    failures=failures,
++                    stop_on_error=stop_on_error,
++                    message=f"stored categoryId={stored} != category_id={requested}",
++                    stop_label="approve-only target does not match stored leaf.",
++                )
++                if should_stop:
++                    return 1
++                print()
++                continue
++            stamped, ok = _stamp_or_fail(
++                sku,
++                approved_category_id=requested,
++                apply=apply,
++                db_path=db_path,
++            )
++            if not ok:
++                failures += 1
++                if stop_on_error:
++                    print(f"\n[STOP] {sku}: could not stamp approved category.")
++                    return 1
++            print()
++            continue
++
++        try:
++            result = run_audit(sku, keys, apply, override_category_lock)
++        except TypeError:
++            result = run_audit(sku, keys, apply)
++        tail = (getattr(result, "stdout", None) or "").strip().splitlines()[-6:]
+         for line in tail:
+             print(f"      {line}")
+         unavailable = _keys_not_offered(sku, keys)
+-        if unavailable:
++        remap_missing = [k for k in unavailable if k in REMAP_KEYS]
++        stampable_missing = [k for k in unavailable if k in STAMPABLE_KEYS]
++        other_missing = [k for k in unavailable if k not in STAMPABLE_KEYS]
++        if other_missing:
+             failures += 1
+-            print(f"      ! manifest names fix keys the audit does not offer: {unavailable}")
++            print(f"      ! manifest names fix keys the audit does not offer: {other_missing}")
+             print(f"      ! nothing was applied for {sku} — fix the manifest, do not retry as-is")
+-            if args.stop_on_error:
++            if stop_on_error:
++                print(f"\n[STOP] {sku}: unusable manifest row.")
++                return 1
++            print()
++            continue
++        if remap_missing:
++            failures += 1
++            print(f"      ! manifest names fix keys the audit does not offer: {remap_missing}")
++            print("      ! category remap was not produced; nothing stamped")
++            if stop_on_error:
++                print(f"\n[STOP] {sku}: unusable manifest row.")
++                return 1
++            print()
++            continue
++        if stampable_missing and not mark_category_approved:
++            failures += 1
++            print(f"      ! manifest names fix keys the audit does not offer: {stampable_missing}")
++            print("      ! category is already correct (or not offered); pass --mark-category-approved with an explicit category_id")
++            if stop_on_error:
+                 print(f"\n[STOP] {sku}: unusable manifest row.")
+                 return 1
+             print()
+             continue
+ 
+-        apply_errors = _apply_errors_for_sku(sku) if args.apply else []
++        apply_errors = _apply_errors_for_sku(sku) if apply else []
+         if apply_errors:
+             # Per-SKU data conditions (missing eBay availability record, dead
+             # offer) are item-level, not systematic: on 2026-08-10 one such SKU
+@@ -217,7 +575,7 @@ def main() -> int:
+             for error in apply_errors:
+                 print(f"      ! {error}")
+             item_errors.append(f"{sku}: {apply_errors[0][:120]}")
+-            if args.stop_on_error and consecutive >= args.max_consecutive_errors:
++            if stop_on_error and consecutive >= max_consecutive_errors:
+                 print(
+                     f"\n[STOP] {consecutive} consecutive apply errors "
+                     f"(last: {sku}) — looks systematic, not per-item."
+@@ -229,12 +587,52 @@ def main() -> int:
+ 
+         if result.returncode != 0:
+             failures += 1
+-            err = (result.stderr or "").strip().splitlines()[-4:]
++            err = (getattr(result, "stderr", None) or "").strip().splitlines()[-4:]
+             for line in err:
+                 print(f"      ! {line}")
+-            if args.stop_on_error:
++            if stop_on_error:
+                 print(f"\n[STOP] {sku} exited {result.returncode}. Nothing further attempted.")
+                 return 1
++            print()
++            continue
++
++        if wants_stamp:
++            stored = load_stored_category_id(sku, db_path=db_path) if apply else ""
++            ok, reason = can_stamp_after_remap(
++                requested_id=requested,
++                returncode=result.returncode,
++                apply_errors=apply_errors,
++                remap_offered=not remap_missing,
++                stored_category_id=stored,
++                apply=apply,
++            )
++            if not ok:
++                failures, should_stop = _fail_row(
++                    sku,
++                    failures=failures,
++                    stop_on_error=stop_on_error,
++                    message=reason,
++                    stop_label="refused to stamp approved category.",
++                )
++                if should_stop:
++                    return 1
++                print()
++                continue
++            if not apply:
++                print(f"      would stamp {requested} after remap")
++                print()
++                continue
++            stamped, stamped_ok = _stamp_or_fail(
++                sku,
++                approved_category_id=requested,
++                apply=True,
++                db_path=db_path,
++            )
++            if not stamped_ok:
++                failures += 1
++                if stop_on_error:
++                    print(f"\n[STOP] {sku}: could not stamp approved category.")
++                    return 1
+         print()
+ 
+     print(f"done: {len(rows)} row(s), {failures} failure(s)")
+diff --git a/scripts/audit_fix_active_listings.py b/scripts/audit_fix_active_listings.py
+index 3b9da0a..c86b048 100644
+--- a/scripts/audit_fix_active_listings.py
++++ b/scripts/audit_fix_active_listings.py
+@@ -97,6 +97,11 @@ from src.utils.dimension_helpers import (
+     find_dimension,
+     replace_description_measurements,
+ )
++from src.utils.approved_category import (
++    blocks_automated_category_change,
++    locked_category_write_error,
++)
++from src.utils.motors_category_tree import listing_category_rejection
+ from src.utils.publish_validation import first_aspect_text, measurement_issue
+ from src.utils.publish_autofix import (
+     SINGLE_VALUE_ASPECTS,
+@@ -920,8 +925,12 @@ def audit_single_product(
+         fixes["__restore_live_description_from_local__"] = True
+ 
+     # ── 1. Category Check — deterministic product profile wins over taxonomy drift ──
++    # A human-approved stored category is not remapped by profile or canonicalize.
++    # Fail closed: any categoryApproved flag blocks generation of category fixes.
++    # Motors also refuses a tree-0 target such as 20487.
++    skip_category_remap = blocks_automated_category_change(opt)
+     profile = classify_listing_profile(title_context or title, live_description, stored_category)
+-    if profile.category_id:
++    if not skip_category_remap and profile.category_id and not listing_category_rejection(profile.category_id):
+         if stored_category != profile.category_id:
+             issues.append({
+                 "type": "category_mismatch",
+@@ -936,7 +945,7 @@ def audit_single_product(
+             fixes["categoryId"] = profile.category_id
+             if profile.category_name:
+                 fixes["categoryName"] = profile.category_name
+-    elif stored_category:
++    elif not skip_category_remap and stored_category:
+         canonical_category, canonical_name = matcher.canonicalize_category(
+             title_context,
+             stored_category,
+@@ -944,7 +953,11 @@ def audit_single_product(
+             live_description,
+         )
+ 
+-        if canonical_category and canonical_category != stored_category:
++        if (
++            canonical_category
++            and canonical_category != stored_category
++            and not listing_category_rejection(canonical_category)
++        ):
+             issues.append({
+                 "type": "category_mismatch",
+                 "severity": "CRITICAL",
+@@ -967,7 +980,11 @@ def audit_single_product(
+                 suggested_name,
+                 live_description,
+             )
+-            if suggested_category and suggested_category != stored_category:
++            if (
++                suggested_category
++                and suggested_category != stored_category
++                and not listing_category_rejection(suggested_category)
++            ):
+                 issues.append({
+                     "type": "category_mismatch",
+                     "severity": "CRITICAL",
+@@ -1868,11 +1885,10 @@ def build_live_listing_opt_snapshot(stored_opt, *, inventory_item=None, offer=No
+ 
+     category = offer.get("category") or {}
+     category_id = offer.get("categoryId") or category.get("categoryId")
+-    if category_id:
+-        opt["categoryId"] = str(category_id)
+     category_name = category.get("categoryName") or category.get("name")
+-    if category_name:
+-        opt["categoryName"] = category_name
++    from src.utils.approved_category import apply_live_category_readback
++
++    apply_live_category_readback(opt, category_id, category_name)
+ 
+     return opt
+ 
+@@ -1939,6 +1955,15 @@ def create_parser():
+         choices=["Yes"],
+         help="Operator override: emit Assembly Required=Yes for assembly_package_conflict. Requires --sku or --sku-file.",
+     )
++    parser.add_argument(
++        "--override-category-lock",
++        action="store_true",
++        help=(
++            "Allow applying categoryId/categoryName fixes on a listing whose "
++            "optimization.categoryApproved flag is set. Required for any live "
++            "category change on a locked SKU."
++        ),
++    )
+     return parser
+ 
+ 
+@@ -3240,6 +3265,7 @@ def fix_listing_on_ebay(
+     *,
+     base_opt_raw=None,
+     source_detail_cache: dict[str, dict] | None = None,
++    override_category_lock: bool = False,
+ ):
+     """Apply fixes to a published eBay listing."""
+     results = []
+@@ -3324,12 +3350,21 @@ def fix_listing_on_ebay(
+             return [f"ERROR [{sku}]: protected live snapshot failed ({exc}); no write attempted"]
+ 
+     # Apply aspect fixes
++    lock_error = locked_category_write_error(stored_opt, override=override_category_lock)
+     for key, value in fixes.items():
+         if key == "categoryId":
++            if lock_error:
++                results.append(f"ERROR [{sku}]: {lock_error}")
++                continue
++            if listing_category_rejection(value):
++                results.append(f"ERROR [{sku}]: {listing_category_rejection(value)}")
++                continue
+             new_category = value
+             category_changed = True
+             continue
+         if key == "categoryName":
++            if lock_error:
++                continue
+             new_category_name = value
+             continue
+         if key == "__motors_compatibility__":
+@@ -4698,6 +4733,7 @@ def main(argv=None):
+                 conn,
+                 base_opt_raw=audit_opt_raw if args.live else None,
+                 source_detail_cache=semantic_source_detail_cache,
++                override_category_lock=bool(getattr(args, "override_category_lock", False)),
+             )
+             for r in fix_results:
+                 if "ERROR" in r:
+diff --git a/scripts/audit_fix_ready_drafts.py b/scripts/audit_fix_ready_drafts.py
+index a5ca870..876c40e 100644
+--- a/scripts/audit_fix_ready_drafts.py
++++ b/scripts/audit_fix_ready_drafts.py
+@@ -25,6 +25,8 @@ from src.utils.dimension_helpers import (
+     extract_product_weight_from_text,
+     replace_description_measurements,
+ )
++from src.utils.approved_category import blocks_automated_category_change
++from src.utils.motors_category_tree import listing_category_rejection
+ from src.utils.publish_autofix import sanitize_placeholder_aspects
+ from src.utils.report_images import normalize_image_list
+ from src.utils.publish_validation import first_aspect_text, measurement_issue
+@@ -575,7 +577,13 @@ def choose_ready_category(
+     aspects,
+     current_category_id,
+     current_category_name,
++    optimization=None,
+ ):
++    if blocks_automated_category_change(optimization):
++        # Flag set: keep the stored leaf, including a blank one. Do not invent
++        # a category and do not follow the matcher.
++        return current_category_id, current_category_name, aspects
++
+     candidates = []
+     seen_titles = set()
+ 
+@@ -597,6 +605,8 @@ def choose_ready_category(
+             candidate_name,
+             description or "",
+         )
++        if listing_category_rejection(candidate_id):
++            candidate_id, candidate_name = None, None
+         candidates.append({
+             "label": label,
+             "title": normalized_title,
+@@ -623,6 +633,8 @@ def choose_ready_category(
+         current_category_name,
+         description or "",
+     )
++    if listing_category_rejection(current_id):
++        current_id, current_category_name = None, None
+     preferred = next((candidate for candidate in candidates if candidate["plausible"] and candidate["strong"]), None)
+     if not preferred:
+         preferred = next((candidate for candidate in candidates if candidate["plausible"]), None)
+@@ -947,6 +959,7 @@ def audit_and_fix_ready_drafts(
+             aspects,
+             original_opt.get("categoryId"),
+             original_opt.get("categoryName"),
++            optimization=original_opt,
+         )
+         if completed_aspects:
+             aspects = completed_aspects
+diff --git a/scripts/fix_listing_categories.py b/scripts/fix_listing_categories.py
+index ed4b460..6d39fb3 100644
+--- a/scripts/fix_listing_categories.py
++++ b/scripts/fix_listing_categories.py
+@@ -113,8 +113,10 @@ CATEGORY_NAMES = {
+ }
+ 
+ 
+-def get_fixes(conn):
++def get_fixes(conn, include_locked=False):
+     """Get all published products that need category fixes."""
++    from src.utils.approved_category import blocks_automated_category_change
++
+     cur = conn.cursor()
+     rows = cur.execute(
+         'SELECT sku, title, listing_id, optimization FROM collected_products WHERE status = ?',
+@@ -124,6 +126,8 @@ def get_fixes(conn):
+     fixes = []
+     for sku, title, listing_id, opt_json in rows:
+         opt = json.loads(opt_json) if opt_json else {}
++        if blocks_automated_category_change(opt) and not include_locked:
++            continue
+         current_cat = str(opt.get('categoryId', ''))
+ 
+         new_cat = None
+@@ -151,13 +155,28 @@ def get_fixes(conn):
+     return fixes
+ 
+ 
+-def apply_fix(ebay_client, conn, fix, dry_run=True):
++def apply_fix(ebay_client, conn, fix, dry_run=True, override_category_lock=False):
+     """Apply a single category fix to eBay and local DB."""
++    from src.utils.approved_category import locked_category_write_error
++    from src.utils.motors_category_tree import listing_category_rejection
++
+     sku = fix['sku']
+     new_cat = fix['new_cat']
+     old_cat = fix['old_cat']
+     cat_name = CATEGORY_NAMES.get(new_cat, new_cat)
+ 
++    cur = conn.cursor()
++    row = cur.execute('SELECT optimization FROM collected_products WHERE sku = ?', (sku,)).fetchone()
++    opt = json.loads(row[0]) if row and row[0] else {}
++    lock_error = locked_category_write_error(opt, override=override_category_lock)
++    if lock_error:
++        print(f"  [LOCK] {sku}: {lock_error}")
++        return False
++    rejected = listing_category_rejection(new_cat)
++    if rejected:
++        print(f"  [BLOCK] {sku}: {rejected}")
++        return False
++
+     if dry_run:
+         print(f"  [DRY] {sku}: {old_cat} → {new_cat} ({cat_name})")
+         return True
+@@ -200,12 +219,17 @@ def main():
+     parser = argparse.ArgumentParser(description='Fix wrong eBay listing categories')
+     parser.add_argument('--apply', action='store_true', help='Actually apply fixes (default: dry run)')
+     parser.add_argument('--sku', type=str, help='Fix only a specific SKU')
++    parser.add_argument(
++        '--override-category-lock',
++        action='store_true',
++        help='Allow remapping a listing whose optimization.categoryApproved flag is set',
++    )
+     args = parser.parse_args()
+ 
+     dry_run = not args.apply
+ 
+     conn = sqlite3.connect('ebay_collection.db')
+-    fixes = get_fixes(conn)
++    fixes = get_fixes(conn, include_locked=args.override_category_lock)
+ 
+     if args.sku:
+         fixes = [f for f in fixes if f['sku'] == args.sku]
+@@ -252,7 +276,13 @@ def main():
+ 
+     for i, fix in enumerate(fixes):
+         print(f"\n[{i+1}/{len(fixes)}] Fixing {fix['sku']}...")
+-        ok = apply_fix(ebay_client, conn, fix, dry_run=False)
++        ok = apply_fix(
++            ebay_client,
++            conn,
++            fix,
++            dry_run=False,
++            override_category_lock=args.override_category_lock,
++        )
+         if ok:
+             success_count += 1
+         else:
+diff --git a/scripts/repair_published_taxonomy.py b/scripts/repair_published_taxonomy.py
+index 41c1561..faa318a 100644
+--- a/scripts/repair_published_taxonomy.py
++++ b/scripts/repair_published_taxonomy.py
+@@ -25,6 +25,13 @@ from src.clients.real_ebay_client import create_real_ebay_client  # noqa: E402
+ from src.services.ebay_category_matcher import create_category_matcher  # noqa: E402
+ from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP  # noqa: E402
+ from src.utils.dimension_helpers import build_package_weight_and_size  # noqa: E402
++from src.utils.approved_category import (  # noqa: E402
++    approved_category_id,
++    blocks_automated_category_change,
++    locked_category_write_error,
++    plan_locked_override_revision,
++)
++from src.utils.motors_category_tree import listing_category_rejection  # noqa: E402
+ from src.utils.publish_validation import (  # noqa: E402
+     category_validation_errors,
+     measurement_validation_errors,
+@@ -120,6 +127,22 @@ def compute_target(match_row: dict, matcher):
+     return title, description, aspects, target_id, target_name, completed_aspects
+ 
+ 
++def parse_explicit_targets(values: list[str] | None) -> dict[str, str]:
++    """Parse repeatable ``SKU=categoryId`` override targets."""
++    targets: dict[str, str] = {}
++    for raw in values or []:
++        text = str(raw or "").strip()
++        if not text or "=" not in text:
++            raise ValueError(f"invalid --target-category {raw!r}; expected SKU=categoryId")
++        sku, category_id = text.split("=", 1)
++        sku = sku.strip()
++        category_id = str(category_id or "").strip()
++        if not sku or not category_id:
++            raise ValueError(f"invalid --target-category {raw!r}; expected SKU=categoryId")
++        targets[sku] = category_id
++    return targets
++
++
+ def parse_row(row: sqlite3.Row) -> dict:
+     data = dict(row)
+     for field in ("optimization", "images", "specs", "attributes", "videos", "cost_breakdown", "logs"):
+@@ -184,9 +207,18 @@ def prepare_inventory_payload(product_row: dict, description: str, aspects: dict
+     return payload
+ 
+ 
+-def audit_candidate(product_row: dict, matcher, client):
++def audit_candidate(
++    product_row: dict,
++    matcher,
++    client,
++    *,
++    override_category_lock: bool = False,
++    explicit_targets: dict[str, str] | None = None,
++):
+     opt = product_row["optimization"]
+-    title, description, existing_aspects, target_id, target_name, completed_aspects = compute_target(product_row, matcher)
++    title, description, existing_aspects, matcher_id, matcher_name, matcher_aspects = compute_target(
++        product_row, matcher
++    )
+     live_info = get_live_offer_info(client, product_row["sku"])
+     local_category_id = normalize_category_id(opt.get("categoryId"))
+     local_category_name = opt.get("categoryName")
+@@ -206,37 +238,93 @@ def audit_candidate(product_row: dict, matcher, client):
+         live_category_id
+         and live_category_id == canonical_live_category_id
+         and matcher.is_category_plausible_for_text(title, live_category_id, live_category_name)
++        and not listing_category_rejection(live_category_id)
+     )
+ 
+-    final_category_id = target_id
+-    final_category_name = target_name
+-    live_matches_target = bool(target_id and live_category_id == target_id)
+-    live_canonical_matches_target = bool(target_id and canonical_live_category_id == target_id)
+-    needs_live_revision = bool(
+-        target_id
+-        and live_category_id
+-        and live_category_id != target_id
+-        and (live_canonical_matches_target or not live_plausible)
+-    )
+-    if live_category_id and live_plausible and live_category_id != target_id and not needs_live_revision:
+-        final_category_id = live_category_id
+-        final_category_name = live_category_name or target_name
+-    elif live_matches_target:
+-        final_category_id = live_category_id
+-        final_category_name = live_category_name or target_name
+-
+-    needs_db_sync = bool(
+-        final_category_id and (
+-            local_category_id != final_category_id
+-            or (final_category_name and local_category_name != final_category_name)
++    locked = blocks_automated_category_change(opt)
++    explicit_target = (explicit_targets or {}).get(product_row["sku"])
++    override_plan = plan_locked_override_revision(
++        opt,
++        live_category_id,
++        explicit_target_id=explicit_target,
++    ) if locked else {"action": "", "target_id": "", "reason": ""}
++    if locked and listing_category_rejection(override_plan.get("target_id")):
++        override_plan = {
++            "action": "SKIP",
++            "target_id": "",
++            "reason": listing_category_rejection(override_plan.get("target_id")),
++        }
++
++    if locked:
++        # Never use a fresh matcher rematch for locked rows.
++        target_id = override_plan["target_id"] or None
++        if target_id and str(opt.get("categoryId") or "").strip() == target_id:
++            target_name = local_category_name or f"Category {target_id}"
++        elif target_id:
++            target_name = f"Category {target_id}"
++        else:
++            target_name = None
++        completed_aspects = existing_aspects
++        final_category_id = target_id or live_category_id or local_category_id
++        final_category_name = target_name or live_category_name or local_category_name
++        if listing_category_rejection(final_category_id):
++            final_category_id = local_category_id if not listing_category_rejection(local_category_id) else None
++            final_category_name = local_category_name if final_category_id else None
++        needs_live_revision = override_plan["action"] == "REVISE_LIVE"
++        needs_db_sync = False
++        action = "LOCKED"
++        if override_category_lock:
++            action = override_plan["action"]
++    else:
++        target_id = matcher_id
++        target_name = matcher_name
++        completed_aspects = matcher_aspects
++        if listing_category_rejection(target_id):
++            logger.warning(
++                "%s matcher category %s is not a Motors tree-100 leaf; not revising to it",
++                product_row["sku"],
++                target_id,
++            )
++            target_id = None
++            target_name = None
++            completed_aspects = existing_aspects
++        final_category_id = target_id
++        final_category_name = target_name
++        live_matches_target = bool(target_id and live_category_id == target_id)
++        live_canonical_matches_target = bool(target_id and canonical_live_category_id == target_id)
++        needs_live_revision = bool(
++            target_id
++            and live_category_id
++            and live_category_id != target_id
++            and not listing_category_rejection(target_id)
++            and (live_canonical_matches_target or not live_plausible)
+         )
+-    )
+-
+-    action = "OK"
+-    if needs_live_revision:
+-        action = "REVISE_LIVE"
+-    elif needs_db_sync:
+-        action = "SYNC_DB"
++        if (
++            live_category_id
++            and live_plausible
++            and not listing_category_rejection(live_category_id)
++            and live_category_id != target_id
++            and not needs_live_revision
++        ):
++            final_category_id = live_category_id
++            final_category_name = live_category_name or target_name
++        elif live_matches_target:
++            final_category_id = live_category_id
++            final_category_name = live_category_name or target_name
++        if listing_category_rejection(final_category_id):
++            final_category_id = None
++            final_category_name = None
++        needs_db_sync = bool(
++            final_category_id and (
++                local_category_id != final_category_id
++                or (final_category_name and local_category_name != final_category_name)
++            )
++        )
++        action = "OK"
++        if needs_live_revision:
++            action = "REVISE_LIVE"
++        elif needs_db_sync:
++            action = "SYNC_DB"
+ 
+     return {
+         "sku": product_row["sku"],
+@@ -257,12 +345,33 @@ def audit_candidate(product_row: dict, matcher, client):
+         "live_plausible": live_plausible,
+         "final_category_id": final_category_id,
+         "final_category_name": final_category_name,
++        "approved_category_id": approved_category_id(opt),
++        "override_action": override_plan["action"] or None,
++        "override_reason": override_plan["reason"] or None,
++        "skip_canonicalize": locked,
+         "action": action,
+     }
+ 
+ 
+-def apply_live_revision(conn: sqlite3.Connection, matcher, client, product_row: dict, candidate: dict):
++def apply_live_revision(
++    conn: sqlite3.Connection,
++    matcher,
++    client,
++    product_row: dict,
++    candidate: dict,
++    *,
++    override_category_lock: bool = False,
++):
+     sku = product_row["sku"]
++    lock_error = locked_category_write_error(
++        product_row.get("optimization") or {},
++        override=override_category_lock,
++    )
++    if lock_error:
++        raise RuntimeError(lock_error)
++    rejection = listing_category_rejection(candidate.get("target_category_id"))
++    if rejection:
++        raise RuntimeError(rejection)
+     enrich_product_dimensions(product_row)
+ 
+     opt = dict(product_row.get("optimization") or {})
+@@ -275,7 +384,15 @@ def apply_live_revision(conn: sqlite3.Connection, matcher, client, product_row:
+     title_context = " ".join(part for part in ((product_row.get("title") or "").strip(), candidate["title"]) if part).strip()
+     blockers = []
+     blockers.extend(measurement_validation_errors(final_aspects))
+-    blockers.extend(category_validation_errors(matcher, title_context, candidate["target_category_id"], candidate["target_category_name"]))
++    blockers.extend(
++        category_validation_errors(
++            matcher,
++            title_context,
++            candidate["target_category_id"],
++            candidate["target_category_name"],
++            skip_canonicalize=bool(candidate.get("skip_canonicalize")),
++        )
++    )
+     if blockers:
+         raise RuntimeError("; ".join(blockers))
+ 
+@@ -315,7 +432,22 @@ def apply_live_revision(conn: sqlite3.Connection, matcher, client, product_row:
+     }
+ 
+ 
+-def apply_db_sync(conn: sqlite3.Connection, product_row: dict, candidate: dict):
++def apply_db_sync(
++    conn: sqlite3.Connection,
++    product_row: dict,
++    candidate: dict,
++    *,
++    override_category_lock: bool = False,
++):
++    lock_error = locked_category_write_error(
++        product_row.get("optimization") or {},
++        override=override_category_lock,
++    )
++    if lock_error:
++        raise RuntimeError(lock_error)
++    rejection = listing_category_rejection(candidate.get("final_category_id"))
++    if rejection:
++        raise RuntimeError(rejection)
+     update_local_optimization(
+         conn,
+         product_row["sku"],
+@@ -335,7 +467,23 @@ def main():
+     parser = argparse.ArgumentParser(description="Repair stale taxonomy for published listings")
+     parser.add_argument("--apply", action="store_true", help="Apply live and local fixes")
+     parser.add_argument("--sku", type=str, help="Limit to one published SKU")
++    parser.add_argument(
++        "--override-category-lock",
++        action="store_true",
++        help="Allow revising a listing whose optimization.categoryApproved flag is set",
++    )
++    parser.add_argument(
++        "--target-category",
++        action="append",
++        default=[],
++        metavar="SKU=ID",
++        help="Explicit per-SKU lock override target (repeatable). Never inferred from the matcher.",
++    )
+     args = parser.parse_args()
++    try:
++        explicit_targets = parse_explicit_targets(args.target_category)
++    except ValueError as exc:
++        parser.error(str(exc))
+ 
+     conn = sqlite3.connect(str(ROOT / "ebay_collection.db"), timeout=30)
+     conn.execute("PRAGMA journal_mode=WAL")
+@@ -349,10 +497,16 @@ def main():
+ 
+     logger.info("Published taxonomy repair scan: %s candidates", len(rows))
+     for row in rows:
+-        candidate = audit_candidate(row, matcher, client)
++        candidate = audit_candidate(
++            row,
++            matcher,
++            client,
++            override_category_lock=args.override_category_lock,
++            explicit_targets=explicit_targets,
++        )
+         results.append(candidate)
+         logger.info(
+-            "%s | action=%s | local=%s/%s | live=%s/%s | target=%s/%s",
++            "%s | action=%s | local=%s/%s | live=%s/%s | target=%s/%s | override=%s (%s)",
+             candidate["sku"],
+             candidate["action"],
+             candidate["local_category_id"],
+@@ -361,6 +515,8 @@ def main():
+             candidate["live_category_name"],
+             candidate["target_category_id"],
+             candidate["target_category_name"],
++            candidate.get("override_action") or "-",
++            candidate.get("override_reason") or "n/a",
+         )
+ 
+     applied = []
+@@ -368,9 +524,31 @@ def main():
+         for row, candidate in zip(rows, results):
+             try:
+                 if candidate["action"] == "REVISE_LIVE":
+-                    applied.append(apply_live_revision(conn, matcher, client, row, candidate))
++                    applied.append(
++                        apply_live_revision(
++                            conn,
++                            matcher,
++                            client,
++                            row,
++                            candidate,
++                            override_category_lock=args.override_category_lock,
++                        )
++                    )
++                elif candidate["action"] == "SKIP":
++                    applied.append({
++                        "sku": candidate["sku"],
++                        "action": "SKIP",
++                        "message": candidate.get("override_reason") or "skipped locked listing",
++                    })
+                 elif candidate["action"] == "SYNC_DB":
+-                    applied.append(apply_db_sync(conn, row, candidate))
++                    applied.append(
++                        apply_db_sync(
++                            conn,
++                            row,
++                            candidate,
++                            override_category_lock=args.override_category_lock,
++                        )
++                    )
+                 time.sleep(1.0)
+             except Exception as exc:
+                 logger.error("%s failed: %s", candidate["sku"], exc)
+diff --git a/server.py b/server.py
+index 9286329..bd397d8 100644
+--- a/server.py
++++ b/server.py
+@@ -1533,13 +1533,36 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
+         category_matcher = EbayCategoryMatcher(ebay_client.oauth)
+         stored_cat = str(opt_data.get("categoryId") or "").strip() or None
+         stored_cat_name = opt_data.get("categoryName")
+-        if stored_cat:
+-            stored_cat, stored_cat_name = category_matcher.canonicalize_category(
++        from src.utils.approved_category import (
++            blocks_automated_category_change,
++            evaluate_approved_category,
++            should_auto_remap_invalid_category,
++        )
++        from src.utils.motors_category_tree import listing_category_rejection
++
++        approved_decision = evaluate_approved_category(stored_cat or "", opt_data)
++        if approved_decision.approved and approved_decision.error:
++            raise HTTPException(status_code=400, detail=approved_decision.error)
++        preserve_approved_category = approved_decision.preserve
++        if not preserve_approved_category and blocks_automated_category_change(opt_data):
++            raise HTTPException(
++                status_code=400,
++                detail=approved_decision.error or "invalid_or_blank_category_id",
++            )
++        if stored_cat and not preserve_approved_category:
++            canonical_cat, canonical_name = category_matcher.canonicalize_category(
+                 title_context,
+                 stored_cat,
+                 stored_cat_name,
+                 product.description,
+             )
++            if canonical_cat and listing_category_rejection(canonical_cat):
++                print(
++                    f"[CAT] Canonical category {canonical_cat} is not a Motors tree-100 leaf; "
++                    f"keeping stored {stored_cat}"
++                )
++            else:
++                stored_cat, stored_cat_name = canonical_cat, canonical_name
+         category_id, category_name, completed_aspects = category_matcher.get_category_and_aspects(
+             category_lookup_title,
+             existing_aspects,
+@@ -1555,7 +1578,8 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
+         
+         stored_plausible = bool(
+             stored_cat and (
+-                stored_cat in protected_stored_categories
++                preserve_approved_category
++                or stored_cat in protected_stored_categories
+                 or category_matcher.is_category_plausible_for_text(title_context, stored_cat, stored_cat_name)
+             )
+         )
+@@ -1583,10 +1607,17 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
+             if not category_id:
+                 suggestions = ebay_client.get_category_suggestions(listing_title)
+                 if suggestions:
+-                    category_id = suggestions[0].get("category", {}).get("categoryId")
+-                    print(f"[FALLBACK] Using suggested category: {category_id}")
++                    suggested = suggestions[0].get("category", {}).get("categoryId")
++                    if suggested and not listing_category_rejection(suggested):
++                        category_id = suggested
++                        print(f"[FALLBACK] Using suggested category: {category_id}")
++                    elif suggested:
++                        print(f"[FALLBACK] Rejecting non-tree-100 category {suggested}")
+             completed_aspects = existing_aspects
+         
++        if category_id and listing_category_rejection(category_id):
++            raise HTTPException(status_code=400, detail=listing_category_rejection(category_id))
++
+         if category_id:
+             print(f"[AUTO] Category: {category_id} ({category_name})")
+             print(f"[AUTO] Aspects: {len(completed_aspects)} items (was {len(existing_aspects)})")
+@@ -1773,8 +1804,9 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
+ 
+                         opt_data["publishedCategoryId"] = str(category_id or "")
+                         if live_category_id:
+-                            opt_data["liveCategoryId"] = live_category_id
+-                            opt_data["categoryId"] = live_category_id
++                            from src.utils.approved_category import apply_live_category_readback
++
++                            apply_live_category_readback(opt_data, live_category_id)
+                         product.optimization = opt_data
+                         flag_modified(product, 'optimization')
+                         break  # Success!
+@@ -1803,12 +1835,22 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
+                         eps_images = None  # force re-upload
+                         fixed = True
+                     
+-                    # Auto-fix: invalid category
+-                    if not fixed and is_invalid_category_error(last_error):
++                    # Auto-fix: invalid category. Locked leaves stay put, and a
++                    # Motors rematch must not land on a tree-0 id.
++                    if (
++                        not fixed
++                        and is_invalid_category_error(last_error)
++                        and should_auto_remap_invalid_category(
++                            opt_data, preserve=preserve_approved_category
++                        )
++                    ):
+                         try:
+                             new_id, new_name, new_aspects = category_matcher.get_category_and_aspects(
+                                 listing_title, completed_aspects, description
+                             )
++                            if new_id and listing_category_rejection(new_id):
++                                print(f"[AUTO-FIX] Rejecting non-tree-100 rematch {new_id}")
++                                new_id = None
+                             if new_id and new_id != category_id:
+                                 category_id, category_name = new_id, new_name
+                                 completed_aspects.update(new_aspects)
+diff --git a/src/plugins/inventory_sync/sync_service.py b/src/plugins/inventory_sync/sync_service.py
+index dc569d4..5349b0a 100644
+--- a/src/plugins/inventory_sync/sync_service.py
++++ b/src/plugins/inventory_sync/sync_service.py
+@@ -39,6 +39,33 @@ from src.utils.sold_through_relist import (
+ )
+ 
+ 
++def pin_offer_category_fields(offer: dict) -> dict:
++    """Snapshot live offer category fields so sync PUTs cannot move taxonomy."""
++    listing = offer.get("listing") if isinstance(offer.get("listing"), dict) else {}
++    return {
++        "categoryId": offer.get("categoryId"),
++        "listing_categoryId": listing.get("categoryId") if listing else None,
++    }
++
++
++def apply_pinned_offer_category(offer: dict, pinned: dict | None) -> dict:
++    """Restore GET-time category fields onto an outgoing offer payload."""
++    if not isinstance(offer, dict) or not pinned:
++        return offer
++    if "categoryId" in pinned:
++        if pinned["categoryId"] is None:
++            offer.pop("categoryId", None)
++        else:
++            offer["categoryId"] = pinned["categoryId"]
++    listing = offer.get("listing")
++    if isinstance(listing, dict) and "listing_categoryId" in pinned:
++        if pinned["listing_categoryId"] is None:
++            listing.pop("categoryId", None)
++        else:
++            listing["categoryId"] = pinned["listing_categoryId"]
++    return offer
++
++
+ def _env_int(name: str, default: int) -> int:
+     value = os.getenv(name, "").strip()
+     if not value:
+@@ -906,7 +933,9 @@ class InventorySyncService:
+         offer_ok = False
+         if offer_id:
+             try:
++                pinned_category = pin_offer_category_fields(offer)
+                 offer['availableQuantity'] = quantity
++                apply_pinned_offer_category(offer, pinned_category)
+                 put_offer = requests.put(
+                     f"{base}/sell/inventory/v1/offer/{offer_id}",
+                     headers=headers,
+@@ -1036,9 +1065,11 @@ class InventorySyncService:
+         
+         offer = offers[0]
+         offer_id = offer['offerId']
++        pinned_category = pin_offer_category_fields(offer)
+         
+         # 更新价格
+         offer['pricingSummary']['price']['value'] = str(round(new_price, 2))
++        apply_pinned_offer_category(offer, pinned_category)
+         
+         url = f"https://api.ebay.com/sell/inventory/v1/offer/{offer_id}"
+         resp = requests.put(url, headers=headers, json=offer, timeout=30, verify=False)
+diff --git a/src/services/ebay_category_matcher.py b/src/services/ebay_category_matcher.py
+index 0406cc8..f135b38 100644
+--- a/src/services/ebay_category_matcher.py
++++ b/src/services/ebay_category_matcher.py
+@@ -37,6 +37,14 @@ class EbayCategoryMatcher:
+         if not cid:
+             return None, category_name
+ 
++        # Motors publishes against tree 100. The furniture remaps below
++        # (pantry -> 20487 Cabinets & Cupboards, and the rest of the tree-0
++        # map) are not Motors leaves. Keep the stored id and let the resolver
++        # reject it when it is not a tree-100 leaf, instead of substituting
++        # a tree-0 id that eBay then rejects as invalid category.
++        if get_store_profile().is_motors:
++            return cid, category_name
++
+         text_lower = self._normalize_keyword_text(
+             " ".join(part for part in (title or "", description or "", category_name or "") if part)
+         )
+@@ -702,17 +710,29 @@ class EbayCategoryMatcher:
+         
+         # Step 3: Cross-validate and decide
+         # Motors stores publish against category tree 100. The keyword fallback map
+-        # holds tree-0 ids (e.g. 174020 Trailer Hitches) that do not exist in tree
+-        # 100; the Taxonomy API is queried against the store's OWN tree, so its
+-        # suggestion is the correct tree-100 leaf (e.g. 33653). Trust the API there
+-        # rather than the wrong-tree keyword id. Furniture (tree 0) is unaffected.
+-        if get_store_profile().is_motors and api_cat_id:
+-            if kw_cat_id and kw_cat_id != api_cat_id:
+-                logging.info(
+-                    f"[CAT] Motors tree 100: using API={api_cat_id} ({api_cat_name}) "
+-                    f"over tree-0 keyword={kw_cat_id} ({kw_cat_name})"
+-                )
+-            return api_cat_id, api_cat_name
++        # holds tree-0 ids (e.g. 20487 Cabinets & Cupboards, 174020 Trailer Hitches).
++        # Some of those numbers also exist in tree 100 under a different name, so
++        # they must not be used as a fallback. Accept an API suggestion only when
++        # it is a tree-100 leaf; otherwise fail closed and return no category.
++        if get_store_profile().is_motors:
++            from src.utils.motors_category_tree import is_tree100_leaf
++
++            if api_cat_id and is_tree100_leaf(str(api_cat_id)):
++                if kw_cat_id and str(kw_cat_id) != str(api_cat_id):
++                    logging.info(
++                        f"[CAT] Motors tree 100: using API={api_cat_id} ({api_cat_name}) "
++                        f"over tree-0 keyword={kw_cat_id} ({kw_cat_name})"
++                    )
++                return str(api_cat_id), api_cat_name
++            logging.warning(
++                "[CAT] Motors tree 100: rejecting category %s (%s); "
++                "not falling back to tree-0 keyword %s (%s)",
++                api_cat_id,
++                api_cat_name,
++                kw_cat_id,
++                kw_cat_name,
++            )
++            return None, None
+ 
+         if kw_cat_id and kw_cat_id != "38208":  # Not the generic fallback default
+             # Strong keyword match — trust it over API
+diff --git a/src/services/ebay_publisher.py b/src/services/ebay_publisher.py
+index 0556436..27dc791 100644
+--- a/src/services/ebay_publisher.py
++++ b/src/services/ebay_publisher.py
+@@ -1231,6 +1231,17 @@ class EbayPublisher:
+                     
+                     # 更新 offer 类目与 buyer-facing 描述
+                     current_category = existing_offer.get("categoryId", "")
++                    from src.utils.approved_category import blocks_automated_category_change
++
++                    if (
++                        current_category
++                        and current_category != category_id
++                        and blocks_automated_category_change(product.get("optimization"))
++                    ):
++                        self.logger.warning(
++                            f"[CATEGORY] lock set; keeping live offer category {current_category}"
++                        )
++                        category_id = current_category
+                     if current_category != category_id:
+                         self.logger.info(f"[INFO] Updating offer category: {current_category} -> {category_id}")
+                     self.ebay_client.update_offer_category(
+@@ -1589,7 +1600,37 @@ class EbayPublisher:
+         suggested_id: Optional[str] = None
+     ) -> Tuple[str, str, Dict[str, List[str]]]:
+         """获取类目和完整的 Item Specifics"""
+-        
++        opt = product.get("optimization") if isinstance(product, dict) else {}
++        if isinstance(opt, str):
++            try:
++                opt = json.loads(opt)
++            except Exception:
++                opt = {}
++        if not isinstance(opt, dict):
++            opt = {}
++        from src.utils.approved_category import blocks_automated_category_change
++        from src.utils.motors_category_tree import listing_category_rejection
++
++        if blocks_automated_category_change(opt):
++            # Fail closed: never inherit suggested_id / rematch when the flag is
++            # set. A blank or invalid stored leaf must not publish a new leaf,
++            # and a Motors lock must not fall through to a tree-0 id.
++            locked_id = str(opt.get("categoryId") or "").strip()
++            if locked_id and listing_category_rejection(locked_id):
++                self.logger.warning(
++                    f"[CATEGORY] locked category {locked_id} is not a Motors tree-100 leaf; refusing rematch"
++                )
++                return "", str(opt.get("categoryName") or ""), existing_aspects
++            if locked_id:
++                self.logger.info(f"[CATEGORY] Preserving locked category {locked_id}")
++                cat_name = str(opt.get("categoryName") or f"Category {locked_id}")
++                aspects = self._ensure_required_aspects(locked_id, existing_aspects, title, product)
++                return locked_id, cat_name, aspects
++            self.logger.warning(
++                "[CATEGORY] lock set but categoryId is blank; refusing rematch"
++            )
++            return "", str(opt.get("categoryName") or ""), existing_aspects
++
+         # Collect all known category IDs from our verified maps
+         known_ids = set(self.CATEGORY_REQUIRED_ASPECTS.keys())
+         for rule in self.CATEGORY_RULES:
+@@ -1598,7 +1639,12 @@ class EbayPublisher:
+         # 1. 优先使用建议的 ID (来自 AI 优化), but validate it first
+         if suggested_id:
+             suggested_id = str(suggested_id).strip()
+-            if suggested_id in known_ids:
++            motors_leaf = bool(get_store_profile().is_motors) and not listing_category_rejection(suggested_id)
++            if listing_category_rejection(suggested_id):
++                self.logger.warning(
++                    f"[CATEGORY] suggested_id {suggested_id} is not a Motors tree-100 leaf; refusing it"
++                )
++            elif suggested_id in known_ids or motors_leaf:
+                 self.logger.info(f"[CATEGORY] Using validated suggested ID: {suggested_id}")
+                 cat_name = f"Category {suggested_id}"
+                 aspects = self._ensure_required_aspects(suggested_id, existing_aspects, title, product)
+@@ -1613,14 +1659,27 @@ class EbayPublisher:
+             matcher = EbayCategoryMatcher(self.oauth)
+             cat_id, cat_name, aspects = matcher.get_category_and_aspects(title, existing_aspects)
+             
+-            if cat_id:
++            if cat_id and not listing_category_rejection(cat_id):
+                 aspects = self._ensure_required_aspects(cat_id, aspects, title, product)
+                 return cat_id, cat_name, aspects
++            if cat_id:
++                self.logger.warning(
++                    f"[CATEGORY] matcher category {cat_id} is not a Motors tree-100 leaf; refusing it"
++                )
+         except Exception as e:
+             self.logger.warning(f"[WARN] Category matcher failed: {e}")
+         
+-        # 3. Fallback: 基于关键词匹配
++        # 3. Fallback: 基于关键词匹配. Motors must not inherit a keyword id.
++        # Tree-0 rules include numbers that also exist in tree 100 under a
++        # different name (174020 is Trailer Hitches here and Brake Pad Wear
++        # Sensors there). Reject the whole keyword map on Motors, including
++        # ids that happen to be numeric leaves.
+         cat_id, cat_name = self._fallback_category_match(title)
++        if get_store_profile().is_motors or listing_category_rejection(cat_id):
++            self.logger.warning(
++                f"[CATEGORY] refusing keyword fallback {cat_id} ({cat_name}) for a Motors listing"
++            )
++            return "", cat_name or "", existing_aspects
+         aspects = self._ensure_required_aspects(cat_id, existing_aspects, title, product)
+         
+         return cat_id, cat_name, aspects
+diff --git a/src/services/semantic_rewrite.py b/src/services/semantic_rewrite.py
+index ceaf79c..acba32f 100644
+--- a/src/services/semantic_rewrite.py
++++ b/src/services/semantic_rewrite.py
+@@ -1970,7 +1970,9 @@ def apply_rewrite(ebay, conn, plan: RewritePlan, *, cli_apply: bool = False) ->
+         opt["description"] = description
+         opt["aspects"] = aspects
+         if category_id:
+-            opt["categoryId"] = str(category_id)
++            from src.utils.approved_category import apply_live_category_readback
++
++            apply_live_category_readback(opt, str(category_id))
+         logs = []
+         if row and row.get("logs"):
+             try:
+diff --git a/src/utils/approved_category.py b/src/utils/approved_category.py
+new file mode 100644
+index 0000000..298922b
+--- /dev/null
++++ b/src/utils/approved_category.py
+@@ -0,0 +1,350 @@
++"""Human-approved eBay category lock for publish / normalize / audit.
++
++Operators mark a product's stored category as approved by setting
++``optimization.categoryApproved = true`` and pinning
++``optimization.categoryApprovedId`` to that leaf (same JSON that holds
++``categoryId``). The allow-category path
++(``scripts/apply_approved_fixes.py --allow-category --mark-category-approved``)
++stamps both fields to an explicit manifest ``category_id``.
++
++While the lock is set, canonicalize / profile-normalize / audit remap
++must keep that stored category. Publish may honor the lock only when the
++id is a well-formed sellable leaf and is not on the high-insertion-fee
++blacklist. The fee/blacklist gate always wins. Unapproved products keep
++the existing remap behavior.
++
++The lock is bound to ``categoryApprovedId``. If another tool later
++rewrites ``categoryId`` without clearing the flag, the new id does not
++inherit *preservation* (publish will not treat the rewritten leaf as
++approved). Automated remaps still fail closed whenever the approval
++*flag* is set — including blank / invalid pins — unless a human passes
++``--override-category-lock``.
++
++Legacy rows that only have ``categoryApproved=true`` are still treated as
++approved for the current ``categoryId``; persist the id with
++``backfill_approved_category_id`` (``is_category_approved`` does not
++mutate). Existing AquaRides rows that lack both fields are unlocked.
++
++On a Motors store (category tree 100) a locked id is preserved only when it
++is a leaf in that tree. Tree-0 ids such as 20487 are not sellable leaves
++there, so the lock does not publish them. The high-insertion-fee blacklist
++still wins over a lock.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Mapping, Optional
++
++CATEGORY_APPROVED_KEY = "categoryApproved"
++CATEGORY_APPROVED_ID_KEY = "categoryApprovedId"
++
++APPROVED_CATEGORY_NON_LEAF_ERROR = (
++    "Approved category {category_id} is not a sellable leaf in the cached category tree"
++)
++APPROVED_CATEGORY_BLACKLIST_ERROR = "high_insertion_fee"
++APPROVED_CATEGORY_INVALID_ID_ERROR = "invalid_or_blank_category_id"
++
++_TRUTHY = {True, 1, "1", "true", "True", "yes", "Yes"}
++logger = logging.getLogger(__name__)
++
++_DEFAULT_BLACKLIST = Path("data/config/high_fee_category_blacklist.json")
++
++
++def _as_optimization(optimization: Any) -> Mapping[str, Any] | None:
++    """Accept a dict or a JSON object string (SQLite / publisher payload)."""
++    if isinstance(optimization, Mapping):
++        return optimization
++    if isinstance(optimization, str) and optimization.strip():
++        try:
++            data = json.loads(optimization)
++        except ValueError:
++            return None
++        return data if isinstance(data, Mapping) else None
++    return None
++
++
++def is_valid_category_id(category_id: str | None) -> bool:
++    cid = str(category_id or "").strip()
++    return bool(cid) and cid.isdigit()
++
++
++def approved_category_id(optimization: Mapping[str, Any] | None) -> str:
++    opt = _as_optimization(optimization)
++    if opt is None:
++        return ""
++    return str(opt.get(CATEGORY_APPROVED_ID_KEY) or "").strip()
++
++
++def plan_locked_override_revision(
++    optimization: Mapping[str, Any] | None,
++    live_category_id: str | None,
++    *,
++    explicit_target_id: str | None = None,
++) -> dict[str, str]:
++    """What ``--override-category-lock`` may do to a locked listing.
++
++    Target is the operator's explicit per-SKU id, else ``categoryApprovedId``.
++    Never a matcher rematch. Skip when live already equals that leaf, or when
++    no approved / explicit target exists.
++    """
++    target = str(explicit_target_id or approved_category_id(optimization) or "").strip()
++    live = str(live_category_id or "").strip()
++    if not target:
++        return {
++            "action": "SKIP",
++            "target_id": "",
++            "reason": "locked with no categoryApprovedId and no explicit --target-category",
++        }
++    if live == target:
++        return {
++            "action": "SKIP",
++            "target_id": target,
++            "reason": f"live {live} already equals approved leaf {target}",
++        }
++    return {
++        "action": "REVISE_LIVE",
++        "target_id": target,
++        "reason": f"restore approved leaf {target} (live={live or 'blank'})",
++    }
++
++
++def category_approval_flag_set(optimization: Mapping[str, Any] | None) -> bool:
++    """True when an operator stamped the approval flag, even if the pin is bad."""
++    opt = _as_optimization(optimization)
++    if opt is None:
++        return False
++    return opt.get(CATEGORY_APPROVED_KEY) in _TRUTHY
++
++
++def is_category_approved(
++    optimization: Mapping[str, Any] | None,
++    category_id: str | None = None,
++) -> bool:
++    opt = _as_optimization(optimization)
++    if opt is None or not category_approval_flag_set(opt):
++        return False
++
++    current = str(category_id or opt.get("categoryId") or "").strip()
++    pinned = approved_category_id(opt)
++    if not pinned:
++        # Legacy flag-only rows: honor the current leaf, but do not write.
++        return bool(current)
++
++    if pinned != current:
++        logger.warning(
++            "categoryApprovedId=%s does not match current categoryId=%s; treating as unapproved",
++            pinned,
++            current,
++        )
++        return False
++    return True
++
++
++def apply_live_category_readback(
++    optimization: dict[str, Any],
++    live_category_id: str | None,
++    live_category_name: str | None = None,
++) -> dict[str, Any]:
++    """Record the live offer category without moving a locked leaf.
++
++    Unlocked rows still adopt the live ``categoryId``. A truthy
++    ``categoryApproved`` flag keeps the stored ``categoryId`` and only
++    writes ``liveCategoryId`` / ``liveCategoryName``.
++    """
++    if not isinstance(optimization, dict):
++        return optimization
++    live = str(live_category_id or "").strip()
++    if not live:
++        return optimization
++    optimization["liveCategoryId"] = live
++    if live_category_name:
++        optimization["liveCategoryName"] = str(live_category_name)
++    if not blocks_automated_category_change(optimization):
++        optimization["categoryId"] = live
++        if live_category_name:
++            optimization["categoryName"] = str(live_category_name)
++    return optimization
++
++
++def blocks_automated_category_change(
++    optimization: Mapping[str, Any] | None,
++    *,
++    override: bool = False,
++) -> bool:
++    """Fail-closed remap gate.
++
++    Any truthy ``categoryApproved`` flag blocks automation from moving the
++    category, including blank / invalid / mismatched pins. Manual remap
++    tools must pass ``override=True`` (``--override-category-lock``).
++    """
++    if override:
++        return False
++    return category_approval_flag_set(optimization)
++
++
++def should_auto_remap_invalid_category(
++    optimization: Mapping[str, Any] | None,
++    *,
++    preserve: bool = False,
++    override: bool = False,
++) -> bool:
++    """Invalid-category publish retry may rematch only when unlocked.
++
++    ``preserve=True`` is the approved-leaf path. A truthy flag with a blank
++    or mismatched pin also blocks rematch (fail closed).
++    """
++    if preserve:
++        return False
++    return not blocks_automated_category_change(optimization, override=override)
++
++
++def locked_category_write_error(
++    optimization: Mapping[str, Any] | None,
++    *,
++    override: bool = False,
++) -> str:
++    if not blocks_automated_category_change(optimization, override=override):
++        return ""
++    pinned = approved_category_id(optimization) or "(blank)"
++    return (
++        f"category lock is set (categoryApprovedId={pinned}); "
++        "pass --override-category-lock to change the category"
++    )
++
++
++def backfill_approved_category_id(
++    optimization: dict[str, Any],
++    category_id: str | None = None,
++) -> str:
++    """Persist ``categoryApprovedId`` for a legacy flag-only row."""
++    if not isinstance(optimization, dict):
++        return ""
++    if not category_approval_flag_set(optimization):
++        return ""
++    pinned = approved_category_id(optimization)
++    if pinned:
++        return pinned
++    cid = str(category_id or optimization.get("categoryId") or "").strip()
++    if not cid:
++        return ""
++    optimization[CATEGORY_APPROVED_ID_KEY] = cid
++    logger.info("Backfilled categoryApprovedId=%s from current categoryId", cid)
++    return cid
++
++
++def mark_category_approved(
++    optimization: dict[str, Any],
++    category_id: str | None = None,
++) -> dict[str, Any]:
++    cid = str(category_id or optimization.get("categoryId") or "").strip()
++    optimization[CATEGORY_APPROVED_KEY] = True
++    if cid:
++        optimization[CATEGORY_APPROVED_ID_KEY] = cid
++    return optimization
++
++
++def approved_category_non_leaf_error(category_id: str) -> str:
++    return APPROVED_CATEGORY_NON_LEAF_ERROR.format(category_id=category_id)
++
++
++def _category_is_high_fee(category_id: str, blacklist_path: Optional[str] = None) -> bool:
++    cid = str(category_id or "").strip()
++    if not cid:
++        return False
++    try:
++        from src.utils.publish_fee_preview import category_is_high_fee
++
++        return bool(category_is_high_fee(cid, blacklist_path=blacklist_path))
++    except ImportError:
++        pass
++    path = Path(
++        blacklist_path
++        or os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH")
++        or _DEFAULT_BLACKLIST
++    )
++    if not path.is_file():
++        return False
++    try:
++        data = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return False
++    skip_ids = data.get("publish_skip_category_ids") if isinstance(data, dict) else None
++    if not isinstance(skip_ids, (list, tuple, set)):
++        return False
++    return cid in {str(item).strip() for item in skip_ids}
++
++
++def _is_sellable_leaf_category(category_id: str, cache_dir: Optional[Path] = None) -> bool:
++    cid = str(category_id or "").strip()
++    if not is_valid_category_id(cid):
++        return False
++    try:
++        from src.utils.category_tree_cache import is_cached_leaf_category
++
++        return bool(is_cached_leaf_category(cid, cache_dir=cache_dir))
++    except ImportError:
++        pass
++    try:
++        from src.utils.store_profile import get_store_profile
++
++        if get_store_profile().is_motors:
++            from src.utils.motors_category_tree import is_tree100_leaf
++
++            return is_tree100_leaf(cid)
++    except Exception:
++        logger.warning("Motors leaf check failed for %s; treating as not sellable", cid)
++        return False
++    # Furniture / non-Motors rows have no local tree cache. A well-formed
++    # numeric id stays acceptable here; publish callers still run their own
++    # live leaf check. Empty / non-numeric ids already failed above.
++    return True
++
++
++@dataclass(frozen=True)
++class ApprovedCategoryDecision:
++    """Outcome of the approved-category gate.
++
++    ``preserve``: skip canonicalize / profile / audit remaps and keep the id.
++    ``error``: publish/audit blocker when the approval cannot be honored.
++    """
++
++    approved: bool
++    preserve: bool
++    error: Optional[str] = None
++
++
++def evaluate_approved_category(
++    category_id: str,
++    optimization: Mapping[str, Any] | None = None,
++    *,
++    blacklist_path: Optional[str] = None,
++    cache_dir: Optional[Path] = None,
++) -> ApprovedCategoryDecision:
++    if not is_category_approved(optimization, category_id):
++        return ApprovedCategoryDecision(approved=False, preserve=False)
++
++    cid = str(category_id or "").strip()
++    if not is_valid_category_id(cid):
++        return ApprovedCategoryDecision(
++            approved=True,
++            preserve=False,
++            error=APPROVED_CATEGORY_INVALID_ID_ERROR,
++        )
++    if _category_is_high_fee(cid, blacklist_path=blacklist_path):
++        return ApprovedCategoryDecision(
++            approved=True,
++            preserve=False,
++            error=APPROVED_CATEGORY_BLACKLIST_ERROR,
++        )
++    if not _is_sellable_leaf_category(cid, cache_dir=cache_dir):
++        return ApprovedCategoryDecision(
++            approved=True,
++            preserve=False,
++            error=approved_category_non_leaf_error(cid),
++        )
++    return ApprovedCategoryDecision(approved=True, preserve=True)
+diff --git a/src/utils/listing_quality_gate.py b/src/utils/listing_quality_gate.py
+index c31981c..f8d95ff 100644
+--- a/src/utils/listing_quality_gate.py
++++ b/src/utils/listing_quality_gate.py
+@@ -23,6 +23,7 @@ from src.utils.product_context_signals import (
+     has_outdoor_marker,
+     outdoor_context as strict_outdoor_context,
+ )
++from src.utils.approved_category import blocks_automated_category_change
+ from src.utils.publish_aspect_completion import infer_number_of_items_in_set
+ from src.utils.publish_autofix import sanitize_placeholder_aspects, sanitize_single_value_aspects
+ from src.utils.publish_validation import (
+@@ -1845,9 +1846,21 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
+     return ListingProfile(kind="unknown")
+ 
+ 
+-def _apply_profile_rules(opt: dict[str, Any], profile: ListingProfile) -> None:
++def _apply_profile_rules(
++    opt: dict[str, Any],
++    profile: ListingProfile,
++    *,
++    preserve_category: bool = False,
++) -> None:
+     aspects = opt.setdefault("aspects", {})
+-    if profile.category_id:
++    apply_category = bool(profile.category_id) and not preserve_category
++    if apply_category:
++        from src.utils.motors_category_tree import listing_category_rejection
++
++        if listing_category_rejection(profile.category_id):
++            # Motors must not inherit a tree-0 profile leaf such as 20487.
++            apply_category = False
++    if apply_category:
+         opt["categoryId"] = profile.category_id
+         opt["categoryName"] = profile.category_name
+     if profile.type_value:
+@@ -2035,23 +2048,28 @@ def normalize_generated_listing(
+ 
+     title_context = " ".join(part for part in (source_title, opt.get("title")) if part).strip()
+     profile = classify_listing_profile(title_context or opt.get("title", ""), opt.get("description", ""), opt.get("categoryId", ""))
++    # Any approval flag blocks a remap, including a blank or mismatched pin.
++    preserve_category = blocks_automated_category_change(opt)
+ 
+-    if category_matcher and opt.get("categoryId"):
++    if category_matcher and opt.get("categoryId") and not preserve_category:
+         category_id, category_name = category_matcher.canonicalize_category(
+             title_context or opt.get("title", ""),
+             str(opt.get("categoryId") or ""),
+             opt.get("categoryName"),
+             opt.get("description", ""),
+         )
+-        opt["categoryId"] = category_id
+-        if category_name:
+-            opt["categoryName"] = category_name
++        from src.utils.motors_category_tree import listing_category_rejection
++
++        if category_id and not listing_category_rejection(category_id):
++            opt["categoryId"] = category_id
++            if category_name:
++                opt["categoryName"] = category_name
+ 
+     seeded_attributes = _seed_attributes_from_description(attributes, opt.get("description", ""))
+     updates = _fill_measurement_aspects(opt["aspects"], seeded_attributes)
+-    _apply_profile_rules(opt, profile)
++    _apply_profile_rules(opt, profile, preserve_category=preserve_category)
+     sanitize_placeholder_aspects(opt["aspects"], title=opt["title"], category_id=str(opt.get("categoryId") or ""))
+-    _apply_profile_rules(opt, profile)
++    _apply_profile_rules(opt, profile, preserve_category=preserve_category)
+     enforce_store_brand_aspect(opt["aspects"])
+     opt["description"] = sanitize_generated_description_html(opt.get("description", ""))
+     opt["description"] = _sanitize_specifications_table_html(opt.get("description", ""))
+@@ -2938,19 +2956,23 @@ def validate_listing_quality(
+         )
+ 
+     category_id = str(opt.get("categoryId") or "").strip()
++    preserve_category = blocks_automated_category_change(opt)
+     profile = classify_listing_profile(" ".join(part for part in (source_title, title) if part), description, category_id)
+-    if profile.category_id and category_id != profile.category_id:
+-        issues.append(
+-            ListingQualityIssue(
+-                "category_mismatch",
+-                f"{profile.kind} should use category {profile.category_id}, got {category_id or 'missing'}",
+-                field="categoryId",
++    if not preserve_category and profile.category_id and category_id != profile.category_id:
++        from src.utils.motors_category_tree import listing_category_rejection
++
++        if not listing_category_rejection(profile.category_id):
++            issues.append(
++                ListingQualityIssue(
++                    "category_mismatch",
++                    f"{profile.kind} should use category {profile.category_id}, got {category_id or 'missing'}",
++                    field="categoryId",
++                )
+             )
+-        )
+     elif not category_id:
+         issues.append(ListingQualityIssue("missing_category", "missing categoryId", field="categoryId"))
+ 
+-    if category_matcher and category_id:
++    if category_matcher and category_id and not preserve_category:
+         if not category_matcher.is_category_plausible_for_text(title, category_id, opt.get("categoryName")):
+             issues.append(
+                 ListingQualityIssue(
+diff --git a/src/utils/motors_category_tree.py b/src/utils/motors_category_tree.py
+new file mode 100644
+index 0000000..40dce13
+--- /dev/null
++++ b/src/utils/motors_category_tree.py
+@@ -0,0 +1,62 @@
++"""eBay Motors category tree 100 leaf check.
++
++AquaRides publishes Motors parts through the Trading API (SiteID 100). Those
++listings may only use a leaf from category tree 100. Tree-0 furniture ids such
++as 20487 (Cabinets & Cupboards) are absent from that tree and come back from
++eBay as ``invalid category``. Some numbers exist in both trees with different
++names (174020 is Trailer Hitches in tree 0 and Brake Pad Wear Sensors in tree
++100), so a tree-0 keyword fallback must never be substituted just because the
++number happens to be present.
++
++The leaf set is a local snapshot (``data/motors_category_tree_100_leaves.json``)
++so publish decisions do not call eBay. An id that is not in the snapshot is
++rejected. Callers block the listing; they do not pick a different id.
++"""
++
++from __future__ import annotations
++
++import json
++from functools import lru_cache
++from pathlib import Path
++
++_LEAF_PATH = Path(__file__).resolve().parents[2] / "data" / "motors_category_tree_100_leaves.json"
++
++NOT_TREE100_LEAF_ERROR = (
++    "category {category_id} is not a leaf in eBay Motors category tree 100; "
++    "refusing to fall back to a tree-0 id"
++)
++
++
++@lru_cache(maxsize=1)
++def tree100_leaf_ids() -> frozenset[str]:
++    raw = json.loads(_LEAF_PATH.read_text(encoding="utf-8"))
++    if not isinstance(raw, list):
++        return frozenset()
++    return frozenset(str(item).strip() for item in raw if str(item).strip())
++
++
++def is_tree100_leaf(category_id: str | None) -> bool:
++    cid = str(category_id or "").strip()
++    return bool(cid) and cid.isdigit() and cid in tree100_leaf_ids()
++
++
++def motors_category_rejection(category_id: str | None) -> str:
++    """Empty when ``category_id`` may be used on a Motors (tree 100) listing."""
++    cid = str(category_id or "").strip()
++    if not cid:
++        return "missing categoryId"
++    if not cid.isdigit() or not is_tree100_leaf(cid):
++        return NOT_TREE100_LEAF_ERROR.format(category_id=cid or "(blank)")
++    return ""
++
++
++def listing_category_rejection(category_id: str | None) -> str:
++    """Reject non-tree-100 ids on Motors. Furniture (tree 0) is unchanged."""
++    try:
++        from src.utils.store_profile import get_store_profile
++
++        if not get_store_profile().is_motors:
++            return ""
++    except Exception:
++        return ""
++    return motors_category_rejection(category_id)
+diff --git a/src/utils/publish_validation.py b/src/utils/publish_validation.py
+index 1927249..e40869e 100644
+--- a/src/utils/publish_validation.py
++++ b/src/utils/publish_validation.py
+@@ -84,22 +84,42 @@ def category_validation_errors(
+     title_context: str,
+     category_id: str,
+     category_name: str = None,
++    *,
++    skip_canonicalize: bool = False,
+ ) -> list[str]:
+     normalized_category_id = str(category_id or '').strip()
+     if not normalized_category_id:
+         return ["missing categoryId"]
+ 
+-    if category_matcher:
+-        normalized_category_id, category_name = category_matcher.canonicalize_category(
++    from src.utils.motors_category_tree import listing_category_rejection
++
++    if category_matcher and not skip_canonicalize:
++        canonical_id, canonical_name = category_matcher.canonicalize_category(
++            title_context,
++            normalized_category_id,
++            category_name,
++        )
++        # A Motors canonicalize that lands on a tree-0 id must not replace a
++        # leaf that is already valid, and must not become the published id.
++        if canonical_id and not listing_category_rejection(canonical_id):
++            normalized_category_id, category_name = canonical_id, canonical_name
++        elif not listing_category_rejection(normalized_category_id):
++            pass
++        else:
++            normalized_category_id, category_name = canonical_id, category_name
++
++    motors_error = listing_category_rejection(normalized_category_id)
++    if motors_error:
++        return [motors_error]
++
++    if (
++        category_matcher
++        and not skip_canonicalize
++        and not category_matcher.is_category_plausible_for_text(
+             title_context,
+             normalized_category_id,
+             category_name,
+         )
+-
+-    if category_matcher and not category_matcher.is_category_plausible_for_text(
+-        title_context,
+-        normalized_category_id,
+-        category_name,
+     ):
+         return [f"implausible category {normalized_category_id} for title '{title_context[:120]}'"]
+ 
+@@ -112,7 +132,17 @@ def get_publish_blockers(
+     aspects: dict,
+     category_id: str,
+     category_name: str = None,
++    *,
++    skip_canonicalize: bool = False,
+ ) -> list[str]:
+     blockers = measurement_validation_errors(aspects)
+-    blockers.extend(category_validation_errors(category_matcher, title_context, category_id, category_name))
++    blockers.extend(
++        category_validation_errors(
++            category_matcher,
++            title_context,
++            category_id,
++            category_name,
++            skip_canonicalize=skip_canonicalize,
++        )
++    )
+     return blockers
+diff --git a/tests/test_aquarides_category_lock.py b/tests/test_aquarides_category_lock.py
+new file mode 100644
+index 0000000..aef277a
+--- /dev/null
++++ b/tests/test_aquarides_category_lock.py
+@@ -0,0 +1,610 @@
++"""AquaRides category lock: tree 100, dry-run persistence, and fail-closed pins.
++
++No live eBay calls. Motors behavior is forced through the store profile.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import json
++import sqlite3
++from dataclasses import replace
++from pathlib import Path
++
++import pytest
++from sqlalchemy import create_engine, text
++from sqlalchemy.orm import sessionmaker
++
++import batch_publish
++from scripts.audit_fix_active_listings import build_live_listing_opt_snapshot
++from scripts.repair_published_taxonomy import audit_candidate
++from src.db.collection_models import Base, CollectedProduct
++from src.plugins.inventory_sync.sync_service import (
++    apply_pinned_offer_category,
++    pin_offer_category_fields,
++)
++from src.utils.approved_category import (
++    apply_live_category_readback,
++    blocks_automated_category_change,
++    evaluate_approved_category,
++    is_category_approved,
++)
++from src.utils.listing_quality_gate import normalize_generated_listing
++from src.utils.motors_category_tree import is_tree100_leaf
++from src.utils.store_profile import get_store_profile
++
++ROOT = Path(__file__).resolve().parent.parent
++SKU = "W2660P287608"
++APPROVED = "179444"
++TREE0_CABINET = "20487"
++OTHER_AUTO_TOOLS = "43998"
++DESCRIPTION = (
++    "<div><h3>KEY FEATURES</h3><ul>"
++    "<li>Five drawers keep sockets and hand tools sorted in a rolling cabinet.</li>"
++    "<li>Locking casters move the chest around a garage without dragging it.</li>"
++    "<li>Steel housing stands up to shop storage cabinet use.</li>"
++    "</ul></div>"
++)
++TITLE = "5-Drawer Rolling Tool Cabinet Storage Cabinet Garage Shop"
++
++
++def _motors_profile():
++    base = get_store_profile()
++    return replace(
++        base,
++        category_tree_id="100",
++        listing_channel="trading",
++        ebay_site_id="100",
++        store_kind="auto",
++    )
++
++
++def use_motors(monkeypatch):
++    profile = _motors_profile()
++
++    def _profile():
++        return profile
++
++    monkeypatch.setattr("src.utils.store_profile.get_store_profile", _profile)
++    monkeypatch.setattr("batch_publish.get_store_profile", _profile)
++    monkeypatch.setattr("src.services.ebay_category_matcher.get_store_profile", _profile)
++    monkeypatch.setattr("src.services.ebay_publisher.get_store_profile", _profile)
++    return profile
++
++
++def _optimization(**extra):
++    opt = {
++        "title": TITLE,
++        "description": DESCRIPTION,
++        "categoryId": APPROVED,
++        "categoryName": "Garage/Shop Tool Chests",
++        "aspects": {
++            "Brand": ["AquaRides"],
++            "Type": ["Tool Chest"],
++            "Item Length": ["26 in"],
++            "Item Width": ["18 in"],
++            "Item Height": ["32 in"],
++        },
++    }
++    opt.update(extra)
++    return opt
++
++
++def _locked(**extra):
++    opt = _optimization(
++        categoryApproved=True,
++        categoryApprovedId=APPROVED,
++    )
++    opt.update(extra)
++    return opt
++
++
++def _product(opt):
++    return {
++        "sku": SKU,
++        "title": TITLE,
++        "description": DESCRIPTION,
++        "price": 180.0,
++        "suggested_price": 249.0,
++        "shipping": 0,
++        "images": ["https://example.com/cabinet.jpg"],
++        "videos": [],
++        "attributes": {
++            "Assembled Length (in.)": "26",
++            "Assembled Width (in.)": "18",
++            "Assembled Height (in.)": "32",
++            "Product Weight (lbs.)": "74",
++        },
++        "specs": {},
++        "cost_breakdown": {"total_dajian_cost": 120},
++        "optimization": opt,
++    }
++
++
++class _PantryFallbackMatcher:
++    """Matcher that first offers 43998, then canonicalizes everything to 20487."""
++
++    def __init__(self, oauth):
++        self.oauth = oauth
++
++    def canonicalize_category(self, title_context, category_id, category_name, description=None):
++        return TREE0_CABINET, "Cabinets & Cupboards"
++
++    def get_category_and_aspects(self, title, aspects, description=None):
++        return OTHER_AUTO_TOOLS, "Other Auto Tools & Supplies", dict(aspects or {})
++
++    def is_category_plausible_for_text(self, title, category_id, category_name):
++        return True
++
++    def _get_category_aspects(self, category_id):
++        return [], []
++
++    def _complete_aspects(self, existing, required, recommended, title, category_name):
++        return dict(existing or {})
++
++
++class _OAuth:
++    api_base = "https://api.ebay.test"
++
++    def __init__(self, environment):
++        self.environment = environment
++
++    def is_authorized(self):
++        return True
++
++    def get_application_token(self):
++        return "app-token"
++
++    def get_valid_token(self):
++        return "token"
++
++
++class _Policy:
++    def __init__(self, oauth):
++        self.oauth = oauth
++
++
++class _Client:
++    calls = []
++
++    def __init__(self, oauth, policy_manager):
++        self.oauth = oauth
++
++    def _prepare_inventory_image_urls(self, sku, raw_images, max_images=24):
++        return ["https://i.ebayimg.com/images/g/AAA/s-l1600.jpg"]
++
++    def add_fixed_price_item_motors(self, product, category_id=None, price=None, quantity=None):
++        _Client.calls.append(str(category_id))
++        if getattr(self, "fail_once", False) and _Client.calls.count(str(category_id)) == 1:
++            raise RuntimeError("Invalid category")
++        return {"itemId": "999000111", "ack": "Success"}
++
++
++@pytest.fixture
++def motors(monkeypatch):
++    use_motors(monkeypatch)
++    monkeypatch.setattr(batch_publish, "fetch_market_price", lambda title: None)
++    monkeypatch.setattr(batch_publish, "calculate_smart_final_price", lambda product, market_p: 249.0)
++    monkeypatch.setattr(batch_publish, "_is_sellable_leaf_category", lambda oauth, category_id: True)
++    monkeypatch.setattr(batch_publish, "resolve_publish_quantity", lambda sku, logger=None: 1)
++    monkeypatch.setattr(batch_publish.time, "sleep", lambda seconds: None)
++    monkeypatch.setattr(
++        batch_publish,
++        "run_listing_qc",
++        lambda **kwargs: {
++            "status": "pass",
++            "blockers": [],
++            "warnings": [],
++            "source_fingerprint": "source",
++            "candidate_fingerprint": "candidate",
++            "ruleset_version": "listing-qc-v2",
++            "fact_sheet_version": 1,
++            "rule_ids": [],
++            "experience_ids": [],
++            "evidence_refs": [],
++        },
++    )
++    real_connect = batch_publish.sqlite3.connect
++
++    def _connect(path, *args, **kwargs):
++        if str(path).endswith("ebay_collection.db"):
++            return real_connect(":memory:")
++        return real_connect(path, *args, **kwargs)
++
++    monkeypatch.setattr(batch_publish.sqlite3, "connect", _connect)
++    monkeypatch.setattr("src.services.ebay_auth.EbayOAuthService", _OAuth)
++    monkeypatch.setattr("src.services.ebay_category_matcher.EbayCategoryMatcher", _PantryFallbackMatcher)
++    monkeypatch.setattr("src.services.ebay_policy_manager.EbayPolicyManager", _Policy)
++    monkeypatch.setattr("src.clients.real_ebay_client.RealEbayClient", _Client)
++    _Client.calls = []
++    return monkeypatch
++
++
++def _temp_session(tmp_path, monkeypatch):
++    engine = create_engine(f"sqlite:///{tmp_path / 'lock.db'}")
++    Base.metadata.create_all(engine)
++    Session = sessionmaker(bind=engine)
++    monkeypatch.setattr("src.db.collection_db.SessionLocal", Session)
++    return engine, Session
++
++
++def _insert(session_cls, opt):
++    db = session_cls()
++    db.add(
++        CollectedProduct(
++            sku=SKU,
++            title=TITLE,
++            price=180.0,
++            description=DESCRIPTION,
++            images=["https://example.com/cabinet.jpg"],
++            optimization=opt,
++            logs=["seed"],
++            status="READY",
++        )
++    )
++    db.commit()
++    db.close()
++
++
++def _raw_optimization(engine):
++    with engine.connect() as conn:
++        return conn.execute(
++            text("SELECT optimization FROM collected_products WHERE sku = :sku"),
++            {"sku": SKU},
++        ).scalar()
++
++
++def test_tree_snapshot_contains_approved_leaf_and_rejects_cabinets():
++    assert is_tree100_leaf(APPROVED)
++    assert is_tree100_leaf(OTHER_AUTO_TOOLS)
++    assert is_tree100_leaf("174020")
++    assert not is_tree100_leaf(TREE0_CABINET)
++
++
++def test_locked_179444_survives_normalize_against_pantry_fallback(motors):
++    class _Matcher:
++        def canonicalize_category(self, title, category_id, category_name=None, description=None):
++            return TREE0_CABINET, "Cabinets & Cupboards"
++
++    normalized = normalize_generated_listing(
++        _locked(),
++        source_title=TITLE,
++        source_description=DESCRIPTION,
++        category_matcher=_Matcher(),
++    )
++    assert normalized["categoryId"] == APPROVED
++    assert normalized["categoryApprovedId"] == APPROVED
++
++
++def test_locked_dry_run_keeps_optimization_bytes_and_category(motors, tmp_path, monkeypatch):
++    engine, Session = _temp_session(tmp_path, monkeypatch)
++    opt = _locked()
++    _insert(Session, opt)
++    before = _raw_optimization(engine)
++
++    result = batch_publish.publish_single_product(_product(opt), dry_run=True)
++
++    assert result["status"] == "dry_run"
++    assert result["category_id"] == APPROVED
++    assert _Client.calls == []
++    assert _raw_optimization(engine) == before
++    stored = json.loads(_raw_optimization(engine))
++    assert stored["categoryId"] == APPROVED
++    assert stored["categoryApprovedId"] == APPROVED
++
++
++def test_locked_publish_and_invalid_category_retry_stay_on_179444(motors, tmp_path, monkeypatch):
++    engine, Session = _temp_session(tmp_path, monkeypatch)
++    opt = _locked()
++    _insert(Session, opt)
++    _Client.fail_once = True
++    try:
++        result = batch_publish.publish_single_product(_product(opt), dry_run=False)
++    finally:
++        _Client.fail_once = False
++
++    assert result["status"] == "success"
++    assert _Client.calls == [APPROVED, APPROVED]
++    stored = json.loads(_raw_optimization(engine))
++    assert stored["categoryId"] == APPROVED
++    assert stored["categoryApprovedId"] == APPROVED
++
++
++def test_unlocked_stored_tree100_leaf_is_not_replaced_by_rejected_canonicalize(motors, tmp_path, monkeypatch):
++    engine, Session = _temp_session(tmp_path, monkeypatch)
++    opt = _optimization()
++    _insert(Session, opt)
++    before = _raw_optimization(engine)
++
++    result = batch_publish.publish_single_product(_product(opt), dry_run=True)
++
++    assert result["status"] == "dry_run"
++    assert result["category_id"] == APPROVED
++    assert _Client.calls == []
++    assert _raw_optimization(engine) == before
++
++
++def test_unlocked_motors_matcher_20487_is_blocked_not_published(motors, tmp_path, monkeypatch):
++    engine, Session = _temp_session(tmp_path, monkeypatch)
++    opt = _optimization(categoryId=TREE0_CABINET, categoryName="Cabinets & Cupboards")
++    opt.pop("categoryApproved", None)
++    opt.pop("categoryApprovedId", None)
++    _insert(Session, opt)
++    before = _raw_optimization(engine)
++
++    result = batch_publish.publish_single_product(_product(opt), dry_run=False)
++
++    assert result["status"] == "error"
++    assert "not a leaf in eBay Motors category tree 100" in result["message"]
++    assert _Client.calls == []
++    assert _raw_optimization(engine) == before
++
++
++def test_blank_pin_and_mismatched_pin_fail_closed(motors, tmp_path, monkeypatch):
++    engine, Session = _temp_session(tmp_path, monkeypatch)
++
++    blank = _optimization(categoryId="abc", categoryName="", categoryApproved=True)
++    blank.pop("categoryApprovedId", None)
++    _insert(Session, blank)
++    before_blank = _raw_optimization(engine)
++    blank_result = batch_publish.publish_single_product(_product(blank), dry_run=True)
++    assert blank_result["status"] == "error"
++    assert "invalid_or_blank_category_id" in blank_result["message"]
++    assert _Client.calls == []
++    assert _raw_optimization(engine) == before_blank
++
++    mismatched = _locked(categoryApprovedId=OTHER_AUTO_TOOLS)
++    db = Session()
++    row = db.query(CollectedProduct).filter_by(sku=SKU).one()
++    row.optimization = mismatched
++    db.commit()
++    db.close()
++    before_mismatch = _raw_optimization(engine)
++    mismatch_result = batch_publish.publish_single_product(_product(mismatched), dry_run=True)
++    assert mismatch_result["status"] == "error"
++    assert _Client.calls == []
++    assert _raw_optimization(engine) == before_mismatch
++    assert json.loads(before_mismatch)["categoryId"] == APPROVED
++
++
++def test_legacy_flag_without_pin_honors_current_leaf_and_missing_keys_stay_unlocked(motors):
++    legacy = _optimization(categoryApproved=True)
++    assert "categoryApprovedId" not in legacy
++    decision = evaluate_approved_category(APPROVED, legacy)
++    assert decision.preserve is True
++    assert is_category_approved(legacy, APPROVED) is True
++
++    unlocked = _optimization()
++    assert blocks_automated_category_change(unlocked) is False
++    assert evaluate_approved_category(APPROVED, unlocked).preserve is False
++
++    as_text = json.dumps(_locked())
++    assert is_category_approved(as_text, APPROVED) is True
++    assert blocks_automated_category_change(as_text) is True
++
++
++def test_json_string_lock_survives_dry_run(motors, tmp_path, monkeypatch):
++    engine, Session = _temp_session(tmp_path, monkeypatch)
++    opt = _locked()
++    _insert(Session, opt)
++    before = _raw_optimization(engine)
++    result = batch_publish.publish_single_product(_product(json.dumps(opt)), dry_run=True)
++    assert result["status"] == "dry_run"
++    assert result["category_id"] == APPROVED
++    assert _raw_optimization(engine) == before
++
++
++def test_live_readback_does_not_overwrite_locked_category():
++    locked = _locked()
++    apply_live_category_readback(locked, TREE0_CABINET, "Cabinets & Cupboards")
++    assert locked["categoryId"] == APPROVED
++    assert locked["categoryApprovedId"] == APPROVED
++    assert locked["liveCategoryId"] == TREE0_CABINET
++
++    snapshot = build_live_listing_opt_snapshot(
++        _locked(),
++        inventory_item={"product": {"title": TITLE, "description": DESCRIPTION, "aspects": {}}},
++        offer={"categoryId": TREE0_CABINET, "category": {"categoryName": "Cabinets & Cupboards"}},
++    )
++    assert snapshot["categoryId"] == APPROVED
++    assert snapshot["liveCategoryId"] == TREE0_CABINET
++    assert snapshot["categoryName"] == "Garage/Shop Tool Chests"
++
++    unlocked = _optimization()
++    apply_live_category_readback(unlocked, OTHER_AUTO_TOOLS, "Other Auto Tools & Supplies")
++    assert unlocked["categoryId"] == OTHER_AUTO_TOOLS
++
++
++def test_high_fee_blacklist_blocks_locked_leaf(motors, tmp_path, monkeypatch):
++    engine, Session = _temp_session(tmp_path, monkeypatch)
++    opt = _locked()
++    _insert(Session, opt)
++    before = _raw_optimization(engine)
++    blacklist = tmp_path / "fees.json"
++    blacklist.write_text(
++        json.dumps({"publish_skip_category_ids": [APPROVED]}),
++        encoding="utf-8",
++    )
++    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", str(blacklist))
++
++    result = batch_publish.publish_single_product(_product(opt), dry_run=False)
++
++    assert result["status"] == "error"
++    assert "high_insertion_fee" in result["message"]
++    assert _Client.calls == []
++    assert _raw_optimization(engine) == before
++
++
++def test_override_never_follows_matcher_and_keyword_collision_is_blocked(motors, monkeypatch):
++    row = {
++        "sku": SKU,
++        "title": TITLE,
++        "description": DESCRIPTION,
++        "listing_id": "1",
++        "optimization": _locked(),
++    }
++
++    class _Matcher:
++        def get_category_and_aspects(self, title, aspects, description=""):
++            return TREE0_CABINET, "Cabinets & Cupboards", dict(aspects or {})
++
++        def canonicalize_category(self, title, category_id, category_name=None, description=None):
++            return category_id, category_name
++
++        def is_category_plausible_for_text(self, title, category_id, category_name):
++            return True
++
++    class _Offers:
++        def get_offers_by_sku(self, sku):
++            return [{
++                "offerId": "offer-1",
++                "categoryId": TREE0_CABINET,
++                "category": {"categoryId": TREE0_CABINET, "categoryName": "Cabinets & Cupboards"},
++            }]
++
++    locked = audit_candidate(row, _Matcher(), _Offers())
++    assert locked["action"] == "LOCKED"
++    assert locked["target_category_id"] == APPROVED
++
++    restored = audit_candidate(
++        row,
++        _Matcher(),
++        _Offers(),
++        override_category_lock=True,
++    )
++    assert restored["action"] == "REVISE_LIVE"
++    assert restored["target_category_id"] == APPROVED
++
++    explicit = audit_candidate(
++        row,
++        _Matcher(),
++        _Offers(),
++        override_category_lock=True,
++        explicit_targets={SKU: OTHER_AUTO_TOOLS},
++    )
++    assert explicit["action"] == "REVISE_LIVE"
++    assert explicit["target_category_id"] == OTHER_AUTO_TOOLS
++
++    bad_explicit = audit_candidate(
++        row,
++        _Matcher(),
++        _Offers(),
++        override_category_lock=True,
++        explicit_targets={SKU: TREE0_CABINET},
++    )
++    assert bad_explicit["action"] == "SKIP"
++    assert bad_explicit["target_category_id"] != TREE0_CABINET
++
++    from src.services.ebay_publisher import EbayPublisher
++
++    class _NoMatch:
++        def __init__(self, oauth):
++            pass
++
++        def get_category_and_aspects(self, title, aspects, description=None):
++            return None, None, aspects
++
++    monkeypatch.setattr("src.services.ebay_category_matcher.EbayCategoryMatcher", _NoMatch)
++    publisher = EbayPublisher.__new__(EbayPublisher)
++    publisher.oauth = _OAuth("PRODUCTION")
++    publisher.logger = batch_publish.logger
++    category_id, _, _ = publisher._get_category_and_aspects(
++        'Class 3 Trailer Hitch Receiver 2"',
++        {},
++        {"optimization": {}},
++    )
++    assert category_id == ""
++    assert category_id != "174020"
++
++
++def _load_apply_approved():
++    spec = importlib.util.spec_from_file_location(
++        "apply_approved_fixes_lock",
++        ROOT / "scripts" / "apply_approved_fixes.py",
++    )
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_mark_category_approved_requires_explicit_matching_leaf(tmp_path, monkeypatch):
++    use_motors(monkeypatch)
++    module = _load_apply_approved()
++    db_path = tmp_path / "stamp.db"
++    conn = sqlite3.connect(db_path)
++    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
++    conn.execute(
++        "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
++        (SKU, json.dumps(_optimization())),
++    )
++    conn.commit()
++    conn.close()
++
++    missing = module.process_rows(
++        [{"sku": SKU, "fix_keys": ["categoryApproved"], "note": ""}],
++        apply=True,
++        mark_category_approved=True,
++        stop_on_error=True,
++        db_path=db_path,
++        run_audit=lambda *args, **kwargs: None,
++    )
++    assert missing == 1
++
++    refused = module.stamp_local_category_approved(
++        SKU,
++        approved_category_id=TREE0_CABINET,
++        apply=True,
++        db_path=db_path,
++    )
++    assert refused["ok"] is False
++
++    stamped = module.stamp_local_category_approved(
++        SKU,
++        approved_category_id=APPROVED,
++        apply=True,
++        db_path=db_path,
++    )
++    assert stamped["ok"] is True
++    conn = sqlite3.connect(db_path)
++    stored = json.loads(conn.execute("SELECT optimization FROM collected_products").fetchone()[0])
++    conn.close()
++    assert stored["categoryId"] == APPROVED
++    assert stored["categoryApproved"] is True
++    assert stored["categoryApprovedId"] == APPROVED
++
++    locked_row = {
++        "sku": SKU,
++        "fix_keys": ["categoryId"],
++        "category_id": OTHER_AUTO_TOOLS,
++        "note": "",
++    }
++    blocked = module.process_rows(
++        [locked_row],
++        apply=False,
++        mark_category_approved=False,
++        stop_on_error=True,
++        db_path=db_path,
++        override_category_lock=False,
++        run_audit=lambda *args, **kwargs: pytest.fail("locked remap must not call audit"),
++    )
++    assert blocked == 1
++
++
++def test_inventory_sync_put_restores_offer_category():
++    offer = {
++        "offerId": "offer-1",
++        "categoryId": APPROVED,
++        "availableQuantity": 0,
++        "listing": {"listingId": "1", "categoryId": APPROVED},
++        "pricingSummary": {"price": {"value": "10.00"}},
++    }
++    pinned = pin_offer_category_fields(offer)
++    offer["availableQuantity"] = 1
++    offer["categoryId"] = TREE0_CABINET
++    offer["listing"]["categoryId"] = TREE0_CABINET
++    offer["pricingSummary"]["price"]["value"] = "12.00"
++    apply_pinned_offer_category(offer, pinned)
++    assert offer["categoryId"] == APPROVED
++    assert offer["listing"]["categoryId"] == APPROVED
++    assert offer["availableQuantity"] == 1
++    assert offer["pricingSummary"]["price"]["value"] == "12.00"

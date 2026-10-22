@@ -97,6 +97,11 @@ from src.utils.dimension_helpers import (
     find_dimension,
     replace_description_measurements,
 )
+from src.utils.approved_category import (
+    blocks_automated_category_change,
+    locked_category_write_error,
+)
+from src.utils.motors_category_tree import listing_category_rejection
 from src.utils.publish_validation import first_aspect_text, measurement_issue
 from src.utils.publish_autofix import (
     SINGLE_VALUE_ASPECTS,
@@ -920,8 +925,12 @@ def audit_single_product(
         fixes["__restore_live_description_from_local__"] = True
 
     # ── 1. Category Check — deterministic product profile wins over taxonomy drift ──
+    # A human-approved stored category is not remapped by profile or canonicalize.
+    # Fail closed: any categoryApproved flag blocks generation of category fixes.
+    # Motors also refuses a tree-0 target such as 20487.
+    skip_category_remap = blocks_automated_category_change(opt)
     profile = classify_listing_profile(title_context or title, live_description, stored_category)
-    if profile.category_id:
+    if not skip_category_remap and profile.category_id and not listing_category_rejection(profile.category_id):
         if stored_category != profile.category_id:
             issues.append({
                 "type": "category_mismatch",
@@ -936,7 +945,7 @@ def audit_single_product(
             fixes["categoryId"] = profile.category_id
             if profile.category_name:
                 fixes["categoryName"] = profile.category_name
-    elif stored_category:
+    elif not skip_category_remap and stored_category:
         canonical_category, canonical_name = matcher.canonicalize_category(
             title_context,
             stored_category,
@@ -944,7 +953,11 @@ def audit_single_product(
             live_description,
         )
 
-        if canonical_category and canonical_category != stored_category:
+        if (
+            canonical_category
+            and canonical_category != stored_category
+            and not listing_category_rejection(canonical_category)
+        ):
             issues.append({
                 "type": "category_mismatch",
                 "severity": "CRITICAL",
@@ -967,7 +980,11 @@ def audit_single_product(
                 suggested_name,
                 live_description,
             )
-            if suggested_category and suggested_category != stored_category:
+            if (
+                suggested_category
+                and suggested_category != stored_category
+                and not listing_category_rejection(suggested_category)
+            ):
                 issues.append({
                     "type": "category_mismatch",
                     "severity": "CRITICAL",
@@ -1868,11 +1885,10 @@ def build_live_listing_opt_snapshot(stored_opt, *, inventory_item=None, offer=No
 
     category = offer.get("category") or {}
     category_id = offer.get("categoryId") or category.get("categoryId")
-    if category_id:
-        opt["categoryId"] = str(category_id)
     category_name = category.get("categoryName") or category.get("name")
-    if category_name:
-        opt["categoryName"] = category_name
+    from src.utils.approved_category import apply_live_category_readback
+
+    apply_live_category_readback(opt, category_id, category_name)
 
     return opt
 
@@ -1938,6 +1954,15 @@ def create_parser():
         "--accept-package-conflict-as",
         choices=["Yes"],
         help="Operator override: emit Assembly Required=Yes for assembly_package_conflict. Requires --sku or --sku-file.",
+    )
+    parser.add_argument(
+        "--override-category-lock",
+        action="store_true",
+        help=(
+            "Allow applying categoryId/categoryName fixes on a listing whose "
+            "optimization.categoryApproved flag is set. Required for any live "
+            "category change on a locked SKU."
+        ),
     )
     return parser
 
@@ -3240,6 +3265,7 @@ def fix_listing_on_ebay(
     *,
     base_opt_raw=None,
     source_detail_cache: dict[str, dict] | None = None,
+    override_category_lock: bool = False,
 ):
     """Apply fixes to a published eBay listing."""
     results = []
@@ -3324,12 +3350,21 @@ def fix_listing_on_ebay(
             return [f"ERROR [{sku}]: protected live snapshot failed ({exc}); no write attempted"]
 
     # Apply aspect fixes
+    lock_error = locked_category_write_error(stored_opt, override=override_category_lock)
     for key, value in fixes.items():
         if key == "categoryId":
+            if lock_error:
+                results.append(f"ERROR [{sku}]: {lock_error}")
+                continue
+            if listing_category_rejection(value):
+                results.append(f"ERROR [{sku}]: {listing_category_rejection(value)}")
+                continue
             new_category = value
             category_changed = True
             continue
         if key == "categoryName":
+            if lock_error:
+                continue
             new_category_name = value
             continue
         if key == "__motors_compatibility__":
@@ -4698,6 +4733,7 @@ def main(argv=None):
                 conn,
                 base_opt_raw=audit_opt_raw if args.live else None,
                 source_detail_cache=semantic_source_detail_cache,
+                override_category_lock=bool(getattr(args, "override_category_lock", False)),
             )
             for r in fix_results:
                 if "ERROR" in r:

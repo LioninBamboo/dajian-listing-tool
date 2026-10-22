@@ -37,6 +37,14 @@ class EbayCategoryMatcher:
         if not cid:
             return None, category_name
 
+        # Motors publishes against tree 100. The furniture remaps below
+        # (pantry -> 20487 Cabinets & Cupboards, and the rest of the tree-0
+        # map) are not Motors leaves. Keep the stored id and let the resolver
+        # reject it when it is not a tree-100 leaf, instead of substituting
+        # a tree-0 id that eBay then rejects as invalid category.
+        if get_store_profile().is_motors:
+            return cid, category_name
+
         text_lower = self._normalize_keyword_text(
             " ".join(part for part in (title or "", description or "", category_name or "") if part)
         )
@@ -702,17 +710,29 @@ class EbayCategoryMatcher:
         
         # Step 3: Cross-validate and decide
         # Motors stores publish against category tree 100. The keyword fallback map
-        # holds tree-0 ids (e.g. 174020 Trailer Hitches) that do not exist in tree
-        # 100; the Taxonomy API is queried against the store's OWN tree, so its
-        # suggestion is the correct tree-100 leaf (e.g. 33653). Trust the API there
-        # rather than the wrong-tree keyword id. Furniture (tree 0) is unaffected.
-        if get_store_profile().is_motors and api_cat_id:
-            if kw_cat_id and kw_cat_id != api_cat_id:
-                logging.info(
-                    f"[CAT] Motors tree 100: using API={api_cat_id} ({api_cat_name}) "
-                    f"over tree-0 keyword={kw_cat_id} ({kw_cat_name})"
-                )
-            return api_cat_id, api_cat_name
+        # holds tree-0 ids (e.g. 20487 Cabinets & Cupboards, 174020 Trailer Hitches).
+        # Some of those numbers also exist in tree 100 under a different name, so
+        # they must not be used as a fallback. Accept an API suggestion only when
+        # it is a tree-100 leaf; otherwise fail closed and return no category.
+        if get_store_profile().is_motors:
+            from src.utils.motors_category_tree import is_tree100_leaf
+
+            if api_cat_id and is_tree100_leaf(str(api_cat_id)):
+                if kw_cat_id and str(kw_cat_id) != str(api_cat_id):
+                    logging.info(
+                        f"[CAT] Motors tree 100: using API={api_cat_id} ({api_cat_name}) "
+                        f"over tree-0 keyword={kw_cat_id} ({kw_cat_name})"
+                    )
+                return str(api_cat_id), api_cat_name
+            logging.warning(
+                "[CAT] Motors tree 100: rejecting category %s (%s); "
+                "not falling back to tree-0 keyword %s (%s)",
+                api_cat_id,
+                api_cat_name,
+                kw_cat_id,
+                kw_cat_name,
+            )
+            return None, None
 
         if kw_cat_id and kw_cat_id != "38208":  # Not the generic fallback default
             # Strong keyword match — trust it over API
