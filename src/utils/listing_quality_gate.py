@@ -20,8 +20,11 @@ from src.utils.dimension_helpers import (
     replace_description_measurements,
 )
 from src.utils.product_context_signals import (
+    has_any_phrase,
     has_outdoor_marker,
     outdoor_context as strict_outdoor_context,
+    primary_product_noun,
+    strip_room_location_lists,
 )
 from src.utils.publish_aspect_completion import (
     NOT_DIMENSION_AFTER,
@@ -202,6 +205,11 @@ def _normalize_value(value: Any) -> Any:
 
 def _text_context(*parts: Any) -> str:
     return _clean_text(" ".join(str(part or "") for part in parts)).lower()
+
+
+def _has_marker(text: str, *markers: str) -> bool:
+    """Word-boundary marker test. ``bench with`` must not match ``workbench with``."""
+    return has_any_phrase(text, markers)
 
 
 def _as_list(value: Any) -> list[str]:
@@ -1387,31 +1395,130 @@ def _seed_attributes_from_description(
     return seeded
 
 
-def classify_listing_profile(title: str, description: str = "", category_id: str = "") -> ListingProfile:
-    title_text = _text_context(title)
-    text = _text_context(title, description)
+def classify_listing_profile(
+    title: str,
+    description: str = "",
+    category_id: str = "",
+    *,
+    source_title: str = "",
+) -> ListingProfile:
+    title_text = strip_room_location_lists(_text_context(title))
+    text = strip_room_location_lists(_text_context(title, source_title, description))
     outdoor_context = has_outdoor_marker(text)
     # Shared with ebay_category_matcher via product_context_signals: one passing
     # mention of a balcony must not outweigh four named indoor rooms. Both
     # engines classify categories, so a guard fixed in only one leaves live wrong.
-    outdoor_context_strict = strict_outdoor_context(title_text, text)
-    sofa_context = any(
-        marker in title_text
-        for marker in (
-            "sectional sofa",
-            "l-shaped sofa",
-            "u-shaped sofa",
-            "modular sectional",
-            "single sofa",
-            "sofa",
-            "couch",
-            "loveseat",
-            "armchair",
-            "reading chair",
-            "chaise lounge",
-            "club chair",
+    outdoor_context_strict = strict_outdoor_context(title_text or _text_context(title), text)
+    primary = primary_product_noun(title, source_title)
+    if primary == "workbench":
+        return ListingProfile(kind="unknown")
+    if primary == "nightstand":
+        return ListingProfile(
+            kind="nightstand",
+            category_id="38199",
+            category_name="Nightstands",
+            type_value="Nightstand",
+            room="Bedroom",
+            remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
         )
-    )
+    if primary == "dresser":
+        # Do not guess a dresser leaf; a wrong remap is worse than no remap.
+        return ListingProfile(kind="unknown")
+    if primary == "storage_ottoman":
+        return ListingProfile(
+            kind="storage_ottoman",
+            category_id="20490",
+            category_name="Ottomans, Footstools & Poufs",
+            type_value="Storage Ottoman",
+            set_includes="Ottoman",
+            room="Living Room",
+            remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
+        )
+    if primary in {"ottoman_bench", "ottoman"}:
+        return ListingProfile(
+            kind="ottoman_bench",
+            category_id="20490",
+            category_name="Ottomans, Footstools & Poufs",
+            type_value="Ottoman",
+            set_includes="Ottoman",
+            room="Living Room",
+            remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
+        )
+    if primary == "daybed":
+        if outdoor_context_strict:
+            return ListingProfile(
+                kind="outdoor_daybed",
+                category_id="138996",
+                category_name="Outdoor Daybeds",
+                indoor_outdoor="Outdoor",
+            )
+        return ListingProfile(kind="unknown")
+    if primary == "accent_chair":
+        if outdoor_context_strict and _has_marker(title_text, "outdoor", "patio", "garden", "wicker"):
+            return ListingProfile(
+                kind="outdoor_chair",
+                category_id="79684",
+                category_name="Outdoor Chairs",
+                type_value="Outdoor Chair",
+                set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
+                indoor_outdoor="Outdoor",
+            )
+        return ListingProfile(
+            kind="armchair",
+            category_id="38208",
+            category_name="Sofas, Armchairs & Couches",
+            type_value="Armchair",
+            set_includes="Chair",
+            room="Living Room",
+        )
+    if primary == "dining_chair":
+        return ListingProfile(
+            kind="dining_chair",
+            category_id="54235",
+            category_name="Chairs",
+            type_value="Dining Chair",
+            set_includes="Chairs" if _has_marker(text, "set of", "chairs") else None,
+            room="Dining Room",
+        )
+    if primary == "outdoor_chair" and outdoor_context_strict:
+        return ListingProfile(
+            kind="outdoor_chair",
+            category_id="79684",
+            category_name="Outdoor Chairs",
+            type_value="Outdoor Chair",
+            set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
+            indoor_outdoor="Outdoor",
+        )
+    if primary == "pantry":
+        return ListingProfile(
+            kind="pantry_cabinet",
+            category_id="20487",
+            category_name="Cabinets & Cupboards",
+            type_value="Cabinet",
+        )
+    if primary in {"dining_bench", "storage_bench"}:
+        return ListingProfile(
+            kind="indoor_bench",
+            category_id="262980",
+            category_name="Benches",
+            type_value="Bench",
+            set_includes="Bench",
+        )
+    sofa_context = _has_marker(
+        title_text,
+        "sectional sofa",
+        "l-shaped sofa",
+        "u-shaped sofa",
+        "modular sectional",
+        "single sofa",
+        "sofa",
+        "couch",
+        "loveseat",
+        "armchair",
+        "reading chair",
+        "chaise lounge",
+        "club chair",
+    ) and primary not in {"storage_ottoman", "ottoman_bench", "ottoman", "workbench"}
     dining_set_markers = (
         "dining set",
         "dining table set",
@@ -1456,8 +1563,8 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         "queen over full",
     )
 
-    if any(marker in title_text for marker in ("treadmill", "walking pad", "running machine")) and not any(
-        marker in title_text for marker in ("dog treadmill", "pet treadmill")
+    if _has_marker(title_text, "treadmill", "walking pad", "running machine") and not _has_marker(
+        title_text, "dog treadmill", "pet treadmill"
     ):
         return ListingProfile(
             kind="treadmill",
@@ -1466,7 +1573,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             type_value="Treadmill",
         )
 
-    if any(marker in title_text for marker in ("potting bench", "garden workstation")):
+    if _has_marker(title_text, "potting bench", "garden workstation"):
         return ListingProfile(
             kind="potting_bench",
             category_id="139939",
@@ -1474,7 +1581,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             type_value="Potting Bench",
         )
 
-    if any(marker in title_text for marker in ("table tennis", "ping pong")):
+    if _has_marker(title_text, "table tennis", "ping pong"):
         return ListingProfile(
             kind="table_tennis",
             category_id="97075",
@@ -1483,8 +1590,8 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             set_includes="Table",
         )
 
-    if any(marker in title_text for marker in kids_table_set_markers) or (
-        "kids table" in title_text and "chair" in title_text
+    if _has_marker(title_text, *kids_table_set_markers) or (
+        _has_marker(title_text, "kids table") and _has_marker(title_text, "chair")
     ):
         return ListingProfile(
             kind="kids_table_set",
@@ -1503,8 +1610,8 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         "console table",
         "nesting table",
     )
-    if any(marker in title_text for marker in dining_set_markers) and not any(
-        marker in title_text for marker in kids_table_set_markers + non_dining_table_set_markers
+    if _has_marker(title_text, *dining_set_markers) and not _has_marker(
+        title_text, *kids_table_set_markers, *non_dining_table_set_markers
     ):
         return ListingProfile(
             kind="dining_set",
@@ -1514,22 +1621,22 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             set_includes="Dining Table & Stools" if "stool" in title_text else "Dining Table & Chairs",
         )
 
-    if any(marker in title_text for marker in ("computer desk", "writing desk", "l-shaped desk", "l shaped desk", "corner desk", "home office desk")):
+    if _has_marker(title_text, "computer desk", "writing desk", "l-shaped desk", "l shaped desk", "corner desk", "home office desk"):
         return ListingProfile(
             kind="desk",
             category_id="88057",
             category_name="Desks & Tables",
         )
 
-    if any(marker in title_text for marker in bed_markers + bed_stack_markers):
+    if _has_marker(title_text, *bed_markers, *bed_stack_markers):
         return ListingProfile(
             kind="bed",
             category_id="175758",
             category_name="Beds & Bed Frames",
             type_value=(
                 "Loft Bed"
-                if "loft bed" in title_text
-                else ("Bunk Bed" if any(marker in title_text for marker in ("bunk bed",) + bed_stack_markers) else "Bed Frame")
+                if _has_marker(title_text, "loft bed")
+                else ("Bunk Bed" if _has_marker(title_text, "bunk bed", *bed_stack_markers) else "Bed Frame")
             ),
             room="Bedroom",
         )
@@ -1546,10 +1653,10 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         "microwave shelf",
     )
     has_pantry = (
-        any(marker in title_text for marker in pantry_markers)
-        or ("hutch" in title_text and any(marker in title_text for marker in ("kitchen", "pantry", "microwave")))
-    )
-    if has_pantry and not any(marker in title_text for marker in ("wine rack", "wine cabinet", "bar cabinet")):
+        _has_marker(title_text, *pantry_markers)
+        or (_has_marker(title_text, "hutch") and _has_marker(title_text, "kitchen", "pantry", "microwave"))
+    ) and not _has_marker(title_text, "nightstand", "bedside table", "dresser", "workbench", "work bench")
+    if has_pantry and not _has_marker(title_text, "wine rack", "wine cabinet", "bar cabinet"):
         return ListingProfile(
             kind="pantry_cabinet",
             category_id="20487",
@@ -1557,14 +1664,14 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             type_value="Cabinet",
         )
 
-    if "golf" in title_text and ("golf putting green" in title_text or "putting green" in title_text):
+    if _has_marker(title_text, "golf") and _has_marker(title_text, "golf putting green", "putting green"):
         return ListingProfile(
             kind="golf_putting_green",
             category_id="36234",
             category_name="Putting Greens & Aids",
         )
 
-    if "golf" in title_text and any(marker in title_text for marker in ("golf hitting mat", "golf practice mat", "golf training mat", "golf swing mat")):
+    if _has_marker(title_text, "golf") and _has_marker(title_text, "golf hitting mat", "golf practice mat", "golf training mat", "golf swing mat"):
         return ListingProfile(
             kind="golf_mat",
             category_id="50876",
@@ -1572,15 +1679,12 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         )
 
     if (
-        "porch swing" in title_text
-        or "porch swing bed" in title_text
-        or "patio swing bed" in title_text
-        or "garden swing bed" in title_text
+        _has_marker(title_text, "porch swing", "porch swing bed", "patio swing bed", "garden swing bed")
         or (
-            "swing bed" in title_text
+            _has_marker(title_text, "swing bed")
             and outdoor_context
-            and "rope" in title_text
-            and not any(marker in title_text for marker in ("cat ", "dog ", "pet ", "kitten", "puppy"))
+            and _has_marker(title_text, "rope")
+            and not _has_marker(title_text, "cat ", "dog ", "pet ", "kitten", "puppy")
         )
     ):
         return ListingProfile(
@@ -1590,12 +1694,11 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             indoor_outdoor="Outdoor",
         )
 
-    if any(marker in title_text for marker in ("outdoor daybed", "patio daybed", "sunbed")) or (
-        "daybed" in title_text
+    if _has_marker(title_text, "outdoor daybed", "patio daybed", "sunbed") or (
+        _has_marker(title_text, "daybed")
         and outdoor_context_strict
-        and "porch swing" not in title_text
-        and "swing bed" not in title_text
-        and not any(marker in title_text for marker in ("sofa", "couch", "loveseat", "sectional"))
+        and not _has_marker(title_text, "porch swing", "swing bed")
+        and not _has_marker(title_text, "sofa", "couch", "loveseat", "sectional")
     ):
         return ListingProfile(
             kind="outdoor_daybed",
@@ -1606,30 +1709,28 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
 
     if (
         outdoor_context_strict
-        and not any(marker in title_text for marker in ("sofa", "couch", "loveseat", "sectional"))
+        and not _has_marker(title_text, "sofa", "couch", "loveseat", "sectional")
         and re.search(r"\btable\b", title_text) is None
-        and any(
-            marker in title_text
-            for marker in (
-                "outdoor chair",
-                "patio chair",
-                "club chair",
-                "club chairs",
-                "armchair",
-                "armchairs",
-                "patio armchair",
-                "patio armchairs",
-                "outdoor dining chair",
-                "outdoor dining chairs",
-                "patio dining chair",
-                "patio dining chairs",
-                "outdoor lounge chair",
-                "outdoor lounge chairs",
-                "patio lounge",
-                "sun lounger",
-                "camping chair",
-                "camping chairs",
-            )
+        and _has_marker(
+            title_text,
+            "outdoor chair",
+            "patio chair",
+            "club chair",
+            "club chairs",
+            "armchair",
+            "armchairs",
+            "patio armchair",
+            "patio armchairs",
+            "outdoor dining chair",
+            "outdoor dining chairs",
+            "patio dining chair",
+            "patio dining chairs",
+            "outdoor lounge chair",
+            "outdoor lounge chairs",
+            "patio lounge",
+            "sun lounger",
+            "camping chair",
+            "camping chairs",
         )
     ):
         return ListingProfile(
@@ -1637,11 +1738,11 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             category_id="79684",
             category_name="Outdoor Chairs",
             type_value="Outdoor Chair",
-            set_includes="Chairs" if any(marker in title_text for marker in ("set of 2", "set of two", "chairs")) else "Chair",
+            set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
             indoor_outdoor="Outdoor",
         )
 
-    if any(marker in title_text for marker in ("bar stool", "bar stools", "counter stool", "counter stools", "barstool", "barstools")):
+    if _has_marker(title_text, "bar stool", "bar stools", "counter stool", "counter stools", "barstool", "barstools"):
         return ListingProfile(
             kind="bar_stool",
             category_id="103431",
@@ -1658,7 +1759,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         "outdoor furniture set",
         "outdoor sectional",
     )
-    if any(marker in title_text for marker in patio_set_markers):
+    if _has_marker(title_text, *patio_set_markers):
         return ListingProfile(
             kind="patio_furniture_set",
             category_id="139849",
@@ -1671,10 +1772,10 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
 
     if (
         not sofa_context
-        and any(marker in title_text for marker in ("storage ottoman", "lift top ottoman", "storage footstool"))
+        and _has_marker(title_text, "storage ottoman", "lift top ottoman", "storage footstool")
     ) or (
         not sofa_context
-        and "ottoman" in title_text and "storage" in title_text
+        and _has_marker(title_text, "ottoman") and _has_marker(title_text, "storage")
     ):
         return ListingProfile(
             kind="storage_ottoman",
@@ -1686,7 +1787,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
         )
 
-    if not sofa_context and "ottoman bench" in title_text:
+    if not sofa_context and _has_marker(title_text, "ottoman bench"):
         return ListingProfile(
             kind="ottoman_bench",
             category_id="20490",
@@ -1697,21 +1798,21 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
         )
 
-    excluded_bench = any(
-        marker in title_text
-        for marker in (
-            "garden bench",
-            "outdoor bench",
-            "park bench",
-            "shower bench",
-            "bath stool",
-            "potting bench",
-            "hall tree",
-            "coat rack bench",
-            "shoe bench",
-            "storage ottoman",
-            "ottoman bench",
-        )
+    excluded_bench = _has_marker(
+        title_text,
+        "garden bench",
+        "outdoor bench",
+        "park bench",
+        "shower bench",
+        "bath stool",
+        "potting bench",
+        "hall tree",
+        "coat rack bench",
+        "shoe bench",
+        "storage ottoman",
+        "ottoman bench",
+        "workbench",
+        "work bench",
     )
     bench_markers = (
         "dining bench",
@@ -1722,7 +1823,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         "end of bed",
         "footrest stool",
     )
-    if not excluded_bench and any(marker in title_text for marker in bench_markers):
+    if not excluded_bench and _has_marker(title_text, *bench_markers):
         return ListingProfile(
             kind="indoor_bench",
             category_id="262980",
@@ -1731,7 +1832,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             set_includes="Bench",
         )
 
-    if any(marker in title_text for marker in ("board game table", "gaming table", "game table")):
+    if _has_marker(title_text, "board game table", "gaming table", "game table"):
         return ListingProfile(
             kind="game_table",
             category_id="38204",
@@ -1742,7 +1843,12 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset(GAME_TABLE_FORBIDDEN_ASPECTS),
         )
 
-    if "dining chair" in title_text or ("chair" in title_text and "dining" in title_text and ("set of" in title_text or "chairs" in title_text)):
+    if _has_marker(title_text, "dining chair") or (
+        _has_marker(title_text, "chair")
+        and _has_marker(title_text, "dining")
+        and _has_marker(title_text, "set of", "chairs")
+        and not _has_marker(title_text, "accent chair", "armchair", "reading chair")
+    ):
         return ListingProfile(
             kind="dining_chair",
             category_id="54235",
@@ -1752,7 +1858,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             room="Dining Room",
         )
 
-    if "bean bag" in title_text:
+    if _has_marker(title_text, "bean bag"):
         return ListingProfile(
             kind="bean_bag",
             category_id="48319",
@@ -1762,7 +1868,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset({"Set Includes"}),
         )
 
-    if "dining table" in title_text and "chair" not in title_text and "bench" not in title_text:
+    if _has_marker(title_text, "dining table") and not _has_marker(title_text, "chair", "bench"):
         return ListingProfile(
             kind="dining_table",
             category_id="38204",
@@ -1773,7 +1879,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset({"Upholstery Material", "Upholstery Fabric"}),
         )
 
-    if any(marker in title_text for marker in ("coffee table", "cocktail table")):
+    if _has_marker(title_text, "coffee table", "cocktail table"):
         return ListingProfile(
             kind="coffee_table",
             category_id="38204",
@@ -1783,7 +1889,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             room="Living Room",
         )
 
-    if any(marker in title_text for marker in ("nightstand", "bedside table")):
+    if _has_marker(title_text, "nightstand", "bedside table"):
         return ListingProfile(
             kind="nightstand",
             category_id="38199",
@@ -1793,11 +1899,11 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
         )
 
-    if any(marker in title_text for marker in ("side table", "end table", "accent table", "lamp table")):
+    if _has_marker(title_text, "side table", "end table", "accent table", "lamp table"):
         # Animal-head / statue accent tables are decorative sculpture (20518), same as
         # published W5398 flamingo sibling. Plain furniture end tables use 38200.
         # Never use 54235 (Chairs) or 38204 (Coffee Tables).
-        if any(m in title_text for m in ("statue", "figurine", "sculpture", "animal head", "head accent")):
+        if _has_marker(title_text, "statue", "figurine", "sculpture", "animal head", "head accent"):
             return ListingProfile(
                 kind="decor_statue_table",
                 category_id="20518",
@@ -1815,7 +1921,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
         )
 
-    if any(marker in title_text for marker in ("armchair", "reading chair", "single seat sofa", "accent chair")) and "dining" not in title_text:
+    if _has_marker(title_text, "armchair", "reading chair", "single seat sofa", "accent chair") and not _has_marker(title_text, "dining"):
         return ListingProfile(
             kind="armchair",
             category_id="38208",
@@ -1831,16 +1937,22 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
     # recategorized into 38208 by this branch).
     sofa_accessory_context = (
         re.search(r"\b(?:sofa|couch)\s+(?:side\s+)?table\b", title_text)
-        or "console table" in title_text
+        or _has_marker(title_text, "console table")
         or re.search(r"\bbehind\s+(?:the\s+)?(?:couch|sofa)\b", title_text)
+        or _has_marker(title_text, "storage ottoman", "ottoman bench", "storage bench")
     )
-    if not sofa_accessory_context and any(
-        marker in title_text
-        for marker in ("loveseat", "sectional sofa", "l-shaped sofa", "u-shaped sofa", "modular sectional", "sofa", "couch")
+    if not sofa_accessory_context and _has_marker(
+        title_text,
+        "loveseat",
+        "sectional sofa",
+        "l-shaped sofa",
+        "u-shaped sofa",
+        "modular sectional",
+        "sofa",
+        "couch",
     ):
-        is_sectional = any(
-            marker in title_text
-            for marker in ("sectional", "modular", "l-shaped", "u-shaped", "u shaped", "l shaped")
+        is_sectional = _has_marker(
+            title_text, "sectional", "modular", "l-shaped", "u-shaped", "u shaped", "l shaped"
         )
         return ListingProfile(
             kind="sofa",
@@ -1871,8 +1983,12 @@ def quality_gate_expected_aspects(
     rewriting them. Keys match Item Specific names (Type, Assembly Required, …).
     """
     expected: dict[str, str] = {}
-    title_for_profile = " ".join(part for part in (source_title, title) if part)
-    profile = classify_listing_profile(title_for_profile, description, category_id)
+    profile = classify_listing_profile(
+        title or source_title,
+        description,
+        category_id,
+        source_title=source_title,
+    )
     if profile.type_value:
         expected["Type"] = profile.type_value
     if profile.set_includes:
@@ -3097,7 +3213,12 @@ def validate_listing_quality(
 
     category_id = str(opt.get("categoryId") or "").strip()
     preserve_category = is_category_approved(opt)
-    profile = classify_listing_profile(" ".join(part for part in (source_title, title) if part), description, category_id)
+    profile = classify_listing_profile(
+        title or source_title,
+        description,
+        category_id,
+        source_title=source_title,
+    )
     if not preserve_category and profile.category_id and category_id != profile.category_id:
         issues.append(
             ListingQualityIssue(

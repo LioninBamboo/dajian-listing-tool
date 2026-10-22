@@ -43,6 +43,16 @@ class TestOutdoorContext:
         assert names_indoor_room("For Living Room and Bedroom") is True
         assert names_indoor_room("Weather resistant wicker") is False
 
+    def test_room_list_balcony_with_velvet_is_not_outdoor(self):
+        title = "Floral Accent Chair Velvet Lounge Arm Chair for Living Room, Balcony"
+        assert outdoor_context(title, title) is False
+
+    def test_workbench_phrase_is_not_bench_with(self):
+        from src.utils.product_context_signals import has_phrase, primary_product_noun
+
+        assert has_phrase("Heavy Duty Steel Workbench with Pegboard", "bench with") is False
+        assert primary_product_noun("Heavy Duty Steel Workbench with Pegboard") == "workbench"
+
 
 class TestCoolerIsSometimesAnAdjective:
     @pytest.mark.parametrize(

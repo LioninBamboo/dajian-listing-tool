@@ -773,6 +773,33 @@ def build_missing_video_autofix_cmd(report_path, *, limit: int = MISSING_VIDEO_D
     ]
 
 
+def _pick_fresh_daily_live_audit_or_skip(task_name: str):
+    """Resolve today's live_audit for autofix tasks. Fail closed on stale data."""
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from scripts.semantic_rewrite import pick_latest_daily_live_audit
+        picked = pick_latest_daily_live_audit(
+            list((PROJECT_ROOT / 'logs').glob('listing_audit_fix_*.json'))
+        )
+    except Exception as exc:
+        logger.warning("SKIP: no fresh daily live_audit (%s)", exc)
+        update_health(task_name, 'skipped', f'SKIP: no fresh daily live_audit ({exc})')
+        return None
+    if not picked:
+        logger.info("SKIP: no fresh daily live_audit")
+        update_health(task_name, 'skipped', 'SKIP: no fresh daily live_audit')
+        return None
+    report_path, data = picked
+    logger.info(
+        "↪ %s using %s generated_at=%s total_published=%s",
+        task_name,
+        report_path.name,
+        data.get("generated_at"),
+        data.get("total_published"),
+    )
+    return report_path, data
+
+
 def task_source_aspect_autofix():
     """把 GIGA 源参数写回 live 属性 — 严格限定 fix key。
 
@@ -793,18 +820,11 @@ def task_source_aspect_autofix():
         logger.info("↪ 跳过源参数自动修复: 今日已成功执行")
         return True, 'Skipped (already succeeded today)'
 
-    try:
-        sys.path.insert(0, str(PROJECT_ROOT))
-        from scripts.semantic_rewrite import pick_latest_full_corpus_audit
-        picked = pick_latest_full_corpus_audit(list((PROJECT_ROOT / 'logs').glob('listing_audit_fix_*.json')))
-    except Exception as exc:
-        logger.warning("↪ 跳过源参数自动修复: 无法定位审计报告 (%s)", exc)
-        return True, f'Skipped (no audit report: {exc})'
+    picked = _pick_fresh_daily_live_audit_or_skip('source_aspect_autofix')
     if not picked:
-        logger.info("↪ 跳过源参数自动修复: 尚无全量审计报告")
-        return True, 'Skipped (no full-corpus audit report)'
+        return True, 'SKIP: no fresh daily live_audit'
 
-    report_path, _scores = picked
+    report_path, _data = picked
     run_task(
         'source_aspect_autofix',
         build_source_aspect_autofix_cmd(report_path),
@@ -818,18 +838,11 @@ def task_missing_video_autofix():
         logger.info("↪ 跳过缺视频同步: 今日已成功执行")
         return True, 'Skipped (already succeeded today)'
 
-    try:
-        sys.path.insert(0, str(PROJECT_ROOT))
-        from scripts.semantic_rewrite import pick_latest_full_corpus_audit
-        picked = pick_latest_full_corpus_audit(list((PROJECT_ROOT / 'logs').glob('listing_audit_fix_*.json')))
-    except Exception as exc:
-        logger.warning("↪ 跳过缺视频同步: 无法定位审计报告 (%s)", exc)
-        return True, f'Skipped (no audit report: {exc})'
+    picked = _pick_fresh_daily_live_audit_or_skip('missing_video_autofix')
     if not picked:
-        logger.info("↪ 跳过缺视频同步: 尚无全量审计报告")
-        return True, 'Skipped (no full-corpus audit report)'
+        return True, 'SKIP: no fresh daily live_audit'
 
-    report_path, _scores = picked
+    report_path, _data = picked
     run_task(
         'missing_video_autofix',
         build_missing_video_autofix_cmd(report_path),

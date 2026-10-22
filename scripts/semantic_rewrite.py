@@ -12,6 +12,7 @@ import json
 import os
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -161,24 +162,103 @@ def pick_latest_full_corpus_audit(
     return chosen, scores
 
 
-def derive_queue_from_latest_audit(limit: int | None = None) -> list[str]:
-    """Project §8.2: latest *non-empty* listing_audit_fix_*.json → rewrite queue.
+def _parse_generated_at(value) -> float | None:
+    """Parse report generated_at to a local naive timestamp, or None."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+    return parsed.timestamp()
 
-    CRITICAL actionable issues score 10; HIGH actionable issues score 1 so they
-    still enter the queue behind CRITICAL. MEDIUM/LOW stay out. Single-SKU
-    dry-run artifacts (0 scored rows) are skipped so the queue is not
-    accidentally wiped by a later tiny report. Full-corpus reports
-    (total_published > 500) always beat single-SKU dry-runs; among full-corpus
-    reports the newest mtime wins.
+
+def _report_is_full_daily_scope(data: dict) -> bool:
+    scope = data.get("scope")
+    if scope is None:
+        try:
+            published = int(data.get("total_published") or 0)
+        except (TypeError, ValueError):
+            published = 0
+        return published >= 20
+    return str(scope).strip() == "full"
+
+
+def pick_latest_daily_live_audit(
+    files: list[Path],
+    *,
+    max_age_hours: float = 36,
+    now: datetime | None = None,
+) -> tuple[Path, dict] | None:
+    """Newest fresh full-store live_audit. Never fall back to a stale report.
+
+    Qualifying reports must be mode=live_audit, unscoped (scope=full, or legacy
+    reports with no scope and total_published >= 20), generated_at/mtime within
+    max_age_hours, parseable JSON, and a non-empty issues list.
+    """
+    clock = now or datetime.now()
+    try:
+        cutoff = clock.timestamp() - float(max_age_hours) * 3600
+    except (TypeError, ValueError):
+        cutoff = clock.timestamp() - 36 * 3600
+    candidates: list[tuple[float, Path, dict]] = []
+    for path in files or []:
+        if path is None:
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if str(data.get("mode") or "") != "live_audit":
+            continue
+        issues = data.get("issues")
+        if not isinstance(issues, list) or not issues:
+            continue
+        if not _report_is_full_daily_scope(data):
+            continue
+        age_ts = _parse_generated_at(data.get("generated_at"))
+        if age_ts is None:
+            try:
+                age_ts = path.stat().st_mtime
+            except OSError:
+                continue
+        if age_ts < cutoff:
+            continue
+        candidates.append((age_ts, path, data))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _ts, chosen, data = candidates[0]
+    return chosen, data
+
+
+def derive_queue_from_latest_audit(limit: int | None = None) -> list[str]:
+    """Project §8.2: latest fresh daily live_audit → rewrite queue.
+
+    Switched from pick_latest_full_corpus_audit: that helper prefers
+    total_published > 500, so a 6-day-old 1000-row report beats today's 217-row
+    live_audit. --from-daily-audit must process today's findings or do nothing.
+    Fail closed (empty queue) rather than rewriting from stale issues.
     """
     logs = ROOT / "logs"
     files = list(logs.glob("listing_audit_fix_*.json"))
     if not files:
         return []
-    picked = pick_latest_full_corpus_audit(files)
+    picked = pick_latest_daily_live_audit(files)
     if not picked:
         return []
-    chosen, scores = picked
+    chosen, data = picked
+    scores = _score_audit_for_queue(data)
     ordered = sorted(scores.keys(), key=lambda s: scores[s], reverse=True)
     if limit:
         ordered = ordered[:limit]
@@ -187,7 +267,10 @@ def derive_queue_from_latest_audit(limit: int | None = None) -> list[str]:
     meta = ROOT / "logs" / "semantic_rewrite_queue_source.txt"
     meta.write_text(f"{chosen.name}\n{len(ordered)} skus\n", encoding="utf-8")
     out.write_text("\n".join(ordered) + ("\n" if ordered else ""), encoding="utf-8")
-    print(f"[queue] source={chosen.name} skus={len(ordered)}")
+    print(
+        f"[queue] source={chosen.name} generated_at={data.get('generated_at')} "
+        f"total_published={data.get('total_published')} skus={len(ordered)}"
+    )
     return ordered
 
 
