@@ -50,7 +50,7 @@ HIGH_BID = 7.0  # %
 MID_BID = 5.0
 LOW_BID = 3.0
 
-SAFETY_MARGIN = 0.05  # 5% 净利润安全边际
+SAFETY_MARGIN = 0.10  # 口径 A: 相对成本的 10%
 BID_DELTA_THRESHOLD = 0.5  # 与现 bid 差异 < 0.5% 视为无需调整
 
 
@@ -394,9 +394,15 @@ def run(apply: bool = False, send_email: bool = False) -> Dict[str, Any]:
     if send_email:
         try:
             from src.utils.email_sender import send_email as _send
+            from src.utils.email_policy import should_smtp
             subject = (f"🎯 Smart Bid {'应用' if apply else '预览'} - "
                        f"调整{summary['by_decision'].get('adjust', 0)} / 总{summary['total']}")
-            _send(subject, render_email_html(report))
+            n_adjust = int(summary['by_decision'].get('adjust', 0) or 0)
+            _send(
+                subject,
+                render_email_html(report),
+                send_smtp=should_smtp(has_issues=bool(n_adjust or summary.get('errors'))),
+            )
         except Exception as exc:
             logger.warning(f"邮件发送失败: {exc}")
 

@@ -8,7 +8,8 @@ This file is for future coding agents working in this repository. It is intentio
 - Current daily workload entrypoint is `daily_tasks.py`.
 - `daily_tasks.py` also runs `run_cro_diagnose()`; CRO execution is then consumed later by scheduler jobs rather than inline in the same step.
 - Generated listing correctness is centralized in `src/utils/listing_quality_gate.py`; do not fork product-family, item-specific, image, or measurement blockers in one-off scripts.
-- `StoreProfile.qc_profile` defaults to `furniture`. AquaRides sets `motors`, which skips furniture FactSheet / quality-gate rules and blocks incomplete Motors fitment instead.
+- `StoreProfile.qc_profile` defaults to `furniture`. AquaRides sets `motors`, which skips furniture quality-gate rules (measurements, category, banner) and the EN-store LLM FactSheet extractor. Motors still blocks incomplete vehicle-specific fitment, and it runs deterministic material / color / capacity invent checks plus claim-invent gates and `package_includes_set_qty_mismatch`, including universal-fit parts. Fitment Type Universal / Universal Fit / Universal Fitment Type with no Year/Make/Model table is not a fitment hard block. Do not invent Year/Make/Model to satisfy that check.
+- Substore `scheduler_profile: ops` stays inventory-only unless `scheduler_enable_qc_autofix` / `scheduler_enable_ads` are flipped in that instance's local yaml. Do not switch substores onto `scheduler_profile: full` to get QC or ads.
 - Do not publish READY drafts before running `scripts/audit_fix_ready_drafts.py` and checking `logs/ready_draft_audit_*.json`.
 - Treat any `quality_gate` unresolved entry in `logs/ready_draft_audit_*.json` as a publish blocker.
 - The scheduled `11:30` live listing audit is detect-only: `scripts/audit_fix_active_listings.py --live --email` reports and emails, but does not auto-fix the full live corpus.
@@ -95,6 +96,10 @@ Image handling rule:
 - `src/services/ebay_category_matcher.py` rejects obvious cross-family matches such as pet products to patio chairs, tents to tables, adirondack chairs to generic chairs, outdoor daybeds to patio chairs, and desk tops or table tops to dining tables unless the title clearly says dining table.
 - `src/utils/listing_quality_gate.py` is the local product-identity layer before taxonomy. If a generated draft is clearly a coffee table, bench, storage ottoman, dining chair, patio set, or sofa, normalize that profile before trusting AI or taxonomy suggestions.
 - Legacy category IDs still appear in historical data. Important remaps include `177815 -> 38204` and `177816 -> 107578`.
+
+## Pricing Floor (口径 A)
+
+Write, ads, and CRO bid increases all keep **net profit ≥ 10% of landed cost** after 5% store discount + 13.6% FVF + 1.3% international + modeled ads + $0.40. Listing floors pad a 10% destination tax on the fee base so that net still holds when collected tax ≤ 10%. Order PnL uses collected tax plus the same FVF/international/ad rates (no pad). Constant: `PricingEngine.MIN_NET_MARGIN_ON_COST`. `repricing_guard.precheck_price` uses that margin (not break-even). `create_ad_safe` / CRO `bid_cap_for_sku` cannot raise ads past the rate that would eat the 10% cost buffer. New publishes may still use the higher listing-price 15% floor in `batch_publish.py`.
 
 ## Repricing Truthfulness
 

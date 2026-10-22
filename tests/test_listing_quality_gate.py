@@ -2,6 +2,8 @@ from types import SimpleNamespace
 
 import src.utils.listing_quality_gate as listing_quality_gate
 from src.utils.listing_quality_gate import (
+    build_store_description_shell,
+    dedupe_store_description_headers,
     description_contains_cjk,
     description_uses_store_template,
     ensure_store_description_template,
@@ -15,6 +17,30 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_store_shell_does_not_double_wrap_existing_banner():
+    body = (
+        '<div style="padding:25px"><h3>KEY FEATURES</h3>'
+        "<ul><li>Soft chenille cushions</li></ul></div>"
+    )
+    once = build_store_description_shell(title="Cloud Couch Test Sofa", body_html=body)
+    assert once.upper().count("AQUAVERVE") == 1
+    twice = build_store_description_shell(title="Cloud Couch Test Sofa", body_html=once)
+    assert twice.upper().count("AQUAVERVE") == 1
+    nested = (
+        '<div style="max-width:900px;margin:0 auto;font-family:Arial,sans-serif;color:#1a1a1a;line-height:1.7">'
+        '<div style="text-align:center;padding:30px 15px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
+        '<h1 style="margin:0;font-size:28px;font-weight:300;letter-spacing:6px;color:#d4af37">AQUAVERVE</h1>'
+        '<p style="margin:8px 0 0;font-size:12px;color:#a0a0a0;letter-spacing:2px">PREMIUM HOME FURNISHINGS</p>'
+        "</div>"
+        '<div style="background:#f8f9fa;padding:25px;text-align:center;border-bottom:2px solid #d4af37">'
+        '<h2 style="margin:0;font-size:20px;color:#2d3436;font-weight:500">Cloud Couch Test Sofa</h2>'
+        f"</div>{once}</div>"
+    )
+    assert nested.upper().count("AQUAVERVE") == 2
+    assert dedupe_store_description_headers(nested).upper().count("AQUAVERVE") == 1
+    assert ensure_store_description_template(nested, title="Cloud Couch Test Sofa").upper().count("AQUAVERVE") == 1
 
 
 def test_description_cjk_and_store_template_helpers():
@@ -583,6 +609,27 @@ def test_tool_free_full_assembly_and_treadmill_setup_are_yes():
 
     assert stroller["required"] == "Yes"
     assert treadmill["required"] == "Yes"
+
+
+def test_garden_trellis_arbor_family_forces_assembly_yes():
+    decision = infer_assembly_decision(
+        source_title='4 Pack Metal Garden Trellis 86.7" x 19.7" Rustproof Trellis for Climbing',
+        source_description="",
+        attributes={
+            "Assembled Length (in.)": "80.00",
+            "Assembled Width (in.)": "19.7",
+            "Assembled Height (in.)": "86.70",
+        },
+        specs={
+            "Package Length (in.)": "45.7",
+            "Package Width (in.)": "21.8",
+            "Package Height (in.)": "4.72",
+        },
+        current_assembly="No",
+    )
+    assert decision["required"] == "Yes"
+    assert decision["status"] == "family"
+    assert decision["package"]["required_family"] == "garden_trellis_arbor"
 
 
 def test_quality_gate_catches_w808_style_description_no_assembly_claim():
@@ -1984,7 +2031,7 @@ class TestSofaAccessoryTableExclusion:
             "", "38208",
         )
         assert profile.kind == "side_table"
-        assert profile.category_id == "54235"
+        assert profile.category_id == "38200"
         assert profile.category_name == "End Tables"
         assert profile.type_value == "End & Side Tables"
 
@@ -2179,3 +2226,156 @@ def test_assembly_conflict_still_fires_when_aspect_missing():
         attributes=attrs, specs=specs,
     )
     assert _has_conflict(issues)
+
+
+def test_package_includes_set_qty_mismatch_flags_set_of_2_vs_1x():
+    from src.utils.listing_quality_gate import (
+        find_package_includes_set_qty_mismatch,
+        validate_listing_quality,
+    )
+
+    title = "Dining Chairs Set of 2 Solid Ash Wood Mid-Century Modern Upholstered Seat Walnut"
+    description = (
+        "<h3>PACKAGE INCLUDES</h3>"
+        "<p>1 x Dining Chair, 1 x Hardware Kit, 1 x Assembly Instructions</p>"
+    )
+    aspects = {
+        "Type": ["Dining Chair"],
+        "Number of Items in Set": ["2"],
+        "Set Includes": ["Chairs"],
+    }
+    issue = find_package_includes_set_qty_mismatch(title, description, aspects)
+    assert issue is not None
+    assert issue.code == "package_includes_set_qty_mismatch"
+
+    issues = validate_listing_quality(
+        {
+            "title": title,
+            "description": (
+                '<div style="max-width:900px">'
+                '<div>AQUAVERVE</div>'
+                "<h2>KEY FEATURES</h2><ul><li>Set of 2 chairs</li></ul>"
+                + description
+                + "<div>Thoughtfully curated for modern living</div>"
+                "</div>"
+            ),
+            "aspects": aspects,
+        },
+        source_title=title,
+        images=["https://example.com/a.jpg", "https://example.com/b.jpg"],
+    )
+    assert any(i.code == "package_includes_set_qty_mismatch" for i in issues)
+
+
+def test_package_includes_set_qty_ok_when_qty_matches():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    title = "Dining Chairs Set of 2 Solid Ash Wood"
+    description = "<h3>PACKAGE INCLUDES</h3><p>2 x Dining Chair, 1 x Hardware Kit</p>"
+    aspects = {"Type": ["Dining Chair"], "Number of Items in Set": ["2"]}
+    assert find_package_includes_set_qty_mismatch(title, description, aspects) is None
+
+
+def test_package_includes_skips_type_that_is_already_a_set():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    title = "10Pcs Premium Wood Chisel Set"
+    description = "<h3>PACKAGE INCLUDES</h3><p>1 x Wood Chisel Set</p>"
+    aspects = {"Type": ["Wood Chisel Set"], "Number of Items in Set": ["10"]}
+    assert find_package_includes_set_qty_mismatch(title, description, aspects) is None
+
+
+def test_package_includes_flags_number_of_pieces_vs_1x():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    issue = find_package_includes_set_qty_mismatch(
+        "Universal Fit Floor Mat",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Floor Mat</p>",
+        {"Type": ["Floor Mat"], "Number of Pieces": ["4"]},
+    )
+    assert issue is not None
+    assert issue.code == "package_includes_set_qty_mismatch"
+    assert "4" in issue.message
+    assert "1" in issue.message
+
+
+def test_package_includes_flags_set_word_when_box_lists_one_piece():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    issue = find_package_includes_set_qty_mismatch(
+        "Cabin Air Filter Set",
+        "<strong>PACKAGE INCLUDES</strong> 1 x Cabin Air Filter",
+        {"Type": ["Cabin Air Filter"]},
+    )
+    assert issue is not None
+    assert issue.code == "package_includes_set_qty_mismatch"
+
+
+def test_package_includes_flags_pieces_mismatch_other_than_one():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    issue = find_package_includes_set_qty_mismatch(
+        "Floor Mat",
+        "PACKAGE INCLUDES: 2 x Floor Mat",
+        {"Number of Pieces": ["4"]},
+    )
+    assert issue is not None
+    assert "4" in issue.message
+
+
+def test_package_includes_flags_set_type_when_box_lists_one_singular_item():
+    from src.utils.listing_quality_gate import find_package_includes_set_qty_mismatch
+
+    issue = find_package_includes_set_qty_mismatch(
+        "All Weather Floor Mat",
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Floor Mat</p>",
+        {"Type": ["Floor Mat Set"], "Number of Pieces": ["4"]},
+    )
+    assert issue is not None
+    assert issue.code == "package_includes_set_qty_mismatch"
+
+def test_invented_kit_size_flags_108_piece_not_in_source():
+    from src.utils.listing_quality_gate import find_invented_kit_size, validate_listing_quality
+
+    title = "Emergency Car Kit with Portable Air Compressor - 108-Piece Auto Safety & Roadsid"
+    description = (
+        '<div style="max-width:900px">'
+        "<div>AQUARIDES</div>"
+        "<p>Emergency Car Kit with Portable Air Compressor - 108-Piece Auto Safety &amp; Roadsid.</p>"
+        "<h2>KEY FEATURES</h2><ul><li>27-piece first aid kit</li></ul>"
+        "<h3>PACKAGE INCLUDES</h3><p>1 x Auto Safety Emergency Kit</p>"
+        "<div>Thoughtfully curated for modern living</div>"
+        "</div>"
+    )
+    source_description = (
+        "1pc air compressor 12V; 1pc booster cable; 27pc first aid kit; hard shell case"
+    )
+    issue = find_invented_kit_size(
+        title,
+        description,
+        source_title="Auto Safety Emergency Kit",
+        source_description=source_description,
+    )
+    assert issue is not None
+    assert issue.code == "invented_kit_size"
+    assert "108" in issue.message
+
+    issues = validate_listing_quality(
+        {"title": title, "description": description, "aspects": {"Type": ["Safety Kits"]}},
+        source_title="Auto Safety Emergency Kit",
+        source_description=source_description,
+        images=["https://example.com/a.jpg", "https://example.com/b.jpg"],
+    )
+    assert any(i.code == "invented_kit_size" for i in issues)
+
+
+def test_invented_kit_size_allows_source_backed_piece_count():
+    from src.utils.listing_quality_gate import find_invented_kit_size
+
+    issue = find_invented_kit_size(
+        "20-Piece Paintless Dent Repair Kit Stainless Steel Rods",
+        "PACKAGE INCLUDES: 1 x Paintless Dent Repair Rods Set",
+        source_title="20 Pcs Paintless Dent Repair Rods Kit",
+        source_description="20 Pcs stainless steel rods kit",
+    )
+    assert issue is None

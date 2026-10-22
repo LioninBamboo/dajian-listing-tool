@@ -25,7 +25,7 @@
 | `scripts/audit_fix_active_listings.py` | 已刊登链接审计与修复 | `scheduler_daemon.py` `11:30` / 手动 | 主路径 | 定时任务当前跑 `--live --email`，detect-only；显式 `--live --fix` 才做修复。报告按唯一 listing 行计数，不按根因去重 |
 | `scripts/repair_published_taxonomy.py` | 历史 taxonomy 修复 | 手动 | 主路径 | 替代旧类目修复思路 |
 | `scripts/batch_smart_reprice.py` | 智能调价 | `daily_tasks.py` / 手动 | 主路径 | 改价后必须回读验证 |
-| `scripts/sales_health_check.py` | 销售健康诊断与部分自动修复 | `daily_tasks.py` / 手动 | 主路径 | 负责 ghost delist 等诊断 |
+| `scripts/sales_health_check.py` | 销售健康诊断与部分自动修复 | `daily_tasks.py` / 手动 | 主路径 | ghost 缺货恢复；Trading/Motors 售完 Completed 走 Relist，Offer NOT_FOUND 不单独标 DELISTED |
 | `scripts/build_motors_compatibility.py` | 兼容性数据处理 | 手动 | 专用工具 | 用于 eBay Motors 相关能力 |
 | `scripts/auto_rotate_promotions.py` | 促销轮换 | 手动 / 专项 | 专用工具 | 不在主发布链路内 |
 | `scripts/retry_failed_categories.py` | 重试类目失败项 | 手动 | 专用工具 | 用于补救 |
@@ -77,7 +77,7 @@
 
 | 路径 | 责任 | 触发方式 | 状态 | 备注 |
 |------|------|----------|------|------|
-| `src/plugins/inventory_sync/sync_service.py` | 大建库存与价格同步 | `daily_tasks.py` | 主路径 | 推荐从主调度进入 |
+| `src/plugins/inventory_sync/sync_service.py` | 大建库存与价格同步 | `daily_tasks.py` | 主路径 | 推荐从主调度进入。Inventory Offer 缺失时用 Trading `ReviseInventoryStatus` / `RelistFixedPriceItem`（Motors SiteID 100） |
 | `src/plugins/inventory_sync/daily_sync.py` | 库存同步独立脚本 | 手动调试 | 调试入口 | 保留，但不再作为默认调度入口 |
 | `src/plugins/active_listing_optimizer/daily_optimize.py` | 已刊登标题优化 | 手动 / 显式启用 | 受控入口 | 默认停用；只有 `ENABLE_SCHEDULED_TITLE_OPTIMIZATION=1` 时才允许定时运行 |
 | `src/plugins/terapeak_research/research_client.py` | 市场研究客户端 | 被改价 / 报告调用 | 核心依赖 | 不是直接入口 |

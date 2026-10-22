@@ -781,6 +781,15 @@ class EbayCategoryMatcher:
             # 33653 is live-publish verified; add each new tree-100 leaf here as it
             # is confirmed by a real publish.
             "33653",   # Trailer Hitches (tree 100) — verified live 2026-07-23
+            # Tree-100 leaves confirmed via Taxonomy API name-check 2026-08-12
+            # (category name matches product type — running boards, racks, trims).
+            "33650",   # Running Boards & Step Bars
+            "33651",   # Roof Racks & Cross Bars
+            "33654",   # Body Moldings & Trims
+            "33655",   # Truck Bed Accessories
+            "33746",   # Other Tire Accessories
+            "14769",   # Other Exterior Parts & Accessories
+            "63690",   # Cargo Nets, Pet Barriers & Storage Bins (vehicle MOLLE storage)
         }
         outdoor_chair_categories = {"79682", "79684", "138996"}
         porch_swing_categories = {"79694"}
@@ -993,7 +1002,14 @@ class EbayCategoryMatcher:
                 if cid not in pet_categories and not any(kw in title_lower for kw in motors_keywords):
                     return False
 
-        if cid in pet_categories and not any(marker in title_lower for marker in pet_product_markers):
+        # Some ids collide across trees: 14769 is a pet category in tree 0 but
+        # "Other Exterior Parts & Accessories" in Motors tree 100. Don't apply the
+        # pet-marker guard when the title is clearly an auto part.
+        if (
+            cid in pet_categories
+            and not any(marker in title_lower for marker in pet_product_markers)
+            and not any(kw in title_lower for kw in motors_keywords)
+        ):
             return False
 
         if any(marker in title_lower for marker in fountain_markers):
@@ -1230,6 +1246,9 @@ class EbayCategoryMatcher:
             if cid != "63108":
                 return False
 
+        # "pillar" alone also matches automotive A-pillar/B-pillar/C-pillar trim
+        # parts (e.g. "Carbon Fiber A-Pillar"); require garden context so an auto
+        # trim piece is not misread as a plant-stand column.
         plant_stand_title = any(
             kw in title_lower
             for kw in (
@@ -1238,9 +1257,10 @@ class EbayCategoryMatcher:
                 "garden pedestal",
                 "roman column",
                 "column pedestal",
-                "pillar",
             )
-        )
+        ) or ("pillar" in title_lower and not any(
+            p in title_lower for p in ("a-pillar", "b-pillar", "c-pillar", "a pillar", "b pillar", "c pillar")
+        ))
         if plant_stand_title and not any(marker in title_lower for marker in fountain_markers):
             allowed_plant_stand_categories = set(plant_stand_categories)
             if any(marker in title_lower for marker in arbor_markers):

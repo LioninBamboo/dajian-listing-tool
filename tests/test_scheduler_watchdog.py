@@ -22,6 +22,9 @@ def isolate_maintenance_lock(tmp_path, monkeypatch):
         'MAINTENANCE_FILE',
         tmp_path / '_no_maintenance.lock',
     )
+    # Full-scheduler assertions must not depend on the host store_profile
+    # (GrovePop/AquaRides default to ops). Ops-specific tests override this.
+    monkeypatch.setattr(scheduler_watchdog, '_is_ops_scheduler', lambda: False)
 
 
 class FixedMondayNoonDateTime(datetime):
@@ -101,6 +104,39 @@ def test_watchdog_honors_tuesday_only_tasks(tmp_path, monkeypatch):
     assert 'smart_bid' in aliases
     assert 'bid_rollback' in aliases
     assert 'cro_delist_email' not in aliases
+
+
+def test_watchdog_does_not_relaunch_daily_tasks_after_today_timeout(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'timeout',
+                    'at': '2026-05-11T12:30:10',
+                    'message': 'Killed after 10800s',
+                },
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    launched = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert 'daily' not in aliases
+    assert 'cro_consume' not in aliases
 
 
 def test_watchdog_skips_task_already_running_today(tmp_path, monkeypatch):
@@ -258,6 +294,32 @@ def test_watchdog_tick_skips_all_recovery_during_maintenance(tmp_path, monkeypat
 
     assert scheduler_watchdog.run_watchdog_tick() is False
     assert [name for name, _ in calls] == ['log']
+
+
+def test_watchdog_ops_profile_recovers_only_ops_daily(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(json.dumps({}, ensure_ascii=False), encoding='utf-8')
+
+    launched = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kwargs):
+            launched.append(cmd)
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedMondayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog.subprocess, 'Popen', FakePopen)
+    monkeypatch.setattr(scheduler_watchdog, '_is_ops_scheduler', lambda: True)
+
+    scheduler_watchdog.check_overdue_critical_tasks()
+
+    aliases = [cmd[-1] for cmd in launched]
+    assert aliases == ['ops_daily']
+    assert 'daily' not in aliases
+    assert 'listing_audit' not in aliases
+    assert 'cro_sentinel' not in aliases
+    assert 'ad_restore' not in aliases
 
 
 def test_watchdog_tick_stops_when_maintenance_starts_between_phases(tmp_path, monkeypatch):

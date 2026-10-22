@@ -271,7 +271,7 @@ qc_profile: arttoy   # AquaRides 用 motors
 每日库存结果拆成两个互不混淆的审计范围：
 
 - `增量库存同步`：只统计本次实际进入 `InventorySyncService.sync_all()` 的 SKU；`检查数`是本次实际处理数，另显示本次范围总数和跳过数。
-- `全量缺货审核`：独立复核全部 `PUBLISHED` 链接的 eBay 实时数量，再交叉检查供应商库存；`检查数`是全量审核实际完成数。
+- `全量缺货审核`：独立复核全部 `PUBLISHED` 链接的 eBay 实时数量，再交叉检查供应商库存；`检查数`是全量审核实际完成数。汽配 Motors（SiteID 100）卖完会 Completed 并离开 ActiveList；审核会另扫近 60 天因售出结束、供应商仍有货的链接，用 Trading `RelistFixedPriceItem` 按 `min(EBAY_LISTING_QUANTITY_CAP, 供应商库存)` 重上，保留 SKU，不改 fitment。Inventory Offer 不存在时改走 Trading 改数量，不会只因 `NOT_FOUND` 写成 `DELISTED`。供应商确无货则不 Relist。
 
 两栏统一返回 `audit_scope`、`checked_count`、`qty_zero_count`、`supplier_oos_count`、`restocked_count`、`error_count`。每日主流程只执行一次全量缺货审核，销售健康诊断复用结果但不再重复调用数量审核。
 

@@ -317,6 +317,10 @@ def _check_material_claims(
     # Add a synonym map to handle cases where the source uses a shorthand (like ABS)
     # but the AI generates the full term (like ABS plastic)
     upgrade_source_synonyms = {
+        # US/UK spelling: a source spelled "aluminium" must ground generated
+        # "aluminum" (and vice versa), not read as an iron->aluminum upgrade.
+        "aluminum": r"\b(?:aluminum|aluminium)\b",
+        "aluminium": r"\b(?:aluminum|aluminium)\b",
         "abs": r"\b(?:abs|abs plastic|abs material)\b",
         "genuine leather": r"\b(?:genuine leather|real leather|top grain leather)\b",
         "real leather": r"\b(?:genuine leather|real leather|top grain leather)\b",

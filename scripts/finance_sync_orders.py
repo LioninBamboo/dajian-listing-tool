@@ -43,6 +43,16 @@ def main() -> int:
             ad_rate=args.ad_rate,
         )
     except Exception as e:
+        # pythonw swallows console stdout/stderr; persist for Task Scheduler Result=1 triage.
+        err_path = PROJECT_ROOT / "logs" / "finance_sync_error.log"
+        try:
+            err_path.parent.mkdir(parents=True, exist_ok=True)
+            err_path.write_text(
+                f"{datetime.now().isoformat()} ERROR: {e}\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
         print(f"[ERROR] {e}")
         return 1
 

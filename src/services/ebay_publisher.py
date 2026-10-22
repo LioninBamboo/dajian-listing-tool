@@ -30,7 +30,7 @@ from src.services.vehicle_compatibility import (
     apply_compatibility_aspects,
 )
 from src.utils.store_profile import get_store_profile
-from src.utils.ebay_quantity import resolve_publish_quantity
+from src.utils.ebay_quantity import default_ebay_listing_quantity, resolve_publish_quantity
 from src.utils.publish_autofix import sanitize_placeholder_aspects, sanitize_single_value_aspects
 from src.utils.publish_aspect_completion import (
     complete_publish_aspects,
@@ -2088,7 +2088,7 @@ class EbayPublisher:
                 # MAPPING CRITICAL: internal 'images' -> client 'image_urls'
                 "image_urls": data["images"],
                 "price": data["price"],
-                "quantity": data.get("quantity", 1),
+                "quantity": data.get("quantity") or default_ebay_listing_quantity(),
                 "condition": "NEW",
                 "aspects": data["aspects"]
             }

@@ -346,6 +346,11 @@ scheduler_daemon.py
 
 库存日报使用两个明确的审计范围：`incremental_inventory_sync` 只表示本次实际同步的
 SKU，`full_oos_audit` 表示全部 `PUBLISHED` 链接的 eBay 数量复核及供应商交叉检查。
+Trading / Motors 店（`listing_channel: trading`，汽配 SiteID 100）卖完会 Completed，
+不留在 ActiveList。全量缺货审核会再扫近 60 天 SoldList：供应商仍有货则
+`RelistFixedPriceItem`（只带 ItemID、数量、SKU，数量为 `min(cap, 供应商库存)`），
+并写入 `inventory_sync_log.action=restocked`。Inventory Offer 缺失时走 Trading
+`ReviseInventoryStatus`；Offer 或 Trading `NOT_FOUND` 本身不把链接改成 `DELISTED`。
 两者都返回统一的 `audit_scope`、`checked_count`、`qty_zero_count`、
 `supplier_oos_count`、`restocked_count`、`error_count` 字段。`daily_tasks` 先执行
 全量缺货审核，随后调用销售健康诊断时传入 `run_quantity_audit=False`，避免再次拉取

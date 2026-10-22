@@ -32,6 +32,7 @@ HEALTHY_STR = 0.0005
 
 # 价格相对市场中位价的告警分位
 PRICE_OVERPRICED = 1.15
+FLOOR_OVER_MARKET_LOCK = 1.30  # same band as copy_skip_gate.NEAR_MARKET_BAND (listing gate)
 PRICE_PREMIUM = 1.05
 
 

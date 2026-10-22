@@ -42,6 +42,14 @@ DAEMON_SPEC = importlib.util.spec_from_file_location('scheduler_daemon', ROOT / 
 scheduler_daemon = importlib.util.module_from_spec(DAEMON_SPEC)
 DAEMON_SPEC.loader.exec_module(scheduler_daemon)
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def force_full_scheduler_profile(monkeypatch):
+    """Recovery tests assert the full profile table; force non-ops on host ops stores."""
+    monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
+
 
 class FixedNoonDateTime(datetime):
     @classmethod
@@ -341,6 +349,94 @@ def test_recover_missed_tasks_waits_for_daily_before_cro(tmp_path, monkeypatch):
     assert 'cro_fill_specifics' not in calls
     assert 'cro_promote' not in calls
     assert 'cro_sentinel' not in calls
+
+
+def test_recover_missed_tasks_does_not_rerun_daily_after_timeout(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'timeout',
+                    'at': '2026-05-11T12:30:10',
+                    'message': 'Killed after 10800s',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+
+    calls: list[str] = []
+
+    def _record(name: str):
+        def runner():
+            calls.append(name)
+            return True, f'mocked {name}'
+        return runner
+
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, 'task_title_optimize', _record('title_optimize'))
+    monkeypatch.setattr(scheduler_daemon, 'task_listing_audit', _record('listing_audit'))
+    monkeypatch.setattr(scheduler_daemon, 'task_daily_full', _record('daily_tasks'))
+    monkeypatch.setattr(scheduler_daemon, 'task_mi_self_check', _record('mi_self_check'))
+    monkeypatch.setattr(scheduler_daemon, 'task_ad_restore', _record('ad_restore'))
+    monkeypatch.setattr(scheduler_daemon, 'task_blacklist_cleanup', _record('blacklist_cleanup'))
+    monkeypatch.setattr(scheduler_daemon, 'task_guard_anomaly', _record('guard_anomaly'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_monthly_report', _record('cro_monthly_report'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_consume', _record('cro_consume'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_image_refresh', _record('cro_image_refresh'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_fill_specifics', _record('cro_fill_specifics'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_promote', _record('cro_promote'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_sentinel', _record('cro_sentinel'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_delist_email', _record('cro_delist_email'))
+    monkeypatch.setattr(scheduler_daemon, 'task_health_check', _record('health_check'))
+    monkeypatch.setattr(scheduler_daemon, 'task_smart_bid', _record('smart_bid'))
+    monkeypatch.setattr(scheduler_daemon, 'task_bid_rollback', _record('bid_rollback'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_learn_thresholds', _record('cro_learn_thresholds'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_promote_thresholds', _record('cro_promote_thresholds'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_ops_snapshot', _record('cro_ops_snapshot'))
+    _stub_recent_recovery_tasks(monkeypatch, _record)
+
+    scheduler_daemon.recover_missed_tasks(log_when_clean=False)
+
+    assert 'daily_tasks' not in calls
+    assert 'cro_consume' not in calls
+    assert 'cro_promote' not in calls
+
+
+def test_task_daily_full_skips_after_today_timeout(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'timeout',
+                    'at': '2026-05-11T12:30:10',
+                    'message': 'Killed after 10800s',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    calls = []
+    monkeypatch.setattr(
+        scheduler_daemon,
+        'run_task',
+        lambda *args, **kwargs: calls.append(args) or (True, 'should not run'),
+    )
+
+    result = scheduler_daemon.task_daily_full()
+
+    assert calls == []
+    assert result[0] is True
+    assert 'already' in result[1].lower() or 'timeout' in result[1].lower()
+
+
+def test_daily_tasks_timeout_is_four_hours():
+    assert scheduler_daemon.TASK_TIMEOUT['daily_tasks'] == 14400
 
 
 def test_recover_missed_tasks_skips_watchdog_recovery_in_progress(tmp_path, monkeypatch):

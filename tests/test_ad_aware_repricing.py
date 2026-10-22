@@ -39,10 +39,10 @@ class AdAwareFloorFormulaTests(unittest.TestCase):
         self.assertGreater((floor_with_ad - floor_no_ad) / floor_with_ad, 0.04)
 
     def test_floor_no_ad_value_correct(self):
-        # cost=100, 无广告: listing × 0.95 × (1-0.1325) - 0.30 = 100
-        # listing = 100.30 / (0.95 × 0.8675) = 100.30 / 0.824125 ≈ 121.71
+        # cost=100, 无广告, 10% 税垫: take=(0.136+0.013)*1.10=0.1639
+        # listing = 100.40 / (0.95 × 0.8361) ≈ 126.40
         floor = PricingEngine.absolute_floor_price(100.0, ad_rate=0.0)
-        self.assertAlmostEqual(floor, 121.70, delta=0.05)
+        self.assertAlmostEqual(floor, 126.40, delta=0.05)
 
     def test_safe_floor_respects_ad_rate(self):
         cost = 50.0
@@ -51,9 +51,10 @@ class AdAwareFloorFormulaTests(unittest.TestCase):
         self.assertLess(f2, f1)
 
     def test_assert_safe_price_with_ad_rate_zero_passes(self):
-        # cost=100, price=$122 → 带 5% 广告会拒, 关广告就过
-        ok_with_ad, _ = PricingEngine.assert_safe_price(122.0, 100.0)
-        ok_no_ad, _   = PricingEngine.assert_safe_price(122.0, 100.0, ad_rate=0.0)
+        no_ad_floor = PricingEngine.absolute_floor_price(100.0, ad_rate=0.0)
+        price = round(no_ad_floor + 0.20, 2)
+        ok_with_ad, _ = PricingEngine.assert_safe_price(price, 100.0)
+        ok_no_ad, _ = PricingEngine.assert_safe_price(price, 100.0, ad_rate=0.0)
         self.assertFalse(ok_with_ad)
         self.assertTrue(ok_no_ad)
 
@@ -66,12 +67,12 @@ class AdAwareFloorFormulaTests(unittest.TestCase):
     def test_required_ad_rate_for(self):
         # 在带广告死线上, required_ad_rate ≈ 5%
         cost = 100.0
-        floor_5 = PricingEngine.absolute_floor_price(cost)  # ~129.16
+        floor_5 = PricingEngine.absolute_floor_price(cost)  # ~$135.25 with intl+tax pad
         ar = PricingEngine.required_ad_rate_for(floor_5, cost)
         self.assertAlmostEqual(ar, 0.05, delta=0.005)
 
         # 在关广告死线上, required_ad_rate ≈ 0
-        floor_0 = PricingEngine.absolute_floor_price(cost, ad_rate=0.0)  # ~121.71
+        floor_0 = PricingEngine.absolute_floor_price(cost, ad_rate=0.0)  # ~$126.40
         ar0 = PricingEngine.required_ad_rate_for(floor_0, cost)
         self.assertAlmostEqual(ar0, 0.0, delta=0.005)
 
@@ -124,7 +125,7 @@ class PrecheckPriceTests(unittest.TestCase):
 
     def test_unsafe_below_break_even_rejected(self):
         from src.services.repricing_guard import precheck_price
-        # $100 远低于关广告死线 $121.71 → 拒
+        # $100 远低于关广告 10% 成本底 $138.99 → 拒
         ok, reason = precheck_price('SKU-100', 100.0, db_path=self.db_path)
         self.assertFalse(ok)
         self.assertIn('unsafe_even_without_ad', reason)
@@ -136,11 +137,11 @@ class PrecheckPriceTests(unittest.TestCase):
         self.assertEqual(reason, 'no_cost_data')
 
     def test_below_ad_floor_no_ad_passes(self):
-        """价格 < 带广告死线, 但 listing 没在打广告 → 放行."""
+        """价格 < 带广告 10% 成本底, 但 >= 关广告 10% 成本底, 且没在打广告 → 放行."""
         from src.services import repricing_guard
         with patch.object(repricing_guard, '_try_disable_ad', return_value=(False, 'no_ad')):
             ok, reason = repricing_guard.precheck_price(
-                'SKU-100', 122.0, db_path=self.db_path,
+                'SKU-100', 144.0, db_path=self.db_path,
             )
         self.assertTrue(ok)
         self.assertEqual(reason, 'ok_no_ad_to_disable')
@@ -149,7 +150,7 @@ class PrecheckPriceTests(unittest.TestCase):
         from src.services import repricing_guard
         with patch.object(repricing_guard, '_try_disable_ad', return_value=(True, 'disabled')):
             ok, reason = repricing_guard.precheck_price(
-                'SKU-100', 122.0, db_path=self.db_path,
+                'SKU-100', 144.0, db_path=self.db_path,
             )
         self.assertTrue(ok)
         self.assertIn('ok_after_ad_disabled', reason)
@@ -158,7 +159,7 @@ class PrecheckPriceTests(unittest.TestCase):
         from src.services import repricing_guard
         with patch.object(repricing_guard, '_try_disable_ad', return_value=(False, 'failed')):
             ok, reason = repricing_guard.precheck_price(
-                'SKU-100', 122.0, db_path=self.db_path,
+                'SKU-100', 144.0, db_path=self.db_path,
             )
         self.assertFalse(ok)
         self.assertIn('ad_disable_failed', reason)
@@ -166,7 +167,7 @@ class PrecheckPriceTests(unittest.TestCase):
     def test_allow_ad_disable_false_rejects_below_ad_floor(self):
         from src.services.repricing_guard import precheck_price
         ok, reason = precheck_price(
-            'SKU-100', 122.0, db_path=self.db_path, allow_ad_disable=False,
+            'SKU-100', 144.0, db_path=self.db_path, allow_ad_disable=False,
         )
         self.assertFalse(ok)
         self.assertIn('unsafe_with_ad_no_disable', reason)
@@ -334,11 +335,13 @@ class CreateAdSafeTests(unittest.TestCase):
         svc.create_ad.assert_called_once()
 
     def test_no_live_price_fails_open(self):
-        """API 取不到 live_price → fail-open."""
+        """Inventory 和 Trading 都取不到 live_price → fail-open."""
         svc = self._make_svc()
         with patch('src.services.repricing_guard._fetch_cost_and_listing',
                    return_value=(50.0, 'L1')), \
              patch('src.services.ebay_ad_service.requests.get') as mock_get, \
+             patch('src.services.ebay_ad_service._trading_live_price',
+                   return_value=None), \
              patch('src.services.ebay_auth.EbayOAuthService') as mock_oauth:
             mock_oauth.return_value.get_valid_token.return_value = 'tok'
             mock_get.return_value.status_code = 200
@@ -346,6 +349,38 @@ class CreateAdSafeTests(unittest.TestCase):
             res = svc.create_ad_safe('CAMP', 'L1', sku='SKU-A', bid_percentage=5.0)
         self.assertTrue(res['success'])
         svc.create_ad.assert_called_once()
+
+    def test_empty_inventory_uses_trading_price_and_can_reject(self):
+        """Trading listing 在 Inventory 不可见时, 用 GetItem 现价做利润守卫."""
+        svc = self._make_svc()
+        with patch('src.services.repricing_guard._fetch_cost_and_listing',
+                   return_value=(100.0, 'L1')), \
+             patch('src.services.ebay_ad_service.requests.get') as mock_get, \
+             patch('src.services.ebay_ad_service._trading_live_price',
+                   return_value=115.0), \
+             patch('src.services.ebay_auth.EbayOAuthService') as mock_oauth:
+            mock_oauth.return_value.get_valid_token.return_value = 'tok'
+            mock_get.return_value.status_code = 200
+            mock_get.return_value.json.return_value = {'offers': []}
+            res = svc.create_ad_safe('CAMP', 'L1', sku='SKU-A', bid_percentage=5.0)
+        self.assertFalse(res['success'])
+        self.assertEqual(res['reason'], 'unsafe')
+        svc.create_ad.assert_not_called()
+
+    def test_empty_inventory_uses_trading_price_and_can_allow(self):
+        svc = self._make_svc()
+        with patch('src.services.repricing_guard._fetch_cost_and_listing',
+                   return_value=(50.0, 'L1')), \
+             patch('src.services.ebay_ad_service.requests.get') as mock_get, \
+             patch('src.services.ebay_ad_service._trading_live_price',
+                   return_value=200.0), \
+             patch('src.services.ebay_auth.EbayOAuthService') as mock_oauth:
+            mock_oauth.return_value.get_valid_token.return_value = 'tok'
+            mock_get.return_value.status_code = 200
+            mock_get.return_value.json.return_value = {'offers': []}
+            res = svc.create_ad_safe('CAMP', 'L1', sku='SKU-A', bid_percentage=5.0)
+        self.assertTrue(res['success'])
+        svc.create_ad.assert_called_once_with('CAMP', 'L1', 5.0)
 
 
 if __name__ == '__main__':

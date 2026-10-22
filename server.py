@@ -611,7 +611,21 @@ def analyze_product_task(sku: str):
             db.commit()
 
         from src.services.pricing_engine import PricingEngine
+        from src.utils.copy_skip_gate import (
+            apply_copy_skip,
+            apply_live_supplier_quote,
+            cargo_gate_applies,
+            evaluate_copy_skip,
+            lookup_live_supplier_quote,
+            market_advisory_log_line,
+        )
         specs = product.specs or {}
+        live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(sku))
+        apply_cargo = cargo_gate_applies(specs, live_quote_applied=live_applied)
+        if live_applied:
+            logging.info(
+                f"[PRICE] {sku} live supplier quote: price=${product.price} ship=${product.shipping}"
+            )
         is_oversize = bool(
             dajian_dims.get('overSizeFlag')
             or 'Dimensions' in specs
@@ -628,7 +642,29 @@ def analyze_product_task(sku: str):
             is_oversize=is_oversize,
         )
         total_cost = dajian_costs["total_dajian_cost"]
-        
+
+        # Cheap gates before Browse/Terapeak and before any listing-copy LLM.
+        local_skip = evaluate_copy_skip(
+            sku=sku,
+            product_price=product.price,
+            shipping=product.shipping,
+            is_oversize=is_oversize,
+            attributes=attrs,
+            specs=specs,
+            description=product.description or "",
+            title=product.title or "",
+            include_market=False,
+            dims_mode="require",
+            apply_cargo=apply_cargo,
+        )
+        if local_skip.skip:
+            apply_copy_skip(product, local_skip, cost_breakdown=dajian_costs)
+            flag_modified(product, "logs")
+            flag_modified(product, "cost_breakdown")
+            db.commit()
+            logging.info(f"[COPY_SKIP] {sku} {','.join(local_skip.reasons)} (no LLM)")
+            return
+
         market_price = None  # Default: no market data
         market_avg = None
         market_source = None
@@ -677,9 +713,35 @@ def analyze_product_task(sku: str):
         product.cost_breakdown = dajian_costs
         flag_modified(product, 'cost_breakdown')  # FIX: Notify SQLAlchemy of JSON change
         product.suggested_price = decision["final_price"]
-        
-        # 2. AI Optimization (Switched to Qwen)
+
+        priced_skip = evaluate_copy_skip(
+            sku=sku,
+            product_price=product.price,
+            shipping=product.shipping,
+            is_oversize=is_oversize,
+            attributes=attrs,
+            specs=specs,
+            description=product.description or "",
+            title=product.title or "",
+            market_median=market_price,
+            include_market=True,
+            dims_mode="require",
+            apply_cargo=apply_cargo,
+        )
+        advisory_line = market_advisory_log_line(priced_skip.detail)
+        if advisory_line:
+            logging.info(advisory_line)
+        if priced_skip.skip:
+            apply_copy_skip(product, priced_skip, cost_breakdown=dajian_costs)
+            flag_modified(product, "logs")
+            flag_modified(product, "cost_breakdown")
+            db.commit()
+            logging.info(f"[COPY_SKIP] {sku} {','.join(priced_skip.reasons)} (no LLM)")
+            return
+
+        # 2. AI Optimization (Switched to Qwen) — only near-market or SAFE_15 survivors.
         from qwen_optimizer import QwenOptimizer, optimize_product_full_with_timeout
+        from src.utils.copy_skip_gate import market_median_from_intel
         import os
         QWEN_KEY = os.getenv("QWEN_API_KEY")
         
@@ -705,7 +767,35 @@ def analyze_product_task(sku: str):
             except Exception as mi_err:
                 logging.warning(f"Market intelligence fetch failed (non-critical): {mi_err}")
                 # Continue without market intelligence — optimization still works fine
-            
+
+            # First lookup can miss a cached Browse/Terapeak median that this
+            # fetch still has. Re-check far-above before paying for copy.
+            if not market_price:
+                intel_skip = evaluate_copy_skip(
+                    sku=sku,
+                    product_price=product.price,
+                    shipping=product.shipping,
+                    is_oversize=is_oversize,
+                    attributes=attrs,
+                    specs=specs,
+                    description=product.description or "",
+                    title=product.title or "",
+                    market_median=market_median_from_intel(market_intel),
+                    include_market=True,
+                    dims_mode="require",
+                    apply_cargo=apply_cargo,
+                )
+                advisory_line = market_advisory_log_line(intel_skip.detail)
+                if advisory_line:
+                    logging.info(advisory_line)
+                if intel_skip.skip:
+                    apply_copy_skip(product, intel_skip, cost_breakdown=dajian_costs)
+                    flag_modified(product, "logs")
+                    flag_modified(product, "cost_breakdown")
+                    db.commit()
+                    logging.info(f"[COPY_SKIP] {sku} {','.join(intel_skip.reasons)} (no LLM)")
+                    return
+
             opt_data = optimize_product_full_with_timeout(
                 api_key=QWEN_KEY,
                 original_title=product.title,
@@ -952,7 +1042,28 @@ async def collect_product(
             f"({len(normalized_images)} imgs, "
             f"{len(normalized_videos)} vids, {len(payload.specs or {})} specs, Shipping: ${payload.shipping})"
         )
-        
+
+        from src.utils.copy_skip_gate import (
+            apply_copy_skip,
+            evaluate_copy_skip,
+        )
+
+        # Intake gates that the payload can already answer. Missing dims stay
+        # deferred so analyze can still read supplier assembled measurements.
+        # Placeholder dims and N735*/W1706*/ZL* / cargo>200 never schedule copy generation.
+        intake_skip = evaluate_copy_skip(
+            sku=payload.sku,
+            product_price=payload.price,
+            shipping=payload.shipping,
+            is_oversize="Dimensions" in specs or "Dimensions" in attributes,
+            attributes=attributes,
+            specs=specs,
+            description=description,
+            title=title,
+            include_market=False,
+            dims_mode="defer_missing",
+        )
+
         # Check if product already exists
         existing = db.query(CollectedProduct).filter_by(sku=payload.sku).first()
         
@@ -977,6 +1088,10 @@ async def collect_product(
             flag_modified(existing, 'attributes')
             flag_modified(existing, 'specs')
             flag_modified(existing, 'logs')
+            if intake_skip.skip:
+                apply_copy_skip(existing, intake_skip)
+                flag_modified(existing, "logs")
+                flag_modified(existing, "cost_breakdown")
             db.commit()
             print(f" Updated existing product: {payload.sku}")
         else:
@@ -998,10 +1113,25 @@ async def collect_product(
             )
             if issue_flags:
                 new_product.logs.append(f"Collection quality flags: {', '.join(issue_flags)}")
+            if intake_skip.skip:
+                apply_copy_skip(new_product, intake_skip)
             db.add(new_product)
             db.commit()
             print(f"?Created new product: {payload.sku}")
-        
+
+        if intake_skip.skip:
+            logging.info(
+                "[COPY_SKIP] %s %s at intake (no LLM)",
+                payload.sku,
+                ",".join(intake_skip.reasons),
+            )
+            return {
+                "status": "success",
+                "message": "Product collected; listing copy skipped",
+                "sku": payload.sku,
+                "copy_skip_reasons": list(intake_skip.reasons),
+            }
+
         # Schedule background optimization
         print(f"?Scheduling background optimization for {payload.sku}...")
         background_tasks.add_task(analyze_product_task, payload.sku)
