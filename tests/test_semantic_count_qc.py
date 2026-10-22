@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from src.utils.listing_fact_sheet import compare_fact_sheets, parse_noun_count
+from src.utils.listing_fact_sheet import (
+    _count_claim_in_text,
+    compare_fact_sheets,
+    parse_noun_count,
+)
 
 
 PARSE_ROWS = (
@@ -17,11 +21,15 @@ PARSE_ROWS = (
     ("Glass Doors and Drawer", "drawer", 1, 2),
     ("Double Glass Doors", "door", 2, 1),
     ("47 Inch Chairs", "chair", None, 47),
+    ("8-inch wheels", "wheel", None, 8),
     ("two glass-door compartments", "door", None, 3),
     ("stable base", "table", None, None),
     ("eleven shelves", "shelf", 11, 1),
     ("pair of pillows", "pillow", 2, 1),
     ("single drawer", "drawer", 1, 2),
+    ("one of the shelves", "shelf", None, 1),
+    ("2-sided panel", "panel", None, 2),
+    ("Double Bed with Storage", "bed", None, 2),
 )
 
 
@@ -129,6 +137,14 @@ def test_none_inputs_do_not_crash():
     assert parse_noun_count("", None) is None  # type: ignore[arg-type]
     source = {"materials": [], "features": [], "counts": {}, "capacity": None, "certifications": [], "dimensions": {}}
     assert compare_fact_sheets(source, source, live_text=None, source_text=None) == []
+
+
+def test_dimension_units_are_not_count_claims():
+    assert _count_claim_in_text(8, "wheel", "8-inch wheels") is False
+    assert _count_claim_in_text(47, "chair", "47 Inch Chairs") is False
+    assert _count_claim_in_text(1, "shelf", "one of the shelves") is False
+    assert _count_claim_in_text(2, "panel", "2-sided panel") is False
+    assert _count_claim_in_text(2, "bed", "Double Bed with Storage") is False
 
 
 def test_cached_sheet_one_without_text_corroboration_is_skipped():

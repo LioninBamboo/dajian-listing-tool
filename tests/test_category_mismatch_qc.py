@@ -144,6 +144,38 @@ def test_edge_velvet_chair_room_list_patio_stays_indoor():
     assert profile.category_id == "38208"
 
 
+COMPOUND_NEGATIVE_CASES = (
+    ("7 Piece Dining Table Set with 6 Dining Chairs", "dining_set"),
+    ("5 Piece Dining Set with Upholstered Bench and 4 Chairs", "dining_set"),
+    ("5 Piece Patio Furniture Set with Ottoman", "patio_furniture_set"),
+    ("Patio Conversation Set with 2 Armchairs and Coffee Table", "patio_furniture_set"),
+    ("Accent Chair and Ottoman Set", "armchair"),
+    ("Swivel Recliner Chair with Ottoman", None),
+    ("L-Shaped Sectional Sofa, Reversible Chaise, Storage Ottoman", "sofa"),
+    ("Queen Upholstered Platform Bed Frame with Storage Bench", "bed"),
+    ("Twin Bunk Bed with Trundle and 2 Nightstands", "bed"),
+    ("Entryway Hall Tree with Storage Bench", None),
+    ("Shoe Storage Bench", None),
+    ("Kitchen Pantry Cabinet with Wine Rack", None),
+    ("Dining Table Set for 4 with Upholstered Bench", "dining_set"),
+    ("Computer Desk with Storage Bench", "desk"),
+)
+
+
+@pytest.mark.parametrize("title,expected_kind", COMPOUND_NEGATIVE_CASES, ids=[row[0][:40] for row in COMPOUND_NEGATIVE_CASES])
+def test_compound_titles_keep_base_behaviour_or_no_remap(title, expected_kind):
+    """primary_product_noun early returns must not invent a new profile."""
+    from src.utils.product_context_signals import primary_product_noun
+
+    assert primary_product_noun(title) is None
+    profile = classify_listing_profile(title, "")
+    if expected_kind is None:
+        assert profile.kind == "unknown"
+        assert not profile.category_id
+    else:
+        assert profile.kind == expected_kind
+
+
 def _audit_titles(sku, giga, live, stored, monkeypatch):
     from scripts import audit_fix_active_listings
 

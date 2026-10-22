@@ -1934,12 +1934,32 @@ def classify_listing_profile(
     # "Sofa Table" / "Sofa Side Table" / "Console Table ... Behind Couch" are
     # tables that merely mention a sofa — never classify them as sofas
     # (live incident 2026-07-13: a nightstand and a console table were both
-    # recategorized into 38208 by this branch).
+    # recategorized into 38208 by this branch). A real sectional/couch/armchair
+    # that happens to include a storage ottoman is still seating, not an
+    # accessory-ottoman title (W3098 "Double Sofa" stuffing stays blocked).
+    true_sofa_seating = _has_marker(
+        title_text,
+        "sectional sofa",
+        "l-shaped sofa",
+        "l-shaped sectional",
+        "u-shaped sofa",
+        "modular sectional",
+        "loveseat",
+        "couch",
+        "armchair",
+        "accent chair",
+        "reading chair",
+        "chaise lounge",
+        "club chair",
+    )
     sofa_accessory_context = (
         re.search(r"\b(?:sofa|couch)\s+(?:side\s+)?table\b", title_text)
         or _has_marker(title_text, "console table")
         or re.search(r"\bbehind\s+(?:the\s+)?(?:couch|sofa)\b", title_text)
-        or _has_marker(title_text, "storage ottoman", "ottoman bench", "storage bench")
+        or (
+            _has_marker(title_text, "storage ottoman", "ottoman bench", "storage bench")
+            and not true_sofa_seating
+        )
     )
     if not sofa_accessory_context and _has_marker(
         title_text,

@@ -880,6 +880,10 @@ def task_semantic_rewrite():
         logger.info("↪ 跳过语义改写: 今日已成功执行")
         return True, 'Skipped (already succeeded today)'
 
+    picked = _pick_fresh_daily_live_audit_or_skip('semantic_rewrite')
+    if not picked:
+        return True, 'SKIP: no fresh daily live_audit'
+
     run_task(
         'semantic_rewrite',
         [

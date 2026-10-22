@@ -79,6 +79,47 @@ _ROOM_LIST_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Set / bundle / compound titles are not a single head noun. Primary-noun
+# early returns must not invent a remap for these (dining set → dining_chair,
+# sofa with ottoman → ottoman, bunk bed + nightstand → nightstand, …).
+_COMPOUND_PHRASES: tuple[str, ...] = (
+    "dining set",
+    "dining table set",
+    "table set",
+    "patio set",
+    "patio furniture set",
+    "conversation set",
+    "furniture set",
+    "bed frame",
+    "bunk bed",
+    "platform bed",
+    "hall tree",
+    "shoe bench",
+    "shoe storage bench",
+    "wine rack",
+)
+
+_OTTOMAN_COMPOUND_RE = re.compile(
+    r"(?:"
+    r"\b(?:and|with)\b.{0,48}\bottoman\b"
+    r"|\b(?:sectional|sofa|couch|recliner)\b.{0,80}\bottoman\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def has_compound_product_signal(text: str) -> bool:
+    """True when the title is a set/bundle/compound, not a single product noun."""
+    hay = str(text or "")
+    if not hay:
+        return False
+    if has_any_phrase(hay, _COMPOUND_PHRASES):
+        return True
+    if has_phrase(hay, "desk"):
+        return True
+    return _OTTOMAN_COMPOUND_RE.search(hay) is not None
+
+
 # Head-noun families, most specific first. "storage cabinet" is intentionally
 # absent: it is a keyword-stuffing phrase, not a product type.
 _PRIMARY_NOUNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -130,11 +171,17 @@ def strip_room_location_lists(text: str) -> str:
 
 
 def primary_product_noun(live_title: str, source_title: str = "") -> str | None:
-    """Head product noun, live title first. GIGA stuffing must not override it."""
+    """Head product noun, live title first. GIGA stuffing must not override it.
+
+    Compound/set titles (dining set, bunk bed + nightstand, chair and ottoman,
+    …) return None — uncertain means no remap, never a new profile.
+    """
     for blob in (live_title, source_title):
         core = strip_room_location_lists(blob or "")
         if not core:
             continue
+        if has_compound_product_signal(core):
+            return None
         # "Sofa with Storage Ottoman" is a sofa. A title whose head noun is the
         # ottoman/bench, with "sofa" only as stuffing, stays ottoman/bench.
         accessory_ottoman = re.search(

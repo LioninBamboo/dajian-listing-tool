@@ -765,9 +765,11 @@ def parse_noun_count(text: str, noun: str) -> int | None:
         if match.end("n") < len(hay) and hay[match.end("n")] == ".":
             continue
         between = hay[match.end("n"):match.start("noun")]
-        if re.match(rf"\s*{_COUNT_DIMENSION_UNIT}\b", between, re.IGNORECASE):
+        if re.match(rf"[\s\-–]*{_COUNT_DIMENSION_UNIT}\b", between, re.IGNORECASE):
             continue
         if re.search(rf"\bof\b", between, re.IGNORECASE):
+            continue
+        if re.search(r"\bsided\b", between, re.IGNORECASE):
             continue
         values.append(int(match.group("n")))
 
@@ -780,6 +782,11 @@ def parse_noun_count(text: str, noun: str) -> int | None:
     for match in word_pat.finditer(hay):
         if match.start("noun") > 0 and hay[match.start("noun") - 1] == "-":
             continue
+        between = hay[match.end("w"):match.start("noun")]
+        if re.search(r"\bof\b", between, re.IGNORECASE):
+            continue
+        if re.search(r"\bsided\b", between, re.IGNORECASE):
+            continue
         values.append(_COUNT_WORD_NUMBERS[match.group("w").lower()])
 
     double_pat = re.compile(
@@ -789,6 +796,10 @@ def parse_noun_count(text: str, noun: str) -> int | None:
     )
     for match in double_pat.finditer(hay):
         if match.start("noun") > 0 and hay[match.start("noun") - 1] == "-":
+            continue
+        noun = str(match.group("noun") or "").lower()
+        # Mattress size "Double Bed" is not a count of two beds.
+        if noun in {"bed", "beds"}:
             continue
         values.append(2)
 
@@ -822,6 +833,15 @@ def parse_noun_count(text: str, noun: str) -> int | None:
     else:
         plural_pat = None
     if singular_pat and singular_pat.search(hay) and not (plural_pat and plural_pat.search(hay)):
+        # "Double Bed" is a mattress size, not a count of one bed.
+        if re.search(r"\bdouble\s+beds?\b", hay, re.IGNORECASE) and any(
+            term in {"bed", "beds"} for term in terms
+        ):
+            return None
+        # "2-sided panel" names a panel that is two-sided, not a count of 1.
+        singular_alt = "|".join(re.escape(term) for term in singulars)
+        if re.search(rf"\bsided\s+(?:{singular_alt})\b", hay, re.IGNORECASE):
+            return None
         return 1
     return None
 
@@ -849,23 +869,45 @@ def _count_claim_in_text(count: int, noun: str, text: str) -> bool:
         return False
     terms = "|".join(re.escape(term) for term in synonyms)
     hay = str(text or "")
-    if re.search(
-        rf"(?<!\d){wanted}\s*[-\s]*(?:{terms})(?![a-z])",
-        hay,
+
+    def _non_count_gap(gap: str) -> bool:
+        if re.search(rf"{_COUNT_DIMENSION_UNIT}\b", gap, re.IGNORECASE):
+            return True
+        if re.search(r"\bsided\b", gap, re.IGNORECASE):
+            return True
+        if re.search(r"\bof\s+the\b", gap, re.IGNORECASE):
+            return True
+        if re.search(r"\bdouble\b", gap, re.IGNORECASE) and re.search(r"\bbeds?\b", gap + " ", re.IGNORECASE):
+            return True
+        return False
+
+    compact = re.compile(
+        rf"(?<!\d)(?P<n>{wanted})(?P<gap>\s*[-\s]*)(?:{terms})(?![a-z])",
         re.IGNORECASE,
-    ):
+    )
+    for match in compact.finditer(hay):
+        after_number = hay[match.end("n"):]
+        if re.match(rf"[\s\-–]*{_COUNT_DIMENSION_UNIT}\b", after_number, re.IGNORECASE):
+            continue
+        if re.match(r"[\s\-–]*sided\b", after_number, re.IGNORECASE):
+            continue
+        if _non_count_gap(match.group("gap")):
+            continue
         return True
     # Source copy often qualifies a component count (``1 main net`` or
     # ``2 side triangular nets``). Keep this bounded to two words so a
     # broader aggregate such as ``1 of 2 nets`` is not treated as the same
-    # claim.
-    return bool(
-        re.search(
-            rf"(?<!\d){wanted}\s+(?:[a-z]+\s+){{1,2}}(?:{terms})(?![a-z])",
-            hay,
-            re.IGNORECASE,
-        )
+    # claim. Dimension units (``8-inch``, ``47 Inch``) and ``one of the``
+    # / ``-sided`` are not counts.
+    qualified = re.compile(
+        rf"(?<!\d)(?P<n>{wanted})(?P<gap>\s+(?:[a-z]+\s+){{1,2}})(?:{terms})(?![a-z])",
+        re.IGNORECASE,
     )
+    for match in qualified.finditer(hay):
+        if _non_count_gap(match.group("gap")):
+            continue
+        return True
+    return False
 
 
 def _resolved_count(noun: str, sheet_count, text: str | None) -> int | None:

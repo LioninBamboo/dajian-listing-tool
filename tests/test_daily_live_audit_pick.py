@@ -195,6 +195,28 @@ def test_empty_issues_are_ignored(tmp_path):
     assert pick_latest_daily_live_audit(list(tmp_path.glob("*.json")), now=now) is None
 
 
+def test_newest_empty_full_blocks_older_in_window_findings(tmp_path):
+    """A fresh empty full live_audit must not lose to yesterday's findings."""
+    from scripts.semantic_rewrite import pick_latest_daily_live_audit
+
+    now = datetime(2026, 10, 22, 12, 10, 0)
+    _write_report(
+        tmp_path / "listing_audit_fix_20261022_113009.json",
+        published=217,
+        generated_at=now - timedelta(hours=1),
+        issues=[],
+        mtime=(now - timedelta(hours=1)).timestamp(),
+    )
+    _write_report(
+        tmp_path / "listing_audit_fix_20261021_113000.json",
+        published=202,
+        generated_at=now - timedelta(hours=24),
+        issues=[{"sku": "OLD1", "issues": [{"type": "semantic_material"}]}],
+        mtime=(now - timedelta(hours=24)).timestamp(),
+    )
+    assert pick_latest_daily_live_audit(list(tmp_path.glob("*.json")), now=now) is None
+
+
 def test_unreadable_mtime_is_skipped_when_generated_at_missing(tmp_path, monkeypatch):
     from scripts import semantic_rewrite as cli
 
@@ -251,6 +273,12 @@ def test_autofix_tasks_skip_without_fresh_report(tmp_path, monkeypatch):
     assert ok is True
     assert msg == "SKIP: no fresh daily live_audit"
     assert health["missing_video_autofix"][0] == "skipped"
+
+    ok, msg = scheduler_daemon.task_semantic_rewrite()
+    assert ok is True
+    assert msg == "SKIP: no fresh daily live_audit"
+    assert health["semantic_rewrite"][0] == "skipped"
+    assert "SKIP: no fresh daily live_audit" in health["semantic_rewrite"][1]
 
 
 def test_audit_report_scope_values():

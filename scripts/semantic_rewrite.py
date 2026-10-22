@@ -197,11 +197,14 @@ def pick_latest_daily_live_audit(
     max_age_hours: float = 36,
     now: datetime | None = None,
 ) -> tuple[Path, dict] | None:
-    """Newest fresh full-store live_audit. Never fall back to a stale report.
+    """Newest fresh full-store live_audit. Never fall back to an older report.
 
-    Qualifying reports must be mode=live_audit, unscoped (scope=full, or legacy
-    reports with no scope and total_published >= 20), generated_at/mtime within
-    max_age_hours, parseable JSON, and a non-empty issues list.
+    First take the newest full live_audit inside the window (mode=live_audit,
+    unscoped: scope=full, or legacy reports with no scope and
+    total_published >= 20, generated_at/mtime within max_age_hours, parseable
+    JSON). If that newest full report has empty issues or fails any check,
+    return None and skip — do not use yesterday's findings when a newer full
+    audit already exists.
     """
     clock = now or datetime.now()
     try:
@@ -221,9 +224,6 @@ def pick_latest_daily_live_audit(
             continue
         if str(data.get("mode") or "") != "live_audit":
             continue
-        issues = data.get("issues")
-        if not isinstance(issues, list) or not issues:
-            continue
         if not _report_is_full_daily_scope(data):
             continue
         age_ts = _parse_generated_at(data.get("generated_at"))
@@ -239,6 +239,9 @@ def pick_latest_daily_live_audit(
         return None
     candidates.sort(key=lambda item: item[0], reverse=True)
     _ts, chosen, data = candidates[0]
+    issues = data.get("issues")
+    if not isinstance(issues, list) or not issues:
+        return None
     return chosen, data
 
 
@@ -374,6 +377,11 @@ def main(argv: list[str] | None = None) -> int:
 
     from_daily = bool(args.from_daily_audit)
     if from_daily:
+        logs = ROOT / "logs"
+        picked = pick_latest_daily_live_audit(list(logs.glob("listing_audit_fix_*.json")))
+        if not picked:
+            print("SKIP: no fresh daily live_audit")
+            return 0
         skus = derive_queue_from_latest_audit(limit=None)
         skus = _exclude_done_and_human(skus)
         if args.limit:

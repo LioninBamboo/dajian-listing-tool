@@ -153,8 +153,11 @@ class EbayCategoryMatcher:
             re.search(rf"\b{kw}\b", title_lower)
             for kw in ("platform bed", "bed frame", "house bed", "floor bed", "montessori bed", "storage bed")
         )
+        # Storage-ottoman remaps must read the TITLE only. A description that
+        # mentions a storage ottoman as an accessory must not move a sofa/chair
+        # off 38208.
         has_storage_ottoman = has_any_phrase(
-            text_lower,
+            title_lower,
             ("storage ottoman", "ottoman bench", "lift top ottoman", "storage footstool"),
         )
         has_storage_ottoman_only = has_storage_ottoman and not has_any_phrase(
@@ -167,6 +170,13 @@ class EbayCategoryMatcher:
                 "sofa bed",
                 "pull out sofa",
                 "loveseat",
+                "sofa",
+                "couch",
+                "armchair",
+                "accent chair",
+                "reading chair",
+                "club chair",
+                "chaise lounge",
             ),
         )
         has_bean_bag = "bean bag" in title_lower
