@@ -30,6 +30,7 @@ from src.utils.product_context_signals import (
     title_has_clear_outdoor_word,
     title_has_mixed_indoor_outdoor,
     title_is_chair_accessory,
+    title_is_chair_only_dining,
     title_is_dining_set_bundle,
 )
 from src.utils.publish_aspect_completion import (
@@ -1565,6 +1566,9 @@ def classify_listing_profile(
     if primary == "dining_chair":
         if _has_marker(title_text, "accent chair"):
             return ListingProfile(kind="unknown")
+        # Cushions/covers fail the outdoor remap and must not fall through to Chairs.
+        if title_is_chair_accessory(title_text):
+            return ListingProfile(kind="unknown")
         if title_is_dining_set_bundle(title_text):
             return _dining_set_bundle_profile(title_text)
         if title_allows_outdoor_chair_remap(title_text):
@@ -1722,9 +1726,13 @@ def classify_listing_profile(
         "nesting table",
     )
     if (
-        _has_marker(title_text, *dining_set_markers) or title_is_dining_set_bundle(title_text)
-    ) and not _has_marker(
-        title_text, *kids_table_set_markers, *non_dining_table_set_markers
+        (
+            _has_marker(title_text, *dining_set_markers) or title_is_dining_set_bundle(title_text)
+        )
+        and not title_is_chair_only_dining(title_text)
+        and not _has_marker(
+            title_text, *kids_table_set_markers, *non_dining_table_set_markers
+        )
     ):
         if title_has_clear_outdoor_word(title_text):
             return _outdoor_dining_set_profile(title_text)
@@ -1970,6 +1978,8 @@ def classify_listing_profile(
         and not _has_marker(title_text, "accent chair", "armchair", "reading chair")
     ):
         if _has_marker(title_text, "accent chair"):
+            return ListingProfile(kind="unknown")
+        if title_is_chair_accessory(title_text):
             return ListingProfile(kind="unknown")
         if title_is_dining_set_bundle(title_text):
             return _dining_set_bundle_profile(title_text)

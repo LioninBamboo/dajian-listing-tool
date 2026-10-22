@@ -22,6 +22,7 @@ from src.utils.product_context_signals import (
     title_has_clear_outdoor_word,
     title_has_mixed_indoor_outdoor,
     title_is_chair_accessory,
+    title_is_chair_only_dining,
     title_is_dining_set_bundle,
 )
 
@@ -126,6 +127,23 @@ class TestDiningSetBundleAndMixedOutdoor:
     def test_chair_cushions_are_accessories(self):
         assert title_is_chair_accessory("Patio Chair Cushions") is True
         assert title_allows_outdoor_chair_remap("Patio Chair Cushions") is False
+
+    def test_chair_only_n_piece_is_not_a_table_set(self):
+        assert title_is_chair_only_dining("4 Piece Outdoor Dining Chair Set") is True
+        assert title_is_dining_set_bundle("4 Piece Outdoor Dining Chair Set") is False
+        assert title_is_chair_only_dining("Outdoor 5-Piece Dining Chairs") is True
+        assert title_is_dining_set_bundle("Outdoor 5-Piece Dining Chairs") is False
+        assert title_is_dining_set_bundle("7-Piece Patio Dining Set") is True
+        assert title_is_chair_only_dining("4 Piece Patio Dining Set with Chairs") is False
+
+    def test_room_list_does_not_allow_outdoor_chair_remap(self):
+        assert title_allows_outdoor_chair_remap(
+            "Velvet Club Chair for Living Room, Patio, Garden"
+        ) is False
+        assert title_allows_outdoor_chair_remap(
+            "Upholstered Dining Chair for Patio, Garden"
+        ) is False
+        assert title_allows_outdoor_chair_remap("Outdoor Dining Chair for Living Room") is True
 
 
 class TestBothEnginesUseTheSharedSignals:

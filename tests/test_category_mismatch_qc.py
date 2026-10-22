@@ -526,3 +526,51 @@ def test_edge_patio_chair_cushions_are_not_chairs():
     assert profile.kind != "outdoor_chair"
     assert profile.category_id not in {"79684", "54235"}
     assert canon not in {"79684", "54235"}
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Outdoor Dining Chair Cushions",
+        "Outdoor Dining Chair Covers",
+        "Patio Dining Chair Cushion Covers",
+    ],
+)
+def test_dining_chair_covers_stay_unknown_not_indoor_chairs(title):
+    profile, canon = _proposed_leaves(title, "177788")
+    assert profile.kind == "unknown"
+    assert profile.category_id != "54235"
+    assert canon != "54235"
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "4 Piece Outdoor Dining Chair Set",
+        "Outdoor 5-Piece Dining Chairs",
+        "5-Piece Dining Chair Set Outdoor",
+    ],
+)
+def test_chair_only_outdoor_sets_are_chairs_not_patio_sets(title):
+    profile, canon = _proposed_leaves(title, "54235")
+    assert profile.category_id == "79684"
+    assert profile.category_id != "139849"
+    assert canon == "79684"
+    assert canon != "139849"
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Velvet Club Chair for Living Room, Patio, Garden",
+        "Club Chair for Patio, Garden",
+        "Upholstered Dining Chair for Patio, Garden",
+        "Dining Chair for Living Room, Patio, Garden",
+    ],
+)
+def test_room_list_does_not_canonicalize_indoor_chairs_outdoors(title):
+    profile, canon = _proposed_leaves(title, "54235")
+    assert profile.category_id != "79684"
+    assert canon != "79684"
+    matcher = _matcher()
+    assert matcher._fallback_category(title)[0] != "79684"

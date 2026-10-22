@@ -24,6 +24,7 @@ from src.utils.product_context_signals import (
     title_has_clear_outdoor_word,
     title_has_mixed_indoor_outdoor,
     title_is_chair_accessory,
+    title_is_chair_only_dining,
     title_is_dining_set_bundle,
 )
 from src.services.ebay_auth import EbayOAuthService
@@ -294,6 +295,7 @@ class EbayCategoryMatcher:
             and re.search(r"\btable\b", title_lower) is None
             and (
                 has_outdoor_rocker
+                or title_is_chair_only_dining(title_lower)
                 or any(
                     kw in title_lower
                     for kw in (
@@ -332,18 +334,23 @@ class EbayCategoryMatcher:
         )
         has_game_table = any(kw in title_lower for kw in ("board game table", "gaming table", "game table"))
         has_shade_sail = any(kw in title_lower for kw in ("shade sail", "sun shade sail", "sunshade sail"))
-        has_explicit_dining_set = not has_bar_stool and not has_patio_furniture_set and any(
-            kw in title_lower
-            for kw in (
-                "dining set",
-                "dining table set",
-                "piece dining set",
-                "5-piece dining",
-                "5 piece dining",
-                "6-piece dining",
-                "6 piece dining",
-                "7-piece dining",
-                "7 piece dining",
+        has_explicit_dining_set = (
+            not has_bar_stool
+            and not has_patio_furniture_set
+            and not title_is_chair_only_dining(title_lower)
+            and any(
+                kw in title_lower
+                for kw in (
+                    "dining set",
+                    "dining table set",
+                    "piece dining set",
+                    "5-piece dining",
+                    "5 piece dining",
+                    "6-piece dining",
+                    "6 piece dining",
+                    "7-piece dining",
+                    "7 piece dining",
+                )
             )
         )
         has_dining_set_bundle = title_is_dining_set_bundle(title_lower)
@@ -1310,11 +1317,16 @@ class EbayCategoryMatcher:
             return cid == "103431"
 
         if (
-            any(marker in title_lower for marker in dining_set_markers)
-            or title_is_dining_set_bundle(title_lower)
-        ) and not any(
-            marker in title_lower for marker in non_dining_table_set_markers
-        ) and not any(marker in title_lower for marker in bar_stool_markers):
+            (
+                any(marker in title_lower for marker in dining_set_markers)
+                or title_is_dining_set_bundle(title_lower)
+            )
+            and not title_is_chair_only_dining(title_lower)
+            and not any(
+                marker in title_lower for marker in non_dining_table_set_markers
+            )
+            and not any(marker in title_lower for marker in bar_stool_markers)
+        ):
             if title_has_clear_outdoor_word(title_lower):
                 return cid in {"107578", "139849"}
             if any(marker in title_lower for marker in dining_set_markers):
@@ -1573,11 +1585,13 @@ class EbayCategoryMatcher:
             if cid not in outdoor_chair_categories:
                 return False
 
+        # Room lists ("for Living Room, Patio, Garden") are placement, not type.
+        chair_core = strip_room_location_lists(title_lower)
         if (
-            any(kw in title_lower for kw in ("club chair", "club chairs", "outdoor dining chair", "outdoor dining chairs"))
-            and any(kw in title_lower for kw in ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "balcony"))
-            and not any(kw in title_lower for kw in ("sofa", "couch", "loveseat", "sectional"))
-            and re.search(r"\btable\b", title_lower) is None
+            any(kw in chair_core for kw in ("club chair", "club chairs", "outdoor dining chair", "outdoor dining chairs"))
+            and any(kw in chair_core for kw in ("outdoor", "patio", "garden", "backyard", "poolside", "deck", "balcony"))
+            and not any(kw in chair_core for kw in ("sofa", "couch", "loveseat", "sectional"))
+            and re.search(r"\btable\b", chair_core) is None
         ):
             if cid not in {"79682", "79684"}:
                 return False
@@ -1649,7 +1663,8 @@ class EbayCategoryMatcher:
         if cid == "54235":
             if 'bar stool' in title_lower or 'counter stool' in title_lower or 'barstool' in title_lower:
                 return False
-            if any(kw in title_lower for kw in ('outdoor', 'patio', 'adirondack', 'chaise', 'daybed')):
+            chair_core = strip_room_location_lists(title_lower)
+            if any(kw in chair_core for kw in ('outdoor', 'patio', 'adirondack', 'chaise', 'daybed')):
                 return False
             if 'zero gravity' in title_lower and not zero_gravity_is_indoor_recliner:
                 return False

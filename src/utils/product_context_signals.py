@@ -183,6 +183,34 @@ def title_is_chair_accessory(text: str) -> bool:
     return True
 
 
+def title_is_chair_only_dining(text: str) -> bool:
+    """Dining chairs with no table are not a table-and-chair furniture set.
+
+    "4 Piece Outdoor Dining Chair Set" and "Outdoor 5-Piece Dining Chairs"
+    name chairs only. "7-Piece Patio Dining Set" and "Dining Set with Chairs"
+    stay sets because the dining-set phrase is the product, even when the
+    title never says table.
+    """
+    hay = str(text or "")
+    if not hay or not has_any_phrase(hay, ("chair", "chairs")):
+        return False
+    if re.search(r"\btables?\b", hay, re.IGNORECASE):
+        return False
+    if has_any_phrase(
+        hay,
+        (
+            "dining set",
+            "dining table set",
+            "patio dining set",
+            "outdoor dining set",
+            "table and chair set",
+            "table and chairs set",
+        ),
+    ):
+        return False
+    return True
+
+
 def title_is_dining_set_bundle(text: str) -> bool:
     """Table+chairs or an N-piece dining set is a SET, not a chair SKU."""
     hay = str(text or "")
@@ -214,7 +242,13 @@ def title_is_dining_set_bundle(text: str) -> bool:
         ),
     ):
         return True
-    if _N_PIECE_DINING_RE.search(hay) and has_any_phrase(hay, ("set",)):
+    # "4 Piece Outdoor Dining Chair Set" is chairs. N-piece + a later "set"
+    # is a furniture set only when the title is not chair-only.
+    if (
+        _N_PIECE_DINING_RE.search(hay)
+        and has_any_phrase(hay, ("set",))
+        and not title_is_chair_only_dining(hay)
+    ):
         return True
     if _TABLE_AND_CHAIRS_RE.search(hay):
         return True
@@ -227,8 +261,13 @@ def title_is_dining_set_bundle(text: str) -> bool:
 
 
 def title_allows_outdoor_chair_remap(text: str) -> bool:
-    """79684 may fire only on a title outdoor word, never mixed or a set/accessory."""
-    hay = str(text or "")
+    """79684 may fire only on a product outdoor word, never a room list, mix, set, or accessory.
+
+    Placement lists ("for Living Room, Patio, Garden") are not product type.
+    Strip them before the outdoor-word check, the same way outdoor_context and
+    the profile engine do. A bare patio/garden in that list must not remap.
+    """
+    hay = strip_room_location_lists(str(text or ""))
     if not hay:
         return False
     if not title_has_clear_outdoor_word(hay):
