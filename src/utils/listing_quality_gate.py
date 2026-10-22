@@ -24,6 +24,7 @@ from src.utils.product_context_signals import (
     outdoor_context as strict_outdoor_context,
 )
 from src.utils.publish_aspect_completion import infer_number_of_items_in_set
+from src.utils.approved_category import blocks_automated_category_change
 from src.utils.publish_autofix import sanitize_placeholder_aspects, sanitize_single_value_aspects
 from src.utils.publish_validation import (
     REQUIRED_MEASUREMENT_ASPECT_KEYS,
@@ -1841,9 +1842,14 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
     return ListingProfile(kind="unknown")
 
 
-def _apply_profile_rules(opt: dict[str, Any], profile: ListingProfile) -> None:
+def _apply_profile_rules(
+    opt: dict[str, Any],
+    profile: ListingProfile,
+    *,
+    preserve_category: bool = False,
+) -> None:
     aspects = opt.setdefault("aspects", {})
-    if profile.category_id:
+    if profile.category_id and not preserve_category:
         opt["categoryId"] = profile.category_id
         opt["categoryName"] = profile.category_name
     if profile.type_value:
@@ -2031,8 +2037,10 @@ def normalize_generated_listing(
 
     title_context = " ".join(part for part in (source_title, opt.get("title")) if part).strip()
     profile = classify_listing_profile(title_context or opt.get("title", ""), opt.get("description", ""), opt.get("categoryId", ""))
+    # Any approval flag blocks a remap, including a blank or mismatched pin.
+    preserve_category = blocks_automated_category_change(opt)
 
-    if category_matcher and opt.get("categoryId"):
+    if category_matcher and opt.get("categoryId") and not preserve_category:
         category_id, category_name = category_matcher.canonicalize_category(
             title_context or opt.get("title", ""),
             str(opt.get("categoryId") or ""),
@@ -2045,9 +2053,9 @@ def normalize_generated_listing(
 
     seeded_attributes = _seed_attributes_from_description(attributes, opt.get("description", ""))
     updates = _fill_measurement_aspects(opt["aspects"], seeded_attributes)
-    _apply_profile_rules(opt, profile)
+    _apply_profile_rules(opt, profile, preserve_category=preserve_category)
     sanitize_placeholder_aspects(opt["aspects"], title=opt["title"], category_id=str(opt.get("categoryId") or ""))
-    _apply_profile_rules(opt, profile)
+    _apply_profile_rules(opt, profile, preserve_category=preserve_category)
     enforce_store_brand_aspect(opt["aspects"])
     opt["description"] = sanitize_generated_description_html(opt.get("description", ""))
     opt["description"] = _sanitize_specifications_table_html(opt.get("description", ""))
@@ -2885,8 +2893,9 @@ def validate_listing_quality(
         )
 
     category_id = str(opt.get("categoryId") or "").strip()
+    preserve_category = blocks_automated_category_change(opt)
     profile = classify_listing_profile(" ".join(part for part in (source_title, title) if part), description, category_id)
-    if profile.category_id and category_id != profile.category_id:
+    if not preserve_category and profile.category_id and category_id != profile.category_id:
         issues.append(
             ListingQualityIssue(
                 "category_mismatch",
@@ -2897,7 +2906,7 @@ def validate_listing_quality(
     elif not category_id:
         issues.append(ListingQualityIssue("missing_category", "missing categoryId", field="categoryId"))
 
-    if category_matcher and category_id:
+    if category_matcher and category_id and not preserve_category:
         if not category_matcher.is_category_plausible_for_text(title, category_id, opt.get("categoryName")):
             issues.append(
                 ListingQualityIssue(

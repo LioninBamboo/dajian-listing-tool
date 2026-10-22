@@ -1231,6 +1231,17 @@ class EbayPublisher:
                     
                     # 更新 offer 类目与 buyer-facing 描述
                     current_category = existing_offer.get("categoryId", "")
+                    from src.utils.approved_category import blocks_automated_category_change
+
+                    if (
+                        current_category
+                        and current_category != category_id
+                        and blocks_automated_category_change(product.get("optimization"))
+                    ):
+                        self.logger.warning(
+                            f"[CATEGORY] lock set; keeping live offer category {current_category}"
+                        )
+                        category_id = current_category
                     if current_category != category_id:
                         self.logger.info(f"[INFO] Updating offer category: {current_category} -> {category_id}")
                     self.ebay_client.update_offer_category(
@@ -1589,7 +1600,30 @@ class EbayPublisher:
         suggested_id: Optional[str] = None
     ) -> Tuple[str, str, Dict[str, List[str]]]:
         """获取类目和完整的 Item Specifics"""
-        
+        opt = product.get("optimization") if isinstance(product, dict) else {}
+        if isinstance(opt, str):
+            try:
+                opt = json.loads(opt)
+            except Exception:
+                opt = {}
+        if not isinstance(opt, dict):
+            opt = {}
+        from src.utils.approved_category import blocks_automated_category_change
+
+        if blocks_automated_category_change(opt):
+            # Fail closed: never inherit suggested_id / rematch when the flag is
+            # set. A blank or invalid stored leaf must not publish a new leaf.
+            locked_id = str(opt.get("categoryId") or "").strip()
+            if locked_id:
+                self.logger.info(f"[CATEGORY] Preserving locked category {locked_id}")
+                cat_name = str(opt.get("categoryName") or f"Category {locked_id}")
+                aspects = self._ensure_required_aspects(locked_id, existing_aspects, title, product)
+                return locked_id, cat_name, aspects
+            self.logger.warning(
+                "[CATEGORY] lock set but categoryId is blank; refusing rematch"
+            )
+            return "", str(opt.get("categoryName") or ""), existing_aspects
+
         # Collect all known category IDs from our verified maps
         known_ids = set(self.CATEGORY_REQUIRED_ASPECTS.keys())
         for rule in self.CATEGORY_RULES:

@@ -25,6 +25,7 @@ from src.utils.dimension_helpers import (
     extract_product_weight_from_text,
     replace_description_measurements,
 )
+from src.utils.approved_category import blocks_automated_category_change
 from src.utils.publish_autofix import sanitize_placeholder_aspects
 from src.utils.report_images import normalize_image_list
 from src.utils.publish_validation import first_aspect_text, measurement_issue
@@ -575,7 +576,14 @@ def choose_ready_category(
     aspects,
     current_category_id,
     current_category_name,
+    optimization=None,
 ):
+    if blocks_automated_category_change(optimization) and str(current_category_id or "").strip():
+        return current_category_id, current_category_name, aspects
+    if blocks_automated_category_change(optimization):
+        # Flag set with no stored leaf: fail closed — do not invent a category.
+        return current_category_id, current_category_name, aspects
+
     candidates = []
     seen_titles = set()
 
@@ -947,6 +955,7 @@ def audit_and_fix_ready_drafts(
             aspects,
             original_opt.get("categoryId"),
             original_opt.get("categoryName"),
+            optimization=original_opt,
         )
         if completed_aspects:
             aspects = completed_aspects

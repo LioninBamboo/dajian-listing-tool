@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,6 +42,7 @@ class TestManifestParsing:
             "sku": "W1",
             "fix_keys": ["Assembly Required", "Item Length"],
             "note": "two keys",
+            "category_id": "",
         }
         assert rows[1]["fix_keys"] == ["categoryId"]
 
@@ -78,6 +80,12 @@ class TestCategoryGuard:
         rows = [{"sku": "W1", "fix_keys": ["categoryName"], "note": ""}]
         with pytest.raises(SystemExit):
             aaf.check_guarded(rows, allow_category=False)
+
+    def test_category_approved_is_also_guarded(self):
+        rows = [{"sku": "W1", "fix_keys": ["categoryApproved"], "note": ""}]
+        with pytest.raises(SystemExit) as excinfo:
+            aaf.check_guarded(rows, allow_category=False)
+        assert excinfo.value.code == 2
 
     def test_category_key_passes_with_optin(self):
         rows = [{"sku": "W1", "fix_keys": ["categoryId"], "note": "approved"}]
@@ -211,3 +219,151 @@ class TestApplyReportErrors:
         assert aaf._apply_errors_for_sku("W1") == [
             "ERROR [W1]: inventory update failed"
         ]
+
+
+class TestStampAlreadyCorrectCategory:
+    def _db(self, tmp_path, sku, opt):
+        import json
+        import sqlite3
+
+        db = tmp_path / "ebay_collection.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+            (sku, json.dumps(opt)),
+        )
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_dry_run_does_not_write(self, tmp_path):
+        import json
+        import sqlite3
+
+        db = self._db(tmp_path, "GP-CASTIRON-001", {"categoryId": "20632", "price": 49})
+        result = aaf.stamp_local_category_approved(
+            "GP-CASTIRON-001", approved_category_id="20632", apply=False, db_path=db
+        )
+        assert result == {"ok": True, "dry_run": True, "category_id": "20632"}
+        raw = sqlite3.connect(db).execute(
+            "SELECT optimization FROM collected_products WHERE sku=?",
+            ("GP-CASTIRON-001",),
+        ).fetchone()[0]
+        assert json.loads(raw) == {"categoryId": "20632", "price": 49}
+
+    def test_apply_pins_explicit_leaf_without_moving_category(self, tmp_path):
+        import json
+        import sqlite3
+
+        db = self._db(tmp_path, "GP-CASTIRON-001", {"categoryId": "20632", "qty": 1})
+        result = aaf.stamp_local_category_approved(
+            "GP-CASTIRON-001", approved_category_id="20632", apply=True, db_path=db
+        )
+        assert result["ok"] is True
+        opt = json.loads(
+            sqlite3.connect(db).execute(
+                "SELECT optimization FROM collected_products WHERE sku=?",
+                ("GP-CASTIRON-001",),
+            ).fetchone()[0]
+        )
+        assert opt["categoryApproved"] is True
+        assert opt["categoryApprovedId"] == "20632"
+        assert opt["categoryId"] == "20632"
+        assert opt["qty"] == 1
+
+    def test_empty_target_is_rejected(self, tmp_path):
+        db = self._db(tmp_path, "W1", {"categoryId": "20632"})
+        result = aaf.stamp_local_category_approved(
+            "W1", approved_category_id="", apply=True, db_path=db
+        )
+        assert result["ok"] is False
+        assert "explicit category_id" in result["error"]
+
+    def test_mismatch_is_rejected(self, tmp_path):
+        db = self._db(tmp_path, "W1", {"categoryId": "975"})
+        result = aaf.stamp_local_category_approved(
+            "W1", approved_category_id="20632", apply=True, db_path=db
+        )
+        assert result["ok"] is False
+        assert "stored categoryId=975 != category_id=20632" in result["error"]
+
+
+class TestLockedRemapRequiresOverride:
+    def _db(self, tmp_path, sku, opt):
+        import json
+        import sqlite3
+
+        db = tmp_path / "ebay_collection.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO collected_products (sku, optimization) VALUES (?, ?)",
+            (sku, json.dumps(opt)),
+        )
+        conn.commit()
+        conn.close()
+        return db
+
+    def test_remap_without_override_is_blocked(self, tmp_path):
+        db = self._db(
+            tmp_path,
+            "GP-CASTIRON-001",
+            {
+                "categoryId": "20632",
+                "categoryApproved": True,
+                "categoryApprovedId": "20632",
+            },
+        )
+        called = []
+
+        def run_audit(*args, **kwargs):
+            called.append(args)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        rc = aaf.process_rows(
+            [{"sku": "GP-CASTIRON-001", "fix_keys": ["categoryId"], "category_id": "975", "note": ""}],
+            apply=True,
+            mark_category_approved=False,
+            db_path=db,
+            run_audit=run_audit,
+        )
+        assert rc == 1
+        assert called == []
+
+    def test_remap_with_override_reaches_audit(self, tmp_path):
+        db = self._db(
+            tmp_path,
+            "GP-CASTIRON-001",
+            {
+                "categoryId": "20632",
+                "categoryApproved": True,
+                "categoryApprovedId": "20632",
+            },
+        )
+        called = []
+
+        def run_audit(sku, keys, apply, *rest):
+            called.append((sku, keys, apply))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        rc = aaf.process_rows(
+            [{"sku": "GP-CASTIRON-001", "fix_keys": ["categoryId"], "category_id": "975", "note": ""}],
+            apply=False,
+            mark_category_approved=False,
+            db_path=db,
+            run_audit=run_audit,
+            override_category_lock=True,
+        )
+        assert rc == 0
+        assert called == [("GP-CASTIRON-001", ["categoryId"], False)]
+
+    def test_build_command_forwards_override_flag(self):
+        cmd = aaf.build_command("W1", ["categoryId"], apply=True, override_category_lock=True)
+        assert "--override-category-lock" in cmd
+        assert "--mark-category-approved" not in cmd
+
