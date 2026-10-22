@@ -17,6 +17,8 @@ PARSE_ROWS = (
     ("Glass Doors and Drawer", "drawer", 1, 2),
     ("Double Glass Doors", "door", 2, 1),
     ("47 Inch Chairs", "chair", None, 47),
+    ("47-Inch Chairs", "chair", None, 47),
+    ("8-inch wheels", "wheel", None, 8),
     ("two glass-door compartments", "door", None, 3),
     ("stable base", "table", None, None),
     ("eleven shelves", "shelf", 11, 1),
@@ -129,6 +131,28 @@ def test_none_inputs_do_not_crash():
     assert parse_noun_count("", None) is None  # type: ignore[arg-type]
     source = {"materials": [], "features": [], "counts": {}, "capacity": None, "certifications": [], "dimensions": {}}
     assert compare_fact_sheets(source, source, live_text=None, source_text=None) == []
+
+
+def test_dimension_sheet_count_is_not_corroborated():
+    source = {"materials": [], "features": [], "counts": {"chairs": 2}, "capacity": None, "certifications": [], "dimensions": {}}
+    live = dict(source, counts={"chairs": 47})
+    for live_text in ("47 Inch Chairs", "47-Inch Chairs"):
+        violations = compare_fact_sheets(
+            source,
+            live,
+            source_text="Set of 2 Chairs",
+            live_text=live_text,
+        )
+        assert not any(v["claim_type"] == "semantic_count" for v in violations)
+
+    wheels = {"materials": [], "features": [], "counts": {"wheels": 4}, "capacity": None, "certifications": [], "dimensions": {}}
+    violations = compare_fact_sheets(
+        wheels,
+        dict(wheels, counts={"wheels": 8}),
+        source_text="4 wheels",
+        live_text="8-inch wheels",
+    )
+    assert not any(v["claim_type"] == "semantic_count" for v in violations)
 
 
 def test_cached_sheet_one_without_text_corroboration_is_skipped():

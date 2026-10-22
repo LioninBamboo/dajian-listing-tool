@@ -745,8 +745,8 @@ def parse_noun_count(text: str, noun: str) -> int | None:
     """Extract an explicit count for ``noun``, or None when unknown/ambiguous.
 
     Plural with no number is unknown, never 1. Dimensions next to a noun are
-    not counts (``47 Inch Chairs``). Hyphenated compounds like ``glass-door``
-    do not count as doors.
+    not counts (``47 Inch Chairs``, ``8-inch wheels``). Hyphenated compounds
+    like ``glass-door`` do not count as doors.
     """
     hay = str(text or "")
     terms = _noun_count_terms(noun)
@@ -765,7 +765,7 @@ def parse_noun_count(text: str, noun: str) -> int | None:
         if match.end("n") < len(hay) and hay[match.end("n")] == ".":
             continue
         between = hay[match.end("n"):match.start("noun")]
-        if re.match(rf"\s*{_COUNT_DIMENSION_UNIT}\b", between, re.IGNORECASE):
+        if re.match(rf"\s*-?\s*{_COUNT_DIMENSION_UNIT}\b", between, re.IGNORECASE):
             continue
         if re.search(rf"\bof\b", between, re.IGNORECASE):
             continue
@@ -858,14 +858,18 @@ def _count_claim_in_text(count: int, noun: str, text: str) -> bool:
     # Source copy often qualifies a component count (``1 main net`` or
     # ``2 side triangular nets``). Keep this bounded to two words so a
     # broader aggregate such as ``1 of 2 nets`` is not treated as the same
-    # claim.
-    return bool(
-        re.search(
-            rf"(?<!\d){wanted}\s+(?:[a-z]+\s+){{1,2}}(?:{terms})(?![a-z])",
-            hay,
-            re.IGNORECASE,
-        )
-    )
+    # claim. A size in that gap (``47 Inch Chairs``) is not a quantity;
+    # parse_noun_count already rejects it, and this pass must not put it back.
+    for match in re.finditer(
+        rf"(?<!\d){wanted}\s+(?P<between>(?:[a-z]+\s+){{1,2}})(?:{terms})(?![a-z])",
+        hay,
+        re.IGNORECASE,
+    ):
+        between = match.group("between")
+        if re.search(rf"\b{_COUNT_DIMENSION_UNIT}\b", between, re.IGNORECASE):
+            continue
+        return True
+    return False
 
 
 def _resolved_count(noun: str, sheet_count, text: str | None) -> int | None:

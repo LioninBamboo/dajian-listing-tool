@@ -201,7 +201,9 @@ def pick_latest_daily_live_audit(
 
     Qualifying reports must be mode=live_audit, unscoped (scope=full, or legacy
     reports with no scope and total_published >= 20), generated_at/mtime within
-    max_age_hours, parseable JSON, and a non-empty issues list.
+    max_age_hours, and parseable JSON with an issues list. An empty issues
+    list on the newest qualifying report means today's corpus is clean:
+    return None instead of an older in-window report that still has findings.
     """
     clock = now or datetime.now()
     try:
@@ -222,7 +224,7 @@ def pick_latest_daily_live_audit(
         if str(data.get("mode") or "") != "live_audit":
             continue
         issues = data.get("issues")
-        if not isinstance(issues, list) or not issues:
+        if not isinstance(issues, list):
             continue
         if not _report_is_full_daily_scope(data):
             continue
@@ -239,6 +241,8 @@ def pick_latest_daily_live_audit(
         return None
     candidates.sort(key=lambda item: item[0], reverse=True)
     _ts, chosen, data = candidates[0]
+    if not data.get("issues"):
+        return None
     return chosen, data
 
 

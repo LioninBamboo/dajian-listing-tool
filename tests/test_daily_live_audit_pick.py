@@ -195,6 +195,27 @@ def test_empty_issues_are_ignored(tmp_path):
     assert pick_latest_daily_live_audit(list(tmp_path.glob("*.json")), now=now) is None
 
 
+def test_newest_empty_full_audit_blocks_older_findings(tmp_path):
+    from scripts.semantic_rewrite import pick_latest_daily_live_audit
+
+    now = datetime(2026, 10, 22, 12, 10, 0)
+    _write_report(
+        tmp_path / "listing_audit_fix_20261022_113009.json",
+        published=217,
+        generated_at=now - timedelta(hours=0.7),
+        issues=[],
+        mtime=(now - timedelta(hours=0.7)).timestamp(),
+    )
+    _write_report(
+        tmp_path / "listing_audit_fix_20261021_113000.json",
+        published=202,
+        generated_at=now - timedelta(hours=24),
+        issues=[{"sku": "OLD", "issues": [{"type": "x"}]}],
+        mtime=(now - timedelta(hours=24)).timestamp(),
+    )
+    assert pick_latest_daily_live_audit(list(tmp_path.glob("*.json")), now=now) is None
+
+
 def test_unreadable_mtime_is_skipped_when_generated_at_missing(tmp_path, monkeypatch):
     from scripts import semantic_rewrite as cli
 
