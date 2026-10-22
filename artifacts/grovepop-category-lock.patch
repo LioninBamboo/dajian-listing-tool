@@ -1,8 +1,8 @@
 diff --git a/app.py b/app.py
-index 4a46133..91b86b1 100644
+index 5bd6294..ec582e8 100644
 --- a/app.py
 +++ b/app.py
-@@ -676,7 +676,19 @@ def publish_to_ebay(product: dict) -> dict:
+@@ -681,7 +681,19 @@ def publish_to_ebay(product: dict) -> dict:
          title = opt_data.get("title", product.get('title', ''))[:80]
          description = opt_data.get("description", product.get('description', ''))
          category_id = remap_legacy_category_id(opt_data.get("categoryId", ""))
@@ -23,7 +23,7 @@ index 4a46133..91b86b1 100644
              from src.services.ebay_category_matcher import EbayCategoryMatcher
              matcher = EbayCategoryMatcher(oauth)
              matched_id, _, _ = matcher.get_category_and_aspects(
-@@ -948,10 +960,27 @@ def publish_with_auto_category(product: dict) -> dict:
+@@ -953,10 +965,27 @@ def publish_with_auto_category(product: dict) -> dict:
              )
              category_id = remap_legacy_category_id(category_id)
              stored_cat = remap_legacy_category_id(opt_data.get("categoryId", ""))
@@ -53,7 +53,7 @@ index 4a46133..91b86b1 100644
                  print(f"[AUTO] Matched category {category_id} is invalid in current taxonomy, ignoring")
                  category_id = ""
  
-@@ -1090,7 +1119,7 @@ def publish_with_auto_category(product: dict) -> dict:
+@@ -1095,7 +1124,7 @@ def publish_with_auto_category(product: dict) -> dict:
                      print(f"[重试 {attempt + 1}/{max_retries}] 已应用属性自动修复，准备重试")
                      continue
  
@@ -63,7 +63,7 @@ index 4a46133..91b86b1 100644
                      if remapped and remapped != category_id and is_sellable_leaf_category(oauth, remapped):
                          print(f"[AUTO-FIX] 类目重映射: {category_id} -> {remapped}")
 diff --git a/batch_publish.py b/batch_publish.py
-index 6c89d14..d4c1770 100644
+index 340aa4b..c1b4beb 100644
 --- a/batch_publish.py
 +++ b/batch_publish.py
 @@ -62,6 +62,12 @@ from src.utils.publish_autofix import (
@@ -79,7 +79,7 @@ index 6c89d14..d4c1770 100644
  from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP, PROTECTED_STORED_CATEGORY_IDS
  from src.utils.dimension_helpers import (
      extract_all_dimensions, find_dimension,
-@@ -796,11 +802,27 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+@@ -845,11 +851,27 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
      title_context = title or source_title
      stored_cat = str(opt.get('categoryId') or '').strip() or None
      stored_cat_name = opt.get('categoryName')
@@ -109,7 +109,7 @@ index 6c89d14..d4c1770 100644
          canonical_cat, canonical_name = category_matcher.canonicalize_category(
              title_context,
              stored_cat,
-@@ -810,7 +832,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+@@ -859,7 +881,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
          if canonical_cat != stored_cat:
              logger.warning(f"  [CAT] Canonicalizing stored category {stored_cat} -> {canonical_cat}")
          stored_cat, stored_cat_name = canonical_cat, canonical_name
@@ -118,7 +118,7 @@ index 6c89d14..d4c1770 100644
          logger.warning(f"  [CAT] Stored category {stored_cat} is not a sellable leaf in EBAY_US; ignoring stored category")
          stored_cat = None
          stored_cat_name = None
-@@ -838,7 +860,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+@@ -887,7 +909,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
      protected_stored_categories = PROTECTED_STORED_CATEGORY_IDS
      stored_plausible = bool(
          stored_cat and (
@@ -128,7 +128,7 @@ index 6c89d14..d4c1770 100644
              or category_matcher.is_category_plausible_for_text(title_context, stored_cat, stored_cat_name)
          )
      )
-@@ -858,6 +881,9 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+@@ -907,6 +930,9 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
          if stored_cat in protected_stored_categories and api_cat_id and api_cat_id != stored_cat:
              completed_aspects = existing_aspects
              logger.warning(f"  [CAT] Preserving stored protected category {stored_cat}; ignoring fallback/API={api_cat_id}")
@@ -138,7 +138,7 @@ index 6c89d14..d4c1770 100644
          elif api_cat_id and api_cat_id != stored_cat:
              required_aspects, recommended_aspects = category_matcher._get_category_aspects(stored_cat)
              completed_aspects = category_matcher._complete_aspects(
-@@ -900,14 +926,17 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+@@ -949,14 +975,17 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
          log=lambda message: logger.info(f"  {message}"),
      )
  
@@ -163,7 +163,7 @@ index 6c89d14..d4c1770 100644
          source_title=source_title or product.get('title', ''),
          source_description=product.get('description', ''),
          attributes=product.get('attributes', {}) or {},
-@@ -950,7 +979,15 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+@@ -999,7 +1028,15 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
  
      publish_blockers = []
      publish_blockers.extend(_measurement_validation_errors(completed_aspects))
@@ -180,7 +180,7 @@ index 6c89d14..d4c1770 100644
      qc_candidate = {
          "title": title,
          "description": description,
-@@ -958,6 +995,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+@@ -1007,6 +1044,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
          "categoryName": category_name,
          "aspects": completed_aspects,
      }
@@ -189,7 +189,7 @@ index 6c89d14..d4c1770 100644
      fs_conn = None
      try:
          fs_conn = sqlite3.connect(str(PROJECT_ROOT / "ebay_collection.db"), timeout=30)
-@@ -1339,7 +1378,11 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
+@@ -1388,7 +1427,12 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                      if deleted:
                          logger.info(f"  [FIX] Deleted {deleted} stale offer(s) after category error")
  
@@ -198,6 +198,7 @@ index 6c89d14..d4c1770 100644
 +                        category_id not in protected_stored_categories
 +                        and not category_reselected
 +                        and not preserve_approved_category
++                        and not blocks_automated_category_change(opt)
 +                    ):
                          new_id, new_name, new_aspects = category_matcher.get_category_and_aspects(
                              title, completed_aspects, description
@@ -746,7 +747,7 @@ index 7c04635..cf9656f 100644
  
      print(f"done: {len(rows)} row(s), {failures} failure(s)")
 diff --git a/scripts/audit_fix_active_listings.py b/scripts/audit_fix_active_listings.py
-index b1ca19d..5648bc6 100644
+index 3b9da0a..3a1c7b7 100644
 --- a/scripts/audit_fix_active_listings.py
 +++ b/scripts/audit_fix_active_listings.py
 @@ -97,6 +97,10 @@ from src.utils.dimension_helpers import (
@@ -798,7 +799,7 @@ index b1ca19d..5648bc6 100644
      return parser
  
  
-@@ -3233,6 +3249,7 @@ def fix_listing_on_ebay(
+@@ -3240,6 +3256,7 @@ def fix_listing_on_ebay(
      *,
      base_opt_raw=None,
      source_detail_cache: dict[str, dict] | None = None,
@@ -806,7 +807,7 @@ index b1ca19d..5648bc6 100644
  ):
      """Apply fixes to a published eBay listing."""
      results = []
-@@ -3317,12 +3334,18 @@ def fix_listing_on_ebay(
+@@ -3324,12 +3341,18 @@ def fix_listing_on_ebay(
              return [f"ERROR [{sku}]: protected live snapshot failed ({exc}); no write attempted"]
  
      # Apply aspect fixes
@@ -825,7 +826,7 @@ index b1ca19d..5648bc6 100644
              new_category_name = value
              continue
          if key == "__motors_compatibility__":
-@@ -4691,6 +4714,7 @@ def main(argv=None):
+@@ -4698,6 +4721,7 @@ def main(argv=None):
                  conn,
                  base_opt_raw=audit_opt_raw if args.live else None,
                  source_detail_cache=semantic_source_detail_cache,
@@ -1075,10 +1076,10 @@ index 41c1561..99db3e6 100644
              except Exception as exc:
                  logger.error("%s failed: %s", candidate["sku"], exc)
 diff --git a/server.py b/server.py
-index 3ddb3e9..0e6b474 100644
+index 9286329..c183cae 100644
 --- a/server.py
 +++ b/server.py
-@@ -1403,7 +1403,20 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
+@@ -1533,7 +1533,20 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
          category_matcher = EbayCategoryMatcher(ebay_client.oauth)
          stored_cat = str(opt_data.get("categoryId") or "").strip() or None
          stored_cat_name = opt_data.get("categoryName")
@@ -1100,7 +1101,7 @@ index 3ddb3e9..0e6b474 100644
              stored_cat, stored_cat_name = category_matcher.canonicalize_category(
                  title_context,
                  stored_cat,
-@@ -1425,7 +1438,8 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
+@@ -1555,7 +1568,8 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
          
          stored_plausible = bool(
              stored_cat and (
@@ -1110,7 +1111,7 @@ index 3ddb3e9..0e6b474 100644
                  or category_matcher.is_category_plausible_for_text(title_context, stored_cat, stored_cat_name)
              )
          )
-@@ -1538,6 +1552,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
+@@ -1668,6 +1682,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
              completed_aspects,
              category_id,
              category_name,
@@ -1119,10 +1120,10 @@ index 3ddb3e9..0e6b474 100644
          if publish_blockers:
              raise HTTPException(
 diff --git a/src/plugins/inventory_sync/sync_service.py b/src/plugins/inventory_sync/sync_service.py
-index 535a3a8..4834099 100644
+index e5e8933..52f4aed 100644
 --- a/src/plugins/inventory_sync/sync_service.py
 +++ b/src/plugins/inventory_sync/sync_service.py
-@@ -30,6 +30,33 @@ from src.utils.inventory_restock_hold import (
+@@ -31,6 +31,33 @@ from src.utils.inventory_restock_hold import (
  )
  
  
@@ -1156,7 +1157,7 @@ index 535a3a8..4834099 100644
  def _env_int(name: str, default: int) -> int:
      value = os.getenv(name, "").strip()
      if not value:
-@@ -680,7 +707,9 @@ class InventorySyncService:
+@@ -681,7 +708,9 @@ class InventorySyncService:
          offer_ok = False
          if offer_id:
              try:
@@ -1166,7 +1167,7 @@ index 535a3a8..4834099 100644
                  put_offer = requests.put(
                      f"{base}/sell/inventory/v1/offer/{offer_id}",
                      headers=headers,
-@@ -810,9 +839,11 @@ class InventorySyncService:
+@@ -811,9 +840,11 @@ class InventorySyncService:
          
          offer = offers[0]
          offer_id = offer['offerId']
@@ -1179,7 +1180,7 @@ index 535a3a8..4834099 100644
          url = f"https://api.ebay.com/sell/inventory/v1/offer/{offer_id}"
          resp = requests.put(url, headers=headers, json=offer, timeout=30, verify=False)
 diff --git a/src/services/ebay_publisher.py b/src/services/ebay_publisher.py
-index 2c9e8af..e0b30ea 100644
+index 2c9e8af..5aa53e3 100644
 --- a/src/services/ebay_publisher.py
 +++ b/src/services/ebay_publisher.py
 @@ -1231,6 +1231,17 @@ class EbayPublisher:
@@ -1200,7 +1201,7 @@ index 2c9e8af..e0b30ea 100644
                      if current_category != category_id:
                          self.logger.info(f"[INFO] Updating offer category: {current_category} -> {category_id}")
                      self.ebay_client.update_offer_category(
-@@ -1589,7 +1600,24 @@ class EbayPublisher:
+@@ -1589,7 +1600,30 @@ class EbayPublisher:
          suggested_id: Optional[str] = None
      ) -> Tuple[str, str, Dict[str, List[str]]]:
          """获取类目和完整的 Item Specifics"""
@@ -1216,22 +1217,28 @@ index 2c9e8af..e0b30ea 100644
 +        from src.utils.approved_category import blocks_automated_category_change
 +
 +        if blocks_automated_category_change(opt):
-+            locked_id = str(opt.get("categoryId") or suggested_id or "").strip()
++            # Fail closed: never inherit suggested_id / rematch when the flag is
++            # set. A blank or invalid stored leaf must not publish a new leaf.
++            locked_id = str(opt.get("categoryId") or "").strip()
 +            if locked_id:
 +                self.logger.info(f"[CATEGORY] Preserving locked category {locked_id}")
 +                cat_name = str(opt.get("categoryName") or f"Category {locked_id}")
 +                aspects = self._ensure_required_aspects(locked_id, existing_aspects, title, product)
 +                return locked_id, cat_name, aspects
++            self.logger.warning(
++                "[CATEGORY] lock set but categoryId is blank; refusing rematch"
++            )
++            return "", str(opt.get("categoryName") or ""), existing_aspects
 +
          # Collect all known category IDs from our verified maps
          known_ids = set(self.CATEGORY_REQUIRED_ASPECTS.keys())
          for rule in self.CATEGORY_RULES:
 diff --git a/src/utils/approved_category.py b/src/utils/approved_category.py
 new file mode 100644
-index 0000000..a32ac63
+index 0000000..6ee4b1c
 --- /dev/null
 +++ b/src/utils/approved_category.py
-@@ -0,0 +1,243 @@
+@@ -0,0 +1,259 @@
 +"""Human-approved eBay category lock for publish / normalize / audit.
 +
 +Operators mark a product's stored category as approved by setting
@@ -1284,33 +1291,49 @@ index 0000000..a32ac63
 +_DEFAULT_BLACKLIST = Path("data/config/high_fee_category_blacklist.json")
 +
 +
++def _as_optimization(optimization: Any) -> Mapping[str, Any] | None:
++    """Accept a dict or a JSON object string (SQLite / publisher payload)."""
++    if isinstance(optimization, Mapping):
++        return optimization
++    if isinstance(optimization, str) and optimization.strip():
++        try:
++            data = json.loads(optimization)
++        except ValueError:
++            return None
++        return data if isinstance(data, Mapping) else None
++    return None
++
++
 +def is_valid_category_id(category_id: str | None) -> bool:
 +    cid = str(category_id or "").strip()
 +    return bool(cid) and cid.isdigit()
 +
 +
 +def approved_category_id(optimization: Mapping[str, Any] | None) -> str:
-+    if not isinstance(optimization, Mapping):
++    opt = _as_optimization(optimization)
++    if opt is None:
 +        return ""
-+    return str(optimization.get(CATEGORY_APPROVED_ID_KEY) or "").strip()
++    return str(opt.get(CATEGORY_APPROVED_ID_KEY) or "").strip()
 +
 +
 +def category_approval_flag_set(optimization: Mapping[str, Any] | None) -> bool:
 +    """True when an operator stamped the approval flag, even if the pin is bad."""
-+    if not isinstance(optimization, Mapping):
++    opt = _as_optimization(optimization)
++    if opt is None:
 +        return False
-+    return optimization.get(CATEGORY_APPROVED_KEY) in _TRUTHY
++    return opt.get(CATEGORY_APPROVED_KEY) in _TRUTHY
 +
 +
 +def is_category_approved(
 +    optimization: Mapping[str, Any] | None,
 +    category_id: str | None = None,
 +) -> bool:
-+    if not category_approval_flag_set(optimization):
++    opt = _as_optimization(optimization)
++    if opt is None or not category_approval_flag_set(opt):
 +        return False
 +
-+    current = str(category_id or (optimization or {}).get("categoryId") or "").strip()
-+    pinned = approved_category_id(optimization)
++    current = str(category_id or opt.get("categoryId") or "").strip()
++    pinned = approved_category_id(opt)
 +    if not pinned:
 +        # Legacy flag-only rows: honor the current leaf, but do not write.
 +        return bool(current)
@@ -1362,7 +1385,7 @@ index 0000000..a32ac63
 +    """Persist ``categoryApprovedId`` for a legacy flag-only row."""
 +    if not isinstance(optimization, dict):
 +        return ""
-+    if optimization.get(CATEGORY_APPROVED_KEY) not in _TRUTHY:
++    if not category_approval_flag_set(optimization):
 +        return ""
 +    pinned = approved_category_id(optimization)
 +    if pinned:
@@ -1476,18 +1499,18 @@ index 0000000..a32ac63
 +        )
 +    return ApprovedCategoryDecision(approved=True, preserve=True)
 diff --git a/src/utils/listing_quality_gate.py b/src/utils/listing_quality_gate.py
-index 8749f84..b2b665b 100644
+index 26725e2..267c932 100644
 --- a/src/utils/listing_quality_gate.py
 +++ b/src/utils/listing_quality_gate.py
 @@ -24,6 +24,7 @@ from src.utils.product_context_signals import (
      outdoor_context as strict_outdoor_context,
  )
  from src.utils.publish_aspect_completion import infer_number_of_items_in_set
-+from src.utils.approved_category import is_category_approved
++from src.utils.approved_category import blocks_automated_category_change
  from src.utils.publish_autofix import sanitize_placeholder_aspects, sanitize_single_value_aspects
  from src.utils.publish_validation import (
      REQUIRED_MEASUREMENT_ASPECT_KEYS,
-@@ -1820,9 +1821,14 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
+@@ -1841,9 +1842,14 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
      return ListingProfile(kind="unknown")
  
  
@@ -1504,18 +1527,18 @@ index 8749f84..b2b665b 100644
          opt["categoryId"] = profile.category_id
          opt["categoryName"] = profile.category_name
      if profile.type_value:
-@@ -2010,8 +2016,9 @@ def normalize_generated_listing(
+@@ -2031,8 +2037,9 @@ def normalize_generated_listing(
  
      title_context = " ".join(part for part in (source_title, opt.get("title")) if part).strip()
      profile = classify_listing_profile(title_context or opt.get("title", ""), opt.get("description", ""), opt.get("categoryId", ""))
-+    preserve_category = is_category_approved(opt)
++    preserve_category = blocks_automated_category_change(opt)
  
 -    if category_matcher and opt.get("categoryId"):
 +    if category_matcher and opt.get("categoryId") and not preserve_category:
          category_id, category_name = category_matcher.canonicalize_category(
              title_context or opt.get("title", ""),
              str(opt.get("categoryId") or ""),
-@@ -2024,9 +2031,9 @@ def normalize_generated_listing(
+@@ -2045,9 +2052,9 @@ def normalize_generated_listing(
  
      seeded_attributes = _seed_attributes_from_description(attributes, opt.get("description", ""))
      updates = _fill_measurement_aspects(opt["aspects"], seeded_attributes)
@@ -1527,18 +1550,18 @@ index 8749f84..b2b665b 100644
      enforce_store_brand_aspect(opt["aspects"])
      opt["description"] = sanitize_generated_description_html(opt.get("description", ""))
      opt["description"] = _sanitize_specifications_table_html(opt.get("description", ""))
-@@ -2444,8 +2451,9 @@ def validate_listing_quality(
+@@ -2885,8 +2892,9 @@ def validate_listing_quality(
          )
  
      category_id = str(opt.get("categoryId") or "").strip()
-+    preserve_category = is_category_approved(opt)
++    preserve_category = blocks_automated_category_change(opt)
      profile = classify_listing_profile(" ".join(part for part in (source_title, title) if part), description, category_id)
 -    if profile.category_id and category_id != profile.category_id:
 +    if not preserve_category and profile.category_id and category_id != profile.category_id:
          issues.append(
              ListingQualityIssue(
                  "category_mismatch",
-@@ -2456,7 +2464,7 @@ def validate_listing_quality(
+@@ -2897,7 +2905,7 @@ def validate_listing_quality(
      elif not category_id:
          issues.append(ListingQualityIssue("missing_category", "missing categoryId", field="categoryId"))
  
@@ -1791,10 +1814,10 @@ index d53ddf3..1dd7726 100644
 +
 diff --git a/tests/test_approved_category.py b/tests/test_approved_category.py
 new file mode 100644
-index 0000000..36cbce4
+index 0000000..bc49c33
 --- /dev/null
 +++ b/tests/test_approved_category.py
-@@ -0,0 +1,383 @@
+@@ -0,0 +1,478 @@
 +"""GrovePop category-lock: automation must never move a locked listing."""
 +
 +from __future__ import annotations
@@ -2178,3 +2201,98 @@ index 0000000..36cbce4
 +    decision = evaluate_approved_category(COOKWARE_LEAF, mismatched)
 +    assert decision.preserve is False
 +    assert blocks_automated_category_change(mismatched) is True
++
++
++def test_normalize_pin_mismatch_does_not_remap():
++    """Flag + pin/current mismatch must keep the stored leaf, not follow rematch."""
++    opt = _cookware_opt(approved=True, pinned=COLLECTIBLES, category_id=COOKWARE_LEAF)
++    out = normalize_generated_listing(
++        opt,
++        source_title=opt["title"],
++        source_description=opt["description"],
++        category_matcher=_RemapMatcher(),
++    )
++    assert out["categoryId"] == COOKWARE_LEAF
++
++
++def test_json_string_optimization_is_treated_as_locked():
++    payload = json.dumps(_cookware_opt(approved=True))
++    assert blocks_automated_category_change(payload) is True
++    assert is_category_approved(payload) is True
++    assert blocks_automated_category_change("{not-json") is False
++    assert blocks_automated_category_change(None) is False
++
++
++def test_stringy_true_flag_blocks_and_legacy_rows_without_fields_do_not():
++    stringy = {"categoryId": COOKWARE_LEAF, CATEGORY_APPROVED_KEY: "true"}
++    assert blocks_automated_category_change(stringy) is True
++    assert is_category_approved(stringy) is True
++
++    yes_flag = {"categoryId": COOKWARE_LEAF, CATEGORY_APPROVED_KEY: "yes"}
++    assert blocks_automated_category_change(yes_flag) is True
++
++    legacy_missing = {"categoryId": COOKWARE_LEAF, "title": "pre-lock GP row"}
++    assert CATEGORY_APPROVED_KEY not in legacy_missing
++    assert CATEGORY_APPROVED_ID_KEY not in legacy_missing
++    assert blocks_automated_category_change(legacy_missing) is False
++    assert is_category_approved(legacy_missing) is False
++
++
++def test_publisher_blank_lock_does_not_follow_suggested_id():
++    import logging
++
++    from src.services.ebay_publisher import EbayPublisher
++
++    pub = object.__new__(EbayPublisher)
++    pub.logger = logging.getLogger("test-category-lock")
++
++    def _must_not_complete(*_a, **_k):
++        raise AssertionError("locked blank category must not rematch or complete aspects")
++
++    pub._ensure_required_aspects = _must_not_complete
++    product = {
++        "optimization": {CATEGORY_APPROVED_KEY: True, "categoryId": ""},
++    }
++    cat_id, _name, aspects = EbayPublisher._get_category_and_aspects(
++        pub,
++        "Pre-Seasoned Cast Iron Dutch Oven",
++        {"Brand": ["GrovePop"]},
++        product,
++        suggested_id=COLLECTIBLES,
++    )
++    assert cat_id == ""
++    assert aspects == {"Brand": ["GrovePop"]}
++
++
++def test_publisher_json_string_optimization_keeps_locked_leaf():
++    import logging
++
++    from src.services.ebay_publisher import EbayPublisher
++
++    pub = object.__new__(EbayPublisher)
++    pub.logger = logging.getLogger("test-category-lock")
++    pub._ensure_required_aspects = lambda *_a, **_k: {"Brand": ["GrovePop"]}
++    product = {"optimization": json.dumps(_cookware_opt(approved=True))}
++    cat_id, _name, _aspects = EbayPublisher._get_category_and_aspects(
++        pub,
++        "Pre-Seasoned Cast Iron Dutch Oven",
++        {"Brand": ["GrovePop"]},
++        product,
++        suggested_id=COLLECTIBLES,
++    )
++    assert cat_id == COOKWARE_LEAF
++
++
++def test_inventory_pin_missing_category_does_not_invent_a_leaf():
++    live = {
++        "offerId": "off-2",
++        "listing": {"listingStatus": "ACTIVE"},
++        "pricingSummary": {"price": {"value": "49.00"}},
++        "availableQuantity": 0,
++    }
++    pinned = pin_offer_category_fields(live)
++    live["categoryId"] = COLLECTIBLES
++    live["listing"]["categoryId"] = COLLECTIBLES
++    apply_pinned_offer_category(live, pinned)
++    assert "categoryId" not in live
++    assert "categoryId" not in live["listing"]
