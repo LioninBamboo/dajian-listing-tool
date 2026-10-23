@@ -102,7 +102,7 @@ def _job_tags(mod=None):
     return {frozenset(job.tags) for job in schedule.get_jobs()}
 
 
-def test_ops_qc_autofix_slice_registers_main_store_qc_chain(monkeypatch):
+def test_ops_qc_autofix_slice_does_not_register_without_allowlist(monkeypatch):
     from src.utils import store_profile as sp
     from src.utils.store_profile import StoreProfile
 
@@ -119,17 +119,17 @@ def test_ops_qc_autofix_slice_registers_main_store_qc_chain(monkeypatch):
     tags = _job_tags()
     assert frozenset({"daily", "ops"}) in tags
     assert frozenset({"recurring", "order_recheck"}) in tags
-    assert frozenset({"daily", "listing_audit"}) in tags
-    assert frozenset({"daily", "source_aspect_autofix"}) in tags
-    assert frozenset({"daily", "missing_video_autofix"}) in tags
-    assert frozenset({"daily", "semantic_rewrite"}) in tags
-    assert frozenset({"daily", "source_refresh"}) in tags
+    assert frozenset({"daily", "listing_audit"}) not in tags
+    assert frozenset({"daily", "source_aspect_autofix"}) not in tags
+    assert frozenset({"daily", "missing_video_autofix"}) not in tags
+    assert frozenset({"daily", "semantic_rewrite"}) not in tags
+    assert frozenset({"daily", "source_refresh"}) not in tags
     assert frozenset({"daily", "mi_snapshot"}) not in tags
     assert frozenset({"daily", "cro_consume"}) not in tags
     assert frozenset({"daily", "auto_publish"}) not in tags
 
 
-def test_ops_ads_slice_registers_ad_chain_without_cro_consume(monkeypatch):
+def test_ops_ads_slice_does_not_register_without_allowlist(monkeypatch):
     from src.utils import store_profile as sp
     from src.utils.store_profile import StoreProfile
 
@@ -145,21 +145,21 @@ def test_ops_ads_slice_registers_ad_chain_without_cro_consume(monkeypatch):
 
     tags = _job_tags()
     assert frozenset({"daily", "ops"}) in tags
-    assert frozenset({"daily", "ad_restore"}) in tags
-    assert frozenset({"daily", "bl_cleanup"}) in tags
-    assert frozenset({"daily", "guard_alert"}) in tags
-    assert frozenset({"daily", "ads_enroll"}) in tags
-    assert frozenset({"weekly", "smart_bid"}) in tags
-    assert frozenset({"weekly", "bid_rollback"}) in tags
-    assert frozenset({"weekly", "smart_reprice"}) in tags
-    assert frozenset({"recurring", "promotion"}) in tags
+    assert frozenset({"daily", "ad_restore"}) not in tags
+    assert frozenset({"daily", "bl_cleanup"}) not in tags
+    assert frozenset({"daily", "guard_alert"}) not in tags
+    assert frozenset({"daily", "ads_enroll"}) not in tags
+    assert frozenset({"weekly", "smart_bid"}) not in tags
+    assert frozenset({"weekly", "bid_rollback"}) not in tags
+    assert frozenset({"weekly", "smart_reprice"}) not in tags
+    assert frozenset({"recurring", "promotion"}) not in tags
     assert frozenset({"daily", "cro_consume"}) not in tags
     assert frozenset({"daily", "cro_promote"}) not in tags
     assert frozenset({"daily", "mi_snapshot"}) not in tags
     assert frozenset({"daily", "listing_audit"}) not in tags
 
 
-def test_ops_qc_recovery_includes_audit_chain(monkeypatch):
+def test_ops_qc_recovery_excludes_audit_chain_without_allowlist(monkeypatch):
     from src.utils import store_profile as sp
     from src.utils.store_profile import StoreProfile
 
@@ -175,14 +175,14 @@ def test_ops_qc_recovery_includes_audit_chain(monkeypatch):
 
     mod = _load_scheduler()
     names = [t["name"] for t in mod._get_critical_recovery_tasks()]
-    assert names[0] == "ops_daily"
-    assert "listing_audit" in names
-    assert "source_aspect_autofix" in names
+    assert names == ["ops_daily"]
+    assert "listing_audit" not in names
+    assert "source_aspect_autofix" not in names
     assert "daily_tasks" not in names
     assert "cro_consume" not in names
 
 
-def test_ops_ads_recovery_includes_enroll_and_restore(monkeypatch):
+def test_ops_ads_recovery_excludes_enroll_and_restore_without_allowlist(monkeypatch):
     from src.utils import store_profile as sp
     from src.utils.store_profile import StoreProfile
 
@@ -198,9 +198,9 @@ def test_ops_ads_recovery_includes_enroll_and_restore(monkeypatch):
 
     mod = _load_scheduler()
     names = [t["name"] for t in mod._get_critical_recovery_tasks()]
-    assert names[0] == "ops_daily"
-    assert "ads_enroll" in names
-    assert "ad_restore" in names
-    assert "smart_reprice" in names
+    assert names == ["ops_daily"]
+    assert "ads_enroll" not in names
+    assert "ad_restore" not in names
+    assert "smart_reprice" not in names
     assert "daily_tasks" not in names
     assert "cro_promote" not in names

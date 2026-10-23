@@ -137,6 +137,9 @@ class StoreProfile:
     # store (scheduler_profile=full) ignores these flags.
     scheduler_enable_qc_autofix: bool = False
     scheduler_enable_ads: bool = False
+    # Explicit ops allowlist. Empty on an ops profile => {ops_daily, order_recheck}.
+    # The main full/daily profile ignores this field (unrestricted).
+    scheduler_allowed_jobs: tuple = ()
 
     @property
     def brand_name_lower(self) -> str:
@@ -197,6 +200,38 @@ class StoreProfile:
     def ops_ads_enabled(self) -> bool:
         """True only on an ops instance that opted into the ads/marketing slice."""
         return self.is_ops_scheduler and bool(self.scheduler_enable_ads)
+
+    @property
+    def resolved_scheduler_allowed_jobs(self) -> frozenset[str] | None:
+        """Fail-closed allowlist for ops; None means unrestricted (main/full).
+
+        An ops profile with a missing, empty, or unknown allowlist schedules
+        only ``ops_daily`` and ``order_recheck``. Unknown ``scheduler_profile``
+        values stay unrestricted so a Main typo cannot shrink the furniture
+        cadence.
+        """
+        name = str(self.scheduler_profile or "full").strip().lower()
+        if name in {"full", "daily", ""}:
+            return None
+        if name != "ops":
+            return None
+        explicit = tuple(
+            str(job).strip()
+            for job in (self.scheduler_allowed_jobs or ())
+            if str(job).strip()
+        )
+        if not explicit:
+            return frozenset(DEFAULT_OPS_ALLOWED_JOBS)
+        unknown = [job for job in explicit if job not in KNOWN_SCHEDULER_JOBS]
+        if unknown:
+            return frozenset(DEFAULT_OPS_ALLOWED_JOBS)
+        return frozenset(explicit)
+
+    def job_is_allowed(self, job_name: str) -> bool:
+        allow = self.resolved_scheduler_allowed_jobs
+        if allow is None:
+            return True
+        return str(job_name or "").strip() in allow
 
     def resolved_scheduler_mutex_name(self) -> str:
         """Kernel mutex name for scheduler_daemon (one per store instance)."""
@@ -264,6 +299,7 @@ _SECTION_FIELD_MAP = {
         "scheduler_mutex_name",
         "scheduler_enable_qc_autofix",
         "scheduler_enable_ads",
+        "scheduler_allowed_jobs",
     },
 }
 
@@ -291,7 +327,56 @@ _BOOL_FIELDS = {
     "scheduler_enable_qc_autofix",
     "scheduler_enable_ads",
 }
-_TUPLE_FIELDS = {"banned_terms"}
+_TUPLE_FIELDS = {"banned_terms", "scheduler_allowed_jobs"}
+
+DEFAULT_OPS_ALLOWED_JOBS = ("ops_daily", "order_recheck")
+KNOWN_SCHEDULER_JOBS = frozenset(
+    {
+        "ops_daily",
+        "order_recheck",
+        "smart_reprice",
+        "ad_restore",
+        "blacklist_cleanup",
+        "guard_anomaly",
+        "ads_enroll",
+        "smart_bid",
+        "bid_rollback",
+        "promotion_rotate",
+        "source_refresh",
+        "listing_audit",
+        "source_aspect_autofix",
+        "semantic_rewrite",
+        "missing_video_autofix",
+    }
+)
+
+
+def peek_yaml_says_ops(*paths: os.PathLike | str) -> bool:
+    """True when a profile file text says ``scheduler_profile: ops``.
+
+    Used when the YAML is unreadable: fail closed to the two ops jobs instead
+    of loading the Main furniture cadence on a GrovePop checkout.
+    """
+    candidates = [Path(p) for p in paths if p]
+    if not candidates:
+        env_path = os.getenv("STORE_PROFILE_PATH")
+        if env_path:
+            candidates.append(Path(env_path))
+        candidates.extend((_LOCAL_PROFILE_PATH, _DEFAULT_PROFILE_PATH))
+    for path in candidates:
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.split("#", 1)[0].strip().lower()
+            if stripped.startswith("scheduler_profile") and ":" in stripped:
+                value = stripped.split(":", 1)[1].strip().strip("'\"")
+                if value == "ops":
+                    return True
+    return False
 
 
 def _coerce(field_name: str, value: Any) -> Any:

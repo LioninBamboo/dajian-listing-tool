@@ -44,6 +44,10 @@ GrovePop sets `qc_profile: furniture` and both flags true. AquaRides sets only t
 
 ## Consequences
 - Existing ops instances that do not flip the flags keep inventory-only cadence.
-- GrovePop Content QC Windows task remains Disabled; daemon slice is the live path.
+- Flags are no longer sufficient: an optional ops job also has to be on
+  `scheduler_allowed_jobs`. Empty / unknown allowlists fail closed to
+  `{ops_daily, order_recheck}`. See `docs/SCHEDULER_OPS_ALLOWLIST.md`.
+- GrovePop Content QC Windows task is out-of-daemon and detect-only (no `--fix`).
+  The daemon QC slice stays off on GP until the allowlist is changed on ZBook.
 - Missing `sell.marketing` is a skip, not a scheduler failure. 2026-09-14 live probe: AquaVerve marketing is `ok`; GrovePop and AquaRides still `403 errorId 1100`. Re-consent runbook: `docs/SUBSTORE_ADS_REAUTH.md`.
 - CRO diagnose / price_drop / image_refresh / fill_specifics / MI auto-publish remain main-store-only until separately opted in.

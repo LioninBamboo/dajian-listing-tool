@@ -9,6 +9,7 @@ from src.utils.store_profile import (
     StoreProfileError,
     get_store_profile,
     load_store_profile,
+    peek_yaml_says_ops,
     reset_store_profile_cache,
 )
 
@@ -133,6 +134,78 @@ class TestOverrides:
         assert profile.scheduler_enable_ads is False
         assert profile.ops_qc_autofix_enabled is False
         assert profile.ops_ads_enabled is False
+        assert profile.resolved_scheduler_allowed_jobs == frozenset({"ops_daily", "order_recheck"})
+        assert profile.job_is_allowed("ops_daily") is True
+        assert profile.job_is_allowed("smart_reprice") is False
+
+    def test_ops_allowlist_unknown_jobs_fail_closed(self, tmp_path):
+        yaml_file = tmp_path / "ops.yaml"
+        yaml_file.write_text(
+            textwrap.dedent(
+                """
+                server:
+                  scheduler_profile: ops
+                  scheduler_allowed_jobs:
+                    - not-a-real-job
+                    - ops_daily
+                """
+            ),
+            encoding="utf-8",
+        )
+        profile = load_store_profile(yaml_file)
+        assert profile.resolved_scheduler_allowed_jobs == frozenset({"ops_daily", "order_recheck"})
+
+    def test_full_profile_allowlist_is_unrestricted(self):
+        profile = load_store_profile()
+        assert profile.scheduler_profile == "full"
+        assert profile.resolved_scheduler_allowed_jobs is None
+        assert profile.job_is_allowed("smart_reprice") is True
+
+    def test_full_profile_ignores_explicit_allowlist(self):
+        profile = StoreProfile(
+            scheduler_profile="full",
+            scheduler_allowed_jobs=("ops_daily", "order_recheck"),
+        )
+        assert profile.resolved_scheduler_allowed_jobs is None
+        assert profile.job_is_allowed("listing_audit") is True
+        assert profile.job_is_allowed("smart_reprice") is True
+
+    def test_unknown_non_ops_profile_stays_unrestricted(self):
+        profile = StoreProfile(scheduler_profile="fullish", scheduler_allowed_jobs=("ops_daily",))
+        assert profile.is_ops_scheduler is False
+        assert profile.resolved_scheduler_allowed_jobs is None
+        assert profile.job_is_allowed("daily_tasks") is True
+
+    def test_ops_rejects_blank_job_names(self):
+        profile = StoreProfile(scheduler_profile="ops")
+        assert profile.job_is_allowed("") is False
+        assert profile.job_is_allowed(None) is False
+
+    def test_ops_allowlist_from_comma_string(self, tmp_path):
+        yaml_file = tmp_path / "ops.yaml"
+        yaml_file.write_text(
+            textwrap.dedent(
+                """
+                server:
+                  scheduler_profile: ops
+                  scheduler_allowed_jobs: "ops_daily, order_recheck"
+                """
+            ),
+            encoding="utf-8",
+        )
+        profile = load_store_profile(yaml_file)
+        assert profile.resolved_scheduler_allowed_jobs == frozenset({"ops_daily", "order_recheck"})
+
+    def test_peek_yaml_says_ops(self, tmp_path):
+        ops = tmp_path / "ops.yaml"
+        ops.write_text("server:\n  scheduler_profile: ops\n", encoding="utf-8")
+        broken = tmp_path / "broken.yaml"
+        broken.write_text("server: [\n  scheduler_profile: ops\n", encoding="utf-8")
+        full = tmp_path / "full.yaml"
+        full.write_text("server:\n  scheduler_profile: full\n", encoding="utf-8")
+        assert peek_yaml_says_ops(ops) is True
+        assert peek_yaml_says_ops(broken) is True
+        assert peek_yaml_says_ops(full) is False
 
     def test_ops_optional_slices_default_off_and_can_opt_in(self, tmp_path):
         yaml_file = tmp_path / "ops_slices.yaml"

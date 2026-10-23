@@ -569,15 +569,21 @@ def test_watchdog_ops_ads_and_qc_slices_recover_without_full_catalog(tmp_path, m
     monkeypatch.setattr(scheduler_watchdog, '_is_ops_scheduler', lambda: True)
     monkeypatch.setattr(scheduler_watchdog, '_ops_qc_autofix_enabled', lambda: True)
     monkeypatch.setattr(scheduler_watchdog, '_ops_ads_enabled', lambda: True)
+    # Flags alone cannot add recovery entries; default ops allowlist is two jobs.
+    monkeypatch.setattr(
+        scheduler_watchdog,
+        '_job_is_allowed',
+        lambda name: name in {'ops_daily', 'order_recheck'},
+    )
 
     scheduler_watchdog.check_overdue_critical_tasks()
 
     aliases = [cmd[-1] for cmd in launched]
-    assert 'ops_daily' in aliases
-    assert 'reprice' in aliases
-    assert 'ad_restore' in aliases
-    assert 'ads_enroll' in aliases
-    assert 'listing_audit' in aliases
+    assert aliases == ['ops_daily']
+    assert 'reprice' not in aliases
+    assert 'ad_restore' not in aliases
+    assert 'ads_enroll' not in aliases
+    assert 'listing_audit' not in aliases
     assert 'daily' not in aliases
     assert 'cro_sentinel' not in aliases
     assert 'cro_consume' not in aliases

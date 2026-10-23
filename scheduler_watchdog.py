@@ -62,7 +62,14 @@ def _store_profile():
 def _is_ops_scheduler():
     """Match daemon scheduler_profile=ops so substores never recover the full catalog."""
     profile = _store_profile()
-    return bool(getattr(profile, 'is_ops_scheduler', False)) if profile is not None else False
+    if profile is not None:
+        return bool(getattr(profile, 'is_ops_scheduler', False))
+    try:
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from src.utils.store_profile import peek_yaml_says_ops
+        return peek_yaml_says_ops()
+    except Exception:
+        return False
 
 
 def _ops_qc_autofix_enabled():
@@ -73,6 +80,15 @@ def _ops_qc_autofix_enabled():
 def _ops_ads_enabled():
     profile = _store_profile()
     return bool(getattr(profile, 'ops_ads_enabled', False)) if profile is not None else False
+
+
+def _job_is_allowed(job_name):
+    profile = _store_profile()
+    if profile is not None:
+        return bool(profile.job_is_allowed(job_name))
+    if _is_ops_scheduler():
+        return job_name in {'ops_daily', 'order_recheck'}
+    return True
 
 
 def _watchdog_critical_tasks():
@@ -88,7 +104,19 @@ def _watchdog_critical_tasks():
         ])
     if _ops_qc_autofix_enabled():
         tasks.append({'health_name': 'listing_audit', 'deadline': '11:45', 'daemon_task': 'listing_audit'})
-    return tasks
+    alias = {
+        'reprice': 'smart_reprice',
+        'daily': 'daily_tasks',
+        'health': 'health_check',
+    }
+    allowed = []
+    for task in tasks:
+        job_name = alias.get(task.get('daemon_task'), task.get('health_name'))
+        if _job_is_allowed(job_name):
+            allowed.append(task)
+        else:
+            log(f"[WATCHDOG] skip {job_name}: not on ops allowlist")
+    return allowed
 
 
 def _daemon_task_command(task_alias):
