@@ -662,8 +662,8 @@ class EbayCategoryMatcher:
 
         # Display / curio cabinets go to 20493, never 20689. "Wine cabinet"
         # stuffing inside a display-cabinet title is not a wine rack.
-        if has_display_cabinet and cid != "20493":
-            return "20493", "Display Cabinets"
+        if has_display_cabinet and cid != "20487":
+            return "20487", "Cabinets & Cupboards"
 
         # Wine/bar liquor cabinets and hall trees must win over generic pantry remap.
         if has_wine_storage and not has_display_cabinet and cid != "20689":
@@ -683,8 +683,8 @@ class EbayCategoryMatcher:
         if has_pantry_cabinet and cid != "20487":
             return "20487", "Cabinets & Cupboards"
 
-        if has_display_cabinet and cid != "20493":
-            return "20493", "Display Cabinets"
+        if has_display_cabinet and cid != "20487":
+            return "20487", "Cabinets & Cupboards"
 
         if has_patio_furniture_set and not has_outdoor_chair and not has_explicit_dining_set and cid != "139849":
             return "139849", "Patio & Garden Furniture Sets"
@@ -1897,7 +1897,7 @@ class EbayCategoryMatcher:
             (["coffee table", "cocktail table"], "38204", "Coffee Tables"),
             (["board game table", "gaming table", "game table"], "38204", "Tables"),
             (["sofa table", "console table", "entry table", "hall table"], "38205", "Console Tables"),
-            (["end table", "side table", "accent table", "lamp table"], "38200", "End Tables"),
+            (["end table", "side table", "accent table", "lamp table"], "38204", "Tables"),
             (["nesting table"], "38204", "Nesting Tables"),
             
             # Bookcases
@@ -1905,7 +1905,7 @@ class EbayCategoryMatcher:
             (["cube storage", "cube organizer", "shelf unit", "etagere", "ladder shelf"], "3199", "Shelving Units"),
             (["wall shelf", "floating shelf"], "20487", "Wall Shelves"),
             (["kitchen pantry", "pantry cabinet", "freestanding pantry", "pantry storage", "storage cabinet", "kitchen hutch", "hutch cabinet", "microwave shelf"], "20487", "Cabinets & Cupboards"),
-            (["display cabinet", "curio cabinet"], "20493", "Display Cabinets"),
+            (["display cabinet", "curio cabinet"], "20487", "Cabinets & Cupboards"),
             
             # ==================== DINING ROOM ====================
             # Bar stools first (higher specificity than "counter height" for dining)
@@ -1919,7 +1919,7 @@ class EbayCategoryMatcher:
             (["dining set"], "107578", "Dining Sets"),
             (["dining chair", "counter chair"], "54235", "Chairs"),
             (["pub table", "bar table", "counter table"], "38204", "Tables"),
-            (["kitchen island", "kitchen cart", "microwave cart", "baker rack"], "177000", "Kitchen Islands & Carts"),
+            (["kitchen island", "kitchen cart", "microwave cart", "baker rack"], "260157", "Kitchen Islands"),
             (["buffet", "sideboard", "credenza"], "183322", "Sideboards & Buffets"),
             (["china cabinet"], "38217", "China Cabinets"),
             (["hutch"], "20487", "Cabinets & Cupboards"),

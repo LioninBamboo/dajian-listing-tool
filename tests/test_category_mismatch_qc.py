@@ -87,8 +87,7 @@ def test_negative_w2275_curio_still_flagged_away_from_stale_leaf():
     profile = classify_listing_profile(title, "", "125085")
     assert profile.kind != "pantry_cabinet"
     canon, name = EbayCategoryMatcher(_Oauth()).canonicalize_category(title, "125085", None, "")
-    assert canon not in {None, "", "125085"}
-    assert canon != "20487"
+    assert canon not in {None, "", "125085", "20493"}
 
 
 @pytest.mark.parametrize(

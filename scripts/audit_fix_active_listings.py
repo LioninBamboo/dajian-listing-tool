@@ -993,6 +993,10 @@ def audit_single_product(
         fixes["categoryId"] = write_id
         if decision.category_name:
             fixes["categoryName"] = decision.category_name
+    elif decision.reason in {"tree_unavailable", "tree_cache_unavailable"}:
+        from src.utils.category_decision import warn_once_tree_unavailable
+
+        warn_once_tree_unavailable()
     elif not skip_category_remap and not write_id and decision.kind not in {"keep"} and (
         decision.category_id
         or decision.reason
@@ -1002,18 +1006,20 @@ def audit_single_product(
             "invalid_target_leaf",
             "implausible_target_path",
             "stored_category_implausible",
-            "tree_unavailable",
             "accessory",
+            "mattress_not_accessory",
         }
+        or (isinstance(opt, dict) and opt.get("_category_remap_review"))
     ):
+        review = opt.get("_category_remap_review") if isinstance(opt, dict) else None
         issues.append({
             "type": "category_remap_pending_review",
             "severity": "WARNING",
             "current": stored_category or None,
-            "expected": decision.category_id,
+            "expected": (review or {}).get("to") if review else decision.category_id,
             "detail": (
-                f"remap {stored_category or 'empty'} → {decision.category_id or 'none'} "
-                f"reason={decision.reason}"
+                f"remap {stored_category or 'empty'} → {(review or {}).get('to') or decision.category_id or 'none'} "
+                f"reason={(review or {}).get('reason') or decision.reason}"
                 + (
                     f" suggested_alternative={decision.suggested_alternative}"
                     if decision.suggested_alternative
@@ -2448,6 +2454,44 @@ def export_category_mismatch_manifest(report, out_dir: Path | None = None) -> Pa
     target_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = target_dir / f"category_mismatch_manifest_{stamp}.csv"
+    import csv
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["sku", "fix_keys", "note"])
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def export_category_remap_review_manifest(report, out_dir: Path | None = None) -> Path | None:
+    """Write needs-review CSV for report-only category remap rows."""
+    rows = []
+    for item in report.get("issues") or []:
+        if not isinstance(item, dict):
+            continue
+        sku = str(item.get("sku") or "").strip()
+        if not sku:
+            continue
+        matched = [
+            issue
+            for issue in (item.get("issues") or [])
+            if isinstance(issue, dict)
+            and str(issue.get("type") or "").strip() == "category_remap_pending_review"
+        ]
+        if not matched:
+            continue
+        detail = str(matched[0].get("detail") or matched[0].get("expected") or "category_remap_pending_review")[:200]
+        expected = matched[0].get("expected")
+        note = f"expected={expected}; {detail}" if expected is not None else detail
+        rows.append({"sku": sku, "fix_keys": "category_remap_review", "note": note.replace("\n", " ")})
+
+    if not rows:
+        return None
+
+    target_dir = Path(out_dir) if out_dir is not None else LOG_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = target_dir / f"needs_review_category_remap_{stamp}.csv"
     import csv
 
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -5603,6 +5647,18 @@ def main(argv=None):
                 )
             )
             print(f"📋 Category mismatch manifest: {manifest_path}")
+        review_path = export_category_remap_review_manifest(report)
+        if review_path:
+            report["needs_review_category_remap"] = str(review_path)
+            report["needs_review_category_remap_count"] = sum(
+                1
+                for item in all_issues
+                if any(
+                    str(issue.get("type") or "") == "category_remap_pending_review"
+                    for issue in (item.get("issues") or [])
+                )
+            )
+            print(f"📋 Category remap needs-review: {review_path}")
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n📄 Full report: {report_path}")
 

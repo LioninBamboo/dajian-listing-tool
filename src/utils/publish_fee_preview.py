@@ -239,6 +239,8 @@ def blacklist_file_is_empty(blacklist_path: Optional[str] = None) -> bool:
     data = _read_blacklist_payload(blacklist_path)
     if data is None:
         return True
+    if not _blacklist_applies_to_store(data):
+        return True
     ids = _ids_from_blacklist_payload(data)
     paths = _path_entries_from_blacklist_payload(data)
     return not ids and not paths

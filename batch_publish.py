@@ -135,9 +135,7 @@ def _publish_image_limit(sku: str) -> int:
 _CATEGORY_VALIDITY_CACHE = {}
 KNOWN_PUBLISHABLE_CATEGORY_IDS = {
     "38217",  # China Cabinets
-    "20493",  # Display Cabinets
     "79694",  # Porch Swings
-    "38200",  # End Tables
     "262980", # Benches
     "20488",  # TV Stands
     "63108",  # Chicken Coops
@@ -394,6 +392,185 @@ def _is_sellable_leaf_category(oauth, category_id: str) -> bool:
     except Exception:
         _CATEGORY_VALIDITY_CACHE[cid] = False
         return False
+
+
+def select_batch_publish_category(
+    *,
+    stored_cat,
+    stored_cat_name=None,
+    title="",
+    description="",
+    existing_aspects=None,
+    opt=None,
+    listing_status="READY",
+    category_matcher=None,
+    preserve_approved_category=False,
+    sellable_check=None,
+):
+    """Pick a publish category, then run the shared write gate.
+
+    Remap, canonicalize, matcher, and empty-fill all go through
+    ``apply_category_write_gate``. Unapproved changes keep the original
+    stored id (report-only). Empty stored holds. Implausible stored on
+    READY/PENDING holds.
+    """
+    from src.utils.category_decision import apply_category_write_gate
+
+    original_stored = str(stored_cat or "").strip() or None
+    original_name = stored_cat_name
+    title_context = title or ""
+    existing_aspects = dict(existing_aspects or {})
+    opt = opt or {}
+    candidate = original_stored
+    candidate_name = original_name
+    completed_aspects = existing_aspects
+
+    if original_stored in INVALID_CATEGORY_REMAP and not preserve_approved_category:
+        candidate = INVALID_CATEGORY_REMAP[original_stored]
+        logger.warning(f"  [CAT] Remapping legacy invalid stored category {original_stored} -> {candidate}")
+    if candidate and not preserve_approved_category and category_matcher is not None:
+        canonical_cat, canonical_name = category_matcher.canonicalize_category(
+            title_context,
+            candidate,
+            candidate_name,
+            description,
+        )
+        if canonical_cat != candidate:
+            logger.warning(f"  [CAT] Canonicalizing stored category {candidate} -> {canonical_cat}")
+        candidate, candidate_name = canonical_cat, canonical_name
+    if (
+        candidate
+        and not preserve_approved_category
+        and callable(sellable_check)
+        and not sellable_check(candidate)
+    ):
+        logger.warning(f"  [CAT] Stored category {candidate} is not a sellable leaf in EBAY_US; ignoring stored category")
+        candidate = None
+        candidate_name = None
+
+    api_cat_id = None
+    api_cat_name = None
+    if category_matcher is not None:
+        api_cat_id, api_cat_name, completed_aspects = category_matcher.get_category_and_aspects(
+            title_context, existing_aspects, description
+        )
+        if api_cat_id:
+            api_cat_id = str(api_cat_id).strip()
+            if api_cat_id in INVALID_CATEGORY_REMAP:
+                remapped = INVALID_CATEGORY_REMAP[api_cat_id]
+                logger.warning(f"  [CAT] Remapping legacy invalid auto category {api_cat_id} -> {remapped}")
+                api_cat_id = remapped
+            api_cat_id, api_cat_name = category_matcher.canonicalize_category(
+                title_context,
+                api_cat_id,
+                api_cat_name,
+                description,
+            )
+            if callable(sellable_check) and not sellable_check(api_cat_id):
+                logger.warning(f"  [CAT] Auto category {api_cat_id} is not a sellable leaf in EBAY_US; ignoring auto category")
+                api_cat_id, api_cat_name = None, None
+
+    protected_stored_categories = PROTECTED_STORED_CATEGORY_IDS
+    stored_plausible = bool(
+        candidate and (
+            preserve_approved_category
+            or candidate in protected_stored_categories
+            or (
+                category_matcher is not None
+                and category_matcher.is_category_plausible_for_text(
+                    title_context, candidate, candidate_name
+                )
+            )
+        )
+    )
+    auto_plausible = bool(
+        api_cat_id
+        and category_matcher is not None
+        and category_matcher.is_category_plausible_for_text(
+            title_context,
+            api_cat_id,
+            api_cat_name,
+        )
+    )
+
+    selected = None
+    selected_name = None
+    if candidate and stored_plausible:
+        selected = candidate
+        selected_name = candidate_name or api_cat_name or f"Category {candidate}"
+        if api_cat_id and api_cat_id != candidate and auto_plausible:
+            logger.info(f"  [CAT] Preserving audited stored category {candidate}; ignoring auto-match {api_cat_id}")
+        if candidate in protected_stored_categories and api_cat_id and api_cat_id != candidate:
+            completed_aspects = existing_aspects
+        elif preserve_approved_category:
+            completed_aspects = existing_aspects
+        elif (
+            api_cat_id
+            and api_cat_id != candidate
+            and category_matcher is not None
+            and hasattr(category_matcher, "_get_category_aspects")
+            and hasattr(category_matcher, "_complete_aspects")
+        ):
+            required_aspects, recommended_aspects = category_matcher._get_category_aspects(candidate)
+            completed_aspects = category_matcher._complete_aspects(
+                existing_aspects,
+                required_aspects,
+                recommended_aspects,
+                title_context,
+                selected_name,
+            )
+    elif api_cat_id and auto_plausible:
+        selected = api_cat_id
+        selected_name = api_cat_name
+    elif candidate:
+        selected = candidate
+        selected_name = candidate_name
+    else:
+        selected = api_cat_id
+        selected_name = api_cat_name
+
+    gated_id, action = apply_category_write_gate(
+        original_stored,
+        selected,
+        title_context,
+        listing_status=listing_status,
+        reason="publish_candidate",
+    )
+    if action in {"hold_empty", "hold_implausible"}:
+        return {
+            "category_id": None,
+            "category_name": None,
+            "aspects": completed_aspects,
+            "action": action,
+            "original_stored": original_stored,
+            "held": True,
+            "selected": selected,
+        }
+    if gated_id and gated_id == original_stored:
+        selected_name = original_name or selected_name or f"Category {gated_id}"
+        if (
+            category_matcher is not None
+            and gated_id != selected
+            and hasattr(category_matcher, "_get_category_aspects")
+            and hasattr(category_matcher, "_complete_aspects")
+        ):
+            required_aspects, recommended_aspects = category_matcher._get_category_aspects(gated_id)
+            completed_aspects = category_matcher._complete_aspects(
+                existing_aspects,
+                required_aspects,
+                recommended_aspects,
+                title_context,
+                selected_name,
+            )
+    return {
+        "category_id": gated_id,
+        "category_name": selected_name if gated_id else None,
+        "aspects": completed_aspects,
+        "action": action,
+        "original_stored": original_stored,
+        "held": False,
+        "selected": selected,
+    }
 
 
 def _is_invalid_compatibility_error(error_msg: str) -> bool:
@@ -953,92 +1130,44 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             result["copy_skip_reasons"] = ["high_insertion_fee"]
         return result
     preserve_approved_category = approved_decision.preserve
-    if stored_cat in INVALID_CATEGORY_REMAP and not preserve_approved_category:
-        remapped = INVALID_CATEGORY_REMAP[stored_cat]
-        logger.warning(f"  [CAT] Remapping legacy invalid stored category {stored_cat} -> {remapped}")
-        stored_cat = remapped
-    if stored_cat and not preserve_approved_category:
-        canonical_cat, canonical_name = category_matcher.canonicalize_category(
-            title_context,
-            stored_cat,
-            stored_cat_name,
-            product.get('description', ''),
-        )
-        if canonical_cat != stored_cat:
-            logger.warning(f"  [CAT] Canonicalizing stored category {stored_cat} -> {canonical_cat}")
-        stored_cat, stored_cat_name = canonical_cat, canonical_name
-    if stored_cat and not preserve_approved_category and not _is_sellable_leaf_category(oauth, stored_cat):
-        logger.warning(f"  [CAT] Stored category {stored_cat} is not a sellable leaf in EBAY_US; ignoring stored category")
-        stored_cat = None
-        stored_cat_name = None
-
-    # Get auto-matched category + completed aspects
-    api_cat_id, api_cat_name, completed_aspects = category_matcher.get_category_and_aspects(
-        category_lookup_title, existing_aspects, product.get('description', '')
+    listing_status = str(product.get('status') or opt.get('status') or opt.get('listingStatus') or 'READY')
+    choice = select_batch_publish_category(
+        stored_cat=stored_cat,
+        stored_cat_name=stored_cat_name,
+        title=title_context,
+        description=product.get('description', ''),
+        existing_aspects=existing_aspects,
+        opt=opt,
+        listing_status=listing_status,
+        category_matcher=category_matcher,
+        preserve_approved_category=preserve_approved_category,
+        sellable_check=(
+            None
+            if preserve_approved_category
+            else (lambda cid, _oauth=oauth: _is_sellable_leaf_category(_oauth, cid))
+        ),
     )
-    if api_cat_id:
-        api_cat_id = str(api_cat_id).strip()
-        if api_cat_id in INVALID_CATEGORY_REMAP:
-            remapped = INVALID_CATEGORY_REMAP[api_cat_id]
-            logger.warning(f"  [CAT] Remapping legacy invalid auto category {api_cat_id} -> {remapped}")
-            api_cat_id = remapped
-        api_cat_id, api_cat_name = category_matcher.canonicalize_category(
-            category_lookup_title,
-            api_cat_id,
-            api_cat_name,
-            product.get('description', ''),
-        )
-        if not _is_sellable_leaf_category(oauth, api_cat_id):
-            logger.warning(f"  [CAT] Auto category {api_cat_id} is not a sellable leaf in EBAY_US; ignoring auto category")
-            api_cat_id, api_cat_name = None, None
-
-    protected_stored_categories = PROTECTED_STORED_CATEGORY_IDS
-    stored_plausible = bool(
-        stored_cat and (
-            preserve_approved_category
-            or stored_cat in protected_stored_categories
-            or category_matcher.is_category_plausible_for_text(title_context, stored_cat, stored_cat_name)
-        )
-    )
-    auto_plausible = bool(
-        api_cat_id and category_matcher.is_category_plausible_for_text(
-            category_lookup_title,
-            api_cat_id,
-            api_cat_name,
-        )
-    )
-
-    if stored_cat and stored_plausible:
-        category_id = stored_cat
-        category_name = stored_cat_name or api_cat_name or f"Category {stored_cat}"
-        if api_cat_id and api_cat_id != stored_cat and auto_plausible:
-            logger.info(f"  [CAT] Preserving audited stored category {stored_cat}; ignoring auto-match {api_cat_id}")
-        if stored_cat in protected_stored_categories and api_cat_id and api_cat_id != stored_cat:
-            completed_aspects = existing_aspects
-            logger.warning(f"  [CAT] Preserving stored protected category {stored_cat}; ignoring fallback/API={api_cat_id}")
-        elif preserve_approved_category:
-            completed_aspects = existing_aspects
-            logger.info(f"  [CAT] Preserving human-approved category {stored_cat}")
-        elif api_cat_id and api_cat_id != stored_cat:
-            required_aspects, recommended_aspects = category_matcher._get_category_aspects(stored_cat)
-            completed_aspects = category_matcher._complete_aspects(
-                existing_aspects,
-                required_aspects,
-                recommended_aspects,
-                category_lookup_title,
-                category_name,
+    stored_cat = choice.get("original_stored") or stored_cat
+    completed_aspects = choice.get("aspects") or existing_aspects
+    if choice.get("held"):
+        if choice.get("action") == "hold_empty":
+            msg = "Cannot determine eBay category"
+        elif choice.get("action") == "hold_implausible":
+            msg = (
+                f"Stored category {stored_cat} is not publishable for title "
+                f"'{title_context[:120]}'"
             )
-    elif api_cat_id and auto_plausible:
-        category_id = api_cat_id
-        category_name = api_cat_name
-    elif stored_cat:
-        msg = f"Stored category {stored_cat} is not plausible for title '{title_context[:120]}'"
+        else:
+            msg = f"Stored category {stored_cat} is not plausible for title '{title_context[:120]}'"
         record_error(sku, msg)
         return {"status": "error", "message": msg}
-    else:
+    category_id = choice.get("category_id")
+    category_name = choice.get("category_name")
+    if not category_id:
         msg = "Cannot determine eBay category"
         record_error(sku, msg)
         return {"status": "error", "message": msg}
+    protected_stored_categories = PROTECTED_STORED_CATEGORY_IDS
 
     # ── Enrich aspects ──
     enriched_product = dict(product)
@@ -1196,6 +1325,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         "categoryId": category_id,
         "categoryName": category_name,
         "aspects": completed_aspects,
+        "status": listing_status,
     }
     if is_category_approved(opt):
         mark_category_approved(qc_candidate, opt.get("categoryId"))
@@ -1654,6 +1784,26 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                             if not _is_sellable_leaf_category(oauth, new_id):
                                 logger.warning(f"  [FIX] Auto reselected category {new_id} is not sellable leaf; keeping current category")
                                 new_id = None
+                        retry_choice = select_batch_publish_category(
+                            stored_cat=stored_cat,
+                            stored_cat_name=stored_cat_name,
+                            title=title,
+                            description=description,
+                            existing_aspects=completed_aspects,
+                            opt=opt,
+                            listing_status=listing_status,
+                            category_matcher=category_matcher,
+                            preserve_approved_category=preserve_approved_category,
+                            sellable_check=lambda cid, _oauth=oauth: _is_sellable_leaf_category(_oauth, cid),
+                        )
+                        gated_retry = retry_choice.get("category_id")
+                        if retry_choice.get("held") or not gated_retry:
+                            new_id = None
+                        elif gated_retry != stored_cat and retry_choice.get("action") != "remap":
+                            new_id = None
+                        else:
+                            new_id = gated_retry
+                            new_name = retry_choice.get("category_name") or new_name
                         if new_id and new_id != category_id:
                             logger.info(f"  [FIX] Category {category_id} invalid, switching to API-suggested: {new_id} ({new_name})")
                             category_id, category_name = new_id, new_name

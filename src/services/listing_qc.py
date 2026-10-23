@@ -607,6 +607,7 @@ def run_listing_qc(
             images=images,
             videos=videos,
             category_matcher=category_matcher,
+            listing_status=str(candidate.get("listingStatus") or candidate.get("status") or ""),
         )
     except Exception as exc:
         result["blockers"] = [f"Quality gate error: {exc}"]

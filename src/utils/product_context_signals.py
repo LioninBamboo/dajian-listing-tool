@@ -920,6 +920,11 @@ STORED_LEAF_LOCK: dict[str, tuple[str, ...]] = {
     "20490": ("ottoman",),
     "88057": ("sewing table", "craft table", "sewing machine table"),
     "20487": ("bar cabinet", "liquor cabinet"),
+    "32878": ("vanity", "makeup table", "bathroom vanity"),
+    "176991": ("cabinet", "bathroom cabinet", "vanity"),
+    "63108": ("chicken coop", "hutch", "rabbit hutch", "coop"),
+    "131588": ("mattress",),
+    "161059": ("trash can", "garbage bin", "bin shed", "trash can storage"),
 }
 
 OUTDOOR_STORED_LEAVES = frozenset({"79684", "79682", "139849", "112590", "138996"})

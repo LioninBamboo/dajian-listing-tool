@@ -581,6 +581,10 @@ def choose_ready_category(
     if is_category_approved(optimization) and str(current_category_id or "").strip():
         return current_category_id, current_category_name, aspects
 
+    from src.utils.category_decision import apply_category_write_gate
+
+    original_id = normalize_category_id(current_category_id)
+    original_name = current_category_name
     candidates = []
     seen_titles = set()
 
@@ -648,8 +652,34 @@ def choose_ready_category(
         )
     )
 
+    def _gate_ready(chosen_id, chosen_name, chosen_aspects):
+        gated, action = apply_category_write_gate(
+            original_id,
+            chosen_id,
+            title_context or source_title or draft_title,
+            listing_status="READY",
+            reason="ready_draft_candidate",
+        )
+        if action in {"hold_empty", "hold_implausible"}:
+            return original_id or None, original_name if original_id else None, aspects
+        if gated == original_id:
+            if not original_id:
+                return None, None, aspects
+            return (
+                original_id,
+                original_name or chosen_name,
+                complete_aspects_for_category(
+                    matcher,
+                    original_id,
+                    source_title or draft_title,
+                    aspects,
+                    original_name,
+                ),
+            )
+        return gated, chosen_name, chosen_aspects
+
     if current_id and current_plausible:
-        return (
+        return _gate_ready(
             current_id,
             current_category_name or (preferred["category_name"] if preferred else None),
             complete_aspects_for_category(
@@ -662,10 +692,10 @@ def choose_ready_category(
         )
 
     if preferred and preferred["category_id"] and preferred["plausible"]:
-        return preferred["category_id"], preferred["category_name"], preferred["aspects"]
+        return _gate_ready(preferred["category_id"], preferred["category_name"], preferred["aspects"])
 
     if current_id:
-        return (
+        return _gate_ready(
             current_id,
             current_category_name,
             complete_aspects_for_category(
@@ -678,9 +708,9 @@ def choose_ready_category(
         )
 
     if preferred:
-        return preferred["category_id"], preferred["category_name"], preferred["aspects"]
+        return _gate_ready(preferred["category_id"], preferred["category_name"], preferred["aspects"])
 
-    return None, None, aspects
+    return _gate_ready(None, None, aspects)
 
 
 def normalize_measurements(sku, attrs, specs, description, aspects, title_context=""):

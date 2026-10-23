@@ -261,6 +261,57 @@ _PATIO_CHAIR_HEADS = frozenset(
 )
 _ADJUSTABLE_LOUNGE_RE = re.compile(r"\b(?:adjustable|reclin(?:e|er|ing))\b", re.IGNORECASE)
 _TV_STAND_HEADS = frozenset({"tv stand", "media console", "entertainment center"})
+_FURNITURE_KINDS = frozenset(
+    {
+        "outdoor_chair",
+        "outdoor_chaise",
+        "dining_chair",
+        "armchair",
+        "sofa",
+        "ottoman",
+        "storage_ottoman",
+        "ottoman_bench",
+        "indoor_bench",
+        "dining_table",
+        "coffee_table",
+        "side_table",
+        "nightstand",
+        "outdoor_table",
+        "patio_furniture_set",
+        "dining_set",
+        "desk",
+        "bed",
+        "kitchen_island",
+        "display_cabinet",
+        "hall_tree",
+        "sideboard",
+        "wine_rack",
+    }
+)
+_HEAD_FITS_STORED = {
+    "vanity": frozenset({"32878", "176991"}),
+    "cabinet": frozenset({"20487", "176991", "42428", "38217"}),
+    "pantry": frozenset({"20487", "42428", "176991"}),
+    "hutch": frozenset({"20487", "63108", "176991"}),
+    "mattress": frozenset({"131588"}),
+    "tv stand": frozenset({"20488"}),
+}
+_TOOL_TITLE_RE = re.compile(
+    r"\b(?:bolt\s+cutters?|vises?|clamps?|workbenches?|work\s+bench|"
+    r"tool\s+sets?|air\s+tanks?|air\s+compressors?|tool\s+chest|"
+    r"tool\s+cabinet|power\s+tools?|impact\s+wrench)\b",
+    re.IGNORECASE,
+)
+_KITCHEN_ISLAND_TITLE_RE = re.compile(
+    r"\b(?:kitchen\s+island|kitchen\s+cart|prep\s+station|baker(?:'s)?\s+rack)\b",
+    re.IGNORECASE,
+)
+_SPORTS_KEEP_RE = re.compile(
+    r"\b(?:treadmill|golf\s+mat|putting\s+(?:green|mat)|ping[\s-]*pong\s+table|"
+    r"table\s+tennis)\b",
+    re.IGNORECASE,
+)
+_TREE_UNAVAILABLE_WARNED = False
 
 # Ship empty. Optional JSON override: data/config/approved_auto_remaps.json
 # Each pair is (stored_or_empty, target_id) or (reason, target_id).
@@ -280,6 +331,61 @@ def _category_index(index=None):
     if index is not None:
         return dict(index)
     return load_category_index()
+
+
+def category_tree_is_available(index=None) -> bool:
+    return bool(_category_index(index))
+
+
+def reset_tree_unavailable_warning() -> None:
+    global _TREE_UNAVAILABLE_WARNED
+    _TREE_UNAVAILABLE_WARNED = False
+
+
+def warn_once_tree_unavailable(log=None) -> None:
+    """One run-level warning when the tree cache is missing or stale."""
+    global _TREE_UNAVAILABLE_WARNED
+    if _TREE_UNAVAILABLE_WARNED:
+        return
+    _TREE_UNAVAILABLE_WARNED = True
+    (log or logger).warning(
+        "Category tree cache missing or stale; skipping per-row plausibility "
+        "flags; category writes fail closed"
+    )
+
+
+def unpublished_listing_status(status: str = "") -> bool:
+    return str(status or "").strip().upper() in {"", "READY", "PENDING"}
+
+
+def _looks_like_tool_title(title: str) -> bool:
+    return bool(_TOOL_TITLE_RE.search(as_safe_text(title)))
+
+
+def _looks_like_kitchen_island_title(title: str) -> bool:
+    return bool(_KITCHEN_ISLAND_TITLE_RE.search(as_safe_text(title)))
+
+
+def _title_agrees_with_stored(title: str, stored: str, index=None) -> bool:
+    """True when the stored leaf already fits the live head (do not flag)."""
+    stored_id = as_safe_category_id(stored)
+    hay = as_safe_text(title)
+    if not stored_id or not hay:
+        return False
+    if stored_leaf_locked(hay, stored_id):
+        return True
+    head = first_product_noun(hay)
+    deny = unknown_head_noun(head) or head
+    if deny and stored_id in _HEAD_FITS_STORED.get(str(deny), ()):
+        return True
+    if deny == "mattress" or head == "mattress":
+        return stored_id in _HEAD_FITS_STORED["mattress"]
+    if _SPORTS_KEEP_RE.search(hay):
+        return True
+    if _looks_like_tool_title(hay):
+        path = _category_path(stored_id, index=index)
+        return path.startswith("Home & Garden > Tools & Workshop Equipment")
+    return False
 
 
 def _category_path(cid: str, index=None) -> str:
@@ -364,25 +470,30 @@ def validate_target_category(
     path = _category_path(target, index=flat)
     if path.startswith(ANTIQUES_PREFIX):
         return False, "implausible_target_path"
-    if path.startswith("Home & Garden > Tools & Workshop Equipment"):
-        return False, "implausible_target_path"
     species = pet_species_mismatch_reason(title, path)
     if species:
         return False, species
-    furniture_like = kind not in {"cat_furniture", "dog_beds", "cat_litter", "pet"}
-    if furniture_like and kind not in {"unknown", "keep", ""}:
-        if not any(path.startswith(prefix) for prefix in FURNITURE_PATH_PREFIXES):
-            if path.startswith("Pet Supplies"):
+    tools_path = path.startswith("Home & Garden > Tools & Workshop Equipment")
+    if tools_path:
+        if kind in _FURNITURE_KINDS or _looks_like_kitchen_island_title(title):
+            if not _looks_like_tool_title(title):
                 return False, "implausible_target_path"
-            if path.startswith("Home & Garden > Tools"):
+        elif target == KITCHEN_ISLAND and "Power Tool" in path:
+            if _looks_like_kitchen_island_title(title) or kind in {
+                "kitchen_island",
+                "side_table",
+                "display_cabinet",
+            }:
                 return False, "implausible_target_path"
-            if not path.startswith("Pet Supplies"):
-                return False, "implausible_target_path"
-    if kind in {"kitchen_island", "side_table", "display_cabinet", "hall_tree", "sideboard", "outdoor_chair", "outdoor_chaise"}:
+    if kind in _FURNITURE_KINDS:
         if not any(path.startswith(prefix) for prefix in FURNITURE_PATH_PREFIXES):
             return False, "implausible_target_path"
-    if target == KITCHEN_ISLAND and kind in {"kitchen_island", "side_table", "display_cabinet", "classified", "canonical", ""}:
-        if "Power Tool" in path:
+    if target == KITCHEN_ISLAND and "Power Tool" in path:
+        if _looks_like_kitchen_island_title(title) or kind in {
+            "kitchen_island",
+            "side_table",
+            "display_cabinet",
+        }:
             return False, "implausible_target_path"
     return True, ""
 
@@ -464,7 +575,14 @@ def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDe
     head = first_product_noun(hay)
     deny_noun = unknown_head_noun(head)
     if deny_noun:
-        if deny_noun in {"cushion", "pad", "cover", "slipcover", "mattress"} or title_is_chair_accessory(hay):
+        stored_id = as_safe_category_id(stored)
+        if deny_noun == "mattress":
+            if stored_id in _HEAD_FITS_STORED["mattress"]:
+                return CategoryDecision(None, "keep", "stored_head_fit")
+            return CategoryDecision(None, "unknown", "mattress_not_accessory")
+        if stored_id and stored_id in _HEAD_FITS_STORED.get(deny_noun, ()):
+            return CategoryDecision(None, "keep", "stored_head_fit")
+        if deny_noun in {"cushion", "pad", "cover", "slipcover"} or title_is_chair_accessory(hay):
             return CategoryDecision(None, "unknown", "accessory")
         return CategoryDecision(None, "unknown", "unknown_head_noun")
     if head in {
@@ -501,6 +619,12 @@ def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDe
         if title_has_clear_outdoor_word(hay) and not title_has_mixed_indoor_outdoor(hay):
             return CategoryDecision(OUTDOOR_CHAISE, "outdoor_chaise", "chaise_lounge", "Loungers")
         return CategoryDecision(None, "unknown", "chaise_not_dining_set")
+    if _SPORTS_KEEP_RE.search(hay) and as_safe_category_id(stored):
+        return CategoryDecision(None, "keep", "stored_head_fit")
+    if _looks_like_tool_title(hay) and as_safe_category_id(stored):
+        tool_path = _category_path(stored)
+        if tool_path.startswith("Home & Garden > Tools & Workshop Equipment"):
+            return CategoryDecision(None, "keep", "stored_head_fit")
     if _is_patio_chair_head(head, hay) or re.search(
         r"\b(?:papasan|adirondack|egg)\s+chairs?\b", hay, re.IGNORECASE
     ):
@@ -618,12 +742,8 @@ def _finalize_decision(
             stored, decision.kind, title, index=index
         )
         if stored_reason == "tree_unavailable":
-            return CategoryDecision(
-                None,
-                "unknown",
-                "tree_unavailable",
-                suggested_alternative=suggested_alternative_for(stored, decision.kind, title),
-            )
+            warn_once_tree_unavailable()
+            return CategoryDecision(None, "keep", "tree_cache_unavailable")
 
     if stored and stored_ok and stored_leaf_locked(title, stored):
         return CategoryDecision(None, "keep", "stored_leaf_lock")
@@ -647,15 +767,22 @@ def _finalize_decision(
             return CategoryDecision(None, "unknown", reason, suggested_alternative=alt)
 
     if stored and not stored_ok and (decision.kind == "keep" or not decision.category_id):
+        if stored_reason == "tree_unavailable":
+            warn_once_tree_unavailable()
+            return CategoryDecision(None, "keep", "tree_cache_unavailable")
         return CategoryDecision(
             None,
             "unknown",
-            "stored_category_implausible" if stored_reason != "tree_unavailable" else stored_reason,
+            "stored_category_implausible",
             suggested_alternative=suggested_alternative_for(stored, decision.kind, title),
         )
 
     if decision.kind == "keep":
         return CategoryDecision(None, "keep", decision.reason, decision.category_name)
+
+    if stored and stored_ok and (decision.kind == "unknown" or not decision.category_id):
+        if _title_agrees_with_stored(title, stored, index=index):
+            return CategoryDecision(None, "keep", "stored_head_fit")
 
     if decision.kind == "unknown" or not decision.category_id:
         return CategoryDecision(
@@ -695,9 +822,12 @@ def resolve_category_decision(
         if stored:
             stored_ok, stored_reason = validate_target_category(stored, "", title, index=index)
             if stored_reason == "tree_unavailable":
-                return CategoryDecision(None, "unknown", "tree_unavailable")
+                warn_once_tree_unavailable()
+                return CategoryDecision(None, "keep", "tree_cache_unavailable")
             if stored_ok and stored_leaf_locked(title, stored):
                 return CategoryDecision(None, "keep", "stored_leaf_lock")
+            if stored_ok and _title_agrees_with_stored(title, stored, index=index):
+                return CategoryDecision(None, "keep", "stored_head_fit")
 
         if live and giga:
             live_dec = _propose_from_title(live, stored, name)
@@ -753,3 +883,55 @@ def decision_category_id(
     if not is_approved_auto_remap(stored, decision.category_id, decision.reason):
         return None
     return decision.category_id
+
+
+def apply_category_write_gate(
+    original_stored: Any,
+    candidate_id: Any,
+    title: str = "",
+    *,
+    listing_status: str = "",
+    reason: str = "publish_candidate",
+    kind: str = "classified",
+    index=None,
+) -> tuple[str | None, str]:
+    """Gate every publish/draft category choice.
+
+    Returns (category_id_or_None_to_hold, action) where action is
+    ``remap``, ``keep``, ``hold_empty``, or ``hold_implausible``.
+    Unapproved remaps keep the original stored id. Empty stored holds.
+    Invalid/implausible stored holds READY/PENDING and stays manifest-only
+    for PUBLISHED.
+    """
+    stored = as_safe_category_id(original_stored)
+    candidate = as_safe_category_id(candidate_id)
+    unpublished = unpublished_listing_status(listing_status)
+    if not category_tree_is_available(index):
+        warn_once_tree_unavailable()
+        if stored:
+            return stored, "keep"
+        return (None, "hold_empty") if unpublished else (candidate or None, "keep")
+
+    action = "keep"
+    chosen = stored
+    if candidate and candidate != stored:
+        ok, _reason = validate_target_category(candidate, kind, title, index=index)
+        if ok and is_approved_auto_remap(stored, candidate, reason):
+            chosen = candidate
+            action = "remap"
+        elif not stored:
+            return None, "hold_empty"
+        else:
+            chosen = stored
+            action = "keep"
+    elif not stored:
+        return None, "hold_empty"
+
+    if chosen == stored and stored:
+        stored_ok, stored_reason = validate_target_category(stored, "", title, index=index)
+        if stored_reason == "tree_unavailable":
+            warn_once_tree_unavailable()
+            return stored, "keep"
+        if not stored_ok and unpublished:
+            return None, "hold_implausible"
+    return chosen or None, action

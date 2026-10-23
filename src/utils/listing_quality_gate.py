@@ -2556,7 +2556,7 @@ def normalize_generated_listing(
                 remove_aspects=profile.remove_aspects,
             )
             if decision.kind not in {"keep"} and (
-                decision.category_id or decision.reason not in {"", "classified", "empty_title"}
+                decision.category_id or decision.reason not in {"", "classified", "empty_title", "tree_cache_unavailable"}
             ):
                 opt["_category_remap_review"] = {
                     "from": stored_category or "",
@@ -3429,6 +3429,7 @@ def validate_listing_quality(
     images: list[str] | None = None,
     videos: list[str] | None = None,
     category_matcher: Any = None,
+    listing_status: str = "",
 ) -> list[ListingQualityIssue]:
     """Return quality issues that should block READY/publish."""
     opt = dict(optimization or {})
@@ -3543,6 +3544,33 @@ def validate_listing_quality(
         opt.get("categoryName"),
     )
     write_id = decision_category_id(decision, category_id)
+    from src.utils.category_decision import (
+        unpublished_listing_status,
+        validate_target_category,
+        warn_once_tree_unavailable,
+    )
+
+    status = str(listing_status or opt.get("listingStatus") or opt.get("status") or "")
+    stored_ok, stored_reason = (True, "")
+    if category_id:
+        stored_ok, stored_reason = validate_target_category(category_id, "", title or source_title)
+    if stored_reason == "tree_unavailable" or decision.reason in {"tree_unavailable", "tree_cache_unavailable"}:
+        warn_once_tree_unavailable()
+    elif (
+        not preserve_category
+        and category_id
+        and not stored_ok
+        and stored_reason in {"stored_category_implausible", "invalid_target_leaf", "implausible_target_path"}
+    ):
+        if unpublished_listing_status(status):
+            issues.append(
+                ListingQualityIssue(
+                    "stored_category_unpublishable",
+                    f"stored category {category_id} is {stored_reason}; holding READY/PENDING publish",
+                    severity="BLOCKER",
+                    field="categoryId",
+                )
+            )
     if decision.conflict or decision.reason == "title_source_conflict":
         issues.append(
             ListingQualityIssue(
@@ -3556,6 +3584,7 @@ def validate_listing_quality(
         not preserve_category
         and not write_id
         and decision.kind not in {"keep"}
+        and decision.reason not in {"tree_unavailable", "tree_cache_unavailable"}
         and (
             bool(decision.category_id)
             or decision.reason
@@ -3565,12 +3594,13 @@ def validate_listing_quality(
                 "invalid_target_leaf",
                 "implausible_target_path",
                 "stored_category_implausible",
-                "tree_unavailable",
                 "accessory",
+                "mattress_not_accessory",
             }
         )
     )
-    if pending_remap:
+    review = opt.get("_category_remap_review") if isinstance(opt.get("_category_remap_review"), dict) else None
+    if pending_remap or (review and not preserve_category and not write_id and decision.kind not in {"keep"}):
         issues.append(
             ListingQualityIssue(
                 "category_remap_pending_review",

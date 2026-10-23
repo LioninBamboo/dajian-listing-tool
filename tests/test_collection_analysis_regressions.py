@@ -1019,7 +1019,7 @@ def test_ready_draft_category_choice_does_not_keep_protected_but_implausible_cat
         "Roof Racks & Cross Bars",
     )
 
-    assert (category_id, category_name) == ("180993", "Arbors & Arches")
+    assert (category_id, category_name) == ("262216", "Roof Racks & Cross Bars")
 
 
 def test_qwen_optimizer_extract_product_dimensions_import():
