@@ -2905,7 +2905,14 @@ def _send_audit_email(report, report_path):
         manual_rows=manual_rows_html or '<tr><td colspan="4" style="padding:8px;">未发现问题</td></tr>',
         transport_section=transport_section,
     )
-    return send_email(subject, html_body, attachments=[str(report_path)])
+    from src.utils.email_policy import should_smtp
+    # 2026-10: audit SMTP only on CRITICAL/HIGH; clean runs stay local/digest
+    return send_email(
+        subject,
+        html_body,
+        attachments=[str(report_path)],
+        send_smtp=should_smtp(has_issues=bool(n_critical or n_high)),
+    )
 
 
 def resolve_inventory_availability_for_product_put(
