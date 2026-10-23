@@ -1986,12 +1986,23 @@ class EbayCategoryMatcher:
                 name = a.get("localizedAspectName", "")
                 constraint = a.get("aspectConstraint", {})
                 values = a.get("aspectValues", [])
-                
+                allowed_values = [
+                    v.get("localizedValue")
+                    for v in values
+                    if str(v.get("localizedValue") or "").strip()
+                ] if values else []
+
                 parsed.append({
                     "name": name,
                     "required": constraint.get("aspectRequired", False),
                     "mode": constraint.get("aspectMode", "FREE_TEXT"),
-                    "allowed_values": [v.get("localizedValue") for v in values[:50]] if values else [],
+                    # FULL allowed list — Material SELECTION_ONLY decisions must
+                    # not silently miss a value past the old [:50] cap.
+                    "allowed_values": allowed_values,
+                    "cardinality": constraint.get(
+                        "itemToAspectCardinality",
+                        "SINGLE",
+                    ),
                     "data_type": constraint.get("aspectDataType", "STRING")
                 })
             

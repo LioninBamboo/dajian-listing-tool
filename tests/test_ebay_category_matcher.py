@@ -425,3 +425,54 @@ def test_get_category_path_missing_cache_returns_empty(monkeypatch, tmp_path):
     assert path == ""
     assert "6038" not in matcher._path_cache
     assert http_calls == []
+
+
+def test_get_category_aspects_keeps_cardinality_and_full_allowed_values(monkeypatch):
+    class _Oauth:
+        def get_application_token(self):
+            return "app-token"
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "aspects": [
+                    {
+                        "localizedAspectName": "Material",
+                        "aspectConstraint": {
+                            "aspectRequired": False,
+                            "aspectMode": "SELECTION_ONLY",
+                            "itemToAspectCardinality": "MULTI",
+                            "aspectDataType": "STRING",
+                        },
+                        "aspectValues": [
+                            {"localizedValue": f"Value-{i}"} for i in range(60)
+                        ],
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(
+        "src.services.ebay_category_matcher.requests.get",
+        lambda *args, **kwargs: _Resp(),
+    )
+    monkeypatch.setattr(
+        "src.services.ebay_category_matcher.get_store_profile",
+        lambda: type(
+            "P",
+            (),
+            {"ebay_marketplace_id": "EBAY_US", "category_tree_id": "0"},
+        )(),
+    )
+
+    matcher = EbayCategoryMatcher(_Oauth())
+    required, recommended = matcher._get_category_aspects("54235")
+    assert required == []
+    assert len(recommended) == 1
+    aspect = recommended[0]
+    assert aspect["name"] == "Material"
+    assert aspect["mode"] == "SELECTION_ONLY"
+    assert aspect["cardinality"] == "MULTI"
+    assert len(aspect["allowed_values"]) == 60
+    assert aspect["allowed_values"][59] == "Value-59"
