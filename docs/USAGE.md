@@ -238,6 +238,8 @@ python daily_tasks.py --audit-only
 
 子店实例在 `config/store_profile.local.yaml` 设置 `scheduler_profile: ops` 后，默认只跑库存运营与出单源复核，**不会**跑主店的 MI 自动刊登、CRO 改价消费、GIGA 履约推单。
 
+`scheduler_allowed_jobs` 是 fail-closed 白名单：空列表、缺省或含未知名字时只保留 `ops_daily` + `order_recheck`。切片开关**不能单独加任务**；可选 ops 任务必须同时在白名单里且对应 slice 为 true。Main 的 `full`/`daily`/未知 profile 忽略该字段（39 项日程不变）。完整语义与 daemon 外的 Windows 任务见 `docs/SCHEDULER_OPS_ALLOWLIST.md`。
+
 可选切片用两个默认关闭的开关叠加，**不会改主店 `scheduler_profile: full` 日程**：
 
 | 开关 | 谁开 | 叠加任务 |
