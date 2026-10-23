@@ -1116,6 +1116,14 @@ def test_fix_listing_does_not_stamp_approval_on_category_remap(monkeypatch):
         "_put_inventory_product_only",
         lambda *args, **kwargs: (object(), stored["description"], stored["aspects"]),
     )
+    monkeypatch.setattr(
+        "src.utils.category_tree_cache.build_category_path",
+        lambda category_id, cache_dir=None, index=None: (
+            "Home & Garden > Furniture > Cabinets & Cupboards > Bathroom Cabinets"
+            if str(category_id) == "176991"
+            else "Home & Garden > Furniture > Cabinets & Cupboards"
+        ),
+    )
 
     class FakeClient:
         def get_offers_by_sku(self, sku):

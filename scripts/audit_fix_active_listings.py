@@ -258,9 +258,10 @@ def parse_json(val):
         return val
     if isinstance(val, str) and val.strip():
         try:
-            return json.loads(val)
+            parsed = json.loads(val)
         except Exception:
             return {}
+        return parsed if isinstance(parsed, dict) else {}
     return {}
 
 
@@ -856,9 +857,9 @@ def audit_single_product(
 
     # Also check the optimized title
     opt_title = opt.get("title", "") if isinstance(opt, dict) else ""
-    combined_title = f"{title} {opt_title}".lower()
+    combined_title = f"{opt_title} {title}".lower()
     matcher = get_category_matcher()
-    title_context = " ".join(part for part in (title, opt_title) if part).strip()
+    title_context = " ".join(part for part in (opt_title, title) if part).strip()
     db_images = parse_image_list(images_raw)
     db_videos = parse_image_list(videos_raw)
     local_video_status = str(opt.get("video_status") or opt.get("videoStatus") or "").strip().upper()
@@ -953,67 +954,98 @@ def audit_single_product(
         })
         fixes["__restore_live_description_from_local__"] = True
 
-    # ── 1. Category Check — deterministic product profile wins over taxonomy drift ──
-    # A human-approved stored category is not remapped by profile or canonicalize.
+    # ── 1. Category Check — one decision contract, same as the publish path ──
+    # A human-approved stored category is not remapped. API-suggest is not a
+    # second leaf source: uncertain stays unknown.
     skip_category_remap = is_category_approved(opt) and bool(stored_category)
-    profile = classify_listing_profile(title_context or title, live_description, stored_category)
-    if not skip_category_remap and profile.category_id:
-        if stored_category != profile.category_id:
+    from src.utils.category_decision import decision_category_id, resolve_category_decision
+
+    decision = resolve_category_decision(
+        opt_title,
+        title,
+        "",
+        stored_category,
+        stored_category_name,
+    )
+    write_id = decision_category_id(decision, stored_category)
+    if decision.conflict or decision.reason == "title_source_conflict":
+        issues.append({
+            "type": "title_source_conflict",
+            "severity": "INFO",
+            "current": stored_category or None,
+            "expected": None,
+            "detail": (
+                f"Live title and GIGA title disagree on the product leaf; "
+                f"holding stored category {stored_category or 'none'}"
+            ),
+        })
+    if not skip_category_remap and write_id:
+        issues.append({
+            "type": "category_mismatch",
+            "severity": "CRITICAL",
+            "current": stored_category or None,
+            "expected": write_id,
+            "detail": (
+                f"Product profile '{decision.kind}' should use category {write_id} "
+                f"for '{(opt_title or title)[:60]}'"
+            ),
+        })
+        fixes["categoryId"] = write_id
+        if decision.category_name:
+            fixes["categoryName"] = decision.category_name
+    elif decision.reason in {"tree_unavailable", "tree_cache_unavailable"}:
+        from src.utils.category_decision import warn_once_tree_unavailable
+
+        warn_once_tree_unavailable()
+    elif not skip_category_remap and not write_id and decision.kind not in {"keep"} and (
+        decision.category_id
+        or decision.reason
+        in {
+            "unknown_head_noun",
+            "pet_species_mismatch",
+            "invalid_target_leaf",
+            "implausible_target_path",
+            "stored_category_implausible",
+            "accessory",
+            "mattress_not_accessory",
+        }
+        or (isinstance(opt, dict) and opt.get("_category_remap_review"))
+    ):
+        review = opt.get("_category_remap_review") if isinstance(opt, dict) else None
+        issues.append({
+            "type": "category_remap_pending_review",
+            "severity": "WARNING",
+            "current": stored_category or None,
+            "expected": (review or {}).get("to") if review else decision.category_id,
+            "detail": (
+                f"remap {stored_category or 'empty'} → {(review or {}).get('to') or decision.category_id or 'none'} "
+                f"reason={(review or {}).get('reason') or decision.reason}"
+                + (
+                    f" suggested_alternative={decision.suggested_alternative}"
+                    if decision.suggested_alternative
+                    else ""
+                )
+            ),
+        })
+    if not skip_category_remap and stored_category and not write_id:
+        try:
+            matcher = get_category_matcher()
+            plausible = matcher.is_category_plausible_for_text(
+                opt_title or title, stored_category, stored_category_name
+            )
+        except Exception:
+            plausible = True
+        if plausible is False:
             issues.append({
-                "type": "category_mismatch",
-                "severity": "CRITICAL",
-                "current": stored_category or None,
-                "expected": profile.category_id,
+                "type": "category_implausible",
+                "severity": "HIGH",
+                "current": stored_category,
+                "expected": None,
                 "detail": (
-                    f"Product profile '{profile.kind}' should use category {profile.category_id} "
-                    f"for '{opt_title[:60] or title[:60]}'"
+                    f"stored category {stored_category} is implausible for "
+                    f"'{(opt_title or title)[:80]}'"
                 ),
             })
-            fixes["categoryId"] = profile.category_id
-            if profile.category_name:
-                fixes["categoryName"] = profile.category_name
-    elif not skip_category_remap and stored_category:
-        canonical_category, canonical_name = matcher.canonicalize_category(
-            title_context,
-            stored_category,
-            stored_category_name,
-            live_description,
-        )
-
-        if canonical_category and canonical_category != stored_category:
-            issues.append({
-                "type": "category_mismatch",
-                "severity": "CRITICAL",
-                "current": stored_category,
-                "expected": canonical_category,
-                "detail": f"Stale category {stored_category} should be {canonical_category} for '{opt_title[:60] or title[:60]}'"
-            })
-            fixes["categoryId"] = canonical_category
-            if canonical_name:
-                fixes["categoryName"] = canonical_name
-        elif not matcher.is_category_plausible_for_text(combined_title, stored_category, stored_category_name):
-            suggested_category, suggested_name, _ = matcher.get_category_and_aspects(
-                title_context,
-                aspects,
-                live_description,
-            )
-            suggested_category, suggested_name = matcher.canonicalize_category(
-                title_context,
-                suggested_category,
-                suggested_name,
-                live_description,
-            )
-            if suggested_category and suggested_category != stored_category:
-                issues.append({
-                    "type": "category_mismatch",
-                    "severity": "CRITICAL",
-                    "current": stored_category,
-                    "expected": suggested_category,
-                    "detail": f"Implausible category {stored_category} for '{opt_title[:60] or title[:60]}'; expected {suggested_category}"
-                })
-                fixes["categoryId"] = suggested_category
-                if suggested_name:
-                    fixes["categoryName"] = suggested_name
 
     # ── 2. Dimension Accuracy ──
     source_dims = extract_all_dimensions(attrs)
@@ -2038,6 +2070,15 @@ def is_full_published_scope(args) -> bool:
     return not args.sku and not args.sku_file and not args.source_report
 
 
+def audit_report_scope(args) -> str:
+    """Persist how this report was scoped so later jobs can fail closed."""
+    if getattr(args, "sku", None) or getattr(args, "sku_file", None):
+        return "sku"
+    if getattr(args, "source_report", None):
+        return "source_report"
+    return "full"
+
+
 def get_report_source(args) -> str:
     return "live_ebay" if args.live else "local_db_optimization"
 
@@ -2533,6 +2574,44 @@ def export_category_mismatch_manifest(report, out_dir: Path | None = None) -> Pa
     target_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = target_dir / f"category_mismatch_manifest_{stamp}.csv"
+    import csv
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["sku", "fix_keys", "note"])
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def export_category_remap_review_manifest(report, out_dir: Path | None = None) -> Path | None:
+    """Write needs-review CSV for report-only category remap rows."""
+    rows = []
+    for item in report.get("issues") or []:
+        if not isinstance(item, dict):
+            continue
+        sku = str(item.get("sku") or "").strip()
+        if not sku:
+            continue
+        matched = [
+            issue
+            for issue in (item.get("issues") or [])
+            if isinstance(issue, dict)
+            and str(issue.get("type") or "").strip() == "category_remap_pending_review"
+        ]
+        if not matched:
+            continue
+        detail = str(matched[0].get("detail") or matched[0].get("expected") or "category_remap_pending_review")[:200]
+        expected = matched[0].get("expected")
+        note = f"expected={expected}; {detail}" if expected is not None else detail
+        rows.append({"sku": sku, "fix_keys": "category_remap_review", "note": note.replace("\n", " ")})
+
+    if not rows:
+        return None
+
+    target_dir = Path(out_dir) if out_dir is not None else LOG_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = target_dir / f"needs_review_category_remap_{stamp}.csv"
     import csv
 
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -3518,6 +3597,16 @@ def fix_listing_on_ebay(
     # Apply aspect fixes
     for key, value in fixes.items():
         if key == "categoryId":
+            from src.utils.publish_fee_preview import guard_category_write_high_fee
+
+            # get_listing_fees(offer_id) reflects the offer's current category,
+            # not this target leaf, so it is not used as a $20 preview here.
+            blocked = guard_category_write_high_fee(
+                category_id=str(value or ""),
+                category_name=str(fixes.get("categoryName") or new_category_name or ""),
+            )
+            if blocked:
+                return [f"{blocked} [{sku}]"]
             new_category = value
             category_changed = True
             continue
@@ -5658,6 +5747,7 @@ def main(argv=None):
     report = {
         "generated_at": datetime.now().isoformat(),
         "mode": "fix" if args.fix else ("live_audit" if args.live else "audit"),
+        "scope": audit_report_scope(args),
         "source": report_source,
         "total_published": len(rows),
         "total_with_issues": len(all_issues),
@@ -5682,6 +5772,18 @@ def main(argv=None):
                 )
             )
             print(f"📋 Category mismatch manifest: {manifest_path}")
+        review_path = export_category_remap_review_manifest(report)
+        if review_path:
+            report["needs_review_category_remap"] = str(review_path)
+            report["needs_review_category_remap_count"] = sum(
+                1
+                for item in all_issues
+                if any(
+                    str(issue.get("type") or "") == "category_remap_pending_review"
+                    for issue in (item.get("issues") or [])
+                )
+            )
+            print(f"📋 Category remap needs-review: {review_path}")
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n📄 Full report: {report_path}")
 

@@ -1,8 +1,10 @@
 """Contract tests for the shared listing_qc package."""
 
 from listing_qc import (
+    MISSING_VIDEO_AUTOFIX_FIX_KEYS,
     SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS,
     SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES,
+    SEMANTIC_REWRITE_AUTOFIX_FIX_KEYS,
     category_allows_assembly_auto_yes,
     fix_attempt_succeeded,
     fix_key_matches_issue,
@@ -13,6 +15,8 @@ from listing_qc import (
 
 def test_whitelist_excludes_category_id():
     assert "categoryId" not in SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS
+    assert "categoryId" not in MISSING_VIDEO_AUTOFIX_FIX_KEYS
+    assert "categoryId" not in SEMANTIC_REWRITE_AUTOFIX_FIX_KEYS
     assert "category_mismatch" not in SCHEDULED_SOURCE_ASPECT_AUTOFIX_ISSUE_TYPES
 
 

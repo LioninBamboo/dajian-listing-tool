@@ -17,12 +17,21 @@ HIGH_FEE_PATH_SEGMENTS = (
     "cars & trucks",
     "cars and trucks",
 )
+# Anchored Motors prefixes (not bare "Boats & Ships" under Collectibles / Toys).
+HIGH_FEE_PATH_PREFIXES = (
+    "ebay motors > powersports",
+    "ebay motors > boats",
+    "ebay motors > motorcycles",
+    "ebay motors > other vehicles & trailers",
+    "ebay motors > cars & trucks",
+)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_HIGH_FEE_BLACKLIST_RELATIVE = Path("data") / "config" / "high_fee_category_blacklist.json"
 DEFAULT_HIGH_FEE_BLACKLIST_CANDIDATES = (
     DEFAULT_HIGH_FEE_BLACKLIST_RELATIVE,
     Path("data") / "config" / "publish_skip_categories.json",
     Path("data") / "config" / "publish_skip_category_ids.json",
+    Path("..") / "Dajian_Listing_Tool" / "data" / "config" / "high_fee_category_blacklist.json",
 )
 _BLACKLIST_ID_KEYS = (
     "publish_skip_category_ids",
@@ -38,6 +47,35 @@ def normalize_fee_type(value: str) -> str:
     return str(value or "").replace("_", "").upper()
 
 
+def _current_store_aliases() -> set[str]:
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        brand = str(get_store_profile().brand_name or "")
+    except Exception:
+        brand = ""
+    aliases = {
+        "AquaVerve": {"main", "aquaverve", "aqua"},
+        "GrovePop": {"grovepop", "gp"},
+        "AquaRides": {"aqua", "aquarides", "autoparts"},
+    }
+    names = {brand.lower()} if brand else set()
+    names.update(aliases.get(brand, set()))
+    return {item for item in names if item}
+
+
+def _blacklist_applies_to_store(data: Any) -> bool:
+    if not isinstance(data, Mapping):
+        return True
+    applies = data.get("applies_to_stores")
+    if not applies:
+        return True
+    aliases = _current_store_aliases()
+    if not aliases:
+        return True
+    return any(str(item).strip().lower() in aliases for item in applies)
+
+
 def resolve_high_fee_blacklist_path(path: Optional[str] = None) -> Path:
     if path:
         return Path(path)
@@ -45,7 +83,7 @@ def resolve_high_fee_blacklist_path(path: Optional[str] = None) -> Path:
     if env_path:
         return Path(env_path)
     for relative in DEFAULT_HIGH_FEE_BLACKLIST_CANDIDATES:
-        candidate = REPO_ROOT / relative
+        candidate = (REPO_ROOT / relative).resolve()
         if candidate.is_file():
             return candidate
     return REPO_ROOT / DEFAULT_HIGH_FEE_BLACKLIST_RELATIVE
@@ -131,6 +169,8 @@ def load_high_fee_category_blacklist(path: Optional[str] = None) -> set[str]:
     data = _read_blacklist_payload(path)
     if data is None:
         return set()
+    if not _blacklist_applies_to_store(data):
+        return set()
     ids = _ids_from_blacklist_payload(data)
     if not ids and not _path_entries_from_blacklist_payload(data):
         _warn_empty_blacklist(str(resolve_high_fee_blacklist_path(path)))
@@ -173,6 +213,9 @@ def category_is_high_fee(
     segments = _path_segments(category_path, category_name)
     if any(segment in HIGH_FEE_PATH_SEGMENTS for segment in segments):
         return True
+    path_norm = re.sub(r"\s+", " ", str(category_path or "")).strip().lower()
+    if path_norm and any(path_norm.startswith(prefix) for prefix in HIGH_FEE_PATH_PREFIXES):
+        return True
 
     incoming = _path_segments(category_path)
     if incoming:
@@ -180,6 +223,93 @@ def category_is_high_fee(
             if incoming == _path_segments(extra):
                 return True
     return False
+
+
+def resolve_category_taxonomy_path(category_id: str, index=None) -> str:
+    """Full taxonomy path from the on-disk tree index. Empty when unknown."""
+    try:
+        from src.utils.category_tree_cache import build_category_path
+
+        return str(build_category_path(str(category_id or "").strip(), index=index) or "")
+    except Exception:
+        return ""
+
+
+def blacklist_file_is_empty(blacklist_path: Optional[str] = None) -> bool:
+    data = _read_blacklist_payload(blacklist_path)
+    if data is None:
+        return True
+    if not _blacklist_applies_to_store(data):
+        return True
+    ids = _ids_from_blacklist_payload(data)
+    paths = _path_entries_from_blacklist_payload(data)
+    return not ids and not paths
+
+
+def guard_category_write_high_fee(
+    category_id: str = "",
+    category_name: str = "",
+    *,
+    allow_unverified_fee: bool = False,
+    index: Optional[Mapping[str, Any]] = None,
+    blacklist_path: Optional[str] = None,
+) -> Optional[str]:
+    """Block a category write using the real GP/Aqua call shape.
+
+    Resolves the full taxonomy path (not just the leaf name) before the
+    path-segment check. ``get_listing_fees(offer_id)`` is intentionally not
+    called here: it reflects the offer's *current* category, not the target.
+    """
+    cid = str(category_id or "").strip()
+    path = resolve_category_taxonomy_path(cid, index=index)
+    empty_blacklist = blacklist_file_is_empty(blacklist_path)
+    if not path and empty_blacklist and not allow_unverified_fee:
+        return (
+            f"BLOCKED_HIGH_FEE_UNVERIFIED: category {cid or category_name or '?'} "
+            "path unresolved and high-fee blacklist empty"
+        )
+    return high_fee_category_block_reason(
+        category_id=cid,
+        category_path=path,
+        category_name=category_name,
+        blacklist_path=blacklist_path,
+    )
+
+
+def high_fee_category_block_reason(
+    category_id: str = "",
+    category_path: str = "",
+    category_name: str = "",
+    listing_fees: Optional[Mapping[str, Any]] = None,
+    blacklist_path: Optional[str] = None,
+) -> Optional[str]:
+    """Human-readable BLOCKED_HIGH_FEE reason, or None if the write may proceed.
+
+    Empty/missing blacklist still applies HIGH_FEE_PATH_SEGMENTS. A $20+
+    insertion-fee preview fails closed. Missing preview is not a block here —
+    callers that already have a fee payload must pass it.
+    """
+    cid = str(category_id or "").strip()
+    # Touch the blacklist so a missing file logs its warning.
+    load_high_fee_category_blacklist(blacklist_path)
+    if category_is_high_fee(
+        cid,
+        category_path=category_path,
+        category_name=category_name,
+        blacklist_path=blacklist_path,
+    ):
+        return (
+            f"BLOCKED_HIGH_FEE: category {cid or category_name or category_path} "
+            "is on the high-fee blacklist or path-segment list"
+        )
+    if listing_fees is not None:
+        fee = insertion_fee_usd(listing_fees)
+        if fee is not None and fee >= HIGH_INSERTION_FEE_USD:
+            return (
+                f"BLOCKED_HIGH_FEE: category {cid} insertion fee ${fee:.2f} >= "
+                f"${HIGH_INSERTION_FEE_USD:.2f}"
+            )
+    return None
 
 
 def insertion_fee_usd(listing_fees: Optional[Mapping[str, Any]]) -> Optional[float]:

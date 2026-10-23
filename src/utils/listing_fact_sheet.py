@@ -517,8 +517,17 @@ def _tokens(text: str) -> set[str]:
 _WORD_NUMBERS: dict[str, int] = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
-    "twelve": 12,
+    "eleven": 11, "twelve": 12,
 }
+
+_COUNT_WORD_NUMBERS: dict[str, int] = {
+    **_WORD_NUMBERS,
+    "single": 1,
+}
+
+_COUNT_DIMENSION_UNIT = (
+    r"(?:inch(?:es)?|in\.?|\"|”|cm|mm|ft|feet|lbs?|pounds?|kg|kilograms?)"
+)
 
 # Standard US mattress occupancy. Only sizes with an unambiguous count are
 # listed: "king" is deliberately mapped to 2 sleepers, so a live "king size"
@@ -706,8 +715,176 @@ def _supported_by_any(claim: str, source_items: list[str], source_blob_tokens: s
     return False
 
 
+def _noun_count_terms(noun: str) -> tuple[str, ...]:
+    raw_noun = str(noun or "").lower().strip()
+    if not raw_noun:
+        return ()
+    noun_key = {
+        "shelves": "shelf",
+        "tiers": "tier",
+        "levels": "level",
+    }.get(raw_noun, raw_noun[:-1] if raw_noun.endswith("s") else raw_noun)
+    return {
+        "shelf": ("shelf", "shelves", "tier", "tiers", "level", "levels"),
+        "tier": ("tier", "tiers", "shelf", "shelves", "level", "levels"),
+        "drawer": ("drawer", "drawers"),
+        "door": ("door", "doors"),
+        "pillow": ("pillow", "pillows"),
+        "chair": ("chair", "chairs"),
+        "pole": ("pole", "poles"),
+        "window": ("window", "windows"),
+        "net": ("net", "nets"),
+        "wheel": ("wheel", "wheels"),
+        "caster": ("caster", "casters"),
+        "tire": ("tire", "tires"),
+        "table": ("table", "tables"),
+    }.get(noun_key, (noun_key, noun_key + "s"))
+
+
+def parse_noun_count(text: str, noun: str) -> int | None:
+    """Extract an explicit count for ``noun``, or None when unknown/ambiguous.
+
+    Plural with no number is unknown, never 1. Dimensions next to a noun are
+    not counts (``47 Inch Chairs``). Hyphenated compounds like ``glass-door``
+    do not count as doors.
+    """
+    hay = str(text or "")
+    # "3-in-1" / "5 in 1" is a combo label, not a count of 3 or of 1.
+    n_in_1 = bool(re.search(r"\b\d+\s*-?\s*in\s*-?\s*1\b", hay, re.IGNORECASE))
+    hay = re.sub(r"\b\d+\s*-?\s*in\s*-?\s*1\b", " ", hay, flags=re.IGNORECASE)
+    terms = _noun_count_terms(noun)
+    if not hay or not terms:
+        return None
+    term_alt = "|".join(re.escape(term) for term in sorted(set(terms), key=len, reverse=True))
+    values: list[int] = []
+
+    digit_pat = re.compile(
+        rf"(?<!\d)(?P<n>\d+)(?:[-\s]*|(?=[A-Za-z]))"
+        rf"(?:[A-Za-z][A-Za-z0-9-]*[-\s]+){{0,2}}"
+        rf"(?P<noun>{term_alt})(?![A-Za-z-])",
+        re.IGNORECASE,
+    )
+    for match in digit_pat.finditer(hay):
+        if match.end("n") < len(hay) and hay[match.end("n")] == ".":
+            continue
+        between = hay[match.end("n"):match.start("noun")]
+        if re.match(rf"[\s\-–]*{_COUNT_DIMENSION_UNIT}\b", between, re.IGNORECASE):
+            continue
+        if re.search(rf"\bof\b", between, re.IGNORECASE):
+            continue
+        if re.search(r"\bsided\b", between, re.IGNORECASE):
+            continue
+        if re.match(r"[\s\-–]*in[\s\-–]*1\b", between, re.IGNORECASE):
+            continue
+        spanned = hay[match.start():match.end()]
+        if re.search(
+            rf"\b{re.escape(match.group('n'))}\s*-?\s*(?:tier|level)s?\b",
+            spanned,
+            re.IGNORECASE,
+        ):
+            continue
+        values.append(int(match.group("n")))
+
+    word_alt = "|".join(re.escape(word) for word in _COUNT_WORD_NUMBERS)
+    word_pat = re.compile(
+        rf"\b(?P<w>{word_alt})\b(?:[-\s]+[A-Za-z][A-Za-z0-9-]*){{0,2}}"
+        rf"[-\s]+(?P<noun>{term_alt})(?![A-Za-z-])",
+        re.IGNORECASE,
+    )
+    for match in word_pat.finditer(hay):
+        if match.start("noun") > 0 and hay[match.start("noun") - 1] == "-":
+            continue
+        between = hay[match.end("w"):match.start("noun")]
+        if re.search(r"\bof\b", between, re.IGNORECASE):
+            continue
+        if re.search(r"\bsided\b", between, re.IGNORECASE):
+            continue
+        values.append(_COUNT_WORD_NUMBERS[match.group("w").lower()])
+
+    double_pat = re.compile(
+        rf"\b(?:double|pair of)\b(?:[-\s]+[A-Za-z][A-Za-z0-9-]*){{0,2}}"
+        rf"[-\s]+(?P<noun>{term_alt})(?![A-Za-z-])",
+        re.IGNORECASE,
+    )
+    for match in double_pat.finditer(hay):
+        if match.start("noun") > 0 and hay[match.start("noun") - 1] == "-":
+            continue
+        noun = str(match.group("noun") or "").lower()
+        between = hay[match.start():match.start("noun")]
+        # Mattress size "Double Bed" is not a count of two beds.
+        if noun in {"bed", "beds"}:
+            continue
+        if re.search(r"\bsided\b", between, re.IGNORECASE):
+            continue
+        # "Double Bed with Drawers" / "double door cabinet" — double modifies
+        # another noun, not the target.
+        after_double = re.search(
+            r"\b(?:double|pair of)\b\s*-?\s*([A-Za-z][A-Za-z0-9-]*)",
+            hay[match.start():match.end()],
+            re.IGNORECASE,
+        )
+        if after_double:
+            first = after_double.group(1).lower()
+            noun_roots = {n.rstrip("s") for n in terms}
+            other_nouns = {"bed", "door", "sided"}
+            if first.rstrip("s") in other_nouns and first.rstrip("s") not in noun_roots:
+                continue
+        values.append(2)
+
+    set_pat = re.compile(
+        rf"\bset\s+of\s+(?P<n>\d+)\s+(?:{term_alt})\b",
+        re.IGNORECASE,
+    )
+    for match in set_pat.finditer(hay):
+        values.append(int(match.group("n")))
+
+    unique = set(values)
+    if len(unique) == 1:
+        return next(iter(unique))
+    if len(unique) > 1:
+        return None
+
+    singulars = [term for term in terms if not term.endswith("s")]
+    plurals = [term for term in terms if term.endswith("s")]
+    if singulars:
+        singular_pat = re.compile(
+            rf"(?<![A-Za-z0-9-])(?:{'|'.join(re.escape(term) for term in singulars)})(?![A-Za-z0-9-])",
+            re.IGNORECASE,
+        )
+    else:
+        singular_pat = None
+    if plurals:
+        plural_pat = re.compile(
+            rf"(?<![A-Za-z0-9-])(?:{'|'.join(re.escape(term) for term in plurals)})(?![A-Za-z0-9-])",
+            re.IGNORECASE,
+        )
+    else:
+        plural_pat = None
+    if singular_pat and singular_pat.search(hay) and not (plural_pat and plural_pat.search(hay)):
+        # "Double Bed" is a mattress size, not a count of one bed.
+        if re.search(r"\bdouble\s+beds?\b", hay, re.IGNORECASE) and any(
+            term in {"bed", "beds"} for term in terms
+        ):
+            return None
+        # "2-sided panel" names a panel that is two-sided, not a count of 1.
+        singular_alt = "|".join(re.escape(term) for term in singulars)
+        if re.search(rf"\bsided\s+(?:{singular_alt})\b", hay, re.IGNORECASE):
+            return None
+        if n_in_1:
+            return None
+        return 1
+    return None
+
+
 def _count_claim_in_text(count: int, noun: str, text: str) -> bool:
     """Recognize an explicit source count, including tier/shelf wording."""
+    try:
+        wanted = int(count)
+    except (TypeError, ValueError):
+        return False
+    parsed = parse_noun_count(text, noun)
+    if parsed == wanted:
+        return True
     raw_noun = str(noun or "").lower()
     noun_key = {
         "shelves": "shelf",
@@ -717,26 +894,81 @@ def _count_claim_in_text(count: int, noun: str, text: str) -> bool:
     synonyms = {
         "shelf": ("shelf", "shelves", "tier", "tiers", "level", "levels"),
         "tier": ("tier", "tiers", "shelf", "shelves", "level", "levels"),
-    }.get(noun_key, (noun_key, noun_key + "s"))
+    }.get(noun_key, (noun_key, noun_key + "s") if noun_key else ())
+    if not synonyms:
+        return False
     terms = "|".join(re.escape(term) for term in synonyms)
-    text = str(text or "")
-    if re.search(
-        rf"(?<!\d){int(count)}\s*[-\s]*(?:{terms})(?![a-z])",
-        text,
+    hay = str(text or "")
+    hay = re.sub(r"\b\d+\s*-?\s*in\s*-?\s*1\b", " ", hay, flags=re.IGNORECASE)
+
+    def _non_count_gap(gap: str) -> bool:
+        if re.search(rf"{_COUNT_DIMENSION_UNIT}\b", gap, re.IGNORECASE):
+            return True
+        if re.search(r"\bsided\b", gap, re.IGNORECASE):
+            return True
+        if re.search(r"\bof\s+the\b", gap, re.IGNORECASE):
+            return True
+        if re.search(r"\bdouble\b", gap, re.IGNORECASE) and re.search(r"\bbeds?\b", gap + " ", re.IGNORECASE):
+            return True
+        return False
+
+    compact = re.compile(
+        rf"(?<!\d)(?P<n>{wanted})(?P<gap>\s*[-\s]*)(?:{terms})(?![a-z])",
         re.IGNORECASE,
-    ):
+    )
+    for match in compact.finditer(hay):
+        after_number = hay[match.end("n"):]
+        if re.match(rf"[\s\-–]*{_COUNT_DIMENSION_UNIT}\b", after_number, re.IGNORECASE):
+            continue
+        if re.match(r"[\s\-–]*sided\b", after_number, re.IGNORECASE):
+            continue
+        if _non_count_gap(match.group("gap")):
+            continue
         return True
     # Source copy often qualifies a component count (``1 main net`` or
     # ``2 side triangular nets``). Keep this bounded to two words so a
     # broader aggregate such as ``1 of 2 nets`` is not treated as the same
-    # claim.
-    return bool(
-        re.search(
-            rf"(?<!\d){int(count)}\s+(?:[a-z]+\s+){{1,2}}(?:{terms})(?![a-z])",
-            text,
-            re.IGNORECASE,
-        )
+    # claim. Dimension units (``8-inch``, ``47 Inch``) and ``one of the``
+    # / ``-sided`` are not counts.
+    qualified = re.compile(
+        rf"(?<!\d)(?P<n>{wanted})(?P<gap>\s+(?:[a-z]+\s+){{1,2}})(?:{terms})(?![a-z])",
+        re.IGNORECASE,
     )
+    for match in qualified.finditer(hay):
+        if _non_count_gap(match.group("gap")):
+            continue
+        return True
+    return False
+
+
+def _resolved_count(noun: str, sheet_count, text: str | None) -> int | None:
+    """Use a sheet count only when the matching text corroborates it.
+
+    When ``text`` is omitted (legacy callers / cached sheets without copy),
+    keep the historical sheet comparison except that a bare 0 stays untrusted.
+    """
+    if text is not None:
+        parsed = parse_noun_count(text, noun)
+        if parsed is not None:
+            return parsed
+        if sheet_count is None:
+            return None
+        try:
+            n = int(sheet_count)
+        except (TypeError, ValueError):
+            return None
+        if _count_claim_in_text(n, noun, text):
+            return n
+        return None
+    if sheet_count is None:
+        return None
+    try:
+        n = int(sheet_count)
+    except (TypeError, ValueError):
+        return None
+    if n == 0:
+        return None
+    return n
 
 
 def compare_fact_sheets(
@@ -843,16 +1075,32 @@ def compare_fact_sheets(
                 }
             )
 
-    for noun, live_count in live["counts"].items():
-        source_count = source["counts"].get(noun)
-        source_count_is_trusted = source_count is not None and (
-            source_count > 0
-            or (
-                source_text is not None
-                and _count_claim_in_text(source_count, noun, source_text)
-            )
-        )
-        if source_count_is_trusted and source_count != live_count:
+    count_nouns = set(live["counts"]) | set(source["counts"])
+    no_text = source_text is None and live_text is None
+    for noun in sorted(count_nouns):
+        if no_text:
+            live_sheet = live["counts"].get(noun)
+            source_sheet = source["counts"].get(noun)
+            if live_sheet is None or source_sheet is None:
+                continue
+            try:
+                if int(live_sheet) != int(source_sheet):
+                    violations.append(
+                        {
+                            "claim_type": "count_unverifiable",
+                            "claim_text": f"{live_sheet} {noun} (source: {source_sheet})",
+                            "severity": "INFO",
+                            "source_evidence": str(source_sheet),
+                        }
+                    )
+            except (TypeError, ValueError):
+                continue
+            continue
+        live_count = _resolved_count(noun, live["counts"].get(noun), live_text)
+        source_count = _resolved_count(noun, source["counts"].get(noun), source_text)
+        if live_count is None or source_count is None:
+            continue
+        if source_count != live_count:
             # If the source copy itself explicitly makes the live count claim,
             # the discrepancy is an internal source-attribute conflict (for
             # example, ``3-tier`` alongside a structured six-shelf field), not

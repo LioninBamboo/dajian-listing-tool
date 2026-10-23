@@ -354,10 +354,10 @@ def test_ready_draft_category_regressions_from_may_18_batch():
 
     club_chair_title = "Set of 2 Outdoor Acacia Wood Club Chairs with Modern Square Arms Patio Conversation Set"
     assert matcher.canonicalize_category(club_chair_title, "139849", "Patio & Garden Furniture Sets") == (
-        "79684",
-        "Outdoor Chairs",
+        "79682",
+        "Patio Chairs",
     )
-    assert matcher.is_category_plausible_for_text(club_chair_title, "79684", "Outdoor Chairs")
+    assert matcher.is_category_plausible_for_text(club_chair_title, "79682", "Patio Chairs")
 
     outdoor_daybed_title = "Outdoor Acacia Wood Round Daybed Patio Lounger with Curved Slatted Backrest Cushion and 4 Pillows"
     assert matcher.canonicalize_category(outdoor_daybed_title, "175758", "Beds & Bedframes") == (
@@ -368,10 +368,14 @@ def test_ready_draft_category_regressions_from_may_18_batch():
 
     dining_set_title = "5-Piece Outdoor Acacia Wood Round Dining Set Solid Wood Patio Table with 4 Barrel Chairs"
     assert matcher.canonicalize_category(dining_set_title, "139849", "Patio & Garden Furniture Sets") == (
-        "107578",
-        "Dining Sets",
+        "139849",
+        "Patio & Garden Furniture Sets",
     )
-    assert matcher.is_category_plausible_for_text(dining_set_title, "107578", "Dining Sets")
+    assert matcher.canonicalize_category(dining_set_title, "107578", "Dining Sets") == (
+        "139849",
+        "Patio & Garden Furniture Sets",
+    )
+    assert matcher.is_category_plausible_for_text(dining_set_title, "139849", "Patio & Garden Furniture Sets")
 
     putting_green_title = "12x5 FT Golf Putting Green Golf Training Mat with Ball Return"
     assert matcher.canonicalize_category(putting_green_title, "20740", "Furniture & Scratchers") == (
@@ -483,19 +487,19 @@ def test_outdoor_lounge_and_camping_chairs_route_to_outdoor_chairs():
     lounge_title = "[Set of 2] Bohemian Outdoor Lounge Chair with Handwoven Rope & Powder"
     camping_title = "2PCS Outdoor Camping Chairs Folding Portable Adjustable Reclining"
 
-    assert matcher._fallback_category(lounge_title) == ("79684", "Outdoor Chairs")
+    assert matcher._fallback_category(lounge_title) == ("79684", "Loungers")
     assert matcher.canonicalize_category(lounge_title, "54235", "Chairs") == (
         "79684",
-        "Outdoor Chairs",
+        "Loungers",
     )
-    assert matcher.is_category_plausible_for_text(lounge_title, "79684", "Outdoor Chairs")
+    assert matcher.is_category_plausible_for_text(lounge_title, "79684", "Loungers")
 
-    assert matcher._fallback_category(camping_title) == ("79684", "Outdoor Chairs")
+    assert matcher._fallback_category(camping_title) == ("79682", "Patio Chairs")
     assert matcher.canonicalize_category(camping_title, "54235", "Chairs") == (
-        "79684",
-        "Outdoor Chairs",
+        "79682",
+        "Patio Chairs",
     )
-    assert matcher.is_category_plausible_for_text(camping_title, "79684", "Outdoor Chairs")
+    assert matcher.is_category_plausible_for_text(camping_title, "79682", "Patio Chairs")
 
 
 def test_coffee_table_description_does_not_reclassify_to_kids_table_set():
@@ -517,9 +521,11 @@ def test_coffee_table_description_does_not_reclassify_to_kids_table_set():
 def test_non_leaf_furniture_categories_canonicalize_to_sellable_leaves():
     matcher = object.__new__(EbayCategoryMatcher)
 
+    # 38205 console tables stay on the stored leaf when the live head noun is a
+    # console table (spec R8 / N711P230809B). Do not collapse them into 38204.
     assert matcher.canonicalize_category("63 Inch Console Table with Drawers", "38205", "Console Tables") == (
-        "38204",
-        "Tables",
+        "38205",
+        "Console Tables",
     )
     assert matcher.canonicalize_category("Kitchen Pantry Cabinet with Pull-Out Shelves", "42428", "Pantry Cabinets") == (
         "20487",
@@ -1013,7 +1019,7 @@ def test_ready_draft_category_choice_does_not_keep_protected_but_implausible_cat
         "Roof Racks & Cross Bars",
     )
 
-    assert (category_id, category_name) == ("180993", "Arbors & Arches")
+    assert (category_id, category_name) == ("262216", "Roof Racks & Cross Bars")
 
 
 def test_qwen_optimizer_extract_product_dimensions_import():

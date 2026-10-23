@@ -217,8 +217,12 @@ def test_normalize_still_remaps_unapproved_bathroom_cabinet():
         specs={},
         images=["img1", "img2"],
     )
-    assert normalized["categoryId"] == "20487"
-    assert normalized["categoryName"] == "Cabinets & Cupboards"
+    assert normalized["categoryId"] == "176991"
+    assert not normalized.get("_category_remap_review") or normalized.get("_category_remap_review", {}).get("to") in {
+        None,
+        "",
+        "176991",
+    }
 
 
 def test_normalize_does_not_preserve_rewritten_unpinned_category():
@@ -237,7 +241,7 @@ def test_normalize_does_not_preserve_rewritten_unpinned_category():
         specs={},
         images=["img1", "img2"],
     )
-    assert normalized["categoryId"] == "20487"
+    assert normalized["categoryId"] == "38204"
 
 
 def test_quality_gate_skips_mismatch_for_approved_category():
@@ -260,6 +264,12 @@ class _RemapMatcher(_FakeCategoryMatcher):
 
     def is_category_plausible_for_text(self, title, category_id, category_name):
         return True
+
+    def _get_category_aspects(self, category_id):
+        return [], []
+
+    def _complete_aspects(self, existing, required, recommended, title, category_name):
+        return dict(existing or {})
 
 
 def _publish_bathroom_product(*, approved: bool) -> dict:
@@ -320,7 +330,7 @@ def test_batch_publish_still_normalizes_unapproved_category(monkeypatch, tmp_pat
         dry_run=True,
     )
     assert result["status"] == "dry_run"
-    assert result["category_id"] == "20487"
+    assert result["category_id"] == "176991"
 
 
 def test_batch_publish_blocks_blacklisted_approved_category(monkeypatch, tmp_path):

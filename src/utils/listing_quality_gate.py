@@ -20,8 +20,19 @@ from src.utils.dimension_helpers import (
     replace_description_measurements,
 )
 from src.utils.product_context_signals import (
+    compound_product_family,
+    has_any_phrase,
+    has_compound_product_signal,
     has_outdoor_marker,
     outdoor_context as strict_outdoor_context,
+    primary_product_noun,
+    strip_mixed_indoor_outdoor,
+    strip_room_location_lists,
+    title_allows_outdoor_chair_remap,
+    title_has_clear_outdoor_word,
+    title_has_mixed_indoor_outdoor,
+    title_is_chair_accessory,
+    title_is_dining_set_bundle,
 )
 from src.utils.publish_aspect_completion import (
     NOT_DIMENSION_AFTER,
@@ -202,6 +213,92 @@ def _normalize_value(value: Any) -> Any:
 
 def _text_context(*parts: Any) -> str:
     return _clean_text(" ".join(str(part or "") for part in parts)).lower()
+
+
+def _has_marker(text: str, *markers: str) -> bool:
+    """Word-boundary marker test. ``bench with`` must not match ``workbench with``."""
+    return has_any_phrase(text, markers)
+
+
+_OTTOMAN_BENCH_FAMILY = frozenset({"20490", "262980"})
+_OTTOMAN_BENCH_NAMES = {
+    "20490": "Ottomans, Footstools & Poufs",
+    "262980": "Benches",
+}
+_INDOOR_TABLE_LEAVES = frozenset({"38199", "38200", "38204"})
+
+
+_OUTDOOR_TABLE_PHRASES = (
+    "outdoor dining table",
+    "patio dining table",
+    "outdoor side table",
+    "patio side table",
+    "outdoor end table",
+    "patio end table",
+    "outdoor table",
+    "patio table",
+    "garden table",
+)
+
+
+def _title_has_outdoor_table_signal(text: str) -> bool:
+    """Outdoor table as the product, not a room-list or indoor/outdoor dual-use coffee table."""
+    from src.utils.product_context_signals import head_clause
+
+    if title_has_mixed_indoor_outdoor(text):
+        return False
+    core = strip_mixed_indoor_outdoor(head_clause(text) or str(text or ""))
+    if _has_marker(core, *_OUTDOOR_TABLE_PHRASES):
+        return True
+    if _has_marker(core, "coffee table", "nesting table", "cocktail table"):
+        return False
+    return _has_marker(core, "outdoor", "patio", "garden") and _has_marker(
+        core, "dining table", "side table", "end table"
+    )
+
+
+def _outdoor_dining_set_profile(title_text: str) -> ListingProfile:
+    """Patio dining set leaf. Never 79682 Patio Chairs or 54235 Chairs."""
+    stool = _has_marker(title_text, "stool", "stools")
+    return ListingProfile(
+        kind="dining_set",
+        category_id="139849",
+        category_name="Patio & Garden Furniture Sets",
+        type_value="Dining Set",
+        set_includes="Dining Table & Stools" if stool else "Dining Table & Chairs",
+        room="Patio",
+        indoor_outdoor="Outdoor",
+    )
+
+
+def _dining_set_bundle_profile(title_text: str) -> ListingProfile:
+    """Outdoor table+chairs / N-piece patio dining set → 139849; indoor bundle without set phrasing → unknown."""
+    if title_has_clear_outdoor_word(title_text):
+        return _outdoor_dining_set_profile(title_text)
+    return ListingProfile(kind="unknown")
+
+
+def _ottoman_bench_leaf(stored: str, proposed: str, proposed_name: str) -> tuple[str, str | None]:
+    """20490 Ottomans and 262980 Benches are one family — never remap between them."""
+    current = str(stored or "").strip()
+    if current in _OTTOMAN_BENCH_FAMILY and proposed in _OTTOMAN_BENCH_FAMILY:
+        return current, _OTTOMAN_BENCH_NAMES[current]
+    return proposed, proposed_name
+
+
+def _outdoor_table_profile(category_id: str) -> ListingProfile:
+    stored = str(category_id or "").strip()
+    # Stay on a non-indoor leaf (dining set / patio table / patio set).
+    # Only leave an indoor table leaf for the outdoor patio-table leaf.
+    if stored in _INDOOR_TABLE_LEAVES:
+        return ListingProfile(
+            kind="outdoor_table",
+            category_id="112590",
+            category_name="Patio & Garden Tables",
+            type_value="Outdoor Table",
+            indoor_outdoor="Outdoor",
+        )
+    return ListingProfile(kind="unknown")
 
 
 def _as_list(value: Any) -> list[str]:
@@ -1387,31 +1484,262 @@ def _seed_attributes_from_description(
     return seeded
 
 
-def classify_listing_profile(title: str, description: str = "", category_id: str = "") -> ListingProfile:
-    title_text = _text_context(title)
-    text = _text_context(title, description)
+def _outdoor_seating_profile(title_text: str) -> ListingProfile:
+    """Patio Chairs 79682 vs Loungers 79684. Never invert those leaves."""
+    hay = str(title_text or "")
+    lounger = bool(
+        re.search(
+            r"\b(?:chaise|lounger|sun\s+lounger|outdoor\s+recliner)\b",
+            hay,
+            re.IGNORECASE,
+        )
+        or (
+            re.search(r"\blounge\s+chairs?\b", hay, re.IGNORECASE)
+            and re.search(r"\b(?:adjustable|reclin(?:e|er|ing))\b", hay, re.IGNORECASE)
+        )
+    )
+    if lounger:
+        return ListingProfile(
+            kind="outdoor_chaise",
+            category_id="79684",
+            category_name="Loungers",
+            type_value="Chaise Lounge",
+            set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
+            indoor_outdoor="Outdoor",
+        )
+    return ListingProfile(
+        kind="outdoor_chair",
+        category_id="79682",
+        category_name="Patio Chairs",
+        type_value="Outdoor Chair",
+        set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
+        indoor_outdoor="Outdoor",
+    )
+
+
+def classify_listing_profile(
+    title: str,
+    description: str = "",
+    category_id: str = "",
+    *,
+    source_title: str = "",
+) -> ListingProfile:
+    title_text = strip_room_location_lists(_text_context(title))
+    text = strip_room_location_lists(_text_context(title, source_title, description))
     outdoor_context = has_outdoor_marker(text)
     # Shared with ebay_category_matcher via product_context_signals: one passing
     # mention of a balcony must not outweigh four named indoor rooms. Both
     # engines classify categories, so a guard fixed in only one leaves live wrong.
-    outdoor_context_strict = strict_outdoor_context(title_text, text)
-    sofa_context = any(
-        marker in title_text
-        for marker in (
-            "sectional sofa",
-            "l-shaped sofa",
-            "u-shaped sofa",
-            "modular sectional",
-            "single sofa",
-            "sofa",
-            "couch",
-            "loveseat",
-            "armchair",
-            "reading chair",
-            "chaise lounge",
-            "club chair",
+    outdoor_context_strict = strict_outdoor_context(title_text or _text_context(title), text)
+    primary = primary_product_noun(title, source_title)
+    if primary == "workbench":
+        return ListingProfile(kind="unknown")
+    if primary == "nightstand":
+        return ListingProfile(
+            kind="nightstand",
+            category_id="38199",
+            category_name="Nightstands",
+            type_value="Nightstand",
+            room="Bedroom",
+            remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
         )
-    )
+    if primary == "dresser":
+        # Do not guess a dresser leaf; a wrong remap is worse than no remap.
+        return ListingProfile(kind="unknown")
+    if primary == "storage_ottoman":
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "20490", "Ottomans, Footstools & Poufs")
+        return ListingProfile(
+            kind="storage_ottoman",
+            category_id=leaf,
+            category_name=leaf_name,
+            type_value="Storage Ottoman",
+            set_includes="Ottoman",
+            room="Living Room",
+            remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
+        )
+    if primary in {"ottoman_bench", "ottoman"}:
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "20490", "Ottomans, Footstools & Poufs")
+        return ListingProfile(
+            kind="ottoman_bench",
+            category_id=leaf,
+            category_name=leaf_name,
+            type_value="Ottoman",
+            set_includes="Ottoman",
+            room="Living Room",
+            remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
+        )
+    if primary == "daybed":
+        if outdoor_context_strict:
+            return ListingProfile(
+                kind="outdoor_daybed",
+                category_id="138996",
+                category_name="Outdoor Daybeds",
+                indoor_outdoor="Outdoor",
+            )
+        return ListingProfile(kind="unknown")
+    if primary == "accent_chair":
+        if _has_marker(title_text, "dining chair"):
+            return ListingProfile(kind="unknown")
+        if title_allows_outdoor_chair_remap(title_text) and _has_marker(
+            title_text, "outdoor", "patio", "garden", "wicker"
+        ):
+            return _outdoor_seating_profile(title_text)
+        return ListingProfile(
+            kind="armchair",
+            category_id="38208",
+            category_name="Sofas, Armchairs & Couches",
+            type_value="Armchair",
+            set_includes="Chair",
+            room="Living Room",
+        )
+    if primary == "dining_chair":
+        if _has_marker(title_text, "accent chair"):
+            return ListingProfile(kind="unknown")
+        if title_is_chair_accessory(title_text):
+            return ListingProfile(kind="unknown")
+        if title_is_dining_set_bundle(title_text):
+            return _dining_set_bundle_profile(title_text)
+        if title_allows_outdoor_chair_remap(title_text):
+            return _outdoor_seating_profile(title_text)
+        if title_has_mixed_indoor_outdoor(title_text):
+            return ListingProfile(kind="unknown")
+        return ListingProfile(
+            kind="dining_chair",
+            category_id="54235",
+            category_name="Chairs",
+            type_value="Dining Chair",
+            set_includes="Chairs" if _has_marker(text, "set of", "chairs") else None,
+            room="Dining Room",
+        )
+    if primary == "outdoor_chair":
+        if title_is_chair_accessory(title_text) or title_is_dining_set_bundle(title_text):
+            return ListingProfile(kind="unknown")
+        if title_allows_outdoor_chair_remap(title_text):
+            return _outdoor_seating_profile(title_text)
+        return ListingProfile(kind="unknown")
+    if primary == "pantry":
+        return ListingProfile(
+            kind="pantry_cabinet",
+            category_id="20487",
+            category_name="Cabinets & Cupboards",
+            type_value="Cabinet",
+        )
+    if primary in {"dining_bench", "storage_bench"}:
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "262980", "Benches")
+        return ListingProfile(
+            kind="indoor_bench",
+            category_id=leaf,
+            category_name=leaf_name,
+            type_value="Bench",
+            set_includes="Bench",
+        )
+
+    # Compound / set titles stop here. Never fall through to the ottoman /
+    # pantry / cabinet keyword ladder (root cause of sofa+ottoman → 20490).
+    compound_kind = compound_product_family(title_text)
+    if compound_kind == "dining_set":
+        if title_has_clear_outdoor_word(title_text):
+            return _outdoor_dining_set_profile(title_text)
+        if _has_marker(title_text, "dining set", "dining table set", "piece dining"):
+            return ListingProfile(
+                kind="dining_set",
+                category_id="107578",
+                category_name="Dining Sets",
+                type_value="Dining Set",
+                set_includes="Dining Table & Chairs",
+            )
+        return ListingProfile(kind="unknown")
+    if compound_kind == "patio_furniture_set":
+        return ListingProfile(
+            kind="patio_furniture_set",
+            category_id="139849",
+            category_name="Patio & Garden Furniture Sets",
+            type_value="Patio Furniture Set",
+            set_includes="Sofa Set",
+            room="Patio",
+            indoor_outdoor="Outdoor",
+        )
+    if compound_kind == "sofa":
+        is_sectional = _has_marker(
+            title_text, "sectional", "modular", "l-shaped", "u-shaped", "u shaped", "l shaped"
+        )
+        is_armchair = (not is_sectional) and _has_marker(
+            title_text, "armchair", "single sofa", "reading chair"
+        )
+        return ListingProfile(
+            kind="armchair" if is_armchair else "sofa",
+            category_id="38208",
+            category_name="Sofas, Armchairs & Couches",
+            type_value="Armchair" if is_armchair else ("Sectional" if is_sectional else "Sofa"),
+            set_includes="Chair" if is_armchair else ("Sofa Set" if is_sectional else "Sofa"),
+            room="Living Room",
+        )
+    if compound_kind == "armchair":
+        return ListingProfile(
+            kind="armchair",
+            category_id="38208",
+            category_name="Sofas, Armchairs & Couches",
+            type_value="Armchair",
+            set_includes="Chair",
+            room="Living Room",
+        )
+    if compound_kind == "coffee_table":
+        return ListingProfile(
+            kind="coffee_table",
+            category_id="38204",
+            category_name="Coffee Tables",
+            type_value="Coffee Table",
+            set_includes="Table",
+            room="Living Room",
+        )
+    if compound_kind == "bed":
+        bed_type = (
+            "Loft Bed"
+            if _has_marker(title_text, "loft bed")
+            else ("Bunk Bed" if _has_marker(title_text, "bunk bed", "twin over", "full over", "queen over") else "Bed Frame")
+        )
+        return ListingProfile(
+            kind="bed",
+            category_id="175758",
+            category_name="Beds & Bed Frames",
+            type_value=bed_type,
+            room="Bedroom",
+        )
+    if compound_kind == "desk":
+        return ListingProfile(
+            kind="desk",
+            category_id="88057",
+            category_name="Desks & Tables",
+        )
+    if compound_kind == "kids_table_set":
+        return ListingProfile(
+            kind="kids_table_set",
+            category_id="66743",
+            category_name="Play Table & Chair Sets",
+            type_value="Play Table & Chair Set",
+            set_includes="Table & Chairs",
+            room="Playroom",
+        )
+    if compound_kind in {"unknown", "kitchen_island"}:
+        return ListingProfile(kind="unknown")
+    if has_compound_product_signal(title_text):
+        return ListingProfile(kind="unknown")
+
+    sofa_context = _has_marker(
+        title_text,
+        "sectional sofa",
+        "l-shaped sofa",
+        "u-shaped sofa",
+        "modular sectional",
+        "single sofa",
+        "sofa",
+        "couch",
+        "loveseat",
+        "armchair",
+        "reading chair",
+        "chaise lounge",
+        "club chair",
+    ) and primary not in {"storage_ottoman", "ottoman_bench", "ottoman", "workbench"}
     dining_set_markers = (
         "dining set",
         "dining table set",
@@ -1456,8 +1784,8 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         "queen over full",
     )
 
-    if any(marker in title_text for marker in ("treadmill", "walking pad", "running machine")) and not any(
-        marker in title_text for marker in ("dog treadmill", "pet treadmill")
+    if _has_marker(title_text, "treadmill", "walking pad", "running machine") and not _has_marker(
+        title_text, "dog treadmill", "pet treadmill"
     ):
         return ListingProfile(
             kind="treadmill",
@@ -1466,7 +1794,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             type_value="Treadmill",
         )
 
-    if any(marker in title_text for marker in ("potting bench", "garden workstation")):
+    if _has_marker(title_text, "potting bench", "garden workstation"):
         return ListingProfile(
             kind="potting_bench",
             category_id="139939",
@@ -1474,7 +1802,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             type_value="Potting Bench",
         )
 
-    if any(marker in title_text for marker in ("table tennis", "ping pong")):
+    if _has_marker(title_text, "table tennis", "ping pong"):
         return ListingProfile(
             kind="table_tennis",
             category_id="97075",
@@ -1483,8 +1811,8 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             set_includes="Table",
         )
 
-    if any(marker in title_text for marker in kids_table_set_markers) or (
-        "kids table" in title_text and "chair" in title_text
+    if _has_marker(title_text, *kids_table_set_markers) or (
+        _has_marker(title_text, "kids table") and _has_marker(title_text, "chair")
     ):
         return ListingProfile(
             kind="kids_table_set",
@@ -1503,33 +1831,39 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         "console table",
         "nesting table",
     )
-    if any(marker in title_text for marker in dining_set_markers) and not any(
-        marker in title_text for marker in kids_table_set_markers + non_dining_table_set_markers
+    if (
+        _has_marker(title_text, *dining_set_markers) or title_is_dining_set_bundle(title_text)
+    ) and not _has_marker(
+        title_text, *kids_table_set_markers, *non_dining_table_set_markers
     ):
-        return ListingProfile(
-            kind="dining_set",
-            category_id="107578",
-            category_name="Dining Sets",
-            type_value="Dining Set",
-            set_includes="Dining Table & Stools" if "stool" in title_text else "Dining Table & Chairs",
-        )
+        if title_has_clear_outdoor_word(title_text):
+            return _outdoor_dining_set_profile(title_text)
+        if _has_marker(title_text, *dining_set_markers):
+            return ListingProfile(
+                kind="dining_set",
+                category_id="107578",
+                category_name="Dining Sets",
+                type_value="Dining Set",
+                set_includes="Dining Table & Stools" if "stool" in title_text else "Dining Table & Chairs",
+            )
+        return ListingProfile(kind="unknown")
 
-    if any(marker in title_text for marker in ("computer desk", "writing desk", "l-shaped desk", "l shaped desk", "corner desk", "home office desk")):
+    if _has_marker(title_text, "computer desk", "writing desk", "l-shaped desk", "l shaped desk", "corner desk", "home office desk"):
         return ListingProfile(
             kind="desk",
             category_id="88057",
             category_name="Desks & Tables",
         )
 
-    if any(marker in title_text for marker in bed_markers + bed_stack_markers):
+    if _has_marker(title_text, *bed_markers, *bed_stack_markers):
         return ListingProfile(
             kind="bed",
             category_id="175758",
             category_name="Beds & Bed Frames",
             type_value=(
                 "Loft Bed"
-                if "loft bed" in title_text
-                else ("Bunk Bed" if any(marker in title_text for marker in ("bunk bed",) + bed_stack_markers) else "Bed Frame")
+                if _has_marker(title_text, "loft bed")
+                else ("Bunk Bed" if _has_marker(title_text, "bunk bed", *bed_stack_markers) else "Bed Frame")
             ),
             room="Bedroom",
         )
@@ -1546,10 +1880,10 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         "microwave shelf",
     )
     has_pantry = (
-        any(marker in title_text for marker in pantry_markers)
-        or ("hutch" in title_text and any(marker in title_text for marker in ("kitchen", "pantry", "microwave")))
-    )
-    if has_pantry and not any(marker in title_text for marker in ("wine rack", "wine cabinet", "bar cabinet")):
+        _has_marker(title_text, *pantry_markers)
+        or (_has_marker(title_text, "hutch") and _has_marker(title_text, "kitchen", "pantry", "microwave"))
+    ) and not _has_marker(title_text, "nightstand", "bedside table", "dresser", "workbench", "work bench")
+    if has_pantry and not _has_marker(title_text, "wine rack", "wine cabinet", "bar cabinet"):
         return ListingProfile(
             kind="pantry_cabinet",
             category_id="20487",
@@ -1557,14 +1891,24 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             type_value="Cabinet",
         )
 
-    if "golf" in title_text and ("golf putting green" in title_text or "putting green" in title_text):
+    if _has_marker(title_text, "display cabinet", "curio cabinet", "glass display cabinet") and not _has_marker(
+        title_text, "wine rack", "stemware rack"
+    ):
+        return ListingProfile(
+            kind="display_cabinet",
+            category_id="20493",
+            category_name="Display Cabinets",
+            type_value="Display Cabinet",
+        )
+
+    if _has_marker(title_text, "golf") and _has_marker(title_text, "golf putting green", "putting green"):
         return ListingProfile(
             kind="golf_putting_green",
             category_id="36234",
             category_name="Putting Greens & Aids",
         )
 
-    if "golf" in title_text and any(marker in title_text for marker in ("golf hitting mat", "golf practice mat", "golf training mat", "golf swing mat")):
+    if _has_marker(title_text, "golf") and _has_marker(title_text, "golf hitting mat", "golf practice mat", "golf training mat", "golf swing mat"):
         return ListingProfile(
             kind="golf_mat",
             category_id="50876",
@@ -1572,15 +1916,12 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         )
 
     if (
-        "porch swing" in title_text
-        or "porch swing bed" in title_text
-        or "patio swing bed" in title_text
-        or "garden swing bed" in title_text
+        _has_marker(title_text, "porch swing", "porch swing bed", "patio swing bed", "garden swing bed")
         or (
-            "swing bed" in title_text
+            _has_marker(title_text, "swing bed")
             and outdoor_context
-            and "rope" in title_text
-            and not any(marker in title_text for marker in ("cat ", "dog ", "pet ", "kitten", "puppy"))
+            and _has_marker(title_text, "rope")
+            and not _has_marker(title_text, "cat ", "dog ", "pet ", "kitten", "puppy")
         )
     ):
         return ListingProfile(
@@ -1590,12 +1931,11 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             indoor_outdoor="Outdoor",
         )
 
-    if any(marker in title_text for marker in ("outdoor daybed", "patio daybed", "sunbed")) or (
-        "daybed" in title_text
+    if _has_marker(title_text, "outdoor daybed", "patio daybed", "sunbed") or (
+        _has_marker(title_text, "daybed")
         and outdoor_context_strict
-        and "porch swing" not in title_text
-        and "swing bed" not in title_text
-        and not any(marker in title_text for marker in ("sofa", "couch", "loveseat", "sectional"))
+        and not _has_marker(title_text, "porch swing", "swing bed")
+        and not _has_marker(title_text, "sofa", "couch", "loveseat", "sectional")
     ):
         return ListingProfile(
             kind="outdoor_daybed",
@@ -1605,43 +1945,34 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         )
 
     if (
-        outdoor_context_strict
-        and not any(marker in title_text for marker in ("sofa", "couch", "loveseat", "sectional"))
+        title_allows_outdoor_chair_remap(title_text)
+        and not _has_marker(title_text, "sofa", "couch", "loveseat", "sectional")
         and re.search(r"\btable\b", title_text) is None
-        and any(
-            marker in title_text
-            for marker in (
-                "outdoor chair",
-                "patio chair",
-                "club chair",
-                "club chairs",
-                "armchair",
-                "armchairs",
-                "patio armchair",
-                "patio armchairs",
-                "outdoor dining chair",
-                "outdoor dining chairs",
-                "patio dining chair",
-                "patio dining chairs",
-                "outdoor lounge chair",
-                "outdoor lounge chairs",
-                "patio lounge",
-                "sun lounger",
-                "camping chair",
-                "camping chairs",
-            )
+        and _has_marker(
+            title_text,
+            "outdoor chair",
+            "patio chair",
+            "club chair",
+            "club chairs",
+            "armchair",
+            "armchairs",
+            "patio armchair",
+            "patio armchairs",
+            "outdoor dining chair",
+            "outdoor dining chairs",
+            "patio dining chair",
+            "patio dining chairs",
+            "outdoor lounge chair",
+            "outdoor lounge chairs",
+            "patio lounge",
+            "sun lounger",
+            "camping chair",
+            "camping chairs",
         )
     ):
-        return ListingProfile(
-            kind="outdoor_chair",
-            category_id="79684",
-            category_name="Outdoor Chairs",
-            type_value="Outdoor Chair",
-            set_includes="Chairs" if any(marker in title_text for marker in ("set of 2", "set of two", "chairs")) else "Chair",
-            indoor_outdoor="Outdoor",
-        )
+        return _outdoor_seating_profile(title_text)
 
-    if any(marker in title_text for marker in ("bar stool", "bar stools", "counter stool", "counter stools", "barstool", "barstools")):
+    if _has_marker(title_text, "bar stool", "bar stools", "counter stool", "counter stools", "barstool", "barstools"):
         return ListingProfile(
             kind="bar_stool",
             category_id="103431",
@@ -1658,7 +1989,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         "outdoor furniture set",
         "outdoor sectional",
     )
-    if any(marker in title_text for marker in patio_set_markers):
+    if _has_marker(title_text, *patio_set_markers):
         return ListingProfile(
             kind="patio_furniture_set",
             category_id="139849",
@@ -1671,47 +2002,49 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
 
     if (
         not sofa_context
-        and any(marker in title_text for marker in ("storage ottoman", "lift top ottoman", "storage footstool"))
+        and _has_marker(title_text, "storage ottoman", "lift top ottoman", "storage footstool")
     ) or (
         not sofa_context
-        and "ottoman" in title_text and "storage" in title_text
+        and _has_marker(title_text, "ottoman") and _has_marker(title_text, "storage")
     ):
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "20490", "Ottomans, Footstools & Poufs")
         return ListingProfile(
             kind="storage_ottoman",
-            category_id="20490",
-            category_name="Ottomans, Footstools & Poufs",
+            category_id=leaf,
+            category_name=leaf_name,
             type_value="Storage Ottoman",
             set_includes="Ottoman",
             room="Living Room",
             remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
         )
 
-    if not sofa_context and "ottoman bench" in title_text:
+    if not sofa_context and _has_marker(title_text, "ottoman bench"):
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "20490", "Ottomans, Footstools & Poufs")
         return ListingProfile(
             kind="ottoman_bench",
-            category_id="20490",
-            category_name="Ottomans, Footstools & Poufs",
+            category_id=leaf,
+            category_name=leaf_name,
             type_value="Ottoman",
             set_includes="Ottoman",
             room="Living Room",
             remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
         )
 
-    excluded_bench = any(
-        marker in title_text
-        for marker in (
-            "garden bench",
-            "outdoor bench",
-            "park bench",
-            "shower bench",
-            "bath stool",
-            "potting bench",
-            "hall tree",
-            "coat rack bench",
-            "shoe bench",
-            "storage ottoman",
-            "ottoman bench",
-        )
+    excluded_bench = _has_marker(
+        title_text,
+        "garden bench",
+        "outdoor bench",
+        "park bench",
+        "shower bench",
+        "bath stool",
+        "potting bench",
+        "hall tree",
+        "coat rack bench",
+        "shoe bench",
+        "storage ottoman",
+        "ottoman bench",
+        "workbench",
+        "work bench",
     )
     bench_markers = (
         "dining bench",
@@ -1722,16 +2055,17 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
         "end of bed",
         "footrest stool",
     )
-    if not excluded_bench and any(marker in title_text for marker in bench_markers):
+    if not excluded_bench and _has_marker(title_text, *bench_markers):
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "262980", "Benches")
         return ListingProfile(
             kind="indoor_bench",
-            category_id="262980",
-            category_name="Benches",
+            category_id=leaf,
+            category_name=leaf_name,
             type_value="Bench",
             set_includes="Bench",
         )
 
-    if any(marker in title_text for marker in ("board game table", "gaming table", "game table")):
+    if _has_marker(title_text, "board game table", "gaming table", "game table"):
         return ListingProfile(
             kind="game_table",
             category_id="38204",
@@ -1742,7 +2076,21 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset(GAME_TABLE_FORBIDDEN_ASPECTS),
         )
 
-    if "dining chair" in title_text or ("chair" in title_text and "dining" in title_text and ("set of" in title_text or "chairs" in title_text)):
+    if _has_marker(title_text, "dining chair") or (
+        _has_marker(title_text, "chair")
+        and _has_marker(title_text, "dining")
+        and _has_marker(title_text, "set of", "chairs")
+        and not _has_marker(title_text, "accent chair", "armchair", "reading chair")
+        and not _has_marker(title_text, "chairs not included", "without chairs", "table only")
+    ):
+        if _has_marker(title_text, "accent chair"):
+            return ListingProfile(kind="unknown")
+        if title_is_dining_set_bundle(title_text):
+            return _dining_set_bundle_profile(title_text)
+        if title_allows_outdoor_chair_remap(title_text):
+            return _outdoor_seating_profile(title_text)
+        if title_has_mixed_indoor_outdoor(title_text):
+            return ListingProfile(kind="unknown")
         return ListingProfile(
             kind="dining_chair",
             category_id="54235",
@@ -1752,7 +2100,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             room="Dining Room",
         )
 
-    if "bean bag" in title_text:
+    if _has_marker(title_text, "bean bag"):
         return ListingProfile(
             kind="bean_bag",
             category_id="48319",
@@ -1762,7 +2110,12 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset({"Set Includes"}),
         )
 
-    if "dining table" in title_text and "chair" not in title_text and "bench" not in title_text:
+    seating_negated = _has_marker(title_text, "chairs not included", "without chairs", "table only")
+    if _has_marker(title_text, "dining table") and (
+        seating_negated or not _has_marker(title_text, "chair", "bench")
+    ):
+        if _title_has_outdoor_table_signal(title_text):
+            return _outdoor_table_profile(category_id)
         return ListingProfile(
             kind="dining_table",
             category_id="38204",
@@ -1773,7 +2126,9 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset({"Upholstery Material", "Upholstery Fabric"}),
         )
 
-    if any(marker in title_text for marker in ("coffee table", "cocktail table")):
+    if _has_marker(title_text, "coffee table", "cocktail table"):
+        if _title_has_outdoor_table_signal(title_text):
+            return _outdoor_table_profile(category_id)
         return ListingProfile(
             kind="coffee_table",
             category_id="38204",
@@ -1783,7 +2138,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             room="Living Room",
         )
 
-    if any(marker in title_text for marker in ("nightstand", "bedside table")):
+    if _has_marker(title_text, "nightstand", "bedside table"):
         return ListingProfile(
             kind="nightstand",
             category_id="38199",
@@ -1793,11 +2148,11 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
         )
 
-    if any(marker in title_text for marker in ("side table", "end table", "accent table", "lamp table")):
+    if _has_marker(title_text, "side table", "end table", "accent table", "lamp table"):
         # Animal-head / statue accent tables are decorative sculpture (20518), same as
         # published W5398 flamingo sibling. Plain furniture end tables use 38200.
         # Never use 54235 (Chairs) or 38204 (Coffee Tables).
-        if any(m in title_text for m in ("statue", "figurine", "sculpture", "animal head", "head accent")):
+        if _has_marker(title_text, "statue", "figurine", "sculpture", "animal head", "head accent"):
             return ListingProfile(
                 kind="decor_statue_table",
                 category_id="20518",
@@ -1806,6 +2161,8 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
                 room="Living Room",
                 remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
             )
+        if _title_has_outdoor_table_signal(title_text):
+            return _outdoor_table_profile(category_id)
         return ListingProfile(
             kind="side_table",
             category_id="38200",
@@ -1815,7 +2172,7 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
             remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
         )
 
-    if any(marker in title_text for marker in ("armchair", "reading chair", "single seat sofa", "accent chair")) and "dining" not in title_text:
+    if _has_marker(title_text, "armchair", "reading chair", "single seat sofa", "accent chair") and not _has_marker(title_text, "dining"):
         return ListingProfile(
             kind="armchair",
             category_id="38208",
@@ -1828,19 +2185,45 @@ def classify_listing_profile(title: str, description: str = "", category_id: str
     # "Sofa Table" / "Sofa Side Table" / "Console Table ... Behind Couch" are
     # tables that merely mention a sofa — never classify them as sofas
     # (live incident 2026-07-13: a nightstand and a console table were both
-    # recategorized into 38208 by this branch).
+    # recategorized into 38208 by this branch). A real sectional/couch/armchair
+    # that happens to include a storage ottoman is still seating, not an
+    # accessory-ottoman title (W3098 "Double Sofa" stuffing stays blocked).
+    true_sofa_seating = _has_marker(
+        title_text,
+        "sectional sofa",
+        "l-shaped sofa",
+        "l-shaped sectional",
+        "u-shaped sofa",
+        "modular sectional",
+        "loveseat",
+        "couch",
+        "armchair",
+        "accent chair",
+        "reading chair",
+        "chaise lounge",
+        "club chair",
+    )
     sofa_accessory_context = (
         re.search(r"\b(?:sofa|couch)\s+(?:side\s+)?table\b", title_text)
-        or "console table" in title_text
+        or _has_marker(title_text, "console table")
         or re.search(r"\bbehind\s+(?:the\s+)?(?:couch|sofa)\b", title_text)
+        or (
+            _has_marker(title_text, "storage ottoman", "ottoman bench", "storage bench")
+            and not true_sofa_seating
+        )
     )
-    if not sofa_accessory_context and any(
-        marker in title_text
-        for marker in ("loveseat", "sectional sofa", "l-shaped sofa", "u-shaped sofa", "modular sectional", "sofa", "couch")
+    if not sofa_accessory_context and _has_marker(
+        title_text,
+        "loveseat",
+        "sectional sofa",
+        "l-shaped sofa",
+        "u-shaped sofa",
+        "modular sectional",
+        "sofa",
+        "couch",
     ):
-        is_sectional = any(
-            marker in title_text
-            for marker in ("sectional", "modular", "l-shaped", "u-shaped", "u shaped", "l shaped")
+        is_sectional = _has_marker(
+            title_text, "sectional", "modular", "l-shaped", "u-shaped", "u shaped", "l shaped"
         )
         return ListingProfile(
             kind="sofa",
@@ -1871,8 +2254,12 @@ def quality_gate_expected_aspects(
     rewriting them. Keys match Item Specific names (Type, Assembly Required, …).
     """
     expected: dict[str, str] = {}
-    title_for_profile = " ".join(part for part in (source_title, title) if part)
-    profile = classify_listing_profile(title_for_profile, description, category_id)
+    profile = classify_listing_profile(
+        title or source_title,
+        description,
+        category_id,
+        source_title=source_title,
+    )
     if profile.type_value:
         expected["Type"] = profile.type_value
     if profile.set_includes:
@@ -2120,20 +2507,63 @@ def normalize_generated_listing(
     if not isinstance(opt["aspects"], dict):
         opt["aspects"] = {}
 
-    title_context = " ".join(part for part in (source_title, opt.get("title")) if part).strip()
-    profile = classify_listing_profile(title_context or opt.get("title", ""), opt.get("description", ""), opt.get("categoryId", ""))
+    # Decision uses the same raw live/giga pair as audit. Sanitized 80-char
+    # listing titles must not become a second live_title.
+    raw_live_title = str((optimization or {}).get("title") or "")
+    giga_title = str(source_title or "")
+    stored_category = str(opt.get("categoryId") or "")
+    live_title = str(opt.get("title") or "")
+    # Aspects still come from the live-title profile. The leaf comes from the
+    # shared decision so publish and audit cannot disagree.
+    profile = classify_listing_profile(
+        raw_live_title or giga_title or live_title,
+        "",
+        stored_category,
+        source_title="",
+    )
     preserve_category = is_category_approved(opt)
+    if not preserve_category:
+        from src.utils.category_decision import decision_category_id, resolve_category_decision
 
-    if category_matcher and opt.get("categoryId") and not preserve_category:
-        category_id, category_name = category_matcher.canonicalize_category(
-            title_context or opt.get("title", ""),
-            str(opt.get("categoryId") or ""),
+        decision = resolve_category_decision(
+            raw_live_title,
+            giga_title,
+            "",
+            stored_category,
             opt.get("categoryName"),
-            opt.get("description", ""),
         )
-        opt["categoryId"] = category_id
-        if category_name:
-            opt["categoryName"] = category_name
+        write_id = decision_category_id(decision, stored_category)
+        if write_id:
+            profile = ListingProfile(
+                kind=decision.kind or profile.kind,
+                category_id=write_id,
+                category_name=decision.category_name or profile.category_name,
+                type_value=profile.type_value,
+                set_includes=profile.set_includes,
+                room=profile.room,
+                indoor_outdoor=profile.indoor_outdoor,
+                remove_aspects=profile.remove_aspects,
+            )
+        else:
+            profile = ListingProfile(
+                kind=profile.kind if decision.kind == "keep" else (decision.kind or "unknown"),
+                category_id=None,
+                category_name=None,
+                type_value=profile.type_value,
+                set_includes=profile.set_includes,
+                room=profile.room,
+                indoor_outdoor=profile.indoor_outdoor,
+                remove_aspects=profile.remove_aspects,
+            )
+            if decision.kind not in {"keep"} and (
+                decision.category_id or decision.reason not in {"", "classified", "empty_title", "tree_cache_unavailable"}
+            ):
+                opt["_category_remap_review"] = {
+                    "from": stored_category or "",
+                    "to": decision.category_id or "",
+                    "reason": decision.reason,
+                    "suggested_alternative": decision.suggested_alternative or "",
+                }
 
     seeded_attributes = _seed_attributes_from_description(attributes, opt.get("description", ""))
     updates = _fill_measurement_aspects(opt["aspects"], seeded_attributes)
@@ -2999,6 +3429,7 @@ def validate_listing_quality(
     images: list[str] | None = None,
     videos: list[str] | None = None,
     category_matcher: Any = None,
+    listing_status: str = "",
 ) -> list[ListingQualityIssue]:
     """Return quality issues that should block READY/publish."""
     opt = dict(optimization or {})
@@ -3097,24 +3528,112 @@ def validate_listing_quality(
 
     category_id = str(opt.get("categoryId") or "").strip()
     preserve_category = is_category_approved(opt)
-    profile = classify_listing_profile(" ".join(part for part in (source_title, title) if part), description, category_id)
-    if not preserve_category and profile.category_id and category_id != profile.category_id:
+    from src.utils.category_decision import decision_category_id, resolve_category_decision
+
+    profile = classify_listing_profile(
+        title or source_title,
+        "",
+        category_id,
+        source_title="",
+    )
+    decision = resolve_category_decision(
+        str((optimization or {}).get("title") or ""),
+        source_title,
+        "",
+        category_id,
+        opt.get("categoryName"),
+    )
+    write_id = decision_category_id(decision, category_id)
+    from src.utils.category_decision import (
+        unpublished_listing_status,
+        validate_target_category,
+        warn_once_tree_unavailable,
+    )
+
+    status = str(listing_status or opt.get("listingStatus") or opt.get("status") or "")
+    stored_ok, stored_reason = (True, "")
+    if category_id:
+        stored_ok, stored_reason = validate_target_category(category_id, "", title or source_title)
+    if stored_reason == "tree_unavailable" or decision.reason in {"tree_unavailable", "tree_cache_unavailable"}:
+        warn_once_tree_unavailable()
+    elif (
+        not preserve_category
+        and category_id
+        and not stored_ok
+        and stored_reason in {"stored_category_implausible", "invalid_target_leaf", "implausible_target_path"}
+    ):
+        if unpublished_listing_status(status):
+            issues.append(
+                ListingQualityIssue(
+                    "stored_category_unpublishable",
+                    f"stored category {category_id} is {stored_reason}; holding READY/PENDING publish",
+                    severity="BLOCKER",
+                    field="categoryId",
+                )
+            )
+    if decision.conflict or decision.reason == "title_source_conflict":
+        issues.append(
+            ListingQualityIssue(
+                "title_source_conflict",
+                "live title and GIGA title disagree on the product leaf; holding stored category",
+                severity="INFO",
+                field="title",
+            )
+        )
+    pending_remap = (
+        not preserve_category
+        and not write_id
+        and decision.kind not in {"keep"}
+        and decision.reason not in {"tree_unavailable", "tree_cache_unavailable"}
+        and (
+            bool(decision.category_id)
+            or decision.reason
+            in {
+                "unknown_head_noun",
+                "pet_species_mismatch",
+                "invalid_target_leaf",
+                "implausible_target_path",
+                "stored_category_implausible",
+                "accessory",
+                "mattress_not_accessory",
+            }
+        )
+    )
+    review = opt.get("_category_remap_review") if isinstance(opt.get("_category_remap_review"), dict) else None
+    if pending_remap or (review and not preserve_category and not write_id and decision.kind not in {"keep"}):
+        issues.append(
+            ListingQualityIssue(
+                "category_remap_pending_review",
+                (
+                    f"remap {category_id or 'empty'} → {decision.category_id or 'none'} "
+                    f"reason={decision.reason}"
+                    + (
+                        f" suggested_alternative={decision.suggested_alternative}"
+                        if decision.suggested_alternative
+                        else ""
+                    )
+                ),
+                severity="WARNING",
+                field="categoryId",
+            )
+        )
+    if not preserve_category and write_id and category_id != write_id:
         issues.append(
             ListingQualityIssue(
                 "category_mismatch",
-                f"{profile.kind} should use category {profile.category_id}, got {category_id or 'missing'}",
+                f"{decision.kind} should use category {write_id}, got {category_id or 'missing'}",
                 field="categoryId",
             )
         )
     elif not category_id:
         issues.append(ListingQualityIssue("missing_category", "missing categoryId", field="categoryId"))
 
-    if category_matcher and category_id and not preserve_category:
-        if not category_matcher.is_category_plausible_for_text(title, category_id, opt.get("categoryName")):
+    if category_matcher and write_id and not preserve_category:
+        if not category_matcher.is_category_plausible_for_text(title or source_title, write_id, opt.get("categoryName")):
             issues.append(
                 ListingQualityIssue(
                     "category_mismatch",
-                    f"category {category_id} is implausible for title '{title[:120]}'",
+                    f"category {write_id} is implausible for title '{(title or source_title)[:120]}'",
                     field="categoryId",
                 )
             )
@@ -3328,5 +3847,9 @@ def validate_listing_quality(
 
 def blocking_issue_messages(issues: list[ListingQualityIssue]) -> list[str]:
     return [issue.message for issue in issues if issue.severity == "BLOCKER"]
+
+
+# Spec name for the publish-path normalizer. Same function, same category gate.
+normalize_listing_optimization = normalize_generated_listing
 
 

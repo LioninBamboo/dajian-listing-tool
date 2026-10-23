@@ -13,10 +13,16 @@ from __future__ import annotations
 import pytest
 
 from src.utils.product_context_signals import (
+    has_compound_product_signal,
     has_outdoor_marker,
     mentions_cooler_product,
     names_indoor_room,
     outdoor_context,
+    title_allows_outdoor_chair_remap,
+    title_has_clear_outdoor_word,
+    title_has_mixed_indoor_outdoor,
+    title_is_chair_accessory,
+    title_is_dining_set_bundle,
 )
 
 
@@ -42,6 +48,16 @@ class TestOutdoorContext:
         assert has_outdoor_marker("leisure bench on the balcony") is True
         assert names_indoor_room("For Living Room and Bedroom") is True
         assert names_indoor_room("Weather resistant wicker") is False
+
+    def test_room_list_balcony_with_velvet_is_not_outdoor(self):
+        title = "Floral Accent Chair Velvet Lounge Arm Chair for Living Room, Balcony"
+        assert outdoor_context(title, title) is False
+
+    def test_workbench_phrase_is_not_bench_with(self):
+        from src.utils.product_context_signals import has_phrase, primary_product_noun
+
+        assert has_phrase("Heavy Duty Steel Workbench with Pegboard", "bench with") is False
+        assert primary_product_noun("Heavy Duty Steel Workbench with Pegboard") == "workbench"
 
 
 class TestCoolerIsSometimesAnAdjective:
@@ -73,6 +89,48 @@ class TestCoolerIsSometimesAnAdjective:
 
     def test_no_mention_at_all(self):
         assert mentions_cooler_product("Solid wood dining table") is False
+
+
+class TestDiningSetBundleAndMixedOutdoor:
+    def test_nulls_are_safe(self):
+        assert title_is_dining_set_bundle(None) is False
+        assert title_has_mixed_indoor_outdoor(None) is False
+        assert title_has_clear_outdoor_word("") is False
+        assert title_allows_outdoor_chair_remap(None) is False
+        assert title_is_chair_accessory("") is False
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Outdoor Dining Table and Chairs",
+            "Patio Dining Table and 4 Dining Chairs",
+            "dining table with chairs",
+            "7-Piece Patio Dining Set",
+            "Bistro Table and 2 Chairs Set",
+        ],
+    )
+    def test_table_plus_chairs_is_a_set_bundle(self, title):
+        assert title_is_dining_set_bundle(title) is True
+        assert has_compound_product_signal(title) is True
+
+    def test_single_dining_chair_is_not_a_set(self):
+        title = "Acacia Wood Outdoor Dining Chair, Rope Seat"
+        assert title_is_dining_set_bundle(title) is False
+        assert title_allows_outdoor_chair_remap(title) is True
+
+    def test_mixed_indoor_outdoor_wording(self):
+        assert title_has_mixed_indoor_outdoor("Round Dining Table Outdoor Indoor") is True
+        assert title_has_clear_outdoor_word("Round Dining Table Outdoor Indoor") is False
+        assert title_allows_outdoor_chair_remap("Indoor/Outdoor Folding Chairs Set of 4") is False
+
+    def test_chair_cushions_are_accessories(self):
+        assert title_is_chair_accessory("Patio Chair Cushions") is True
+        assert title_allows_outdoor_chair_remap("Patio Chair Cushions") is False
+        assert title_is_chair_accessory("Dining Chairs Set of 2 Navy Cushions") is False
+        assert title_is_dining_set_bundle("Dining Set for 4-6 People") is False
+        assert title_is_dining_set_bundle("Counter Height Dining Table (Chairs Not Included)") is False
+        assert title_has_mixed_indoor_outdoor("Perfect for Indoor or Outdoor Use") is True
+        assert title_has_clear_outdoor_word("Side Table Perfect for Indoor or Outdoor Use") is False
 
 
 class TestBothEnginesUseTheSharedSignals:

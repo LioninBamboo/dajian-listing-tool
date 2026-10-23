@@ -279,19 +279,66 @@ def check_and_restart():
         log(f"[WATCHDOG] Failed to restart daemon: {e}")
 
 
+def _newer_qualifying_audit_since(since_iso, today):
+    try:
+        since_ts = datetime.fromisoformat(str(since_iso)).timestamp()
+    except (TypeError, ValueError):
+        return False
+    try:
+        from pathlib import Path
+        from scripts.semantic_rewrite import pick_latest_daily_live_audit, _parse_generated_at
+        root = Path(__file__).resolve().parent
+        now = datetime.combine(today, datetime.min.time()).replace(hour=12)
+        picked = pick_latest_daily_live_audit(
+            list((root / 'logs').glob('listing_audit_fix_*.json')),
+            now=now,
+        )
+    except Exception:
+        return False
+    if not picked:
+        return False
+    path, data = picked
+    try:
+        age_ts = _parse_generated_at(data.get('generated_at'))
+        if age_ts is None:
+            age_ts = path.stat().st_mtime
+    except Exception:
+        return False
+    return float(age_ts) > since_ts
+
+
 def _task_succeeded_today(health, task_name, today):
     info = _get_task_info(health, task_name)
-    if str(info.get('status', '')).lower() not in {
+    status = str(info.get('status', '')).lower()
+    at = info.get('at')
+    audit_driven = {
+        'source_aspect_autofix',
+        'semantic_rewrite',
+        'missing_video_autofix',
+    }
+    if status == 'skipped':
+        if str(task_name) not in audit_driven or not at:
+            return False
+        try:
+            if datetime.fromisoformat(at).date() != today:
+                return False
+        except Exception:
+            return False
+        if _newer_qualifying_audit_since(at, today):
+            return False
+        return True
+    if status not in {
         'success', 'ok', 'partial_success', 'completed_with_errors'
     }:
         return False
-    at = info.get('at')
     if not at:
         return False
     try:
-        return datetime.fromisoformat(at).date() == today
+        if datetime.fromisoformat(at).date() != today:
+            return False
     except Exception:
         return False
+    return True
 
 
 def _task_in_progress_today(health, task_name, today):

@@ -758,6 +758,11 @@ def test_semantic_rewrite_task_uses_daily_limit_and_apply_flags(monkeypatch):
     )
     monkeypatch.setattr(
         scheduler_daemon,
+        '_pick_fresh_daily_live_audit_or_skip',
+        lambda name: (__import__('pathlib').Path('listing_audit_fix_today.json'), {'issues': [{'sku': 'X'}]}),
+    )
+    monkeypatch.setattr(
+        scheduler_daemon,
         'run_task',
         lambda *args, **kwargs: calls.append((args, kwargs)) or (True, 'ok'),
     )

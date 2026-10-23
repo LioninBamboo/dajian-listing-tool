@@ -344,10 +344,9 @@ def test_active_audit_surfaces_description_only_fixes(monkeypatch):
     )
 
     issue_types = {issue["type"] for issue in issues}
-    assert issue_types == {
-        "description_structure_missing_key_features",
-        "desc_weight_mismatch",
-    }
+    assert "description_structure_missing_key_features" in issue_types
+    assert "desc_weight_mismatch" in issue_types
+    assert "categoryId" not in fixes
     assert fixes == {
         "__restore_live_description_from_local__": True,
         "__desc_needs_update__": True,

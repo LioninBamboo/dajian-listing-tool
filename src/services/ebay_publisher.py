@@ -689,17 +689,17 @@ class EbayPublisher:
                 "Lock Type": "Electronic"
             }
         },
-        # Patio Chairs, Swings & Benches (79682)
+        # Patio Chairs (79682)
         "79682": {
             "required": ["Brand", "Type", "Material", "Color"],
             "defaults": {
                 "Brand": "Unbranded",
-                "Type": "Chaise Lounge",
+                "Type": "Patio Chair",
                 "Material": "Acacia Wood",
                 "Color": "Natural"
             }
         },
-        # Patio Chairs, Swings & Benches (79684) — Egg Chairs, Hanging Chairs
+        # Loungers (79684)
         "79684": {
             "required": ["Brand", "Type", "Material", "Color", "Item Width", "Item Height", "Item Length"],
             "defaults": {
@@ -1217,7 +1217,8 @@ class EbayPublisher:
         
         # Outdoor
         "139849": ["patio furniture", "patio set", "outdoor sofa", "outdoor sectional"],
-        "79682": ["outdoor chair", "adirondack", "outdoor chaise", "patio chaise", "sun lounger", "outdoor lounge chair", "patio lounge", "patio recliner"],
+        "79682": ["outdoor chair", "adirondack", "patio chair", "papasan", "egg chair", "rocking chair", "folding chair", "garden stool"],
+        "79684": ["outdoor chaise", "patio chaise", "sun lounger", "outdoor lounge chair", "patio lounge", "patio recliner"],
         "79686": ["outdoor table", "patio table"],
         "79683": ["garden bench", "park bench", "outdoor bench"],
         "79694": ["porch swing"],
@@ -1237,10 +1238,10 @@ class EbayPublisher:
         "139946": ["fence panel", "garden fence", "privacy screen panel"],
         
         # Storage
-        "261263": ["hall tree"],
+        "261263": ["hall tree antique"],
         "262980": ["storage bench", "entryway bench", "shoe bench"],
         "38221": ["shoe rack", "shoe cabinet", "shoe bench", "shoe storage", "cabinet"],
-        "22656": ["coat rack", "coat stand"],
+        "22656": ["hall tree", "coat rack", "coat stand"],
         "108044": ["umbrella stand"],
         "20584": ["safe", "gun safe", "security safe", "safe box", "lockbox"],
         "175764": ["room divider", "partition", "screen"],
@@ -1911,7 +1912,10 @@ class EbayPublisher:
         ], []),
         ("79682", "Patio Chairs", [
             "patio chair", "patio chair set", "adirondack", "outdoor chair", "outdoor chair set",
-            "outdoor chaise", "outdoor lounge chair", "patio lounge", "rattan chair set",
+            "papasan", "egg chair", "rattan chair set",
+        ], []),
+        ("79684", "Loungers", [
+            "outdoor chaise", "patio chaise", "sun lounger", "outdoor lounge chair", "patio lounge",
         ], []),
         ("79686", "Outdoor Tables", ["patio table", "outdoor table"], []),
         ("138996", "Outdoor Daybeds", ["outdoor daybed", "patio daybed", "sunbed"], []),
@@ -1990,7 +1994,7 @@ class EbayPublisher:
         
         # ---- Other ----
         ("175764", "Room Dividers", ["room divider", "partition", "screen divider"], []),
-        ("261263", "Hall Trees & Stands", ["hall tree"], []),
+        ("22656", "Coat & Hat Racks", ["hall tree"], []),
         ("262980", "Benches", ["storage bench", "entryway bench", "shoe bench"], []),
         ("112581", "Lamps", ["floor lamp", "standing lamp", "crystal lamp"], []),
         ("50876", "Sports Nets", ["golf net", "batting cage", "practice net"], []),
