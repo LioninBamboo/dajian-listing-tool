@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Sequence
 
 from src.services.vehicle_compatibility import (
+    CURRENT_YEAR,
     KNOWN_MODELS,
     MAKE_NORMALIZE,
     VehicleCompatibilityParser,
@@ -66,9 +67,12 @@ _UNIVERSAL_MARKERS = (
 _YEAR = r"(?:19|20)\d{2}"
 # Numbers followed by a unit are dimensions / weights, not model years.
 _YEAR_UNIT_AFTER = r"(?!\s*(?:in(?:ch(?:es)?)?\b|cm\b|mm\b|lbs?\b|pounds?\b|kg\b|v\b|volts?\b|ft\b|feet\b|\"|''))"
-# 2005-2023 / 2019–2026 / 2007-2026
+# 2005-2023 / 2019–2026 / 2007-2026 / 2024 2025 / 2021+
 _YEAR_RANGE = re.compile(rf"\b({_YEAR})\s*[-–—]\s*({_YEAR})\b{_YEAR_UNIT_AFTER}")
+_YEAR_RANGE_SPACE = re.compile(rf"\b({_YEAR})\s+({_YEAR})\b{_YEAR_UNIT_AFTER}")
+_YEAR_PLUS = re.compile(rf"\b({_YEAR})\+")
 _YEAR_SINGLE = re.compile(rf"\b({_YEAR})\b{_YEAR_UNIT_AFTER}")
+_RAM_TOOL_TAIL = re.compile(r"\s+(?:jack|press|pump|cylinder|hoist)\b")
 
 
 @dataclass
@@ -187,6 +191,12 @@ def _years_near(text: str, start: int) -> tuple[Optional[int], Optional[int]]:
     year_range = _YEAR_RANGE.search(around)
     if year_range:
         return int(year_range.group(1)), int(year_range.group(2))
+    space_range = _YEAR_RANGE_SPACE.search(around)
+    if space_range:
+        return int(space_range.group(1)), int(space_range.group(2))
+    plus = _YEAR_PLUS.search(around)
+    if plus:
+        return int(plus.group(1)), int(CURRENT_YEAR)
     single = _YEAR_SINGLE.search(around)
     if single:
         year = int(single.group(1))
@@ -232,6 +242,8 @@ def _scan_title_makes(title: str) -> list[VehicleFit]:
         if canon == "dodge" and not re.search(r"\bdodge\b", t):
             continue
         for m in re.finditer(rf"\b{re.escape(alias)}\b", t):
+            if alias == "ram" and _RAM_TOOL_TAIL.match(t[m.end():]):
+                continue
             start = m.start()
             window = t[start:start + 70]
             model = None
@@ -488,15 +500,21 @@ def build_compatible_products(title: str) -> list[dict[str, Any]]:
     for f in parse_title_fitment(title):
         if not (f.make and f.model):
             continue
-        years = ([f.year_from] if f.year_from and not f.year_to else
-                 list(range(f.year_from, f.year_to + 1)) if f.year_from and f.year_to else [None])
+        if not f.year_from:
+            continue
+        years = (
+            [f.year_from]
+            if f.year_from and not f.year_to
+            else list(range(f.year_from, f.year_to + 1))
+        )
         make_disp = "Chevrolet" if f.make == "chevrolet" else f.make.title()
         model_disp = _CATALOG_MODEL.get(f.model, f.model.title())
         for y in years:
-            props = [{"name": "Make", "value": make_disp},
-                     {"name": "Model", "value": model_disp}]
-            if y:
-                props.insert(0, {"name": "Year", "value": str(y)})
+            props = [
+                {"name": "Year", "value": str(y)},
+                {"name": "Make", "value": make_disp},
+                {"name": "Model", "value": model_disp},
+            ]
             out.append({"compatibilityProperties": props})
     return out
 
@@ -506,11 +524,23 @@ def _fit_key(fit: VehicleFit) -> tuple[str, str]:
 
 
 def _year_ranges_overlap(left: VehicleFit, right: VehicleFit) -> bool:
+    # Apply requires a year range on both sides. Make+Model-only is not a match.
     if left.year_from is None or right.year_from is None:
-        return True
+        return False
     left_to = left.year_to if left.year_to is not None else left.year_from
     right_to = right.year_to if right.year_to is not None else right.year_from
     return not (left_to < right.year_from or right_to < left.year_from)
+
+
+def _stored_mismatches_giga_title(
+    title: str,
+    stored_compatible_products: Sequence[Mapping[str, Any]],
+) -> bool:
+    """True when a stored list is not supported by the GIGA/listing title."""
+    return any(
+        issue.code == "fitment_mismatch"
+        for issue in check_fitment_qc(title, stored_compatible_products)
+    )
 
 
 def source_supports_title_fitment(
@@ -520,10 +550,11 @@ def source_supports_title_fitment(
     source_description: str = "",
     stored_compatible_products: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> bool:
-    """True when GIGA source (or stored authoritative list) has the same YMM."""
+    """True when GIGA source has the same make + model + year range."""
+    check_title = (source_title or title or "").strip()
     if stored_compatible_products:
-        return True
-    title_fits = [f for f in parse_title_fitment(title) if f.make and f.model]
+        return not _stored_mismatches_giga_title(check_title, stored_compatible_products)
+    title_fits = [f for f in parse_title_fitment(title) if f.make and f.model and f.year_from]
     if not title_fits:
         return False
     source_blob = f"{source_title or ''} {source_description or ''}".strip()
@@ -536,7 +567,9 @@ def source_supports_title_fitment(
     )
     for needed in title_fits:
         if not any(
-            _fit_key(needed) == _fit_key(have) and _year_ranges_overlap(needed, have)
+            _fit_key(needed) == _fit_key(have)
+            and have.year_from is not None
+            and _year_ranges_overlap(needed, have)
             for have in source_fits
         ):
             return False
@@ -550,14 +583,26 @@ def resolve_apply_fitment(
     source_description: str = "",
     stored_compatible_products: Optional[Sequence[Mapping[str, Any]]] = None,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Choose a fitment list to push, or skip with ``skipped_no_source_fitment``.
+    """Choose a fitment list to push, or skip.
 
-    Same rule as ``batch_publish._persist_prepared_listing``: if a stored
-    authoritative ``compatibleProducts`` list exists, push that list and never
-    a poorer title re-derivation.
+    A stored list is pushed only when it matches the GIGA source title
+    (``check_fitment_qc`` finds no ``fitment_mismatch``). Make+Model rows
+    without a year are never applied.
     """
     stored = [dict(entry) for entry in (stored_compatible_products or []) if entry]
+    check_title = (source_title or title or "").strip()
     if stored:
+        if _stored_mismatches_giga_title(check_title, stored):
+            return [], "skipped_stored_mismatch"
+        if not all(
+            any(
+                str(prop.get("name") or "").lower() == "year"
+                and str(prop.get("value") or "").strip()
+                for prop in (entry.get("compatibilityProperties") or [])
+            )
+            for entry in stored
+        ):
+            return [], "skipped_no_source_fitment"
         return stored, ""
     if not source_supports_title_fitment(
         title,

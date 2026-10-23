@@ -89,7 +89,41 @@ def test_rv_year_not_a_vehicle():
 
 
 # ── T2 parsing table (one test per row) ──────────────────────────────────
+W3611P339821_TITLE = (
+    "4PCS Running Boards For 2024 2025 Toyota Tacoma Double Cab/Crew Cab Side Steps"
+)
+W3611P339821_STORED_2005_2025 = [
+    {
+        "compatibilityProperties": [
+            {"name": "Year", "value": str(year)},
+            {"name": "Make", "value": "Toyota"},
+            {"name": "Model", "value": "Tacoma"},
+        ]
+    }
+    for year in range(2005, 2026)
+]
+
+
 def test_t2_f1_real_sku_w3611p339821_title_years_not_live_range():
+    title = W3611P339821_TITLE
+    fits = parse_title_fitment(title)
+    assert fits and fits[0].make == "toyota"
+    assert fits[0].model == "tacoma"
+    assert (fits[0].year_from, fits[0].year_to) == (2024, 2025)
+    issues = check_fitment_qc(title, live_compat=W3611P339821_STORED_2005_2025)
+    assert any(i.code == "fitment_mismatch" for i in issues)
+    assert not any(i.code == "missing_fitment" for i in issues)
+    products, skip = resolve_apply_fitment(
+        title,
+        source_title=title,
+        source_description="",
+        stored_compatible_products=W3611P339821_STORED_2005_2025,
+    )
+    assert products == []
+    assert skip == "skipped_stored_mismatch"
+
+
+def test_synthetic_silverado_title_years_not_live_range():
     title = "Running Boards For 2024–2025 Chevy Silverado 1500"
     fits = parse_title_fitment(title)
     assert fits and fits[0].make == "chevrolet"
@@ -106,7 +140,6 @@ def test_t2_f1_real_sku_w3611p339821_title_years_not_live_range():
     ]
     issues = check_fitment_qc(title, live_compat=live)
     assert any(i.code == "fitment_mismatch" for i in issues)
-    assert not any(i.code == "missing_fitment" for i in issues)
     products, skip = resolve_apply_fitment(title, source_title="", source_description="")
     assert products == []
     assert skip == "skipped_no_source_fitment"
@@ -302,7 +335,7 @@ def test_c3_apply_xml_has_no_itemspecifics_or_product_listing_details():
     assert "<ReplaceAll>" not in xml
 
 
-def test_c4_prefers_stored_authoritative_list_over_title():
+def test_c4_skips_stored_list_that_mismatches_giga_title():
     stored = [
         {
             "compatibilityProperties": [
@@ -311,6 +344,27 @@ def test_c4_prefers_stored_authoritative_list_over_title():
                 {"name": "Model", "value": "Silverado 1500"},
             ]
         }
+    ]
+    products, skip = resolve_apply_fitment(
+        "Running Boards For 2024-2025 Chevy Silverado 1500",
+        source_title="",
+        source_description="",
+        stored_compatible_products=stored,
+    )
+    assert products == []
+    assert skip == "skipped_stored_mismatch"
+
+
+def test_c4_pushes_stored_when_it_matches_giga_title():
+    stored = [
+        {
+            "compatibilityProperties": [
+                {"name": "Year", "value": str(year)},
+                {"name": "Make", "value": "Chevrolet"},
+                {"name": "Model", "value": "Silverado 1500"},
+            ]
+        }
+        for year in (2024, 2025)
     ]
     products, skip = resolve_apply_fitment(
         "Running Boards For 2024-2025 Chevy Silverado 1500",
@@ -443,3 +497,210 @@ def test_fitment_audit_apply_skips_without_source_and_does_not_post(monkeypatch,
     rc = fitment_audit.main(["--apply", "--db", str(db), "--sku", "W3611P339821"])
     assert rc == 0
     assert posted == []
+
+
+def test_s1_space_separated_years_parse_as_range():
+    fits = parse_title_fitment(W3611P339821_TITLE)
+    assert fits and (fits[0].year_from, fits[0].year_to) == (2024, 2025)
+
+
+def test_s1_plus_year_runs_through_current_year():
+    from src.services.vehicle_compatibility import CURRENT_YEAR
+
+    fits = parse_title_fitment("Running Boards For 2021+ Toyota Tacoma")
+    assert fits and fits[0].make == "toyota" and fits[0].model == "tacoma"
+    assert (fits[0].year_from, fits[0].year_to) == (2021, CURRENT_YEAR)
+
+
+def test_s2_ram_jack_is_not_the_ram_make():
+    for title in (
+        "Hydraulic Long Ram Jack",
+        "Ram Jack 8 Ton Heavy Duty",
+        "Hydraulic Ram Press",
+    ):
+        assert parse_title_fitment(title) == [], title
+        assert classify_fitment(title) == "universal", title
+
+
+def test_real_sku_w2801p540956_yearless_defender_is_not_applied():
+    title = "Off-Road Tailgate Flagpole Mount Kit Fit For New Land Rover Defender 90/110"
+    fits = parse_title_fitment(title)
+    assert fits and fits[0].make == "land rover" and fits[0].model == "defender"
+    assert fits[0].year_from is None
+    products, skip = resolve_apply_fitment(
+        title,
+        source_title=title,
+        source_description=title,
+    )
+    assert products == []
+    assert skip == "skipped_no_source_fitment"
+    built = build_compatible_products(title)
+    assert built == []
+
+
+def _aqua_auto_profile() -> StoreProfile:
+    return StoreProfile(
+        store_kind="auto",
+        brand_name="AquaRides",
+        listing_channel="trading",
+        ebay_site_id="100",
+        qc_profile="motors",
+        scheduler_profile="ops",
+    )
+
+
+def _published_db(tmp_path, sku, listing_id, title, description="", optimization=None):
+    db = tmp_path / "ebay_collection.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE collected_products ("
+        "sku TEXT, listing_id TEXT, title TEXT, description TEXT, "
+        "optimization TEXT, status TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO collected_products VALUES (?,?,?,?,?,?)",
+        (
+            sku,
+            listing_id,
+            title,
+            description,
+            json.dumps(optimization or {}),
+            "PUBLISHED",
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_real_sku_w3611p339821_apply_does_not_push_stored_tacoma_2005_2025(
+    monkeypatch, tmp_path
+):
+    from scripts import fitment_audit
+
+    db = _published_db(
+        tmp_path,
+        "W3611P339821",
+        "188000000821",
+        W3611P339821_TITLE,
+        W3611P339821_TITLE,
+        {
+            "motorsCompatibility": {
+                "compatibleProducts": W3611P339821_STORED_2005_2025,
+            }
+        },
+    )
+    monkeypatch.setattr("src.utils.store_profile.get_store_profile", _aqua_auto_profile)
+
+    class FakeOAuth:
+        def get_valid_token(self):
+            return "token"
+
+    monkeypatch.setattr("src.services.ebay_auth.EbayOAuthService", lambda **kwargs: FakeOAuth())
+    posted = []
+    monkeypatch.setattr(fitment_audit, "get_live_compat", lambda *a, **k: [])
+    monkeypatch.setattr(
+        fitment_audit,
+        "push_compat",
+        lambda *a, **k: posted.append((a, k)) or (True, "", "<xml/>"),
+    )
+    monkeypatch.setattr(fitment_audit, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(fitment_audit, "time", type("T", (), {"sleep": staticmethod(lambda *_: None)})())
+
+    rc = fitment_audit.main(["--apply", "--db", str(db), "--sku", "W3611P339821"])
+    assert rc == 0
+    assert posted == []
+    reports = list(tmp_path.glob("fitment_audit_*.json"))
+    assert reports
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["applied"] == 0
+    assert any(row.get("skip_reason") == "skipped_stored_mismatch" for row in payload["findings"])
+
+
+def test_real_sku_w2801p540956_apply_does_not_write_yearless_defender(
+    monkeypatch, tmp_path
+):
+    from scripts import fitment_audit
+
+    title = "Off-Road Tailgate Flagpole Mount Kit Fit For New Land Rover Defender 90/110"
+    db = _published_db(tmp_path, "W2801P540956", "188000000956", title, title, {})
+    monkeypatch.setattr("src.utils.store_profile.get_store_profile", _aqua_auto_profile)
+
+    class FakeOAuth:
+        def get_valid_token(self):
+            return "token"
+
+    monkeypatch.setattr("src.services.ebay_auth.EbayOAuthService", lambda **kwargs: FakeOAuth())
+    posted = []
+    monkeypatch.setattr(fitment_audit, "get_live_compat", lambda *a, **k: [])
+    monkeypatch.setattr(
+        fitment_audit,
+        "push_compat",
+        lambda *a, **k: posted.append((a, k)) or (True, "", "<xml/>"),
+    )
+    monkeypatch.setattr(fitment_audit, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(fitment_audit, "time", type("T", (), {"sleep": staticmethod(lambda *_: None)})())
+
+    rc = fitment_audit.main(["--apply", "--db", str(db), "--sku", "W2801P540956"])
+    assert rc == 0
+    assert posted == []
+    reports = list(tmp_path.glob("fitment_audit_*.json"))
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["applied"] == 0
+    assert any(row.get("skip_reason") == "skipped_no_source_fitment" for row in payload["findings"])
+
+
+def test_getitem_failure_is_unknown_and_apply_does_not_write(monkeypatch, tmp_path):
+    from scripts import fitment_audit
+
+    db = _published_db(
+        tmp_path,
+        "SYNTHETIC-GETITEM-FAIL",
+        "188000000099",
+        "Running Boards For 2019-2026 Chevy Silverado 1500",
+        "Fits 2019-2026 Chevy Silverado 1500.",
+        {},
+    )
+    monkeypatch.setattr("src.utils.store_profile.get_store_profile", _aqua_auto_profile)
+
+    class FakeOAuth:
+        def get_valid_token(self):
+            return "token"
+
+    class FailResp:
+        status_code = 200
+        text = (
+            "<GetItemResponse>"
+            "<Ack>Failure</Ack>"
+            "<Errors><LongMessage>Auth token is hard expired.</LongMessage>"
+            "<SeverityCode>Error</SeverityCode></Errors>"
+            "</GetItemResponse>"
+        )
+
+    posted = []
+
+    def _no_push(*args, **kwargs):
+        posted.append((args, kwargs))
+        return True, "", "<xml/>"
+
+    monkeypatch.setattr("src.services.ebay_auth.EbayOAuthService", lambda **kwargs: FakeOAuth())
+    monkeypatch.setattr("requests.post", lambda *a, **k: FailResp())
+    monkeypatch.setattr(fitment_audit, "push_compat", _no_push)
+    monkeypatch.setattr(fitment_audit, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(fitment_audit, "time", type("T", (), {"sleep": staticmethod(lambda *_: None)})())
+
+    with pytest.raises(fitment_audit.LiveCompatReadError):
+        fitment_audit.get_live_compat("token", "188000000099", site_id="100", session=None)
+
+    rc = fitment_audit.main(["--apply", "--db", str(db), "--sku", "SYNTHETIC-GETITEM-FAIL"])
+    assert rc == 0
+    assert posted == []
+    reports = list(tmp_path.glob("fitment_audit_*.json"))
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["applied"] == 0
+    assert payload["findings"]
+    row = payload["findings"][0]
+    assert row["status"] == "unknown"
+    assert row["applied"] is False
+    assert row["issues"] == []
+    assert "missing_fitment" not in json.dumps(row)

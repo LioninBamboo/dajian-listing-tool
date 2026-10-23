@@ -66,6 +66,10 @@ def _hdr(call: str, site_id: str, token: str | None = None) -> dict[str, str]:
     return headers
 
 
+class LiveCompatReadError(RuntimeError):
+    """GetItem did not return a usable compatibility snapshot."""
+
+
 def get_live_compat(tok: str, item_id: str, *, site_id: str, session: Any = None) -> list[dict[str, Any]]:
     import requests
 
@@ -78,7 +82,21 @@ def get_live_compat(tok: str, item_id: str, *, site_id: str, session: Any = None
         "</GetItemRequest>"
     )
     r = poster(API, data=xml.encode("utf-8"), headers=_hdr("GetItem", site_id, tok), timeout=30)
+    status = getattr(r, "status_code", 200)
+    try:
+        status_code = int(status)
+    except (TypeError, ValueError):
+        status_code = 200
     body = r.text if hasattr(r, "text") else str(r)
+    ack_match = re.search(r"<Ack>(.*?)</Ack>", body, re.IGNORECASE | re.DOTALL)
+    ack = (ack_match.group(1) if ack_match else "").strip()
+    err = re.search(r"<LongMessage>(.*?)</LongMessage>", body, re.IGNORECASE | re.DOTALL)
+    detail = (err.group(1).strip() if err else body[:160])
+    has_error = bool(re.search(r"<SeverityCode>\s*Error\s*</SeverityCode>", body, re.I))
+    if status_code >= 400 or ack not in {"Success", "Warning"} or has_error:
+        raise LiveCompatReadError(
+            f"Trading GetItem failed (Ack={ack or 'missing'} HTTP={status_code}): {detail}"
+        )
     entries = []
     for block in re.findall(r"<Compatibility>(.*?)</Compatibility>", body, re.S):
         props = [
@@ -217,7 +235,27 @@ def main(argv: list[str] | None = None) -> int:
         else:
             n_univ += 1
             continue
-        live = get_live_compat(tok, r["listing_id"], site_id=site_id)
+        try:
+            live = get_live_compat(tok, r["listing_id"], site_id=site_id)
+        except Exception as exc:
+            message = re.sub(r"\s+", " ", str(exc)).strip()[:500]
+            findings.append(
+                {
+                    "sku": r["sku"],
+                    "listing_id": r["listing_id"],
+                    "title": title,
+                    "status": "unknown",
+                    "issues": [],
+                    "applied": False,
+                    "apply_error": "",
+                    "skip_reason": "",
+                    "error": message,
+                    "post_apply_issues": None,
+                }
+            )
+            print(f"  [UNKNOWN] {r['sku']} {r['listing_id']}: {message}")
+            time.sleep(0.25)
+            continue
         issues = check_fitment_qc(title, live)
         time.sleep(0.25)
         if not issues:
@@ -227,6 +265,7 @@ def main(argv: list[str] | None = None) -> int:
             "sku": r["sku"],
             "listing_id": r["listing_id"],
             "title": title,
+            "status": "checked",
             "issues": [
                 {"code": i.code, "severity": i.severity, "detail": i.detail, "parsed": i.parsed}
                 for i in issues
@@ -257,22 +296,28 @@ def main(argv: list[str] | None = None) -> int:
                     row_out["applied"] = True
                     print(f"  [APPLY] {r['sku']} {r['listing_id']}: +{len(products)} fitment OK")
                     time.sleep(0.4)
-                    live2 = get_live_compat(tok, r["listing_id"], site_id=site_id)
-                    post = check_fitment_qc(title, live2)
-                    row_out["post_apply_issues"] = [
-                        {
-                            "code": i.code,
-                            "severity": i.severity,
-                            "detail": i.detail,
-                            "parsed": i.parsed,
-                        }
-                        for i in post
-                    ]
-                    if any(i.code == "missing_fitment" for i in post):
+                    try:
+                        live2 = get_live_compat(tok, r["listing_id"], site_id=site_id)
+                    except Exception as verify_exc:
                         verify_failed += 1
-                        print(f"  [VERIFY] {r['sku']} still missing_fitment after apply")
+                        row_out["error"] = re.sub(r"\s+", " ", str(verify_exc)).strip()[:500]
+                        print(f"  [VERIFY] {r['sku']} GetItem failed after apply (unknown)")
                     else:
-                        verified_ok += 1
+                        post = check_fitment_qc(title, live2)
+                        row_out["post_apply_issues"] = [
+                            {
+                                "code": i.code,
+                                "severity": i.severity,
+                                "detail": i.detail,
+                                "parsed": i.parsed,
+                            }
+                            for i in post
+                        ]
+                        if any(i.code == "missing_fitment" for i in post):
+                            verify_failed += 1
+                            print(f"  [VERIFY] {r['sku']} still missing_fitment after apply")
+                        else:
+                            verified_ok += 1
                 else:
                     apply_fail += 1
                     row_out["apply_error"] = err

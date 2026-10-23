@@ -342,55 +342,49 @@ class EbayContentGateway:
         return None
 
     def _inventory_put_description(self, offer_id: str, current: Mapping[str, Any], description: str) -> None:
-        """PUT listingDescription only; copy category/qty/price from GET.
+        """Read-modify-write the full GET offer; change listingDescription only.
 
-        Never invent a quantity (including never overriding qty=0) or a price.
+        eBay ``updateOffer`` replaces the whole offer. Start from ``dict(current)``,
+        drop read-only keys eBay rejects, then set ``listingDescription``.
+        ``availableQuantity``, ``pricingSummary`` and ``categoryId`` stay as GET.
         """
         category_id = str(current.get("categoryId") or "").strip()
         if not category_id:
             raise RuntimeError(f"Inventory offer {offer_id} has no categoryId")
-        payload: dict[str, Any] = {
-            "categoryId": category_id,
-            "listingDescription": description,
-        }
-        if "availableQuantity" in current:
-            payload["availableQuantity"] = current.get("availableQuantity")
-        if "pricingSummary" in current:
-            payload["pricingSummary"] = current.get("pricingSummary")
+        payload = dict(current)
         for key in (
-            "listingDuration",
-            "listingPolicies",
-            "merchantLocationKey",
+            "offerId",
+            "listing",
+            "status",
             "marketplaceId",
-            "format",
             "sku",
+            "format",
+            "listingStatus",
+            "soldQuantity",
+            "listingId",
         ):
-            if key in current and current.get(key) is not None:
-                payload[key] = current.get(key)
+            payload.pop(key, None)
+        payload["listingDescription"] = description
 
         session = getattr(self.client, "session", None)
-        if session is not None and getattr(self.client, "base_url", None):
-            response = session.put(
-                f"{self.client.base_url}/sell/inventory/v1/offer/{offer_id}",
-                headers={
-                    **self._inventory_headers(),
-                    "Content-Type": "application/json",
-                    "Content-Language": "en-US",
-                },
-                json=payload,
-                timeout=120,
+        if session is None or not getattr(self.client, "base_url", None):
+            raise RuntimeError(
+                f"Inventory offer update requires an HTTP session for offerId={offer_id}"
             )
-            if response.status_code not in {200, 204}:
-                raise RuntimeError(
-                    f"Inventory offer update failed for offerId={offer_id}: HTTP {response.status_code}"
-                )
-            return
-        if not self.client.update_offer_category(
-            offer_id,
-            category_id,
-            listing_description=description,
-        ):
-            raise RuntimeError(f"Inventory offer update failed for offerId={offer_id}")
+        response = session.put(
+            f"{self.client.base_url}/sell/inventory/v1/offer/{offer_id}",
+            headers={
+                **self._inventory_headers(),
+                "Content-Type": "application/json",
+                "Content-Language": "en-US",
+            },
+            json=payload,
+            timeout=120,
+        )
+        if response.status_code not in {200, 204}:
+            raise RuntimeError(
+                f"Inventory offer update failed for offerId={offer_id}: HTTP {response.status_code}"
+            )
 
     def update_inventory_description(self, sku: str, listing_id: str, description: str) -> dict[str, str]:
         """Update and publish only the Inventory offer's listingDescription."""

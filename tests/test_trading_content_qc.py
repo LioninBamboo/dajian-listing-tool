@@ -125,6 +125,9 @@ def test_generate_description_emits_gold_not_furniture_shell(monkeypatch):
 
     assert looks_like_gold_template(desc)
     assert "overwhelming the room" not in desc.lower()
+    assert "factory-style" not in desc.lower()
+    assert "purpose-built" not in desc.lower()
+    assert "installation on the vehicle" not in desc.lower()
 
 
 def test_check_description_does_not_flag_gold_chrome_as_thin():
@@ -289,6 +292,46 @@ def test_inventory_listing_uses_offer_put_and_publish_without_trading_revise():
     assert [call[0] for call in gateway.calls] == ["get-live", "find-offer", "inventory-update", "get-live"]
 
 
+def test_socket_set_without_count_is_blocked_at_run_qc():
+    class FakeGateway:
+        def __init__(self):
+            self.writes = []
+
+        def get_live_description(self, listing_id):
+            return "<div>broken thin copy</div>"
+
+        def find_inventory_offer(self, sku, listing_id):
+            return None
+
+        def revise_description(self, listing_id, description, aspects=None):
+            self.writes.append((listing_id, description))
+            return {"ack": "Success"}
+
+        def update_inventory_description(self, sku, listing_id, description):
+            self.writes.append((sku, listing_id, description))
+            return {"channel": "inventory", "ack": "Success"}
+
+    gateway = FakeGateway()
+    report = qc.run_qc(
+        [
+            _listing(
+                sku="SYNTHETIC-SOCKET-SET",
+                listing_id="188000000004",
+                title="Socket Set",
+                source_description="",
+                aspects={"Type": ["Socket Set"]},
+            )
+        ],
+        gateway=gateway,
+        fix=True,
+        sleep_seconds=0.4,
+    )
+    assert report["fixed_count"] == 0
+    assert report["items"][0]["status"] == "fix_failed"
+    assert "package includes" in report["items"][0]["error"]
+    assert gateway.writes == []
+
+
 def test_c1_revise_description_matches_real_client_signature():
     client = create_autospec(RealEbayClient, instance=True)
     client.revise_fixed_price_item_motors.return_value = {"ack": "Success"}
@@ -338,6 +381,16 @@ def test_c2_inventory_put_preserves_get_category_qty_and_price():
         "listingDuration": "GTC",
         "sku": "W2913P449891",
         "listing": {"listingId": "188683585596"},
+        "tax": {"applyTax": False},
+        "storeCategoryNames": ["Auto"],
+        "regulatory": {"hazmat": False},
+        "includeCatalogProductDetails": True,
+        "quantityLimitPerBuyer": 4,
+        "lotSize": 1,
+        "secondaryCategoryId": "123",
+        "listingStartQuantity": 0,
+        "hideBuyerDetails": True,
+        "mysteryExtraField": "must-survive",
     }
 
     class FakeClient:
@@ -379,6 +432,19 @@ def test_c2_inventory_put_preserves_get_category_qty_and_price():
     assert body["categoryId"] == get_offer["categoryId"]
     assert body["availableQuantity"] == 0
     assert body["pricingSummary"] == get_offer["pricingSummary"]
+    assert body["tax"] == get_offer["tax"]
+    assert body["storeCategoryNames"] == get_offer["storeCategoryNames"]
+    assert body["regulatory"] == get_offer["regulatory"]
+    assert body["includeCatalogProductDetails"] is True
+    assert body["quantityLimitPerBuyer"] == 4
+    assert body["lotSize"] == 1
+    assert body["secondaryCategoryId"] == "123"
+    assert body["listingStartQuantity"] == 0
+    assert body["hideBuyerDetails"] is True
+    assert body["mysteryExtraField"] == "must-survive"
+    assert "offerId" not in body
+    assert "listing" not in body
+    assert "status" not in body
 
 
 def test_trading_gateway_get_item_sends_item_return_description_and_iaf_token():
@@ -417,15 +483,44 @@ def test_trading_gateway_get_item_sends_item_return_description_and_iaf_token():
 
 
 def test_inventory_gateway_matches_item_id_updates_offer_and_publishes():
+    class Response:
+        def __init__(self, status_code=200, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class Session:
+        def __init__(self, client):
+            self.client = client
+            self.puts = []
+
+        def get(self, url, **kwargs):
+            if str(url).endswith("/offer"):
+                return Response(200, {"offers": [self.client.offer]})
+            return Response(200, self.client.offer)
+
+        def put(self, url, **kwargs):
+            self.puts.append((url, kwargs))
+            return Response(204)
+
     class FakeClient:
+        base_url = "https://api.ebay.example"
+
         def __init__(self):
             self.offer = {
                 "offerId": "offer-1",
                 "categoryId": "33653",
+                "availableQuantity": 0,
+                "pricingSummary": {"price": {"value": "89.99", "currency": "USD"}},
                 "listingDescription": "old",
                 "listing": {"listingId": "188683585596"},
+                "mysteryExtraField": "keep-me",
             }
+            self.session = Session(self)
             self.calls = []
+            self.oauth = type("O", (), {"get_valid_token": staticmethod(lambda: "token")})()
 
         def get_offers_by_sku(self, sku, marketplace_id=None):
             self.calls.append(("offers", sku, marketplace_id))
@@ -435,10 +530,8 @@ def test_inventory_gateway_matches_item_id_updates_offer_and_publishes():
             self.calls.append(("get-offer", offer_id))
             return dict(self.offer)
 
-        def update_offer_category(self, offer_id, category_id, listing_description=None):
-            self.calls.append(("put", offer_id, category_id, listing_description))
-            self.offer["listingDescription"] = listing_description
-            return True
+        def update_offer_category(self, *args, **kwargs):
+            raise AssertionError("C2 path must PUT the GET snapshot, not update_offer_category")
 
         def publish_offer(self, offer_id):
             self.calls.append(("publish", offer_id))
@@ -447,12 +540,53 @@ def test_inventory_gateway_matches_item_id_updates_offer_and_publishes():
     class Profile:
         ebay_marketplace_id = "EBAY_US"
 
+    from src.services.motors_trading import ascii_safe
+
     client = FakeClient()
+    safe = ascii_safe("<div>clean</div>")
+    client.offer["listingDescription"] = safe
     gateway = qc.EbayContentGateway(client, Profile())
     result = gateway.update_inventory_description("W2913P449891", "188683585596", "<div>clean</div>")
     assert result["channel"] == "inventory"
-    assert ("put", "offer-1", "33653", "<div>clean</div>") in client.calls
     assert ("publish", "offer-1") in client.calls
+    assert client.session.puts
+    body = client.session.puts[0][1]["json"]
+    assert body["categoryId"] == "33653"
+    assert body["availableQuantity"] == 0
+    assert body["pricingSummary"]["price"]["value"] == "89.99"
+    assert body["mysteryExtraField"] == "keep-me"
+    assert body["listingDescription"] == safe
+
+
+def test_inventory_put_fails_closed_without_session_and_does_not_change_qty():
+    class FakeClient:
+        def __init__(self):
+            self.offer = {
+                "offerId": "offer-1",
+                "categoryId": "33653",
+                "availableQuantity": 0,
+                "listingDescription": "old",
+                "listing": {"listingId": "188683585596"},
+            }
+
+        def get_offers_by_sku(self, sku, marketplace_id=None):
+            return [self.offer]
+
+        def get_offer(self, offer_id):
+            return dict(self.offer)
+
+        def update_offer_category(self, *args, **kwargs):
+            raise AssertionError("no session fallback must not call update_offer_category")
+
+        def publish_offer(self, offer_id):
+            raise AssertionError("no session fallback must not publish")
+
+    class Profile:
+        ebay_marketplace_id = "EBAY_US"
+
+    gateway = qc.EbayContentGateway(FakeClient(), Profile())
+    with pytest.raises(RuntimeError, match="HTTP session"):
+        gateway.update_inventory_description("W2913P449891", "188683585596", "<div>clean</div>")
 
 
 def test_inventory_gateway_fails_closed_when_inventory_item_exists_without_matching_offer():

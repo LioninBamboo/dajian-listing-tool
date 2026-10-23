@@ -565,6 +565,14 @@ def extract_source_bom_lines(source_description: str) -> list[str]:
         rest = match.group(2).strip().rstrip(" ,.;")
         if not rest:
             continue
+        # A GIGA title like "4pcs Running Boards For 2024 2025 Toyota …" is
+        # not a BOM line (S3). Keep only short component rows.
+        if re.search(r"\b(?:for|fits?|compatible with)\b", rest, re.I) and re.search(
+            r"\b(?:19|20)\d{2}\b", rest
+        ):
+            continue
+        if len(rest) > 80:
+            continue
         # Keep supplier wording; normalize only the qty token spacing.
         unit = "pc" if qty == "1" else "pcs"
         line = f"{qty}{unit} {rest}"
@@ -693,15 +701,15 @@ def _auto_middle_html(
     placement = _first_aspect_value(aspects, "Placement on Vehicle")
     item_type = _first_aspect_value(aspects, "Type")
     if fitment:
-        features.append(("Vehicle Fit", f"{fitment} — verify the eBay compatibility table before purchase."))
+        features.append(("Vehicle Fit", fitment))
     if placement:
-        features.append(("Placement", f"Designed for {placement.lower()} installation on the vehicle."))
+        features.append(("Placement", placement))
     if material:
-        features.append(("Material", f"{material} construction for a solid, purpose-built fit."))
+        features.append(("Material", material))
     if finish:
-        features.append(("Finish", f"{finish} exterior that matches common factory-style trims."))
+        features.append(("Finish", finish))
     if item_type and len(features) < 4:
-        features.append(("Type", f"{item_type} built from the supplier source specifications."))
+        features.append(("Type", item_type))
     bom_lines = extract_source_bom_lines(source_description)
     source_plain = html.unescape(source_description or "")
     source_plain = re.sub(r"<[^>]+>", " ", source_plain)
@@ -713,9 +721,6 @@ def _auto_middle_html(
         snippet = whole_sentence_snippet(source_plain)
         if snippet and not any(marker in snippet.lower() for marker in _FURNITURE_DECOR_MARKERS):
             features.append(("Source Spec", snippet))
-    if not features:
-        features.append(("Purpose", "Built from the supplier source facts for this listing."))
-
     items = []
     for label, detail in features[:6]:
         items.append(
@@ -729,7 +734,11 @@ def _auto_middle_html(
         pkg_lines = build_package_lines_without_bom(
             title=title, item_type=item_type, aspects=aspects, source_description=source_description
         )
-        package_html = "<br/>".join(html.escape(line) for line in (pkg_lines or [f"1 x {item_type or 'Item'}"]))
+        if pkg_lines is None:
+            raise ValueError(
+                "package includes cannot be expanded honestly (set/kit with no source count)"
+            )
+        package_html = "<br/>".join(html.escape(line) for line in pkg_lines)
     return (
         "<div>"
         f"{intro}"

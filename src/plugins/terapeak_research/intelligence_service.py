@@ -25,6 +25,28 @@ from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
 
 
+def _breakdown_is_oversize(
+    breakdown: Dict,
+    specs: Optional[Dict] = None,
+    attributes: Optional[Dict] = None,
+) -> bool:
+    """True when stored GIGA insurance used the 5% freight rate, or specs say so."""
+    if "Dimensions" in (specs or {}) or "Dimensions" in (attributes or {}):
+        return True
+    try:
+        base = float(breakdown.get("base_cost") or 0)
+        insurance = float(breakdown.get("logistics_insurance") or 0)
+    except (TypeError, ValueError):
+        return False
+    if base > 0 and insurance > 0:
+        return (insurance / base) >= 0.04
+    try:
+        stored_rate = float(breakdown.get("logistics_insurance_rate") or 0)
+    except (TypeError, ValueError):
+        stored_rate = 0.0
+    return stored_rate >= 0.04
+
+
 def landed_cost_from_breakdown(
     cost_data: Optional[Dict] = None,
     *,
@@ -34,22 +56,52 @@ def landed_cost_from_breakdown(
 ) -> float:
     """Resolve a usable landed cost from a collected_products cost snapshot.
 
-    Returns ``PricingEngine.resolve_landed_cost`` when it is > 0, else ``0.0``
-    so the MI candidate is excluded. Does not fall back to raw ``base_cost``
-    or ``product_price`` (those omit freight and understate cost).
+    Recomputes with the stored oversize/freight-insurance rate (5% vs 3.2%)
+    when the snapshot used freight insurance. Floors at stored
+    ``total_dajian_cost`` so Main MI costs never drop. Returns 0.0 (candidate
+    excluded) when no positive resolved or stored landed cost exists. Does not
+    fall back to raw ``base_cost`` / ``product_price``.
     """
     breakdown = cost_data or {}
     try:
+        stored = float(breakdown.get("total_dajian_cost") or 0)
+    except (TypeError, ValueError):
+        stored = 0.0
+    try:
         from src.services.pricing_engine import PricingEngine
 
-        resolved = PricingEngine.resolve_landed_cost(
-            breakdown,
-            shipping_fallback=shipping_fallback,
-            specs=specs,
-            attributes=attributes,
-        )
-        if resolved and float(resolved) > 0:
-            return float(resolved)
+        oversize = _breakdown_is_oversize(breakdown, specs, attributes)
+        try:
+            product = float(breakdown.get("product_price") or 0)
+        except (TypeError, ValueError):
+            product = 0.0
+        try:
+            stored_ship = float(breakdown.get("shipping_cost") or 0)
+        except (TypeError, ValueError):
+            stored_ship = 0.0
+        try:
+            fallback_ship = float(shipping_fallback or 0)
+        except (TypeError, ValueError):
+            fallback_ship = 0.0
+        shipping = max(stored_ship, fallback_ship)
+        if product > 0:
+            resolved = PricingEngine.calculate_dajian_cost(product, shipping, oversize)[
+                "total_dajian_cost"
+            ]
+        else:
+            resolved = PricingEngine.resolve_landed_cost(
+                breakdown,
+                shipping_fallback=shipping_fallback,
+                specs=specs,
+                attributes=attributes,
+            )
+        new_cost = float(resolved) if resolved and float(resolved) > 0 else 0.0
+        if new_cost > 0 and stored > 0:
+            return max(new_cost, stored)
+        if new_cost > 0:
+            return new_cost
+        if stored > 0:
+            return stored
     except Exception:
         pass
     return 0.0
