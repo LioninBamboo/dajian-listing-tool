@@ -360,6 +360,20 @@ HOLD_TREE_UNAVAILABLE_ERROR = (
     "category tree unavailable; refresh failed; no publish"
 )
 NEEDS_MANUAL_MOTORS_LEAF_REVIEW = "needs_manual_motors_leaf_review"
+
+
+class CategoryGateResult(tuple):
+    """``(category_id, action, error)`` plus report-only ``.flags``.
+
+    Unpacks like the historical 3-tuple so existing callers stay intact.
+    """
+
+    def __new__(cls, category_id, action, error, flags=None):
+        inst = super().__new__(cls, (category_id, action, error))
+        inst.flags = list(flags or [])
+        return inst
+
+
 # Aqua READY tool items sitting in tree-0 furniture leaves (R7–R11).
 # Decision B3 default: do not hold; only report.
 MOTORS_FURNITURE_REVIEW_LEAVES: frozenset[str] = frozenset(
@@ -1561,6 +1575,42 @@ def category_gate_report_flags(
     return flags
 
 
+def explicit_override_target_allowed(
+    target_id: Any,
+    title: str = "",
+    *,
+    stored: Any = None,
+    index=None,
+    is_motors: bool | None = None,
+    indexes=None,
+) -> tuple[bool, str]:
+    """``--override-category-lock`` + explicit id: validate leaf/tree/fee.
+
+    Bypasses only ``APPROVED_AUTO_REMAPS``. Restoring the stored id is
+    allowed (name-only SYNC_DB / live restore). High-fee still wins on a
+    *new* target.
+    """
+    target = as_safe_category_id(target_id)
+    if not target:
+        return False, "invalid_target_leaf"
+    stored_id = as_safe_category_id(stored)
+    if target == stored_id:
+        return True, ""
+    ok, reason = validate_target_category(target, "classified", title, index=index)
+    if not ok:
+        return False, reason
+    tree_ok, tree_reason = validate_new_target_publish_tree(
+        target, is_motors=is_motors, indexes=indexes
+    )
+    if not tree_ok:
+        return False, tree_reason
+    from src.utils.publish_fee_preview import category_is_high_fee
+
+    if category_is_high_fee(target):
+        return False, "high_insertion_fee"
+    return True, ""
+
+
 def apply_category_write_gate(
     original_stored: Any,
     candidate_id: Any,
@@ -1637,12 +1687,15 @@ def gate_publish_category_choice(
     reason: str = "publish_candidate",
     kind: str = "classified",
     index=None,
-) -> tuple[str | None, str, str]:
+    optimization: Any = None,
+    is_motors: bool | None = None,
+    indexes=None,
+) -> CategoryGateResult:
     """Shared choke point for every manual/API publish category write.
 
-    Returns ``(category_id, action, error)``. ``error`` is set on hold;
-    callers must not publish or write a category when it is non-empty.
-    Unapproved remaps keep the stored id (report-only).
+    Returns ``(category_id, action, error)`` with report-only ``.flags``.
+    ``error`` is set on hold; callers must not publish or write a category
+    when it is non-empty. Unapproved remaps keep the stored id (report-only).
     """
     gated, action = apply_category_write_gate(
         original_stored,
@@ -1653,10 +1706,18 @@ def gate_publish_category_choice(
         kind=kind,
         index=index,
     )
+    flags = category_gate_report_flags(
+        original_stored,
+        optimization=optimization,
+        is_motors=is_motors,
+        indexes=indexes,
+    )
     if action == "hold_empty":
-        return None, action, HOLD_EMPTY_PUBLISH_ERROR
+        return CategoryGateResult(None, action, HOLD_EMPTY_PUBLISH_ERROR, flags)
     if action == "hold_implausible":
-        return None, action, hold_implausible_publish_error(original_stored, title)
+        return CategoryGateResult(
+            None, action, hold_implausible_publish_error(original_stored, title), flags
+        )
     if action == "hold_tree_unavailable":
-        return None, action, tree_unavailable_publish_error()
-    return gated, action, ""
+        return CategoryGateResult(None, action, tree_unavailable_publish_error(), flags)
+    return CategoryGateResult(gated, action, "", flags)

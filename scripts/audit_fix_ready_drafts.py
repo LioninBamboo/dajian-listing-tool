@@ -29,6 +29,7 @@ from src.utils.publish_autofix import sanitize_placeholder_aspects
 from src.utils.report_images import normalize_image_list
 from src.utils.publish_validation import first_aspect_text, measurement_issue
 from src.utils.approved_category import blocks_automated_category_change
+from src.utils.category_decision import category_gate_report_flags
 from src.utils.listing_quality_gate import (
     normalize_generated_listing,
 )
@@ -940,6 +941,7 @@ def audit_and_fix_ready_drafts(
         "unresolved": [],
         "marked_ready": [],
         "qc_results": [],
+        "category_flags": {},
     }
 
     for row in rows:
@@ -993,6 +995,11 @@ def audit_and_fix_ready_drafts(
             opt["categoryId"] = str(category_id)
         if category_name:
             opt["categoryName"] = category_name
+        row_flags = category_gate_report_flags(
+            original_opt.get("categoryId"), optimization=original_opt
+        )
+        if row_flags:
+            report["category_flags"][sku] = row_flags
 
         aspects = normalize_semantic_aspects(draft_title or row["title"], opt.get("categoryId"), aspects)
         aspects = apply_category_defaults(opt.get("categoryId"), aspects)

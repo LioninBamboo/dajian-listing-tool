@@ -174,6 +174,10 @@ def can_stamp_after_remap(
     return True, ""
 
 
+class StoredOptimizationReadError(RuntimeError):
+    """SQLite failed while reading a stored optimization; fail closed."""
+
+
 def load_stored_optimization(sku: str, db_path: Path | None = None) -> dict:
     path = Path(db_path) if db_path is not None else DEFAULT_DB
     if not path.is_file():
@@ -187,8 +191,10 @@ def load_stored_optimization(sku: str, db_path: Path | None = None) -> dict:
         if not row:
             return {}
         return _parse_optimization(row[0])
-    except sqlite3.Error:
-        return {}
+    except sqlite3.Error as exc:
+        raise StoredOptimizationReadError(
+            f"failed to read optimization for {sku}: {exc}"
+        ) from exc
     finally:
         conn.close()
 
@@ -458,7 +464,20 @@ def process_rows(
         wants_stamp = wants_approval_stamp(row, mark_category_approved)
         print(f"[{index}/{len(rows)}] {sku}  keys={keys}" + (f"  # {row['note']}" if row.get("note") else ""))
         if any(key in REMAP_KEYS for key in keys):
-            stored_opt = load_stored_optimization(sku, db_path=db_path)
+            try:
+                stored_opt = load_stored_optimization(sku, db_path=db_path)
+            except StoredOptimizationReadError as exc:
+                failures, should_stop = _fail_row(
+                    sku,
+                    failures=failures,
+                    stop_on_error=stop_on_error,
+                    message=str(exc),
+                    stop_label="database read failed.",
+                )
+                if should_stop:
+                    return 1
+                print()
+                continue
             lock_error = locked_category_write_error(
                 stored_opt, override=override_category_lock
             )
@@ -506,7 +525,20 @@ def process_rows(
             continue
 
         if wants_stamp and is_approve_only_row(row):
-            stored = load_stored_category_id(sku, db_path=db_path)
+            try:
+                stored = load_stored_category_id(sku, db_path=db_path)
+            except StoredOptimizationReadError as exc:
+                failures, should_stop = _fail_row(
+                    sku,
+                    failures=failures,
+                    stop_on_error=stop_on_error,
+                    message=str(exc),
+                    stop_label="database read failed.",
+                )
+                if should_stop:
+                    return 1
+                print()
+                continue
             if stored != requested:
                 failures, should_stop = _fail_row(
                     sku,
@@ -603,7 +635,20 @@ def process_rows(
             continue
 
         if wants_stamp:
-            stored = load_stored_category_id(sku, db_path=db_path) if apply else ""
+            try:
+                stored = load_stored_category_id(sku, db_path=db_path) if apply else ""
+            except StoredOptimizationReadError as exc:
+                failures, should_stop = _fail_row(
+                    sku,
+                    failures=failures,
+                    stop_on_error=stop_on_error,
+                    message=str(exc),
+                    stop_label="database read failed.",
+                )
+                if should_stop:
+                    return 1
+                print()
+                continue
             ok, reason = can_stamp_after_remap(
                 requested_id=requested,
                 returncode=result.returncode,

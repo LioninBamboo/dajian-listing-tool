@@ -470,10 +470,14 @@ def select_batch_publish_category(
     stored id (report-only). Empty stored holds. Implausible stored on
     READY/PENDING holds.
     """
-    from src.utils.category_decision import apply_category_write_gate
+    from src.utils.category_decision import (
+        apply_category_write_gate,
+        category_gate_report_flags,
+    )
 
     original_stored = str(stored_cat or "").strip() or None
     original_name = stored_cat_name
+    report_flags = category_gate_report_flags(original_stored, optimization=opt)
     title_context = title or ""
     existing_aspects = dict(existing_aspects or {})
     opt = opt or {}
@@ -492,6 +496,7 @@ def select_batch_publish_category(
                 "original_stored": original_stored,
                 "held": True,
                 "selected": None,
+                "flags": report_flags,
             }
 
     if original_stored in INVALID_CATEGORY_REMAP and not preserve_approved_category:
@@ -614,6 +619,7 @@ def select_batch_publish_category(
             "original_stored": original_stored,
             "held": True,
             "selected": selected,
+            "flags": report_flags,
         }
     if gated_id and gated_id == original_stored:
         selected_name = original_name or selected_name or f"Category {gated_id}"
@@ -639,6 +645,7 @@ def select_batch_publish_category(
         "original_stored": original_stored,
         "held": False,
         "selected": selected,
+        "flags": report_flags,
     }
 
 
@@ -1226,6 +1233,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     )
     stored_cat = choice.get("original_stored") or stored_cat
     completed_aspects = choice.get("aspects") or existing_aspects
+    category_flags = list(choice.get("flags") or [])
     if choice.get("held"):
         if choice.get("action") == "hold_empty":
             msg = "Cannot determine eBay category"
@@ -1238,11 +1246,16 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             from src.utils.category_decision import tree_unavailable_publish_error
 
             msg = tree_unavailable_publish_error()
-            return {"status": "error", "message": msg, "action": "hold_tree_unavailable"}
+            return {
+                "status": "error",
+                "message": msg,
+                "action": "hold_tree_unavailable",
+                "flags": category_flags,
+            }
         else:
             msg = f"Stored category {stored_cat} is not plausible for title '{title_context[:120]}'"
         record_error(sku, msg)
-        return {"status": "error", "message": msg}
+        return {"status": "error", "message": msg, "flags": category_flags}
     category_id = choice.get("category_id")
     category_name = choice.get("category_name")
     if not category_id:
@@ -1810,6 +1823,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 "listing_id": listing_id,
                 "offer_id": offer_id,
                 "category_id": category_id,
+                "flags": category_flags,
                 "write_state": "verified",
                 "readback": readback,
                 "qc_rule_ids": qc_result.get("rule_ids", []),

@@ -1803,6 +1803,13 @@ class EbayPublisher:
         )
 
         opt = product.get("optimization") if isinstance(product, dict) else None
+        if isinstance(opt, str) and opt.strip():
+            try:
+                parsed = json.loads(opt)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                opt = parsed
         if not isinstance(opt, dict):
             opt = {}
         if blocks_automated_category_change(opt):

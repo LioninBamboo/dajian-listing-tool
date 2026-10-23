@@ -36,7 +36,11 @@ from src.utils.approved_category import (  # noqa: E402
     locked_category_write_error,
     plan_locked_override_revision,
 )
-from src.utils.category_decision import gate_publish_category_choice  # noqa: E402
+from src.utils.category_decision import (  # noqa: E402
+    category_gate_report_flags,
+    explicit_override_target_allowed,
+    gate_publish_category_choice,
+)
 
 
 LOG_DIR = ROOT / "logs"
@@ -257,16 +261,16 @@ def audit_candidate(
         target_id = override_plan["target_id"] or None
         target_name = None
         if override_category_lock and explicit_target and explicit_target == target_id:
-            gated, gate_action, hold_err = gate_publish_category_choice(
-                stored, explicit_target, title, "PUBLISHED", reason="override_category_lock"
+            ok, reason = explicit_override_target_allowed(
+                explicit_target, title, stored=stored
             )
-            if hold_err or gate_action != "remap":
-                action = "would_remap_report_only" if gate_action == "keep" else "SKIP"
-                skip_reason = hold_err or gate_action or "would_remap_report_only"
+            if not ok:
+                action = "SKIP"
+                skip_reason = reason
                 target_id = explicit_target
             else:
                 action = override_plan["action"] or "REVISE_LIVE"
-                target_id = gated or explicit_target
+                target_id = explicit_target
         else:
             action = "category_locked"
             skip_reason = "category_locked"
@@ -340,6 +344,7 @@ def audit_candidate(
         "skip_canonicalize": locked,
         "skip_reason": skip_reason,
         "action": action,
+        "flags": category_gate_report_flags(stored, optimization=opt),
     }
 
 
@@ -349,15 +354,26 @@ def apply_live_revision(conn: sqlite3.Connection, matcher, client, product_row: 
     lock_error = locked_category_write_error(opt, override=override_category_lock)
     if lock_error:
         raise RuntimeError(lock_error)
-    gated, action, hold_err = gate_publish_category_choice(
-        opt.get("categoryId"),
-        candidate["target_category_id"],
-        candidate.get("title") or "",
-        "PUBLISHED",
-        reason="override_category_lock" if override_category_lock else "publish_candidate",
-    )
-    if hold_err or action != "remap":
-        raise RuntimeError(hold_err or "would_remap_report_only")
+    target = candidate.get("target_category_id")
+    stored = opt.get("categoryId")
+    title = candidate.get("title") or ""
+    if str(target or "").strip() == str(stored or "").strip():
+        pass
+    elif override_category_lock:
+        ok, reason = explicit_override_target_allowed(target, title, stored=stored)
+        if not ok:
+            raise RuntimeError(reason)
+    else:
+        gated, action, hold_err = gate_publish_category_choice(
+            stored,
+            target,
+            title,
+            "PUBLISHED",
+            reason="publish_candidate",
+            optimization=opt,
+        )
+        if hold_err or action != "remap":
+            raise RuntimeError(hold_err or "would_remap_report_only")
     enrich_product_dimensions(product_row)
 
     opt["categoryId"] = candidate["target_category_id"]
@@ -414,15 +430,26 @@ def apply_db_sync(conn: sqlite3.Connection, product_row: dict, candidate: dict, 
     lock_error = locked_category_write_error(opt, override=override_category_lock)
     if lock_error:
         raise RuntimeError(lock_error)
-    gated, action, hold_err = gate_publish_category_choice(
-        opt.get("categoryId"),
-        candidate.get("final_category_id") or candidate.get("target_category_id"),
-        candidate.get("title") or "",
-        "PUBLISHED",
-        reason="override_category_lock" if override_category_lock else "publish_candidate",
-    )
-    if hold_err or action != "remap":
-        raise RuntimeError(hold_err or "would_remap_report_only")
+    target = candidate.get("final_category_id") or candidate.get("target_category_id")
+    stored = opt.get("categoryId")
+    title = candidate.get("title") or ""
+    if str(target or "").strip() == str(stored or "").strip():
+        pass
+    elif override_category_lock:
+        ok, reason = explicit_override_target_allowed(target, title, stored=stored)
+        if not ok:
+            raise RuntimeError(reason)
+    else:
+        gated, action, hold_err = gate_publish_category_choice(
+            stored,
+            target,
+            title,
+            "PUBLISHED",
+            reason="publish_candidate",
+            optimization=opt,
+        )
+        if hold_err or action != "remap":
+            raise RuntimeError(hold_err or "would_remap_report_only")
     update_local_optimization(
         conn,
         product_row["sku"],

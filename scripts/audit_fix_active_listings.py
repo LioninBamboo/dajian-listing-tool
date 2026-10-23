@@ -103,6 +103,7 @@ from src.utils.approved_category import (
     is_category_approved,
     locked_category_write_error,
 )
+from src.utils.category_decision import category_gate_report_flags
 from src.utils.publish_validation import first_aspect_text, measurement_issue
 from src.utils.publish_autofix import (
     SINGLE_VALUE_ASPECTS,
@@ -1050,6 +1051,14 @@ def audit_single_product(
                     f"'{(opt_title or title)[:80]}'"
                 ),
             })
+
+    for flag in category_gate_report_flags(stored_category, optimization=opt):
+        issues.append({
+            "type": flag,
+            "severity": "INFO",
+            "current": stored_category or None,
+            "detail": flag,
+        })
 
     # ── 2. Dimension Accuracy ──
     source_dims = extract_all_dimensions(attrs)

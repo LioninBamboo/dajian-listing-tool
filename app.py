@@ -966,8 +966,12 @@ def publish_with_auto_category(product: dict) -> dict:
         if live_category_id:
             opt_data["liveCategoryId"] = live_category_id
             opt_data["liveCategoryName"] = live_category_name
-            # For already-published listings, prefer showing the actual live category next time.
-            opt_data["categoryId"] = live_category_id
+            # For already-published listings, prefer showing the actual live
+            # category next time — unless the lock is set (keep the pin).
+            from src.utils.approved_category import blocks_automated_category_change
+
+            if not blocks_automated_category_change(opt_data):
+                opt_data["categoryId"] = live_category_id
 
     for attempt in range(max_retries):
         try:
