@@ -2,15 +2,18 @@
 
 Publish and dry-run read ``data/cache/category_tree_<id>.json``. When that
 snapshot is missing or stale they refresh it in-process via read-only
-``getCategoryTree`` (tree 0 for Main/GP, tree 100 for AquaRides Motors)
-using the store app-token path, then write the snapshot back. Only if that
-refresh fails do they fail closed. No scheduled task is required.
+``getCategoryTree`` (tree 0 for Main/GP; trees 100 and 0 for AquaRides
+Motors) using the store app-token path, then write the snapshot back
+atomically. Refresh failure uses a last-good snapshot (<=30 days) or
+fail-closes. No scheduled task is required.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -19,6 +22,8 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CACHE_DIR = REPO_ROOT / "data" / "cache"
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+LAST_GOOD_SNAPSHOT_SECONDS = 30 * 24 * 60 * 60
+RUNTIME_REFRESH_RETRY_SECONDS = 30 * 60
 DEFAULT_TREE_IDS = ("0", "100")
 PATH_SEPARATOR = " > "
 PRODUCTION_API_BASE = "https://api.ebay.com"
@@ -30,7 +35,7 @@ logger = logging.getLogger(__name__)
 _INDEX: Optional[dict[str, tuple[str, str]]] = None
 _INDEX_DIR: Optional[Path] = None
 _CACHE_WARNED: set[str] = set()
-_RUNTIME_REFRESH_ATTEMPTED: set[str] = set()
+_RUNTIME_REFRESH_ATTEMPTED: dict[str, float] = {}
 _REFRESH_FAIL_WARNED = False
 
 
@@ -123,14 +128,14 @@ def _warn_cache_unavailable(tree_id: str, path: Path, reason: str) -> None:
 
 
 def store_runtime_tree_ids() -> tuple[str, ...]:
-    """Tree 0 for Main/GP; tree 100 for AquaRides Motors."""
+    """Tree 0 for Main/GP; trees 100 and 0 for AquaRides Motors."""
     try:
         from src.utils.store_profile import get_store_profile
 
         profile = get_store_profile()
         tid = str(getattr(profile, "category_tree_id", None) or "0").strip() or "0"
         if bool(getattr(profile, "is_motors", False)) or tid == "100":
-            return ("100",)
+            return ("100", "0")
         return ("0",)
     except Exception:
         return ("0",)
@@ -154,14 +159,56 @@ def _warn_refresh_failed_once() -> None:
         pass
 
 
+def _snapshot_age_seconds(path: Path, now: Optional[float] = None) -> Optional[float]:
+    if not path.is_file():
+        return None
+    age = (now if now is not None else time.time()) - path.stat().st_mtime
+    if age < 0:
+        return None
+    return age
+
+
+def _cache_is_last_good(path: Path, now: Optional[float] = None) -> bool:
+    age = _snapshot_age_seconds(path, now)
+    return age is not None and age <= LAST_GOOD_SNAPSHOT_SECONDS
+
+
+def _refresh_failure_reason(exc: BaseException) -> str:
+    text = str(exc or "")
+    if "missing EBAY_APP_ID" in text or "CERT_ID" in text:
+        return "missing EBAY_APP_ID/CERT_ID"
+    http = re.search(r"HTTP\s+(\d+)", text)
+    if http:
+        return f"{type(exc).__name__} HTTP {http.group(1)}"
+    return type(exc).__name__
+
+
+def _log_refresh_failure(tree_id: str, exc: BaseException) -> None:
+    logger.warning(
+        "Runtime category-tree refresh failed for tree %s: %s",
+        tree_id,
+        _refresh_failure_reason(exc),
+    )
+
+
+def _warn_last_good(tree_id: str, path: Path, now: Optional[float] = None) -> None:
+    age = _snapshot_age_seconds(path, now) or 0.0
+    logger.warning(
+        "Category tree %s refresh failed; using last-good snapshot (%.1f days old) at %s",
+        tree_id,
+        age / 86400,
+        path,
+    )
+
+
 def _default_runtime_refresh(tree_id: str, cache_dir: Optional[Path]) -> bool:
     """GET getCategoryTree with the store app token; write data/cache."""
-    import os
-
     import requests
 
     from src.services.ebay_auth import EbayOAuthService
 
+    if not os.getenv("EBAY_APP_ID") or not os.getenv("EBAY_CERT_ID"):
+        raise RuntimeError("missing EBAY_APP_ID/CERT_ID")
     env = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION").upper()
     oauth = EbayOAuthService(env)
     api_base = getattr(oauth, "api_base", "") or PRODUCTION_API_BASE
@@ -184,32 +231,39 @@ def try_runtime_refresh_tree(tree_id: str, cache_dir: Optional[Path] = None) -> 
     """Refresh one missing/stale tree. Mock this in tests; never hit live eBay."""
     directory = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
     key = f"{directory}:{tree_id}"
-    if key in _RUNTIME_REFRESH_ATTEMPTED:
+    now = time.time()
+    last = _RUNTIME_REFRESH_ATTEMPTED.get(key)
+    if last is not None and (now - last) < RUNTIME_REFRESH_RETRY_SECONDS:
         return False
-    _RUNTIME_REFRESH_ATTEMPTED.add(key)
+    _RUNTIME_REFRESH_ATTEMPTED[key] = now
     try:
         return bool(_runtime_refresh_impl(str(tree_id), directory))
     except Exception as exc:
-        logger.debug("Runtime category-tree refresh failed for tree %s: %s", tree_id, exc)
+        _log_refresh_failure(tree_id, exc)
         return False
 
 
 def _load_one_tree(tree_id: str, cache_dir: Path) -> dict[str, tuple[str, str]]:
     path = category_tree_cache_path(tree_id, cache_dir)
+    owned = str(tree_id) in {str(tid) for tid in store_runtime_tree_ids()}
     needs_refresh = (not path.is_file()) or (not _cache_is_fresh(path))
-    if needs_refresh and str(tree_id) in store_runtime_tree_ids():
+    used_last_good = False
+    if needs_refresh and owned:
         if try_runtime_refresh_tree(tree_id, cache_dir):
             path = category_tree_cache_path(tree_id, cache_dir)
+        elif _cache_is_last_good(path):
+            _warn_last_good(tree_id, path)
+            used_last_good = True
         else:
             _warn_refresh_failed_once()
             return {}
     if not path.is_file():
-        if str(tree_id) not in store_runtime_tree_ids():
+        if not owned:
             return {}
         _warn_cache_unavailable(tree_id, path, "missing")
         return {}
-    if not _cache_is_fresh(path):
-        if str(tree_id) not in store_runtime_tree_ids():
+    if not _cache_is_fresh(path) and not used_last_good:
+        if not owned:
             return {}
         _warn_cache_unavailable(tree_id, path, "stale")
         return {}
@@ -289,7 +343,16 @@ def write_category_tree_cache(
     stamped[SOURCE_HOST_FIELD] = host
     path = category_tree_cache_path(tree_id, cache_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(stamped), encoding="utf-8")
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(stamped), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     reset_category_tree_cache()
     return path
 

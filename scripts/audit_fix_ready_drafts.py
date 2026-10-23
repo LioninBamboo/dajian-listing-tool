@@ -661,7 +661,7 @@ def choose_ready_category(
             listing_status=listing_status or "READY",
             reason="ready_draft_candidate",
         )
-        if action in {"hold_empty", "hold_implausible"}:
+        if action in {"hold_empty", "hold_implausible", "hold_tree_unavailable"}:
             return original_id or None, original_name if original_id else None, aspects
         if gated == original_id:
             if not original_id:

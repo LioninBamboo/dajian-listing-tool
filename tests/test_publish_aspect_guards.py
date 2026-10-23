@@ -925,7 +925,9 @@ def test_missing_cache_returns_empty_and_blacklist_by_id_still_blocks(monkeypatc
     )
     result = batch_publish.publish_single_product(product, dry_run=True)
     assert result["status"] == "error"
-    assert result["copy_skip_reasons"] == ["high_insertion_fee"]
+    from src.utils.category_decision import HOLD_TREE_UNAVAILABLE_ERROR
+
+    assert HOLD_TREE_UNAVAILABLE_ERROR in str(result.get("message") or "")
 
 
 def test_resolve_path_uses_blacklist_categories_path_when_cache_missing(monkeypatch, tmp_path):

@@ -1759,11 +1759,62 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             except Exception:
                 return ebay_client.oauth.get_valid_token()
 
+        from src.utils.category_decision import (
+            gate_publish_category_choice,
+            publish_listing_status,
+            stored_category_name_for_keep,
+        )
+
+        gate_status = publish_listing_status(getattr(product, "status", ""))
+        original_name = stored_cat_name
+
+        def _restore_original_category():
+            if not original_stored:
+                return
+            opt_data["categoryId"] = original_stored
+            opt_data["categoryName"] = stored_category_name_for_keep(
+                original_stored, original_name
+            )
+            product.optimization = opt_data
+            flag_modified(product, "optimization")
+
+        def _rebind_kept_stored(gated_id, candidate_id):
+            nonlocal category_id, category_name, completed_aspects
+            category_id = gated_id
+            if not gated_id or str(gated_id) == str(candidate_id or "").strip():
+                return
+            category_name = stored_category_name_for_keep(original_stored, original_name)
+            completed_aspects = dict(existing_aspects)
+            completed_aspects = complete_publish_aspects(
+                completed_aspects,
+                title=listing_title,
+                category_id=category_id,
+                attrs=attrs,
+                description=description,
+                category_required_aspects=EbayPublisher.CATEGORY_REQUIRED_ASPECTS,
+                log=print,
+            )
+            enforce_store_brand_aspect(completed_aspects)
+            sanitize_single_value_aspects(completed_aspects, log=print)
+            rebound_blockers = _get_publish_blockers(
+                category_matcher,
+                title_context,
+                completed_aspects,
+                category_id,
+                category_name,
+                skip_canonicalize=preserve_approved_category,
+            )
+            if rebound_blockers:
+                raise HTTPException(
+                    status_code=400,
+                    detail="; ".join(rebound_blockers),
+                )
+
         gated = apply_category_publish_gate(
             category_id=category_id,
             category_name=category_name,
             title=title_context or listing_title,
-            product=product,
+            product=None,
             aspects=completed_aspects,
             ebay_client=ebay_client,
             oauth=ebay_client.oauth,
@@ -1775,6 +1826,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             matcher=category_matcher,
         )
         if not isinstance(gated, tuple):
+            _restore_original_category()
             product.status = "READY"
             flag_modified(product, "optimization")
             flag_modified(product, "logs")
@@ -1785,19 +1837,17 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                 "errors": [HUMAN_GATE_ERROR],
             }
         category_id, category_name, completed_aspects = gated
-        from src.utils.category_decision import gate_publish_category_choice
-
+        candidate_before_gate = category_id
         category_id, _gate_action, hold_err = gate_publish_category_choice(
             original_stored,
             category_id,
             title_context or listing_title,
-            getattr(product, "status", "") or "READY",
+            gate_status,
         )
         if hold_err:
-            if original_stored:
-                opt_data["categoryId"] = original_stored
-                product.optimization = opt_data
+            _restore_original_category()
             raise HTTPException(status_code=400, detail=hold_err)
+        _rebind_kept_stored(category_id, candidate_before_gate)
         opt_data["categoryId"] = category_id
         if category_name:
             opt_data["categoryName"] = category_name
@@ -1955,7 +2005,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                                 category_id=category_id,
                                 category_name=category_name,
                                 title=title_context or listing_title,
-                                product=product,
+                                product=None,
                                 aspects=completed_aspects,
                                 ebay_client=ebay_client,
                                 oauth=ebay_client.oauth,
@@ -1971,6 +2021,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                             remapped = None
                         if not isinstance(remapped, tuple):
                             last_error = HUMAN_GATE_ERROR
+                            _restore_original_category()
                             product.status = "READY"
                             flag_modified(product, "logs")
                             flag_modified(product, "optimization")
@@ -1980,25 +2031,32 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                             original_stored,
                             new_id,
                             title_context or listing_title,
-                            getattr(product, "status", "") or "READY",
+                            gate_status,
                         )
-                        if retry_hold:
-                            last_error = retry_hold
+                        if retry_hold or retry_action != "remap" or not gated_retry or str(gated_retry) == str(original_stored):
+                            last_error = retry_hold or HUMAN_GATE_ERROR
+                            _restore_original_category()
                             product.status = "READY"
                             flag_modified(product, "logs")
-                            break
-                        if retry_action == "remap" and gated_retry and str(gated_retry) != str(original_stored):
-                            category_id, category_name = gated_retry, new_name
-                            opt_data["categoryId"] = category_id
-                            opt_data["categoryName"] = category_name
-                            product.optimization = opt_data
                             flag_modified(product, "optimization")
-                            print(f"[CAT_REMAP] retry category: {category_id}")
-                            fixed = True
-                        else:
-                            last_error = HUMAN_GATE_ERROR
-                            product.status = "READY"
                             break
+                        category_id, category_name = gated_retry, new_name
+                        completed_aspects = dict(existing_aspects)
+                        completed_aspects = complete_publish_aspects(
+                            completed_aspects,
+                            title=listing_title,
+                            category_id=category_id,
+                            attrs=attrs,
+                            description=description,
+                            category_required_aspects=EbayPublisher.CATEGORY_REQUIRED_ASPECTS,
+                            log=print,
+                        )
+                        opt_data["categoryId"] = category_id
+                        opt_data["categoryName"] = category_name
+                        product.optimization = opt_data
+                        flag_modified(product, "optimization")
+                        print(f"[CAT_REMAP] retry category: {category_id}")
+                        fixed = True
                     
                     if fixed:
                         print(f"[AUTO-FIX] Retrying (attempt {attempt+2})...")

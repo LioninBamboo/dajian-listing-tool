@@ -695,9 +695,16 @@ def publish_to_ebay(product: dict) -> dict:
             source_title=product.get('title', ''),
         )
         description = opt_data.get("description", product.get('description', ''))
-        original_stored = remap_legacy_category_id(opt_data.get("categoryId", ""))
-        category_id = original_stored
-        if not is_sellable_leaf_category(oauth, category_id):
+        original_stored = str(opt_data.get("categoryId") or "").strip()
+        from src.utils.category_decision import (
+            gate_publish_category_choice,
+            legacy_remap_candidate,
+            publish_listing_status,
+        )
+
+        remapped, gate_reason = legacy_remap_candidate(original_stored)
+        category_id = remapped or original_stored
+        if gate_reason != "legacy_invalid_remap" and not is_sellable_leaf_category(oauth, category_id):
             from src.services.ebay_category_matcher import EbayCategoryMatcher
             matcher = EbayCategoryMatcher(oauth)
             matched_id, _, _ = matcher.get_category_and_aspects(
@@ -706,13 +713,13 @@ def publish_to_ebay(product: dict) -> dict:
                 description,
             )
             category_id = remap_legacy_category_id(matched_id)
-        from src.utils.category_decision import gate_publish_category_choice
-
+            gate_reason = "publish_candidate"
         category_id, _gate_action, hold_err = gate_publish_category_choice(
             original_stored,
             category_id,
             title,
-            product.get("status") or "READY",
+            publish_listing_status(product.get("status")),
+            reason=gate_reason,
         )
         if hold_err:
             return {"status": "error", "message": hold_err}
@@ -978,8 +985,15 @@ def publish_with_auto_category(product: dict) -> dict:
                 product.get('description', '')
             )
             category_id = remap_legacy_category_id(category_id)
-            original_stored = remap_legacy_category_id(opt_data.get("categoryId", ""))
+            original_stored = str(opt_data.get("categoryId") or "").strip()
             stored_cat = original_stored
+            from src.utils.category_decision import (
+                gate_publish_category_choice,
+                legacy_remap_candidate,
+                publish_listing_status,
+                stored_category_name_for_keep,
+            )
+            _legacy_candidate, _legacy_reason = legacy_remap_candidate(original_stored)
             from src.utils.approved_category import evaluate_approved_category
 
             approved_decision = evaluate_approved_category(stored_cat, opt_data)
@@ -1008,24 +1022,36 @@ def publish_with_auto_category(product: dict) -> dict:
                 print(f"[AUTO] Category: {category_id} ({category_name})")
                 print(f"[AUTO] Aspects: {len(completed_aspects)} items")
             else:
-                category_id = stored_cat
+                category_id = stored_cat or original_stored
                 completed_aspects = existing_aspects
                 if category_id:
                     print(f"[AUTO] Fallback to stored category: {category_id}")
-                else:
-                    return {"status": "error", "message": "无法确定有效类目，请先运行草稿审计修复"}
-            from src.utils.category_decision import gate_publish_category_choice
-
+            candidate_before_gate = category_id
+            gate_reason = (
+                _legacy_reason
+                if _legacy_reason == "legacy_invalid_remap"
+                and str(candidate_before_gate or "") == str(_legacy_candidate or "")
+                else "publish_candidate"
+            )
+            if not candidate_before_gate and _legacy_reason == "legacy_invalid_remap":
+                candidate_before_gate = _legacy_candidate
+                gate_reason = _legacy_reason
             category_id, _gate_action, hold_err = gate_publish_category_choice(
                 original_stored,
-                category_id,
+                candidate_before_gate,
                 opt_data.get("title", product.get("title", "")),
-                product.get("status") or "READY",
+                publish_listing_status(product.get("status")),
+                reason=gate_reason,
             )
             if hold_err:
                 return {"status": "error", "message": hold_err}
             if not category_id:
                 return {"status": "error", "message": "无法确定有效类目，请先运行草稿审计修复"}
+            if category_id != str(candidate_before_gate or "").strip():
+                category_name = stored_category_name_for_keep(
+                    original_stored, opt_data.get("categoryName")
+                )
+                completed_aspects = dict(existing_aspects)
             
             completed_aspects = complete_publish_aspects(
                 completed_aspects,
@@ -1154,7 +1180,7 @@ def publish_with_auto_category(product: dict) -> dict:
                             original_stored,
                             remapped,
                             opt_data.get("title", product.get("title", "")),
-                            product.get("status") or "READY",
+                            publish_listing_status(product.get("status")),
                             reason="app_invalid_category_autofix",
                         )
                         if fix_hold:

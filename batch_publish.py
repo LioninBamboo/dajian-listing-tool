@@ -581,7 +581,7 @@ def select_batch_publish_category(
         listing_status=listing_status,
         reason="publish_candidate",
     )
-    if action in {"hold_empty", "hold_implausible"}:
+    if action in {"hold_empty", "hold_implausible", "hold_tree_unavailable"}:
         return {
             "category_id": None,
             "category_name": None,
@@ -1202,6 +1202,10 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 f"Stored category {stored_cat} is not publishable for title "
                 f"'{title_context[:120]}'"
             )
+        elif choice.get("action") == "hold_tree_unavailable":
+            from src.utils.category_decision import HOLD_TREE_UNAVAILABLE_ERROR
+
+            msg = HOLD_TREE_UNAVAILABLE_ERROR
         else:
             msg = f"Stored category {stored_cat} is not plausible for title '{title_context[:120]}'"
         record_error(sku, msg)
@@ -1278,7 +1282,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         listing_status,
         is_motors=get_store_profile().is_motors,
     )
-    if restore_action in {"hold_empty", "hold_implausible"}:
+    if restore_action in {"hold_empty", "hold_implausible", "hold_tree_unavailable"}:
         msg = restore_detail or f"Stored category {stored_cat} is not publishable"
         record_error(sku, msg)
         return {"status": "error", "message": msg}

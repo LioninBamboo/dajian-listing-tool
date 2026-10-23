@@ -315,6 +315,15 @@ _GRILL_TABLE_RE = re.compile(
     r"\b(?:grill|bbq|barbecue)\s+tables?\b",
     re.IGNORECASE,
 )
+_GRILL_CART_RE = re.compile(
+    r"\b(?:grill\s+carts?|bbq\s+carts?|barbecue\s+carts?|"
+    r"outdoor\s+kitchen\s+islands?)\b",
+    re.IGNORECASE,
+)
+_BARBECUE_CATEGORY_IDS = frozenset({"20725"})
+_BARBECUE_PATH_PREFIXES = (
+    "Home & Garden > Yard, Garden & Outdoor Living > Outdoor Heating, Cooking & Eating",
+)
 _TREE_UNAVAILABLE_WARNED = False
 
 # Ship empty. Optional JSON override: data/config/approved_auto_remaps.json
@@ -338,6 +347,9 @@ _KIND_ALLOWED_STORED = {
 HOLD_EMPTY_PUBLISH_ERROR = (
     "Stored category is empty or invalid; holding publish. No category write."
 )
+HOLD_TREE_UNAVAILABLE_ERROR = (
+    "category tree unavailable; refresh failed; no publish"
+)
 
 _SUGGESTED_ALTERNATIVES = {
     "38200": "38204",
@@ -352,9 +364,10 @@ def _category_index(index=None):
 
     if index is not None:
         return dict(index)
-    flat = load_category_index()
-    if not flat:
+    loaded = load_category_index()
+    if not loaded:
         return {}
+    flat = dict(loaded)
     for cid, meta in _TREE_KNOWN_PUBLISHABLE_INDEX.items():
         flat.setdefault(cid, meta)
     return flat
@@ -390,6 +403,11 @@ def unpublished_listing_status(status: str = "") -> bool:
     }
 
 
+def publish_listing_status(status: str = "") -> str:
+    """Manual/API publish treats every non-PUBLISHED row as READY (about to publish)."""
+    return "PUBLISHED" if str(status or "").strip().upper() == "PUBLISHED" else "READY"
+
+
 def _looks_like_tool_title(title: str) -> bool:
     return bool(_TOOL_TITLE_RE.search(as_safe_text(title)))
 
@@ -400,6 +418,37 @@ def _looks_like_kitchen_island_title(title: str) -> bool:
 
 def _looks_like_grill_table_title(title: str) -> bool:
     return bool(_GRILL_TABLE_RE.search(as_safe_text(title)))
+
+
+def _looks_like_grill_cart_title(title: str) -> bool:
+    return bool(_GRILL_CART_RE.search(as_safe_text(title)))
+
+
+def _is_barbecue_category(cid: str, index=None) -> bool:
+    stored = as_safe_category_id(cid)
+    if stored in _BARBECUE_CATEGORY_IDS:
+        return True
+    path = _category_path(stored, index=index)
+    return any(path.startswith(prefix) for prefix in _BARBECUE_PATH_PREFIXES)
+
+
+def legacy_remap_candidate(stored: Any) -> tuple[str, str]:
+    """Raw stored id plus the INVALID_CATEGORY_REMAP candidate, if any."""
+    from src.services.taxonomy_constants import normalize_legacy_category_id
+
+    raw = as_safe_category_id(stored)
+    remapped = normalize_legacy_category_id(raw)
+    if remapped and raw and remapped != raw:
+        return remapped, "legacy_invalid_remap"
+    return remapped or raw, "publish_candidate"
+
+
+def stored_category_name_for_keep(original_stored: Any, stored_name: Any = None) -> str:
+    stored = as_safe_category_id(original_stored)
+    name = str(stored_name or "").strip()
+    if name:
+        return name
+    return f"Category {stored}" if stored else ""
 
 
 def _confident_title_kind(title: str) -> str:
@@ -417,10 +466,30 @@ def _confident_title_kind(title: str) -> str:
         return "outdoor_table"
     if _looks_like_kitchen_island_title(hay):
         return "kitchen_island"
-    head = first_product_noun(hay)
-    if head == "hall tree" or re.search(r"\bhall\s+tree\b", hay, re.IGNORECASE):
+    if _title_is_hall_tree_head(hay):
         return "hall_tree"
     return ""
+
+
+def _title_is_hall_tree_head(title: str) -> bool:
+    """True only when hall tree is the live head noun, not a later mention."""
+    hay = as_safe_text(title)
+    if not hay:
+        return False
+    head = first_product_noun(hay)
+    if head == "hall tree":
+        return True
+    from src.utils.product_context_signals import _first_product_noun_clause
+
+    clause = _first_product_noun_clause(hay)
+    if not clause or not re.search(r"\bhall\s+tree\b", clause, re.IGNORECASE):
+        return False
+    # Same first-clause product named as a coat rack (T3971P401872).
+    if head in {None, "coat rack", "coat stand"}:
+        return True
+    if head and str(head).startswith(UNKNOWN_HEAD_PREFIX):
+        return True
+    return False
 
 
 def hold_implausible_publish_error(stored: str, title: str = "") -> str:
@@ -447,6 +516,8 @@ def _title_agrees_with_stored(title: str, stored: str, index=None) -> bool:
     if deny == "mattress" or head == "mattress":
         return stored_id in _HEAD_FITS_STORED["mattress"]
     if _SPORTS_KEEP_RE.search(hay):
+        return True
+    if _looks_like_grill_cart_title(hay) and _is_barbecue_category(stored_id, index):
         return True
     if _looks_like_tool_title(hay):
         path = _category_path(stored_id, index=index)
@@ -544,6 +615,8 @@ def validate_target_category(
     species = pet_species_mismatch_reason(title, path)
     if species:
         return False, species
+    if _looks_like_grill_cart_title(title) and _is_barbecue_category(target, index=flat):
+        return True, ""
     if kind in _FURNITURE_KINDS:
         effective_kind = kind
     else:
@@ -561,7 +634,7 @@ def validate_target_category(
                 "outdoor_table",
             }:
                 return False, "implausible_target_path"
-    if effective_kind in _FURNITURE_KINDS:
+    if effective_kind in _FURNITURE_KINDS and target not in TREE_KNOWN_PUBLISHABLE_LEAVES:
         if not any(path.startswith(prefix) for prefix in FURNITURE_PATH_PREFIXES):
             return False, "implausible_target_path"
     if target == KITCHEN_ISLAND and "Power Tool" in path:
@@ -686,7 +759,7 @@ def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDe
         return CategoryDecision(None, "unknown", "bar_cabinet_not_wine_rack")
     if head in _WINE_RACK_HEADS:
         return CategoryDecision(WINE_RACK, "wine_rack", "wine_rack_head", "Wine Racks & Bottle Holders")
-    if head == "hall tree" or re.search(r"\bhall\s+tree\b", hay, re.IGNORECASE):
+    if _title_is_hall_tree_head(hay):
         return CategoryDecision(HALL_TREE, "hall_tree", "hall_tree_head", "Coat & Hat Racks")
     if head in {"sideboard", "buffet"} and as_safe_category_id(stored) not in {"183322", "63557"}:
         return CategoryDecision(SIDEBOARD, "sideboard", "sideboard_head", "Sideboards & Buffets")
@@ -978,19 +1051,22 @@ def apply_category_write_gate(
     """Gate every publish/draft category choice.
 
     Returns (category_id_or_None_to_hold, action) where action is
-    ``remap``, ``keep``, ``hold_empty``, or ``hold_implausible``.
+    ``remap``, ``keep``, ``hold_empty``, ``hold_implausible``, or
+    ``hold_tree_unavailable``.
     Unapproved remaps keep the original stored id. Empty stored holds.
     Invalid/implausible stored holds READY/PENDING/READY_TO_PUBLISH and
-    stays manifest-only for PUBLISHED.
+    stays manifest-only for PUBLISHED. Missing tree on a publish path holds.
     """
     stored = as_safe_category_id(original_stored)
     candidate = as_safe_category_id(candidate_id)
     unpublished = unpublished_listing_status(listing_status)
     if not category_tree_is_available(index):
         warn_once_tree_unavailable()
+        if unpublished:
+            return None, "hold_tree_unavailable"
         if stored:
             return stored, "keep"
-        return (None, "hold_empty") if unpublished else (candidate or None, "keep")
+        return candidate or None, "keep"
 
     action = "keep"
     chosen = stored
@@ -1011,6 +1087,8 @@ def apply_category_write_gate(
         stored_ok, stored_reason = validate_target_category(stored, "", title, index=index)
         if stored_reason == "tree_unavailable":
             warn_once_tree_unavailable()
+            if unpublished:
+                return None, "hold_tree_unavailable"
             return stored, "keep"
         if not stored_ok and unpublished:
             return None, "hold_implausible"
@@ -1046,4 +1124,6 @@ def gate_publish_category_choice(
         return None, action, HOLD_EMPTY_PUBLISH_ERROR
     if action == "hold_implausible":
         return None, action, hold_implausible_publish_error(original_stored, title)
+    if action == "hold_tree_unavailable":
+        return None, action, HOLD_TREE_UNAVAILABLE_ERROR
     return gated, action, ""
