@@ -12,7 +12,8 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -208,6 +209,32 @@ def _report_timestamp(path: Path, data: dict | None, clock: datetime) -> float |
     return age_ts
 
 
+_AUDIT_FILENAME_DATE_RE = re.compile(r"listing_audit_fix_(\d{8})")
+
+
+def _file_in_picker_window(path: Path, clock: datetime, allow_yesterday: bool) -> bool:
+    """Cheap pre-filter so the picker does not read every historical JSON."""
+    name = getattr(path, "name", "") or ""
+    match = _AUDIT_FILENAME_DATE_RE.search(name)
+    if match:
+        try:
+            file_date = datetime.strptime(match.group(1), "%Y%m%d").date()
+        except ValueError:
+            file_date = None
+        if file_date is not None:
+            if allow_yesterday:
+                return file_date >= (clock - timedelta(hours=36)).date()
+            return file_date == clock.date()
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return False
+    if allow_yesterday:
+        return mtime >= clock.timestamp() - 36 * 3600
+    start = datetime(clock.year, clock.month, clock.day).timestamp()
+    return mtime >= start
+
+
 def _same_local_day_after_six(ts: float, clock: datetime) -> bool:
     try:
         generated = datetime.fromtimestamp(ts)
@@ -249,6 +276,8 @@ def pick_latest_daily_live_audit(
             continue
         name = getattr(path, "name", "") or ""
         if "listing_audit_fix_" not in name:
+            continue
+        if not _file_in_picker_window(path, clock, allow_yesterday):
             continue
         parse_error = None
         data = None
@@ -320,19 +349,22 @@ def pick_latest_daily_live_audit(
     return chosen, data
 
 
-def derive_queue_from_latest_audit(limit: int | None = None) -> list[str]:
+def derive_queue_from_latest_audit(
+    limit: int | None = None,
+    picked: tuple[Path, dict] | None = None,
+    allow_yesterday: bool = False,
+) -> list[str]:
     """Project §8.2: latest fresh daily live_audit → rewrite queue.
 
-    Switched from pick_latest_full_corpus_audit: that helper prefers
-    total_published > 500, so a 6-day-old 1000-row report beats today's 217-row
-    live_audit. --from-daily-audit must process today's findings or do nothing.
-    Fail closed (empty queue) rather than rewriting from stale issues.
+    Accepts an already-picked ``(path, data)`` from ``main()`` so
+    ``--allow-yesterday`` is not lost on the second picker call.
     """
-    logs = ROOT / "logs"
-    files = list(logs.glob("listing_audit_fix_*.json"))
-    if not files:
-        return []
-    picked = pick_latest_daily_live_audit(files)
+    if picked is None:
+        logs = ROOT / "logs"
+        files = list(logs.glob("listing_audit_fix_*.json"))
+        if not files:
+            return []
+        picked = pick_latest_daily_live_audit(files, allow_yesterday=allow_yesterday)
     if not picked:
         return []
     chosen, data = picked
@@ -466,7 +498,11 @@ def main(argv: list[str] | None = None) -> int:
         if not picked:
             print(last_daily_audit_skip_message())
             return 0
-        skus = derive_queue_from_latest_audit(limit=None)
+        skus = derive_queue_from_latest_audit(
+            limit=None,
+            picked=picked,
+            allow_yesterday=bool(args.allow_yesterday),
+        )
         skus = _exclude_done_and_human(skus)
         if args.limit:
             skus = skus[: args.limit]

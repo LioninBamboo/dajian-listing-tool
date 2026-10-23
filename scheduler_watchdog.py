@@ -310,19 +310,33 @@ def _newer_qualifying_audit_since(since_iso, today):
 def _task_succeeded_today(health, task_name, today):
     info = _get_task_info(health, task_name)
     status = str(info.get('status', '')).lower()
+    at = info.get('at')
+    audit_driven = {
+        'source_aspect_autofix',
+        'semantic_rewrite',
+        'missing_video_autofix',
+    }
+    if status == 'skipped':
+        if str(task_name) not in audit_driven or not at:
+            return False
+        try:
+            if datetime.fromisoformat(at).date() != today:
+                return False
+        except Exception:
+            return False
+        if _newer_qualifying_audit_since(at, today):
+            return False
+        return True
     if status not in {
-        'success', 'ok', 'partial_success', 'completed_with_errors', 'skipped'
+        'success', 'ok', 'partial_success', 'completed_with_errors'
     }:
         return False
-    at = info.get('at')
     if not at:
         return False
     try:
         if datetime.fromisoformat(at).date() != today:
             return False
     except Exception:
-        return False
-    if status == 'skipped' and _newer_qualifying_audit_since(at, today):
         return False
     return True
 

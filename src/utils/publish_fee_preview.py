@@ -182,6 +182,55 @@ def category_is_high_fee(
     return False
 
 
+def resolve_category_taxonomy_path(category_id: str, index=None) -> str:
+    """Full taxonomy path from the on-disk tree index. Empty when unknown."""
+    try:
+        from src.utils.category_tree_cache import build_category_path
+
+        return str(build_category_path(str(category_id or "").strip(), index=index) or "")
+    except Exception:
+        return ""
+
+
+def blacklist_file_is_empty(blacklist_path: Optional[str] = None) -> bool:
+    data = _read_blacklist_payload(blacklist_path)
+    if data is None:
+        return True
+    ids = _ids_from_blacklist_payload(data)
+    paths = _path_entries_from_blacklist_payload(data)
+    return not ids and not paths
+
+
+def guard_category_write_high_fee(
+    category_id: str = "",
+    category_name: str = "",
+    *,
+    allow_unverified_fee: bool = False,
+    index: Optional[Mapping[str, Any]] = None,
+    blacklist_path: Optional[str] = None,
+) -> Optional[str]:
+    """Block a category write using the real GP/Aqua call shape.
+
+    Resolves the full taxonomy path (not just the leaf name) before the
+    path-segment check. ``get_listing_fees(offer_id)`` is intentionally not
+    called here: it reflects the offer's *current* category, not the target.
+    """
+    cid = str(category_id or "").strip()
+    path = resolve_category_taxonomy_path(cid, index=index)
+    empty_blacklist = blacklist_file_is_empty(blacklist_path)
+    if not path and empty_blacklist and not allow_unverified_fee:
+        return (
+            f"BLOCKED_HIGH_FEE_UNVERIFIED: category {cid or category_name or '?'} "
+            "path unresolved and high-fee blacklist empty"
+        )
+    return high_fee_category_block_reason(
+        category_id=cid,
+        category_path=path,
+        category_name=category_name,
+        blacklist_path=blacklist_path,
+    )
+
+
 def high_fee_category_block_reason(
     category_id: str = "",
     category_path: str = "",

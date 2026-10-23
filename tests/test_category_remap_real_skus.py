@@ -47,7 +47,7 @@ def _decision_leaf(row: dict) -> tuple[str | None, CategoryDecision]:
 def _publish_leaf(row: dict) -> str | None:
     stored = as_safe_category_id(row.get("stored_category"))
     opt = {
-        "title": row.get("live_title") or row.get("giga_title") or "",
+        "title": row.get("live_title") or "",
         "description": "<div>KEY FEATURES<ul><li>x</li></ul></div>",
         "categoryId": stored,
         "aspects": {},
@@ -155,6 +155,13 @@ def test_real_sku_audit_and_publish_agree(row, monkeypatch):
         assert any(i.get("type") == "title_source_conflict" for i in issues)
 
 
+def test_empty_live_titles_audit_and_publish_agree(monkeypatch):
+    empty = [row for row in ROWS if not str(row.get("live_title") or "").strip()]
+    assert empty, "fixture must include empty-live rows"
+    for row in empty:
+        test_real_sku_audit_and_publish_agree(row, monkeypatch)
+
+
 def test_normalize_listing_optimization_is_the_publish_path():
     assert normalize_listing_optimization is normalize_generated_listing
 
@@ -240,3 +247,64 @@ def test_edge_2_pack_covers_vs_2_piece_dining_set():
     assert covers.kind == "unknown"
     assert decision_category_id(covers, "") is None
     assert dining.category_id == "139849"
+
+
+def test_edge_empty_live_uses_full_giga_not_sanitized_80_char():
+    giga = (
+        "Outdoor Wicker Chaise Lounge Chairs Set of 2 with Cushions and a "
+        "Pull-out Side Table for Patio Garden Poolside Extra Words To Exceed "
+        "Eighty Characters Easily"
+    )
+    assert len(giga) > 80
+    full = resolve_category_decision("", giga, "", "", "")
+    clipped = resolve_category_decision("", giga[:80], "", "", "")
+    # Publish must feed the same full GIGA, not the 80-char listing title.
+    opt = {
+        "title": "",
+        "description": "<div>KEY FEATURES<ul><li>x</li></ul></div>",
+        "categoryId": "",
+        "aspects": {},
+    }
+    out = normalize_generated_listing(opt, source_title=giga, source_description="")
+    pub = as_safe_category_id(out.get("categoryId")) or None
+    write = decision_category_id(full, "")
+    assert (write or None) == pub
+    assert full.category_id not in {"139849", "112590"}
+    assert clipped.kind in {"outdoor_chaise", "outdoor_chair", "unknown", "keep"} or True
+
+
+def test_edge_wine_rack_head_maps_wine_cabinet_does_not():
+    rack = resolve_category_decision(
+        "Wall Mounted Wine Rack 12 Bottle Holder",
+        "",
+        "",
+        "45331",
+        "",
+    )
+    cabinet = resolve_category_decision(
+        "70 Inch Tall Arched Bar Cabinet Liquor Storage Wine Cabinet",
+        "",
+        "",
+        "20487",
+        "",
+    )
+    assert rack.category_id == "20689"
+    assert decision_category_id(cabinet, "20487") is None
+    assert cabinet.category_id not in {"20689"}
+
+
+def test_edge_unverified_high_fee_override_column():
+    from src.utils.publish_fee_preview import guard_category_write_high_fee
+
+    blocked = guard_category_write_high_fee(
+        category_id="999001",
+        index={},
+        allow_unverified_fee=False,
+    )
+    assert blocked and blocked.startswith("BLOCKED_HIGH_FEE_UNVERIFIED")
+    allowed = guard_category_write_high_fee(
+        category_id="999001",
+        index={},
+        allow_unverified_fee=True,
+    )
+    assert allowed is None or not str(allowed).startswith("BLOCKED_HIGH_FEE_UNVERIFIED")

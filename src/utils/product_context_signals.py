@@ -121,8 +121,8 @@ _COMPOUND_PHRASES: tuple[str, ...] = (
 
 _OTTOMAN_COMPOUND_RE = re.compile(
     r"(?:"
-    r"\b(?:and|with)\b.{0,48}\bottomans?\b"
-    r"|\b(?:sectional|sofa|couch|loveseat|recliner)\b.{0,80}\bottomans?\b"
+    r"\b(?:and|with)\b.{0,48}\b(?:ottomans?|footstools?)\b"
+    r"|\b(?:sectional|sofa|couch|loveseat|recliner)\b.{0,80}\b(?:ottomans?|footstools?)\b"
     r")",
     re.IGNORECASE,
 )
@@ -169,12 +169,94 @@ _CAPACITY_PHRASE_RE = re.compile(
 _TABLE_WORDS = (
     "dining table",
     "bistro table",
+    "bar table",
     "patio table",
     "outdoor table",
     "kitchen table",
-    "table",
+    "table and chairs",
+    "table and chair",
 )
 _SEATING_WORDS = ("chair", "chairs", "bench", "benches", "stool", "stools")
+_CHAISE_LOUNGE_WORDS = (
+    "chaise",
+    "chaise lounge",
+    "lounge chair",
+    "lounger",
+    "sun lounger",
+    "recliner",
+)
+_SIDE_END_TABLE_WORDS = ("side table", "end table")
+
+# Leftmost product noun wins. Longer phrases are preferred on the same start.
+_FIRST_NOUN_PHRASES: tuple[str, ...] = (
+    "outdoor daybed",
+    "patio daybed",
+    "daybed",
+    "nesting coffee table",
+    "coffee table",
+    "cocktail table",
+    "nesting table",
+    "dog crate",
+    "dog kennel",
+    "pet cage",
+    "pet crate",
+    "cat litter box",
+    "litter box enclosure",
+    "litter enclosure",
+    "cat furniture",
+    "raised garden bed",
+    "garden bed",
+    "planter",
+    "steel wagon",
+    "console table",
+    "chaise lounge",
+    "sun lounger",
+    "lounger",
+    "chaise",
+    "coffee bar cabinet",
+    "bar cabinet",
+    "liquor cabinet",
+    "wine cabinet",
+    "wine rack",
+    "bottle holder",
+    "stemware rack",
+    "glass display cabinet",
+    "display cabinet",
+    "curio cabinet",
+    "medicine cabinet",
+    "bathroom cabinet",
+    "pantry cabinet",
+    "bookshelf",
+    "bookcase",
+    "hall tree",
+    "sideboard",
+    "buffet",
+    "dining table",
+    "bistro table",
+    "bar table",
+    "end table",
+    "side table",
+    "sectional sofa",
+    "conversation set",
+    "patio furniture set",
+    "furniture set",
+    "patio set",
+    "storage footstool",
+    "footstool",
+    "ottoman",
+    "dining chair",
+    "club armchair",
+    "armchair",
+    "lounge chair",
+    "chair cushion",
+    "chair cover",
+    "seat cushion",
+    "slipcover",
+    "sofa",
+    "couch",
+    "loveseat",
+    "wagon",
+)
 
 
 def as_safe_text(value) -> str:
@@ -242,6 +324,26 @@ def title_has_clear_outdoor_word(text: str) -> bool:
     return bool(_OUTDOOR_MARKER_RE.search(clause))
 
 
+def first_product_noun(text: str) -> str | None:
+    """Leftmost product noun in the live head clause. Never invents a leaf."""
+    core = strip_room_location_lists(head_clause(as_safe_text(text)) or as_safe_text(text))
+    if not core:
+        return None
+    best: tuple[int, int, str] | None = None
+    for phrase in _FIRST_NOUN_PHRASES:
+        match = re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(phrase)}s?(?![A-Za-z0-9])",
+            core,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        candidate = (match.start(), -len(phrase), phrase)
+        if best is None or candidate < best:
+            best = candidate
+    return best[2] if best else None
+
+
 def title_is_chair_accessory(text: str) -> bool:
     """Accessory only when the accessory noun IS the head noun.
 
@@ -257,6 +359,21 @@ def title_is_chair_accessory(text: str) -> bool:
         re.IGNORECASE,
     ):
         return False
+    head = first_product_noun(hay)
+    if head in {
+        "dining chair",
+        "armchair",
+        "club armchair",
+        "lounge chair",
+        "chaise",
+        "chaise lounge",
+        "sofa",
+        "couch",
+        "loveseat",
+    }:
+        return False
+    if head in {"chair cushion", "chair cover", "seat cushion", "slipcover"}:
+        return True
     if re.search(r"\bonly\b.{0,24}\b(?:chair\s+)?cushions?\b", hay, re.IGNORECASE):
         return True
     if re.search(
@@ -265,8 +382,9 @@ def title_is_chair_accessory(text: str) -> bool:
         re.IGNORECASE,
     ):
         return True
+    if head:
+        return False
     # Head noun is the accessory: "chair cushion(s)", "seat cushion", "slipcover".
-    # "Dining Chairs Set of 2 … Navy Cushions" does not contain this compound.
     if re.search(
         r"\b(?:chair|seat)\s+(?:cushions?|covers?|pads?|pillows?)\b",
         hay,
@@ -347,6 +465,10 @@ def title_is_dining_set_bundle(text: str) -> bool:
         return False
     if _SEATING_NEGATION_RE.search(hay):
         return False
+    if has_any_phrase(hay, _CHAISE_LOUNGE_WORDS) and not has_any_phrase(
+        hay, ("dining table", "bistro table", "bar table")
+    ):
+        return False
     if _is_chair_only_n_piece(hay):
         return False
     seating = _has_seating_evidence(hay)
@@ -409,11 +531,11 @@ _LOFT_DESK_RE = re.compile(
     re.IGNORECASE,
 )
 _CHAIR_AND_OTTOMAN_SET_RE = re.compile(
-    r"\b(?:accent\s+)?chairs?\b.{0,32}\band\b.{0,32}\bottoman\b.{0,16}\bset\b",
+    r"\b(?:accent\s+)?chairs?\b.{0,32}\band\b.{0,32}\b(?:ottoman|footstool)\b.{0,16}\bset\b",
     re.IGNORECASE,
 )
 _SOFA_OTTOMAN_RE = re.compile(
-    r"\b(?:sectional|sofa|couch|loveseat)\b.{0,80}\bottomans?\b",
+    r"\b(?:sectional|sofa|couch|loveseat)\b.{0,80}\b(?:ottomans?|footstools?)\b",
     re.IGNORECASE,
 )
 _PATIO_SET_RE = re.compile(
@@ -483,35 +605,51 @@ def compound_product_family(text: str) -> str | None:
     if title_is_dining_set_bundle(hay):
         return "dining_set"
     chair_set_head = re.search(
-        r"\bset of\s+\d+\b.{0,64}\b(?:club |dining |outdoor |patio )?chairs?\b",
+        r"\bset of\s+\d+\b.{0,64}\b(?:club |dining |outdoor |patio |chaise |lounge )?chairs?\b",
         hay,
         re.IGNORECASE,
     )
     if chair_set_head and not title_is_dining_set_bundle(hay):
         return None
-    if has_any_phrase(
-        hay,
-        (
-            "patio furniture set",
-            "patio set",
-            "patio conversation",
-            "conversation set",
-            "outdoor conversation set",
-            "outdoor furniture set",
-            "outdoor sectional",
-            "outdoor sofa set",
-            "furniture sofa set",
-            "furniture set",
-        ),
-    ) or (_PATIO_SET_RE.search(hay) and title_has_clear_outdoor_word(hay)):
-        return "patio_furniture_set"
+    head = first_product_noun(hay)
+    chair_heads = {
+        "dining chair",
+        "armchair",
+        "club armchair",
+        "lounge chair",
+        "chaise",
+        "chaise lounge",
+        "lounger",
+        "sun lounger",
+    }
+    patio_phrases = (
+        "patio furniture set",
+        "patio set",
+        "patio conversation",
+        "conversation set",
+        "outdoor conversation set",
+        "outdoor furniture set",
+        "outdoor sectional",
+        "outdoor sofa set",
+        "furniture sofa set",
+        "furniture set",
+    )
+    if head not in chair_heads and (
+        has_any_phrase(hay, patio_phrases)
+        or (_PATIO_SET_RE.search(hay) and title_has_clear_outdoor_word(hay))
+    ):
+        if title_has_clear_outdoor_word(hay):
+            return "patio_furniture_set"
+        if has_any_phrase(hay, ("sofa", "couch", "loveseat", "sectional", "living room")):
+            return "sofa"
+        return "unknown"
     if _KITCHEN_ISLAND_TABLE_RE.search(hay):
         return "kitchen_island"
     if _COFFEE_TABLE_OTTOMAN_RE.search(hay):
         return "coffee_table"
     if _SOFA_OTTOMAN_RE.search(hay) or (
         has_any_phrase(hay, ("sectional", "sofa", "couch", "loveseat"))
-        and has_any_phrase(hay, ("ottoman", "ottomans"))
+        and has_any_phrase(hay, ("ottoman", "ottomans", "footstool", "footstools"))
     ):
         return "sofa"
     if _CHAIR_AND_OTTOMAN_SET_RE.search(hay):
@@ -642,6 +780,7 @@ STORED_LEAF_LOCK: dict[str, tuple[str, ...]] = {
     "262980": ("bench",),
     "20490": ("ottoman",),
     "88057": ("sewing table", "craft table", "sewing machine table"),
+    "20487": ("bar cabinet", "liquor cabinet"),
 }
 
 OUTDOOR_STORED_LEAVES = frozenset({"79684", "79682", "139849", "112590", "138996"})
@@ -666,13 +805,20 @@ def stored_leaf_locked(title: str, stored_category: str) -> bool:
     if not phrases:
         return False
     core = strip_room_location_lists(head_clause(hay)) or hay
+    core = re.sub(r"\bmedicine\s+glass\s+cabinet\b", "medicine cabinet", core, flags=re.IGNORECASE)
+    core = re.sub(r"\bglass\s+medicine\s+cabinet\b", "medicine cabinet", core, flags=re.IGNORECASE)
     if stored == "262980":
         # Lock benches only when "bench" is the head noun, not workbench/chaise stuffing.
         return bool(primary_product_noun(core) in {"dining_bench", "storage_bench"} or (
             has_phrase(core, "bench") and not has_any_phrase(core, ("workbench", "work bench"))
         ))
     if stored == "20490":
-        return primary_product_noun(core) in {"ottoman", "storage_ottoman", "ottoman_bench"} or has_phrase(core, "ottoman")
+        head = first_product_noun(core)
+        return head in {"ottoman", "storage footstool", "footstool"} or primary_product_noun(core) in {
+            "ottoman",
+            "storage_ottoman",
+            "ottoman_bench",
+        }
     if stored == "75671":
         # Kitchen cart is 177000; wagon/utility cart stays 75671.
         return has_any_phrase(core, ("wagon", "utility cart", "garden cart", "steel wagon"))

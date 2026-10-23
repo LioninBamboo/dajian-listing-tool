@@ -1107,7 +1107,11 @@ def test_from_daily_audit_empty_queue_exits_zero(monkeypatch, capsys):
             {"issues": [{"sku": "X1"}]},
         ),
     )
-    monkeypatch.setattr(cli, "derive_queue_from_latest_audit", lambda limit=None: ["X1", "X2"])
+    monkeypatch.setattr(
+        cli,
+        "derive_queue_from_latest_audit",
+        lambda limit=None, picked=None, allow_yesterday=False: ["X1", "X2"],
+    )
     monkeypatch.setattr(cli, "_exclude_done_and_human", lambda skus: [])
     code = cli.main(["--from-daily-audit", "--limit", "40"])
     assert code == 0

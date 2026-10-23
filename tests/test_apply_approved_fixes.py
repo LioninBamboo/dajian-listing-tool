@@ -42,6 +42,7 @@ class TestManifestParsing:
             "fix_keys": ["Assembly Required", "Item Length"],
             "note": "two keys",
             "category_id": "",
+            "allow_unverified_fee": False,
         }
         assert rows[1]["fix_keys"] == ["categoryId"]
         assert rows[1]["category_id"] == ""
@@ -432,6 +433,22 @@ class TestExplicitCategoryStamp:
                 encoding="utf-8",
             )
         monkeypatch.setattr(aaf, "ROOT", tmp_path)
+
+        def _furniture_path(category_id, cache_dir=None, index=None):
+            cid = str(category_id or "").strip()
+            furniture = {
+                "176991": "Home & Garden > Furniture > Cabinets & Cupboards > Bathroom Cabinets",
+                "20748": "Home & Garden > Furniture > Cabinets & Cupboards",
+                "20487": "Home & Garden > Furniture > Cabinets & Cupboards",
+                "38200": "Home & Garden > Furniture > Tables > End Tables",
+            }
+            return furniture.get(cid, "")
+
+        # Stub the tree index only — the high-fee gate itself still runs.
+        monkeypatch.setattr(
+            "src.utils.category_tree_cache.build_category_path",
+            _furniture_path,
+        )
 
     def _db(self, tmp_path, sku, opt):
         import json

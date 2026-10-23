@@ -67,23 +67,50 @@ def test_high_fee_twenty_dollar_preview_fails_closed():
     assert reason and reason.startswith("BLOCKED_HIGH_FEE")
 
 
-def test_apply_approved_fixes_blocks_high_fee_category():
+def _trailer_path(category_id, cache_dir=None, index=None):
+    cid = str(category_id or "").strip()
+    if cid == "6001":
+        return "eBay Motors > Other Vehicles & Trailers > Trailers"
+    return ""
+
+
+def test_process_rows_blocks_trailer_leaf_empty_blacklist_gp_layout(tmp_path, monkeypatch):
+    from src.utils import publish_fee_preview
     from scripts import apply_approved_fixes as aaf
 
-    blocked = aaf.high_fee_category_block_reason(
-        category_id="1",
-        category_name="Trailers",
+    monkeypatch.setattr(publish_fee_preview, "REPO_ROOT", tmp_path)
+    publish_fee_preview._EMPTY_BLACKLIST_WARNED.clear()
+    monkeypatch.setattr("src.utils.category_tree_cache.build_category_path", _trailer_path)
+
+    rows = [
+        {
+            "sku": "GP-TRAILER",
+            "fix_keys": ["categoryId"],
+            "category_id": "6001",
+            "note": "gp empty-blacklist layout",
+            "allow_unverified_fee": False,
+        }
+    ]
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("audit must not run after high-fee block")
+
+    rc = aaf.process_rows(
+        rows,
+        apply=False,
+        mark_category_approved=False,
+        run_audit=_boom,
     )
-    assert blocked and blocked.startswith("BLOCKED_HIGH_FEE")
+    assert rc == 1
 
 
-def test_fix_listing_on_ebay_blocks_high_fee_category_write(monkeypatch):
+def test_fix_listing_on_ebay_blocks_trailer_leaf_empty_blacklist(tmp_path, monkeypatch):
+    from src.utils import publish_fee_preview
     from scripts import audit_fix_active_listings
 
-    monkeypatch.setattr(
-        "src.utils.publish_fee_preview.high_fee_category_block_reason",
-        lambda **kwargs: "BLOCKED_HIGH_FEE: trailers",
-    )
+    monkeypatch.setattr(publish_fee_preview, "REPO_ROOT", tmp_path)
+    publish_fee_preview._EMPTY_BLACKLIST_WARNED.clear()
+    monkeypatch.setattr("src.utils.category_tree_cache.build_category_path", _trailer_path)
 
     class _Client:
         pass
@@ -102,6 +129,17 @@ def test_fix_listing_on_ebay_blocks_high_fee_category_write(monkeypatch):
         None,
     )
     assert results and str(results[0]).startswith("BLOCKED_HIGH_FEE")
+    assert "UNVERIFIED" not in str(results[0])
+
+
+def test_unresolvable_path_empty_blacklist_fails_closed(tmp_path, monkeypatch):
+    from src.utils import publish_fee_preview
+
+    monkeypatch.setattr(publish_fee_preview, "REPO_ROOT", tmp_path)
+    publish_fee_preview._EMPTY_BLACKLIST_WARNED.clear()
+    monkeypatch.setattr("src.utils.category_tree_cache.build_category_path", lambda *a, **k: "")
+    reason = publish_fee_preview.guard_category_write_high_fee(category_id="999001")
+    assert reason and reason.startswith("BLOCKED_HIGH_FEE_UNVERIFIED")
 
 
 def test_count_double_sided_and_double_bed_drawers_are_not_two():
@@ -223,3 +261,87 @@ def test_legacy_optimization_list_stays_empty_dict():
     assert parse_json("[1, 2]") == {}
     assert parse_json("not-json") == {}
     assert parse_json(None) == {}
+
+
+def test_allow_yesterday_reuses_picked_report_for_queue(tmp_path, monkeypatch):
+    from scripts import semantic_rewrite as sr
+    from scripts.semantic_rewrite import derive_queue_from_latest_audit, pick_latest_daily_live_audit
+
+    monkeypatch.setattr(sr, "ROOT", tmp_path)
+    now = datetime(2026, 10, 22, 12, 10, 0)
+    yesterday = tmp_path / "listing_audit_fix_20261021_113000.json"
+    yesterday.write_text(
+        json.dumps(
+            {
+                "mode": "live_audit",
+                "scope": "full",
+                "total_published": 202,
+                "generated_at": (now - timedelta(hours=24)).isoformat(),
+                "issues": [{"sku": "OLD1", "issues": [{"type": "semantic_material", "severity": "CRITICAL"}]}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    picked = pick_latest_daily_live_audit(
+        list(tmp_path.glob("*.json")), now=now, allow_yesterday=True
+    )
+    assert picked is not None
+    queue = derive_queue_from_latest_audit(picked=picked, allow_yesterday=True)
+    assert "OLD1" in queue
+
+
+def test_watchdog_skipped_audit_task_is_done_without_pythonw(monkeypatch):
+    import scheduler_watchdog as wd
+
+    today = datetime(2026, 10, 23).date()
+    health = {
+        "tasks": {
+            "source_aspect_autofix": {"status": "skipped", "at": "2026-10-23T12:10:00"},
+            "listing_audit": {"status": "skipped", "at": "2026-10-23T11:30:00"},
+        }
+    }
+    monkeypatch.setattr(wd, "_newer_qualifying_audit_since", lambda *a, **k: False)
+
+    def _info(data, name):
+        return (data.get("tasks") or {}).get(name) or {}
+
+    monkeypatch.setattr(wd, "_get_task_info", _info)
+    assert wd._task_succeeded_today(health, "source_aspect_autofix", today) is True
+    assert wd._task_succeeded_today(health, "listing_audit", today) is False
+
+
+def test_category_implausible_has_no_category_write(monkeypatch):
+    from scripts import audit_fix_active_listings
+
+    class _Matcher:
+        def is_category_plausible_for_text(self, title, category_id, category_name):
+            return False
+
+        def canonicalize_category(self, *args, **kwargs):
+            return None, None
+
+    monkeypatch.setattr(audit_fix_active_listings, "get_category_matcher", lambda: _Matcher())
+    issues, fixes = audit_fix_active_listings.audit_single_product(
+        "N770P358873T",
+        "Heavy Duty Bolt Cutter 24 Inch",
+        "{}",
+        "{}",
+        json.dumps(
+            {
+                "title": "Heavy Duty Bolt Cutter 24 Inch",
+                "categoryId": "42430",
+                "aspects": {
+                    "Material": ["Wood"],
+                    "Item Length": ["30 in"],
+                    "Item Width": ["12 in"],
+                    "Item Height": ["29 in"],
+                },
+                "description": "<div>AQUAVERVE KEY FEATURES <li>x</li> SPECIFICATIONS 30 12 29 Ships from California, USA</div>",
+            }
+        ),
+        "src",
+    )
+    implausible = [i for i in issues if i.get("type") == "category_implausible"]
+    assert implausible, issues
+    assert implausible[0].get("expected") is None
+    assert "categoryId" not in fixes

@@ -13,6 +13,7 @@ import logging
 from typing import Dict, List, Optional, Any, Tuple
 
 from src.utils.product_context_signals import (
+    first_product_noun,
     has_any_phrase,
     has_phrase,
     mentions_cooler_product,
@@ -394,17 +395,8 @@ class EbayCategoryMatcher:
                 "pantry",
             )
         )
-        has_wine_storage = (
-            not kitchen_buffet_context
-            and (
-                any(kw in product_text_lower for kw in ("wine rack", "wine cabinet", "stemware rack"))
-                or (
-                    "bar cabinet" in product_text_lower
-                    and "coffee bar cabinet" not in product_text_lower
-                    and any(kw in product_text_lower for kw in ("wine", "stemware", "liquor", "bottle"))
-                )
-            )
-        )
+        wine_head = first_product_noun(title_lower or product_text_lower)
+        has_wine_storage = wine_head in {"wine rack", "bottle holder", "stemware rack"}
         has_hall_tree = any(
             kw in product_text_lower for kw in ("hall tree", "coat rack bench", "hall stand")
         )
@@ -428,10 +420,18 @@ class EbayCategoryMatcher:
                 )
             )
         )
-        has_display_cabinet = (
-            not has_pantry_cabinet
-            and any(kw in text_lower for kw in ("display cabinet", "curio cabinet", "glass cabinet"))
-        )
+        display_head = first_product_noun(title_lower or product_text_lower)
+        has_display_cabinet = display_head in {
+            "display cabinet",
+            "curio cabinet",
+            "glass display cabinet",
+        } and display_head not in {
+            "bookshelf",
+            "bookcase",
+            "medicine cabinet",
+            "bathroom cabinet",
+            "pantry cabinet",
+        }
         # "cooler" is also the comparative of "cool", and outdoor copy is full of
         # it ("cozy even in cooler weather", "ideal for cooler months"). The bare
         # \bcooler\b match therefore wanted to move 4 bell tents into
@@ -1221,7 +1221,7 @@ class EbayCategoryMatcher:
             "outdoor table", "patio table",
             "outdoor side table", "outdoor end table", "patio side table", "patio end table",
         )
-        wine_storage_markers = ("wine rack", "wine cabinet", "stemware rack")
+        wine_storage_markers = ("wine rack", "bottle holder", "stemware rack")
         hall_tree_markers = ("hall tree", "coat rack bench", "hall stand")
 
         if any(kw in title_lower for kw in pet_identity_terms):
@@ -1366,12 +1366,8 @@ class EbayCategoryMatcher:
             if cid not in outdoor_table_categories:
                 return False
 
-        has_bar_cabinet_wine_context = (
-            "bar cabinet" in title_lower
-            and "coffee bar cabinet" not in title_lower
-            and any(kw in title_lower for kw in ("wine", "stemware", "liquor", "bottle"))
-        )
-        has_wine_storage_context = any(marker in title_lower for marker in wine_storage_markers) or has_bar_cabinet_wine_context
+        wine_head = first_product_noun(title_lower)
+        has_wine_storage_context = wine_head in {"wine rack", "bottle holder", "stemware rack"}
         if has_wine_storage_context:
             if cid not in wine_storage_categories:
                 return False
@@ -1903,7 +1899,7 @@ class EbayCategoryMatcher:
             (["buffet", "sideboard", "credenza"], "183322", "Sideboards & Buffets"),
             (["china cabinet"], "38217", "China Cabinets"),
             (["hutch"], "20487", "Cabinets & Cupboards"),
-            (["wine rack", "wine cabinet", "stemware rack", "bar cabinet"], "20689", "Wine Racks & Bottle Holders"),
+            (["wine rack", "bottle holder", "stemware rack"], "20689", "Wine Racks & Bottle Holders"),
             (["pantry", "pantry cabinet"], "42428", "Pantry Cabinets"),
             
             # ==================== OFFICE ====================

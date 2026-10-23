@@ -993,6 +993,25 @@ def audit_single_product(
         fixes["categoryId"] = write_id
         if decision.category_name:
             fixes["categoryName"] = decision.category_name
+    elif not skip_category_remap and stored_category and not write_id:
+        try:
+            matcher = get_category_matcher()
+            plausible = matcher.is_category_plausible_for_text(
+                opt_title or title, stored_category, stored_category_name
+            )
+        except Exception:
+            plausible = True
+        if plausible is False:
+            issues.append({
+                "type": "category_implausible",
+                "severity": "HIGH",
+                "current": stored_category,
+                "expected": None,
+                "detail": (
+                    f"stored category {stored_category} is implausible for "
+                    f"'{(opt_title or title)[:80]}'"
+                ),
+            })
 
     # ── 2. Dimension Accuracy ──
     source_dims = extract_all_dimensions(attrs)
@@ -3386,19 +3405,13 @@ def fix_listing_on_ebay(
     # Apply aspect fixes
     for key, value in fixes.items():
         if key == "categoryId":
-            from src.utils.publish_fee_preview import high_fee_category_block_reason
+            from src.utils.publish_fee_preview import guard_category_write_high_fee
 
-            listing_fees = None
-            try:
-                preview = getattr(ebay_client, "publish_fee_preview", None)
-                if callable(preview):
-                    listing_fees = preview(sku, value)
-            except Exception:
-                listing_fees = None
-            blocked = high_fee_category_block_reason(
+            # get_listing_fees(offer_id) reflects the offer's current category,
+            # not this target leaf, so it is not used as a $20 preview here.
+            blocked = guard_category_write_high_fee(
                 category_id=str(value or ""),
                 category_name=str(fixes.get("categoryName") or new_category_name or ""),
-                listing_fees=listing_fees,
             )
             if blocked:
                 return [f"{blocked} [{sku}]"]

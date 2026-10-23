@@ -376,7 +376,24 @@ def _task_succeeded_today(task_name, now=None):
 
     status = str(info.get('status', '')).lower()
     at = info.get('at')
-    done_statuses = {'success', 'ok', 'partial_success', 'completed_with_errors', 'skipped'}
+    audit_driven = {
+        'source_aspect_autofix',
+        'semantic_rewrite',
+        'missing_video_autofix',
+    }
+    done_statuses = {'success', 'ok', 'partial_success', 'completed_with_errors'}
+    if status == 'skipped':
+        if str(task_name) not in audit_driven or not at:
+            return False
+        try:
+            last_dt = datetime.fromisoformat(at)
+        except (TypeError, ValueError):
+            return False
+        if last_dt.date() != now.date():
+            return False
+        if _newer_qualifying_audit_since(at, now=now):
+            return False
+        return True
     if status not in done_statuses or not at:
         return False
 
@@ -386,8 +403,6 @@ def _task_succeeded_today(task_name, now=None):
         return False
 
     if last_dt.date() != now.date():
-        return False
-    if status == 'skipped' and _newer_qualifying_audit_since(at, now=now):
         return False
     return True
 

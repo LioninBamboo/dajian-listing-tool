@@ -324,8 +324,13 @@ def test_derive_queue_uses_daily_selector(tmp_path, monkeypatch):
     # Freeze "now" inside the picker via wrapper
     real = cli.pick_latest_daily_live_audit
 
-    def _frozen(files, *, max_age_hours=36, now=None):
-        return real(files, max_age_hours=max_age_hours, now=now or datetime(2026, 10, 22, 12, 30, 0))
+    def _frozen(files, *, max_age_hours=36, now=None, allow_yesterday=False):
+        return real(
+            files,
+            max_age_hours=max_age_hours,
+            now=now or datetime(2026, 10, 22, 12, 30, 0),
+            allow_yesterday=allow_yesterday,
+        )
 
     monkeypatch.setattr(cli, "pick_latest_daily_live_audit", _frozen)
     queue = cli.derive_queue_from_latest_audit()

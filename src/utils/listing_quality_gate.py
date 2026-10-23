@@ -1648,12 +1648,18 @@ def classify_listing_profile(
             indoor_outdoor="Outdoor",
         )
     if compound_kind == "sofa":
+        is_sectional = _has_marker(
+            title_text, "sectional", "modular", "l-shaped", "u-shaped", "u shaped", "l shaped"
+        )
+        is_armchair = (not is_sectional) and _has_marker(
+            title_text, "armchair", "single sofa", "reading chair"
+        )
         return ListingProfile(
-            kind="sofa",
+            kind="armchair" if is_armchair else "sofa",
             category_id="38208",
             category_name="Sofas, Armchairs & Couches",
-            type_value="Sofa",
-            set_includes="Sofa",
+            type_value="Armchair" if is_armchair else ("Sectional" if is_sectional else "Sofa"),
+            set_includes="Chair" if is_armchair else ("Sofa Set" if is_sectional else "Sofa"),
             room="Living Room",
         )
     if compound_kind == "armchair":
@@ -2503,13 +2509,16 @@ def normalize_generated_listing(
     if not isinstance(opt["aspects"], dict):
         opt["aspects"] = {}
 
-    live_title = str(opt.get("title") or "")
+    # Decision uses the same raw live/giga pair as audit. Sanitized 80-char
+    # listing titles must not become a second live_title.
+    raw_live_title = str((optimization or {}).get("title") or "")
     giga_title = str(source_title or "")
     stored_category = str(opt.get("categoryId") or "")
+    live_title = str(opt.get("title") or "")
     # Aspects still come from the live-title profile. The leaf comes from the
     # shared decision so publish and audit cannot disagree.
     profile = classify_listing_profile(
-        live_title or giga_title,
+        raw_live_title or giga_title or live_title,
         "",
         stored_category,
         source_title="",
@@ -2519,7 +2528,7 @@ def normalize_generated_listing(
         from src.utils.category_decision import decision_category_id, resolve_category_decision
 
         decision = resolve_category_decision(
-            live_title,
+            raw_live_title,
             giga_title,
             "",
             stored_category,
@@ -3520,7 +3529,7 @@ def validate_listing_quality(
         source_title="",
     )
     decision = resolve_category_decision(
-        title,
+        str((optimization or {}).get("title") or ""),
         source_title,
         "",
         category_id,

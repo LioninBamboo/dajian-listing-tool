@@ -648,5 +648,284 @@
    "54235"
   ],
   "note": "chair CUSHIONS product (no stored cat) must not become a chair"
+ },
+ {
+  "sku": "N728S455834B",
+  "store": "main",
+  "status": "PUBLISHED",
+  "stored_category": "20487",
+  "live_title": "70 Inch Tall Arched Bar Cabinet with Glass Doors Liquor Storage",
+  "giga_title": "70 Inch Tall Arched Bar Cabinet with Glass Doors Liquor Storage Wine Cabinet",
+  "expected": [
+   "KEEP"
+  ],
+  "must_not": [
+   "20689"
+  ],
+  "note": "bar cabinet is not a wine rack"
+ },
+ {
+  "sku": "N728S455834Z",
+  "store": "main",
+  "status": "PUBLISHED",
+  "stored_category": "20487",
+  "live_title": "Arched Bar Cabinet Wine Cabinet Ford Ranger Mazda",
+  "giga_title": "Arched Bar Cabinet Wine Cabinet Ford Ranger Mazda",
+  "expected": [
+   "KEEP"
+  ],
+  "must_not": [
+   "20689"
+  ],
+  "note": "bar cabinet + stray car-model words; keep 20487"
+ },
+ {
+  "sku": "W757P332043",
+  "store": "gp",
+  "status": "PUBLISHED",
+  "stored_category": "38204",
+  "live_title": "Coffee Table and Side Table Set Outdoor Indoor",
+  "giga_title": "Coffee Table and Side Table Set Outdoor Indoor",
+  "expected": [
+   "KEEP"
+  ],
+  "must_not": [
+   "38200",
+   "112590"
+  ],
+  "note": "coffee table is the first noun; mixed indoor/outdoor"
+ },
+ {
+  "sku": "N735P305623D",
+  "store": "main",
+  "status": "READY",
+  "stored_category": "38204",
+  "live_title": "Vintage Round Nesting Coffee Table Center Cocktail End Table",
+  "giga_title": "Vintage Round Nesting Coffee Table Center Cocktail End Table",
+  "expected": [
+   "KEEP"
+  ],
+  "must_not": [
+   "38200"
+  ],
+  "note": "nesting coffee table head, not end table"
+ },
+ {
+  "sku": "WF321204AAD",
+  "store": "gp",
+  "status": "PENDING",
+  "stored_category": "",
+  "live_title": "",
+  "giga_title": "Outdoor Wicker Chaise Lounge Chairs Set of 2 with Cushions Pull-out Side Table",
+  "expected": [
+   "79682",
+   "79684",
+   "NONE"
+  ],
+  "must_not": [
+   "139849",
+   "112590"
+  ],
+  "note": "chaise lounge set is never a dining/patio furniture set"
+ },
+ {
+  "sku": "N770P264304T",
+  "store": "gp",
+  "status": "PENDING",
+  "stored_category": "",
+  "live_title": "",
+  "giga_title": "Outdoor Wood Club Wooden Armchair with Cushions (Set of 2), Conversation Set",
+  "expected": [
+   "79684",
+   "NONE"
+  ],
+  "must_not": [
+   "54235",
+   "38208"
+  ],
+  "note": "armchair head + conversation set stuffing; A must equal B"
+ },
+ {
+  "sku": "W808P391670",
+  "store": "gp",
+  "status": "DELISTED",
+  "stored_category": "",
+  "live_title": "",
+  "giga_title": "Dog Crate Furniture Wooden Pet Cage End Table for Small Dogs",
+  "expected": [
+   "NONE",
+   "121851"
+  ],
+  "must_not": [
+   "38200"
+  ],
+  "note": "dog crate end table with no stored leaf"
+ },
+ {
+  "sku": "N752P394342N",
+  "store": "main",
+  "status": "DELISTED",
+  "stored_category": "116391",
+  "live_title": "Cat Litter Box Enclosure & Side Table",
+  "giga_title": "Cat Litter Box Enclosure & Side Table Wooden Hidden Litter Furniture",
+  "expected": [
+   "KEEP"
+  ],
+  "must_not": [
+   "38200"
+  ],
+  "note": "cat litter enclosure is not an end table"
+ },
+ {
+  "sku": "W2530P458025",
+  "store": "main",
+  "status": "DELISTED",
+  "stored_category": "",
+  "live_title": "",
+  "giga_title": "Cloud Couch Modular Sectional Sofas for Living Room Furniture Sets",
+  "expected": [
+   "38208",
+   "NONE"
+  ],
+  "must_not": [
+   "139849"
+  ],
+  "note": "living room furniture set is indoor sofa, not patio set"
+ },
+ {
+  "sku": "WY000485AAE",
+  "store": "gp",
+  "status": "DELISTED",
+  "stored_category": "138996",
+  "live_title": "Outdoor Sun Lounger with Hidden Side Table",
+  "giga_title": "Outdoor Sun Lounger with Hidden Side Table",
+  "expected": [
+   "KEEP"
+  ],
+  "must_not": [
+   "112590"
+  ],
+  "note": "lounger head; hidden side table is a part"
+ },
+ {
+  "sku": "W465P189516",
+  "store": "gp",
+  "status": "DELISTED",
+  "stored_category": "",
+  "live_title": "",
+  "giga_title": "Raised Garden Bed with Foldable Side Table",
+  "expected": [
+   "NONE"
+  ],
+  "must_not": [
+   "112590"
+  ],
+  "note": "garden bed is not a patio table"
+ },
+ {
+  "sku": "W331P478260",
+  "store": "main",
+  "status": "DELISTED",
+  "stored_category": "",
+  "live_title": "",
+  "giga_title": "Bookshelf with 2-Door Glass Cabinet Oak Finish",
+  "expected": [
+   "NONE"
+  ],
+  "must_not": [
+   "20493"
+  ],
+  "note": "bookshelf head is not a display cabinet"
+ },
+ {
+  "sku": "W1151P455537",
+  "store": "main",
+  "status": "PENDING",
+  "stored_category": "",
+  "live_title": "",
+  "giga_title": "2 walnut colored solid wood dining chairs, black PU soft seat cushions",
+  "expected": [
+   "54235"
+  ],
+  "must_not": [
+   "NONE"
+  ],
+  "note": "dining chairs with seat cushions are chairs, not accessories"
+ },
+ {
+  "sku": "W1413P533028",
+  "store": "main",
+  "status": "DELISTED",
+  "stored_category": "38208",
+  "live_title": "Two-Seater Sofa with Storage Footstool Chenille",
+  "giga_title": "Two-Seater Sofa with Storage Footstool Chenille",
+  "expected": [
+   "KEEP"
+  ],
+  "must_not": [
+   "20490"
+  ],
+  "note": "sofa + footstool is a sofa compound"
+ },
+ {
+  "sku": "T3971P401872",
+  "store": "main",
+  "status": "PUBLISHED",
+  "stored_category": "103431",
+  "live_title": "Corner Coat Rack Hall Tree with Shoe Rack",
+  "giga_title": "Corner Coat Rack Hall Tree with Shoe Rack",
+  "expected": [
+   "261263"
+  ],
+  "must_not": [
+   "103431"
+  ],
+  "note": "hall tree head recovers 261263"
+ },
+ {
+  "sku": "SYNTHETIC_CHAISE_SET",
+  "store": "synthetic",
+  "status": "TEST",
+  "stored_category": "79682",
+  "live_title": "Patio Chaise Lounge Set of 2 with Side Table",
+  "giga_title": "",
+  "expected": [
+   "KEEP"
+  ],
+  "must_not": [
+   "112590",
+   "139849"
+  ],
+  "note": "chaise set stays 79682"
+ },
+ {
+  "sku": "SYNTHETIC_MEDICINE_GLASS",
+  "store": "synthetic",
+  "status": "TEST",
+  "stored_category": "42425",
+  "live_title": "Bathroom Medicine Glass Cabinet",
+  "giga_title": "",
+  "expected": [
+   "KEEP"
+  ],
+  "must_not": [
+   "20493"
+  ],
+  "note": "medicine glass cabinet locks 42425"
+ },
+ {
+  "sku": "SYNTHETIC_LR_FURNITURE_SET",
+  "store": "synthetic",
+  "status": "TEST",
+  "stored_category": "38208",
+  "live_title": "Living Room Furniture Set 3 Piece Sofa Loveseat Chair",
+  "giga_title": "",
+  "expected": [
+   "KEEP"
+  ],
+  "must_not": [
+   "139849"
+  ],
+  "note": "indoor furniture set is not patio 139849"
  }
 ]

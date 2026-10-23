@@ -21,14 +21,14 @@ from src.utils.product_context_signals import (
     as_safe_category_id,
     as_safe_text,
     compound_product_family,
+    first_product_noun,
     has_any_phrase,
-    head_clause,
     is_outdoor_to_indoor_downgrade,
     stored_leaf_locked,
-    strip_room_location_lists,
     title_has_clear_outdoor_word,
     title_has_mixed_indoor_outdoor,
     title_is_chair_accessory,
+    title_is_dining_set_bundle,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,7 @@ _LEAF_FAMILY = {
     DISPLAY_CABINET: "display",
     WINE_RACK: "wine",
     DESK: "desk",
+    "79682": "outdoor_chair",
     "175761": "table",
     "175758": "bed",
     "175754": "bed",
@@ -84,6 +85,7 @@ _LEAF_FAMILY = {
 
 _KIND_FAMILY = {
     "outdoor_chair": "outdoor_chair",
+    "outdoor_chaise": "outdoor_chair",
     "dining_chair": "dining_chair",
     "armchair": "seating",
     "sofa": "seating",
@@ -144,20 +146,64 @@ def _family_of(kind: str, category_id: str | None) -> str:
     return kind or "unknown"
 
 
+_DISPLAY_HEADS = {"display cabinet", "curio cabinet", "glass display cabinet"}
+_BAR_CABINET_HEADS = {"bar cabinet", "liquor cabinet", "wine cabinet", "coffee bar cabinet"}
+_WINE_RACK_HEADS = {"wine rack", "bottle holder", "stemware rack"}
+_SIDE_END_HEADS = {"end table", "side table"}
+_COFFEE_HEADS = {"coffee table", "cocktail table", "nesting table", "nesting coffee table"}
+_SIDE_TABLE_LOCK_STORED = frozenset({"121851", "79682", "138996", "75671"})
+HALL_TREE = "261263"
+SIDEBOARD = "183322"
+OUTDOOR_CHAISE = "79682"
+
+
 def _display_cabinet_title(title: str) -> bool:
-    hay = as_safe_text(title)
-    return has_any_phrase(hay, ("display cabinet", "curio cabinet", "glass display", "glass cabinet"))
+    head = first_product_noun(title)
+    if head in {"bookshelf", "bookcase", "medicine cabinet", "bathroom cabinet", "pantry cabinet"}:
+        return False
+    return head in _DISPLAY_HEADS
 
 
 def _sewing_or_craft_table(title: str) -> bool:
     return has_any_phrase(as_safe_text(title), ("sewing table", "craft table", "sewing machine table"))
 
 
-def _side_or_end_table_head(title: str) -> bool:
-    core = strip_room_location_lists(head_clause(title) or title)
-    if has_any_phrase(core, ("nightstand", "bedside table")):
+def _side_or_end_table_head(title: str, stored: str = "") -> bool:
+    """True only when side/end table is the first product noun of the live head."""
+    stored_id = as_safe_category_id(stored)
+    head = first_product_noun(title)
+    if stored_id in _SIDE_TABLE_LOCK_STORED:
         return False
-    return has_any_phrase(core, ("end table", "side table"))
+    if stored_id == INDOOR_TABLE and head in _COFFEE_HEADS:
+        return False
+    if head in {
+        "coffee table",
+        "cocktail table",
+        "nesting table",
+        "nesting coffee table",
+        "dog crate",
+        "dog kennel",
+        "pet cage",
+        "pet crate",
+        "cat litter box",
+        "litter box enclosure",
+        "litter enclosure",
+        "cat furniture",
+        "raised garden bed",
+        "garden bed",
+        "planter",
+        "wagon",
+        "steel wagon",
+        "console table",
+        "chaise",
+        "chaise lounge",
+        "lounger",
+        "sun lounger",
+    }:
+        return False
+    if head in _SIDE_END_HEADS:
+        return True
+    return False
 
 
 def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDecision:
@@ -174,8 +220,31 @@ def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDe
             return CategoryDecision(None, "keep", "sewing_table_lock")
         return CategoryDecision(None, "unknown", "sewing_or_craft_table")
 
+    head = first_product_noun(hay)
+    if head in _BAR_CABINET_HEADS:
+        if as_safe_category_id(stored) == "20487":
+            return CategoryDecision(None, "keep", "bar_cabinet_lock")
+        return CategoryDecision(None, "unknown", "bar_cabinet_not_wine_rack")
+    if head in _WINE_RACK_HEADS:
+        return CategoryDecision(WINE_RACK, "wine_rack", "wine_rack_head", "Wine Racks & Bottle Holders")
+    if head == "hall tree":
+        return CategoryDecision(HALL_TREE, "hall_tree", "hall_tree_head", "Hall Trees & Stands")
+    if head in {"sideboard", "buffet"} and as_safe_category_id(stored) not in {"183322", "63557"}:
+        return CategoryDecision(SIDEBOARD, "sideboard", "sideboard_head", "Sideboards & Buffets")
+    if head in {"chaise", "chaise lounge", "lounger", "sun lounger"}:
+        if as_safe_category_id(stored) in {"79682", "79684", "138996"}:
+            return CategoryDecision(None, "keep", "outdoor_chaise_lock")
+        if title_has_clear_outdoor_word(hay) and not title_has_mixed_indoor_outdoor(hay):
+            return CategoryDecision(OUTDOOR_CHAISE, "outdoor_chaise", "chaise_lounge", "Outdoor Chaise Lounges")
+        return CategoryDecision(None, "unknown", "chaise_not_dining_set")
+
     if _display_cabinet_title(hay):
         return CategoryDecision(DISPLAY_CABINET, "display_cabinet", "display_cabinet", "Display Cabinets")
+
+    if head in {"dining table"} and title_is_dining_set_bundle(hay) and not title_has_clear_outdoor_word(hay):
+        return CategoryDecision(DINING_SET, "dining_set", "dining_table_set", "Dining Sets")
+    if head == "bar table" and title_is_dining_set_bundle(hay):
+        return CategoryDecision(DINING_SET, "dining_set", "bar_table_set", "Dining Sets")
 
     family = compound_product_family(hay)
     if family == "dining_set":
@@ -232,7 +301,7 @@ def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDe
             proposed = None
             kind = "unknown"
 
-    if _side_or_end_table_head(hay):
+    if _side_or_end_table_head(hay, stored):
         if title_has_clear_outdoor_word(hay) and not title_has_mixed_indoor_outdoor(hay):
             return CategoryDecision(OUTDOOR_TABLE, "outdoor_table", "outdoor_side_table", "Patio & Garden Tables")
         if proposed == NIGHTSTAND:
@@ -244,11 +313,18 @@ def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDe
             kind = "side_table"
             name = "End Tables"
 
+    if proposed == WINE_RACK and first_product_noun(hay) in _BAR_CABINET_HEADS:
+        return CategoryDecision(None, "unknown", "bar_cabinet_not_wine")
     if proposed == WINE_RACK and _display_cabinet_title(hay):
         return CategoryDecision(DISPLAY_CABINET, "display_cabinet", "display_not_wine", "Display Cabinets")
+    if proposed == WINE_RACK and first_product_noun(hay) not in _WINE_RACK_HEADS:
+        return CategoryDecision(None, "unknown", "not_wine_rack_head")
 
     if proposed == INDOOR_CHAIR and title_is_chair_accessory(hay):
         return CategoryDecision(None, "unknown", "accessory_not_dining_chair")
+
+    if proposed == END_TABLE and not _side_or_end_table_head(hay, stored):
+        return CategoryDecision(None, "unknown", "secondary_side_table")
 
     return CategoryDecision(proposed or None, kind, "classified", name)
 
