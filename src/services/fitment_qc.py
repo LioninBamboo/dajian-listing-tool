@@ -553,6 +553,8 @@ def source_supports_title_fitment(
     """True when GIGA source has the same make + model + year range."""
     check_title = (source_title or title or "").strip()
     if stored_compatible_products:
+        if not any(f.year_from for f in parse_title_fitment(check_title)):
+            return False
         return not _stored_mismatches_giga_title(check_title, stored_compatible_products)
     title_fits = [f for f in parse_title_fitment(title) if f.make and f.model and f.year_from]
     if not title_fits:
@@ -586,12 +588,15 @@ def resolve_apply_fitment(
     """Choose a fitment list to push, or skip.
 
     A stored list is pushed only when it matches the GIGA source title
-    (``check_fitment_qc`` finds no ``fitment_mismatch``). Make+Model rows
+    (``check_fitment_qc`` finds no ``fitment_mismatch``) and that title
+    names a year range the list can be confirmed against. Make+Model rows
     without a year are never applied.
     """
     stored = [dict(entry) for entry in (stored_compatible_products or []) if entry]
     check_title = (source_title or title or "").strip()
     if stored:
+        if not any(f.year_from for f in parse_title_fitment(check_title)):
+            return [], "skipped_title_no_year"
         if _stored_mismatches_giga_title(check_title, stored):
             return [], "skipped_stored_mismatch"
         if not all(

@@ -144,12 +144,16 @@ def push_compat(
     return False, (m.group(1)[:160] if m else body[:160]), xml
 
 
-def _fitment_process_exit_code(*, apply: bool, apply_fail: int) -> int:
-    """Scheduled Task exit code: only apply write failures are non-zero.
+def _fitment_process_exit_code(*, apply: bool, apply_fail: int, read_fail: int = 0) -> int:
+    """Scheduled Task exit code for apply writes and live GetItem read failures.
 
     Residual HIGH/mismatch findings stay in the JSON/email report and must not
-    mark the Windows job as failed when apply_fail==0.
+    mark the Windows job as failed when apply_fail==0 and every GetItem succeeded.
+    A failed live read is a transport failure (same as trading_content_qc):
+    non-zero even without ``--apply``.
     """
+    if int(read_fail or 0) > 0:
+        return 1
     if apply and int(apply_fail or 0) > 0:
         return 2
     return 0
@@ -227,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     verified_ok = 0
     verify_failed = 0
     skipped_no_source = 0
+    skipped_title_no_year = 0
 
     for r in rows:
         title = r["title"] or ""
@@ -285,8 +290,11 @@ def main(argv: list[str] | None = None) -> int:
                 stored_compatible_products=_stored_compatible_products(optimization),
             )
             if skip_reason or not products:
-                skipped_no_source += 1
                 row_out["skip_reason"] = skip_reason or "skipped_no_source_fitment"
+                if skip_reason == "skipped_title_no_year":
+                    skipped_title_no_year += 1
+                else:
+                    skipped_no_source += 1
             else:
                 ok, err, _xml = push_compat(
                     tok, r["listing_id"], products, site_id=site_id
@@ -357,6 +365,8 @@ def main(argv: list[str] | None = None) -> int:
         if any(i["code"] == "fitment_mismatch" for i in row["issues"])
     ]
     applied_rows = [row for row in findings if row.get("applied")]
+    unknown_rows = [row for row in findings if row.get("status") == "unknown"]
+    n_unknown = len(unknown_rows)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     report = {
@@ -372,6 +382,8 @@ def main(argv: list[str] | None = None) -> int:
         "verified_ok": verified_ok,
         "verify_failed": verify_failed,
         "skipped_no_source_fitment": skipped_no_source,
+        "skipped_title_no_year": skipped_title_no_year,
+        "read_failed": n_unknown,
         "findings": findings,
     }
     LOG_DIR.mkdir(exist_ok=True)
@@ -381,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"\n=== Fitment audit: vehicle_specific={n_spec} universal={n_univ} | "
         f"listings_with_issues={len(findings)} missing={n_missing} mismatch={n_mismatch}"
+        + (f" read_failed={n_unknown}" if n_unknown else "")
         + (f" | applied={applied} apply_fail={apply_fail} verified_ok={verified_ok}" if args.apply else "")
         + f" ===\n📄 {report_path}"
     )
@@ -390,6 +403,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  [{i['severity']}] {row['sku']} {safe} :: {i['code']} — {i['detail'][:80]}")
 
     if args.email:
+        def _row_issue_html(row):
+            issues = (
+                row.get("post_apply_issues")
+                if row.get("post_apply_issues") is not None
+                else row.get("issues") or []
+            )
+            if issues:
+                return "<br>".join(
+                    f"<b>{_html.escape(i['severity'])}</b> {_html.escape(i['detail'][:90])}"
+                    for i in issues
+                )
+            return _html.escape(str(row.get("error") or row.get("skip_reason") or "live 读取失败"))
+
         def _table(rows_data, empty="无"):
             if not rows_data:
                 return f"<p>{empty}</p>"
@@ -398,16 +424,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"<td style='padding:6px;border-bottom:1px solid #eee'>{_html.escape(row['sku'])}</td>"
                 f"<td style='padding:6px;border-bottom:1px solid #eee'>{_html.escape(str(row['listing_id']))}</td>"
                 f"<td style='padding:6px;border-bottom:1px solid #eee'>{_html.escape((row['title'] or '')[:60])}</td>"
-                f"<td style='padding:6px;border-bottom:1px solid #eee'>"
-                + "<br>".join(
-                    f"<b>{_html.escape(i['severity'])}</b> {_html.escape(i['detail'][:90])}"
-                    for i in (
-                        row.get("post_apply_issues")
-                        if row.get("post_apply_issues") is not None
-                        else row["issues"]
-                    )
-                )
-                + "</td></tr>"
+                f"<td style='padding:6px;border-bottom:1px solid #eee'>{_row_issue_html(row)}</td>"
+                "</tr>"
                 for row in rows_data
             )
             return (
@@ -420,41 +438,55 @@ def main(argv: list[str] | None = None) -> int:
                 f"{body}</tbody></table>"
             )
 
-        banner = "#c0392b" if residual or mismatches else "#27ae60"
-        head = (
-            f"车型适配需处理 {len(residual)} 条残留（漏挂检出 {n_missing} · 错挂 {n_mismatch}）"
-            if residual or mismatches
-            else "车型适配全部通过"
-        )
+        has_content_issues = bool(residual or mismatches)
+        has_read_failures = n_unknown > 0
+        has_issues = has_content_issues or has_read_failures
+        banner = "#c0392b" if has_issues else "#27ae60"
+        head_bits = []
+        if has_content_issues:
+            head_bits.append(
+                f"车型适配需处理 {len(residual)} 条残留（漏挂检出 {n_missing} · 错挂 {n_mismatch}）"
+            )
+        if has_read_failures:
+            head_bits.append(f"live 读取失败 {n_unknown} 条")
+        head = " · ".join(head_bits) if head_bits else "车型适配全部通过"
         html = (
             f"<h2>AquaRides 车型适用性(Fitment)质检</h2>"
             f"<div style='background:{banner};color:#fff;padding:12px 16px;border-radius:6px;font-weight:700'>{head}</div>"
             f"<p>模式: {'apply' if args.apply else 'audit（只读）'} · "
             f"整车适配件 {n_spec} 条 / 通用件 {n_univ} 条"
             + (f"；本次已挂适配 {applied} 条（回读通过 {verified_ok}）" if args.apply else "")
+            + (f"；live 读取失败 {n_unknown} 条" if n_unknown else "")
             + f"</p><p>报告: <code>{_html.escape(str(report_path))}</code></p>"
             f"<h3>已挂适配（{len(applied_rows)}）</h3>{_table(applied_rows, '无本次写入')}"
             f"<h3>仍需处理 / 残留（{len(residual)}）</h3>{_table(residual, '无残留')}"
             f"<h3>疑似错挂 mismatch（{len(mismatches)}，不自动改）</h3>"
             f"{_table(mismatches, '无 mismatch')}"
+            f"<h3>live 读取失败（{n_unknown}）</h3>{_table(unknown_rows, '无读取失败')}"
         )
         from src.utils.email_sender import send_email
         from src.utils.email_policy import should_smtp
 
+        subject_bits = []
+        if has_content_issues:
+            subject_bits.append(f"残留 {len(residual)} / 错挂 {n_mismatch}")
+        if has_read_failures:
+            subject_bits.append(f"读取失败 {n_unknown}")
         subject = (
-            f"AquaRides 车型适配质检 - 残留 {len(residual)} / 错挂 {n_mismatch}"
-            if (residual or mismatches)
+            "AquaRides 车型适配质检 - " + " / ".join(subject_bits)
+            if subject_bits
             else "AquaRides 车型适配质检 - 通过"
         )
         try:
-            has_issues = bool(residual or mismatches)
             send_email(subject, html, send_smtp=should_smtp(has_issues=has_issues))
             print(f"email archived; smtp={'on' if has_issues else 'silenced'}")
         except Exception as e:
             # Email failure must not flip apply_fail==0 into a Task Scheduler fail.
             print(f"email failed: {e}")
 
-    return _fitment_process_exit_code(apply=bool(args.apply), apply_fail=apply_fail)
+    return _fitment_process_exit_code(
+        apply=bool(args.apply), apply_fail=apply_fail, read_fail=n_unknown
+    )
 
 
 if __name__ == "__main__":

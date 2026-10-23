@@ -404,6 +404,8 @@ def test_fitment_process_exit_code():
     assert _fitment_process_exit_code(apply=True, apply_fail=2) == 2
     assert _fitment_process_exit_code(apply=False, apply_fail=0) == 0
     assert _fitment_process_exit_code(apply=True, apply_fail=0) == 0
+    assert _fitment_process_exit_code(apply=False, apply_fail=0, read_fail=24) == 1
+    assert _fitment_process_exit_code(apply=True, apply_fail=0, read_fail=1) == 1
 
 
 def test_fitment_audit_refuses_main_and_gp_without_client_calls(monkeypatch):
@@ -549,7 +551,7 @@ def _aqua_auto_profile() -> StoreProfile:
     )
 
 
-def _published_db(tmp_path, sku, listing_id, title, description="", optimization=None):
+def _published_rows(tmp_path, rows):
     db = tmp_path / "ebay_collection.db"
     conn = sqlite3.connect(str(db))
     conn.execute(
@@ -557,20 +559,27 @@ def _published_db(tmp_path, sku, listing_id, title, description="", optimization
         "sku TEXT, listing_id TEXT, title TEXT, description TEXT, "
         "optimization TEXT, status TEXT)"
     )
-    conn.execute(
-        "INSERT INTO collected_products VALUES (?,?,?,?,?,?)",
-        (
-            sku,
-            listing_id,
-            title,
-            description,
-            json.dumps(optimization or {}),
-            "PUBLISHED",
-        ),
-    )
+    for sku, listing_id, title, description, optimization in rows:
+        conn.execute(
+            "INSERT INTO collected_products VALUES (?,?,?,?,?,?)",
+            (
+                sku,
+                listing_id,
+                title,
+                description,
+                json.dumps(optimization or {}),
+                "PUBLISHED",
+            ),
+        )
     conn.commit()
     conn.close()
     return db
+
+
+def _published_db(tmp_path, sku, listing_id, title, description="", optimization=None):
+    return _published_rows(
+        tmp_path, [(sku, listing_id, title, description, optimization)]
+    )
 
 
 def test_real_sku_w3611p339821_apply_does_not_push_stored_tacoma_2005_2025(
@@ -693,14 +702,170 @@ def test_getitem_failure_is_unknown_and_apply_does_not_write(monkeypatch, tmp_pa
         fitment_audit.get_live_compat("token", "188000000099", site_id="100", session=None)
 
     rc = fitment_audit.main(["--apply", "--db", str(db), "--sku", "SYNTHETIC-GETITEM-FAIL"])
-    assert rc == 0
+    assert rc != 0
     assert posted == []
     reports = list(tmp_path.glob("fitment_audit_*.json"))
     payload = json.loads(reports[0].read_text(encoding="utf-8"))
     assert payload["applied"] == 0
+    assert payload["read_failed"] == 1
     assert payload["findings"]
     row = payload["findings"][0]
     assert row["status"] == "unknown"
     assert row["applied"] is False
     assert row["issues"] == []
     assert "missing_fitment" not in json.dumps(row)
+
+
+def test_n1_all_24_getitem_failures_are_not_a_pass(monkeypatch, tmp_path):
+    from scripts import fitment_audit
+
+    title = "Running Boards For 2019-2026 Chevy Silverado 1500"
+    rows = [
+        (f"SKU-{i:02d}", f"1880001{i:04d}", title, "Fits 2019-2026 Chevy Silverado 1500.", {})
+        for i in range(24)
+    ]
+    db = _published_rows(tmp_path, rows)
+    monkeypatch.setattr("src.utils.store_profile.get_store_profile", _aqua_auto_profile)
+
+    class FakeOAuth:
+        def get_valid_token(self):
+            return "token"
+
+    posted = []
+    emails = []
+
+    def _fail_read(*_args, **_kwargs):
+        raise fitment_audit.LiveCompatReadError("Invalid IAF token")
+
+    def _no_push(*args, **kwargs):
+        posted.append((args, kwargs))
+        return True, "", "<xml/>"
+
+    def _send_email(subject, html, send_smtp=False, **kwargs):
+        emails.append({"subject": subject, "html": html, "send_smtp": send_smtp})
+        return True
+
+    monkeypatch.setattr("src.services.ebay_auth.EbayOAuthService", lambda **kwargs: FakeOAuth())
+    monkeypatch.setattr(fitment_audit, "get_live_compat", _fail_read)
+    monkeypatch.setattr(fitment_audit, "push_compat", _no_push)
+    monkeypatch.setattr("src.utils.email_sender.send_email", _send_email)
+    monkeypatch.setattr(fitment_audit, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(fitment_audit, "time", type("T", (), {"sleep": staticmethod(lambda *_: None)})())
+
+    rc = fitment_audit.main(["--apply", "--email", "--db", str(db)])
+    assert rc != 0
+    assert posted == []
+    assert emails
+    subject = emails[0]["subject"]
+    html = emails[0]["html"]
+    assert "通过" not in subject
+    assert "全部通过" not in html
+    assert "读取失败 24" in subject
+    assert "live 读取失败 24" in html
+    assert emails[0]["send_smtp"] is True
+    reports = list(tmp_path.glob("fitment_audit_*.json"))
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["read_failed"] == 24
+    assert payload["applied"] == 0
+    assert all(row["status"] == "unknown" for row in payload["findings"])
+
+
+W3611P511712_TITLE = "Side Steps Running Boards For Toyota Tacoma Double Cab"
+W3611P339830_TITLE = "Nerf Bars For Jeep Wrangler JL"
+
+
+def test_n2_yearless_title_does_not_push_stored_fitment():
+    stored_tacoma = [
+        {
+            "compatibilityProperties": [
+                {"name": "Year", "value": str(year)},
+                {"name": "Make", "value": "Toyota"},
+                {"name": "Model", "value": "Tacoma"},
+            ]
+        }
+        for year in range(2005, 2026)
+    ]
+    stored_wrangler = [
+        {
+            "compatibilityProperties": [
+                {"name": "Year", "value": "2018"},
+                {"name": "Make", "value": "Jeep"},
+                {"name": "Model", "value": "Wrangler"},
+            ]
+        }
+    ]
+    for sku, title, stored in (
+        ("W3611P511712", W3611P511712_TITLE, stored_tacoma),
+        ("W3611P339830", W3611P339830_TITLE, stored_wrangler),
+    ):
+        fits = parse_title_fitment(title)
+        assert fits and fits[0].year_from is None, sku
+        products, skip = resolve_apply_fitment(
+            title,
+            source_title=title,
+            source_description=title,
+            stored_compatible_products=stored,
+        )
+        assert products == [], sku
+        assert skip == "skipped_title_no_year", sku
+
+
+def test_n2_yearless_stored_apply_reports_skip_and_does_not_write(monkeypatch, tmp_path):
+    from scripts import fitment_audit
+
+    stored = [
+        {
+            "compatibilityProperties": [
+                {"name": "Year", "value": str(year)},
+                {"name": "Make", "value": "Toyota"},
+                {"name": "Model", "value": "Tacoma"},
+            ]
+        }
+        for year in range(2005, 2026)
+    ]
+    db = _published_rows(
+        tmp_path,
+        [
+            (
+                "W3611P511712",
+                "188000005117",
+                W3611P511712_TITLE,
+                W3611P511712_TITLE,
+                {"motorsCompatibility": {"compatibleProducts": stored}},
+            ),
+            (
+                "W3611P339830",
+                "188000003398",
+                W3611P339830_TITLE,
+                W3611P339830_TITLE,
+                {"motorsCompatibility": {"compatibleProducts": stored}},
+            ),
+        ],
+    )
+    monkeypatch.setattr("src.utils.store_profile.get_store_profile", _aqua_auto_profile)
+
+    class FakeOAuth:
+        def get_valid_token(self):
+            return "token"
+
+    posted = []
+    monkeypatch.setattr("src.services.ebay_auth.EbayOAuthService", lambda **kwargs: FakeOAuth())
+    monkeypatch.setattr(fitment_audit, "get_live_compat", lambda *a, **k: [])
+    monkeypatch.setattr(
+        fitment_audit,
+        "push_compat",
+        lambda *a, **k: posted.append((a, k)) or (True, "", "<xml/>"),
+    )
+    monkeypatch.setattr(fitment_audit, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(fitment_audit, "time", type("T", (), {"sleep": staticmethod(lambda *_: None)})())
+
+    rc = fitment_audit.main(["--apply", "--db", str(db)])
+    assert rc == 0
+    assert posted == []
+    reports = list(tmp_path.glob("fitment_audit_*.json"))
+    payload = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert payload["applied"] == 0
+    assert payload["skipped_title_no_year"] == 2
+    reasons = {row["sku"]: row.get("skip_reason") for row in payload["findings"]}
+    assert reasons["W3611P511712"] == "skipped_title_no_year"
+    assert reasons["W3611P339830"] == "skipped_title_no_year"
