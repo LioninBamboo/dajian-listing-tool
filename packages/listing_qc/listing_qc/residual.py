@@ -39,6 +39,8 @@ FIX_KEY_ISSUE_TYPES = {
 
 def fix_key_matches_issue(key: str, issue_type: str) -> bool:
     """Return whether a generated fix is backed by the current issue type."""
+    if key == "__strip_claims_from_manifest__":
+        return issue_type.startswith("semantic_")
     if key == "__semantic_rebuild_from_source__":
         return (
             issue_type.startswith("semantic_")
