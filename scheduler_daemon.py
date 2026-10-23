@@ -258,8 +258,17 @@ def _ops_ads_enabled() -> bool:
         return False
 
 
+_UNREADABLE_OPS_WARNED = False
+
+
+def _reset_unreadable_ops_warning() -> None:
+    global _UNREADABLE_OPS_WARNED
+    _UNREADABLE_OPS_WARNED = False
+
+
 def _resolved_allowed_jobs():
     """None = unrestricted (Main/full). frozenset = ops fail-closed allowlist."""
+    global _UNREADABLE_OPS_WARNED
     from src.utils.store_profile import (
         DEFAULT_OPS_ALLOWED_JOBS,
         peek_yaml_says_ops,
@@ -269,11 +278,13 @@ def _resolved_allowed_jobs():
         return profile.resolved_scheduler_allowed_jobs
     except Exception as exc:
         if peek_yaml_says_ops():
-            logger.warning(
-                "store profile unreadable (%s); fail-closed to ops allowlist %s",
-                exc,
-                list(DEFAULT_OPS_ALLOWED_JOBS),
-            )
+            if not _UNREADABLE_OPS_WARNED:
+                logger.warning(
+                    "store profile unreadable (%s); fail-closed to ops allowlist %s",
+                    exc,
+                    list(DEFAULT_OPS_ALLOWED_JOBS),
+                )
+                _UNREADABLE_OPS_WARNED = True
             return frozenset(DEFAULT_OPS_ALLOWED_JOBS)
         return None
 
@@ -1914,6 +1925,7 @@ def task_mi_self_check():
 
 def setup_schedule():
     """配置任务调度时间表（按 store_profile.scheduler_profile 分流）."""
+    _reset_unreadable_ops_warning()
     schedule.clear()
     if _is_ops_scheduler():
         _setup_schedule_ops()

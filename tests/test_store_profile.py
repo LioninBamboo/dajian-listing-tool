@@ -207,6 +207,44 @@ class TestOverrides:
         assert peek_yaml_says_ops(broken) is True
         assert peek_yaml_says_ops(full) is False
 
+    def test_peek_yaml_says_ops_quoted_whitespace_and_flow(self, tmp_path):
+        quoted_space = tmp_path / "quoted_space.yaml"
+        quoted_space.write_text(
+            'server:\n  scheduler_profile: "OPS "\nstore: [unclosed\n',
+            encoding="utf-8",
+        )
+        single = tmp_path / "single.yaml"
+        single.write_text(
+            "server:\n  scheduler_profile: 'ops'\nstore: [unclosed\n",
+            encoding="utf-8",
+        )
+        flow = tmp_path / "flow.yaml"
+        flow.write_text(
+            "server: {scheduler_profile: ops, scheduler_enable_ads: true\n",
+            encoding="utf-8",
+        )
+        flow_quoted = tmp_path / "flow_quoted.yaml"
+        flow_quoted.write_text(
+            'server: {scheduler_profile: "OPS "}\nstore: [unclosed\n',
+            encoding="utf-8",
+        )
+        comment_only = tmp_path / "comment.yaml"
+        comment_only.write_text(
+            "server:\n  scheduler_profile: full  # scheduler_profile: ops\n",
+            encoding="utf-8",
+        )
+        ops_daily = tmp_path / "ops_daily.yaml"
+        ops_daily.write_text(
+            "server:\n  scheduler_allowed_jobs: [ops_daily]\n",
+            encoding="utf-8",
+        )
+        assert peek_yaml_says_ops(quoted_space) is True
+        assert peek_yaml_says_ops(single) is True
+        assert peek_yaml_says_ops(flow) is True
+        assert peek_yaml_says_ops(flow_quoted) is True
+        assert peek_yaml_says_ops(comment_only) is False
+        assert peek_yaml_says_ops(ops_daily) is False
+
     def test_ops_optional_slices_default_off_and_can_opt_in(self, tmp_path):
         yaml_file = tmp_path / "ops_slices.yaml"
         yaml_file.write_text(

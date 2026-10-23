@@ -1,24 +1,29 @@
 """Registered-task table and allowlist entry-point tests for PR-A.
 
 M1 golden lists were captured from 9b62e1f before any allowlist code landed.
+
+Do not import ``scheduler_daemon`` / ``schedule`` at module level: 
+``test_scheduler_recovery.py`` may have already installed a schedule stub.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import logging
+import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-import schedule
 
-import scheduler_daemon
-import scheduler_watchdog
 from src.db.database_safety import DatabaseSafetyReport
 from src.utils.store_profile import (
     KNOWN_SCHEDULER_JOBS,
     reset_store_profile_cache,
 )
+
+_mods = SimpleNamespace(daemon=None, watchdog=None, schedule=None)
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN_PROFILE = ROOT / "config" / "store_profile.yaml"
@@ -226,9 +231,26 @@ def _at_time(job) -> str:
     return value.strftime("%H:%M")
 
 
+def _ensure_real_schedule(monkeypatch):
+    current = sys.modules.get("schedule")
+    if current is None or not getattr(current, "__file__", None):
+        sys.modules.pop("schedule", None)
+        import schedule as real_schedule
+        monkeypatch.setitem(sys.modules, "schedule", real_schedule)
+        return real_schedule
+    return current
+
+
+def _load_private_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _registered_rows():
     rows = []
-    for job in schedule.get_jobs():
+    for job in _mods.schedule.get_jobs():
         rows.append(
             (
                 _job_tag(job),
@@ -243,7 +265,7 @@ def _registered_rows():
 
 def _registered_callables():
     rows = []
-    for job in schedule.get_jobs():
+    for job in _mods.schedule.get_jobs():
         fn = job.job_func
         name = getattr(getattr(fn, "func", fn), "__name__", None)
         rows.append(
@@ -271,19 +293,30 @@ def _activate_profile(monkeypatch, path: Path) -> None:
 
 
 def _recovery_names():
-    return [task["name"] for task in scheduler_daemon._get_critical_recovery_tasks()]
+    return [task["name"] for task in _mods.daemon._get_critical_recovery_tasks()]
 
 
 def _watchdog_names():
-    return [task["health_name"] for task in scheduler_watchdog._watchdog_critical_tasks()]
+    return [task["health_name"] for task in _mods.watchdog._watchdog_critical_tasks()]
 
 
 @pytest.fixture(autouse=True)
-def _isolate_schedule_and_profile():
-    schedule.clear()
+def _isolate_schedule_and_profile(monkeypatch):
+    """Bind the real schedule package, then load daemon/watchdog under private names."""
+    real_schedule = _ensure_real_schedule(monkeypatch)
+    _mods.schedule = real_schedule
+    _mods.daemon = _load_private_module(
+        "scheduler_daemon_ops_allowlist",
+        ROOT / "scheduler_daemon.py",
+    )
+    _mods.watchdog = _load_private_module(
+        "scheduler_watchdog_ops_allowlist",
+        ROOT / "scheduler_watchdog.py",
+    )
+    real_schedule.clear()
     reset_store_profile_cache()
     yield
-    schedule.clear()
+    real_schedule.clear()
     reset_store_profile_cache()
 
 
@@ -578,7 +611,7 @@ def test_registered_task_table(
 ):
     path = Path(profile_path) if profile_path is not None else _write_profile(tmp_path, yaml_body)
     _activate_profile(monkeypatch, path)
-    scheduler_daemon.setup_schedule()
+    _mods.daemon.setup_schedule()
     assert _registered_rows() == expected_jobs
     assert _recovery_names() == recovery
     assert _watchdog_names() == watchdog
@@ -606,7 +639,7 @@ def test_SYNTHETIC_S2_logs_allowlist_but_ads_slice_off(tmp_path, monkeypatch, ca
     )
     _activate_profile(monkeypatch, path)
     with caplog.at_level(logging.INFO):
-        scheduler_daemon.setup_schedule()
+        _mods.daemon.setup_schedule()
     assert any("on allowlist but ads slice off" in record.message for record in caplog.records)
     assert _registered_rows() == OPS_DEFAULT_JOBS
 
@@ -619,13 +652,54 @@ def test_SYNTHETIC_S5_unreadable_ops_yaml_fail_closed(tmp_path, monkeypatch, cap
     )
     _activate_profile(monkeypatch, path)
     with caplog.at_level(logging.WARNING):
-        scheduler_daemon.setup_schedule()
+        _mods.daemon.setup_schedule()
     assert _registered_rows() == OPS_DEFAULT_JOBS
+    warn_msgs = [record.message for record in caplog.records if "fail-closed" in record.message]
+    assert len(warn_msgs) == 1
     assert any("unreadable" in record.message for record in caplog.records)
-    assert any("fail-closed" in record.message for record in caplog.records)
     tags = {tag for tag, *_ in _registered_rows()}
     assert "full" not in tags
     assert "mi_snapshot" not in tags
+    _mods.daemon.setup_schedule()
+    warn_msgs = [record.message for record in caplog.records if "fail-closed" in record.message]
+    assert len(warn_msgs) == 2
+
+
+@pytest.mark.parametrize(
+    ("case_id", "body"),
+    [
+        (
+            "S14",
+            'server:\n  scheduler_profile: "OPS "\nstore: [unclosed\n',
+        ),
+        (
+            "S15",
+            "server:\n  scheduler_profile: 'ops'\nstore: [unclosed\n",
+        ),
+        (
+            "S16",
+            "server: {scheduler_profile: ops, scheduler_enable_ads: true\nstore: [unclosed\n",
+        ),
+        (
+            "S17",
+            'server: {scheduler_profile: "OPS ", scheduler_enable_ads: true\nstore: [unclosed\n',
+        ),
+    ],
+    ids=["SYNTHETIC-S14", "SYNTHETIC-S15", "SYNTHETIC-S16", "SYNTHETIC-S17"],
+)
+def test_SYNTHETIC_unreadable_quoted_or_flow_ops_fail_closed(
+    tmp_path, monkeypatch, caplog, case_id, body
+):
+    path = tmp_path / "broken.yaml"
+    path.write_text(body, encoding="utf-8")
+    _activate_profile(monkeypatch, path)
+    with caplog.at_level(logging.WARNING):
+        _mods.daemon.setup_schedule()
+    assert _registered_rows() == OPS_DEFAULT_JOBS
+    tags = {tag for tag, *_ in _registered_rows()}
+    assert "full" not in tags
+    assert "mi_snapshot" not in tags
+    assert len(_registered_rows()) == 2
 
 
 def test_G2_run_task_skips_smart_reprice(tmp_path, monkeypatch):
@@ -636,8 +710,8 @@ def test_G2_run_task_skips_smart_reprice(tmp_path, monkeypatch):
         spawned.append((args, kwargs))
         raise AssertionError("must not spawn a subprocess for a disallowed ops job")
 
-    monkeypatch.setattr(scheduler_daemon.subprocess, "Popen", fake_popen)
-    ok, msg = scheduler_daemon.run_task(
+    monkeypatch.setattr(_mods.daemon.subprocess, "Popen", fake_popen)
+    ok, msg = _mods.daemon.run_task(
         "smart_reprice",
         ["python", "-c", "print(1)"],
     )
@@ -651,7 +725,7 @@ def _invoke_cli_task(monkeypatch, tmp_path, task_name: str):
         pass
 
     monkeypatch.setattr(
-        scheduler_daemon,
+        _mods.daemon,
         "validate_runtime_database",
         lambda *args, **kwargs: DummyReport(
             path=tmp_path / "unused.db",
@@ -661,13 +735,13 @@ def _invoke_cli_task(monkeypatch, tmp_path, task_name: str):
             size_bytes=1,
         ),
     )
-    monkeypatch.setattr(scheduler_daemon, "MAINTENANCE_FILE", tmp_path / "no.lock")
+    monkeypatch.setattr(_mods.daemon, "MAINTENANCE_FILE", tmp_path / "no.lock")
     monkeypatch.setattr(
-        scheduler_daemon.sys,
+        _mods.daemon.sys,
         "argv",
         ["scheduler_daemon.py", "--task", task_name],
     )
-    scheduler_daemon.main()
+    _mods.daemon.main()
 
 
 def test_G3_task_cli_and_recovery_and_watchdog(tmp_path, monkeypatch):
@@ -693,7 +767,7 @@ def test_G3_task_cli_and_recovery_and_watchdog(tmp_path, monkeypatch):
         "task_missing_video_autofix",
         "task_source_refresh",
     ):
-        monkeypatch.setattr(scheduler_daemon, attr, track(attr))
+        monkeypatch.setattr(_mods.daemon, attr, track(attr))
 
     for alias in ("reprice", "promotion", "listing_audit"):
         before = list(called)
@@ -705,7 +779,7 @@ def test_G3_task_cli_and_recovery_and_watchdog(tmp_path, monkeypatch):
 
     health = tmp_path / "_scheduler_health.json"
     health.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(scheduler_daemon, "HEALTH_FILE", health)
+    monkeypatch.setattr(_mods.daemon, "HEALTH_FILE", health)
     recovered = []
 
     def recover_ops():
@@ -719,7 +793,7 @@ def test_G3_task_cli_and_recovery_and_watchdog(tmp_path, monkeypatch):
 
         return _inner
 
-    monkeypatch.setattr(scheduler_daemon, "task_ops_daily", recover_ops)
+    monkeypatch.setattr(_mods.daemon, "task_ops_daily", recover_ops)
     for attr, name in (
         ("task_smart_reprice", "smart_reprice"),
         ("task_ad_restore", "ad_restore"),
@@ -727,9 +801,9 @@ def test_G3_task_cli_and_recovery_and_watchdog(tmp_path, monkeypatch):
         ("task_listing_audit", "listing_audit"),
         ("task_source_aspect_autofix", "source_aspect_autofix"),
     ):
-        monkeypatch.setattr(scheduler_daemon, attr, recover_ads_or_qc(name))
+        monkeypatch.setattr(_mods.daemon, attr, recover_ads_or_qc(name))
 
-    scheduler_daemon.recover_missed_tasks()
+    _mods.daemon.recover_missed_tasks()
     assert "smart_reprice" not in recovered
     assert "ad_restore" not in recovered
     assert "ads_enroll" not in recovered

@@ -45,6 +45,17 @@ DAEMON_SPEC.loader.exec_module(scheduler_daemon)
 import pytest
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _restore_schedule_module_after_file():
+    """Do not leave the collection-time schedule stub in sys.modules."""
+    yield
+    if sys.modules.get("schedule") is schedule_stub:
+        sys.modules.pop("schedule", None)
+    loaded = sys.modules.get("scheduler_daemon")
+    if loaded is scheduler_daemon:
+        sys.modules.pop("scheduler_daemon", None)
+
+
 @pytest.fixture(autouse=True)
 def force_full_scheduler_profile(monkeypatch):
     """Recovery tests assert the full profile table; force non-ops on host ops stores."""

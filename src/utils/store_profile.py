@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 import threading
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -351,11 +352,27 @@ KNOWN_SCHEDULER_JOBS = frozenset(
 )
 
 
+# Quoted / padded / flow-map ``scheduler_profile: ops`` (not ops_daily).
+_SCHEDULER_PROFILE_OPS_RE = re.compile(
+    r"""(?ix)
+    scheduler_profile
+    \s*:\s*
+    (?:['"]\s*)?
+    ops
+    (?:\s*['"])?
+    (?=\s|$|[,}\]#])
+    """
+)
+
+
 def peek_yaml_says_ops(*paths: os.PathLike | str) -> bool:
     """True when a profile file text says ``scheduler_profile: ops``.
 
     Used when the YAML is unreadable: fail closed to the two ops jobs instead
     of loading the Main furniture cadence on a GrovePop checkout.
+
+    Accepts ``ops``, ``"OPS "``, ``'ops'``, and flow maps such as
+    ``{scheduler_profile: ops}``.
     """
     candidates = [Path(p) for p in paths if p]
     if not candidates:
@@ -370,12 +387,9 @@ def peek_yaml_says_ops(*paths: os.PathLike | str) -> bool:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for line in text.splitlines():
-            stripped = line.split("#", 1)[0].strip().lower()
-            if stripped.startswith("scheduler_profile") and ":" in stripped:
-                value = stripped.split(":", 1)[1].strip().strip("'\"")
-                if value == "ops":
-                    return True
+        uncommented = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+        if _SCHEDULER_PROFILE_OPS_RE.search(uncommented):
+            return True
     return False
 
 
