@@ -490,3 +490,303 @@ def finalize_auto_technical_listing(
     if not isinstance(result.get("features"), list):
         result["features"] = []
     return result
+
+
+_FURNITURE_DECOR_MARKERS = (
+    "overwhelming the room",
+    "styling the space",
+    "pairs easily with modern or classic",
+    "clear visual impact",
+    "modern or classic décor",
+    "modern or classic decor",
+)
+_ASSEMBLY_RE = re.compile(r"assembly\s+(?:required|instructions)", re.IGNORECASE)
+
+
+def looks_like_furniture_shell(description: str) -> bool:
+    """True when HTML is the main-store furniture layout, even if recolored."""
+    value = str(description or "")
+    lowered = html.unescape(value).lower()
+    if any(marker in lowered for marker in _FURNITURE_DECOR_MARKERS):
+        return True
+    return "border-left:4px solid" in value and "specifications" in lowered and "#1f2329" not in value
+
+
+def looks_like_gold_template(description: str) -> bool:
+    """True when HTML matches the W3611/AquaRides chrome, not the furniture shell."""
+    value = str(description or "")
+    lowered = html.unescape(value).lower()
+    return (
+        "aquarides" in lowered
+        and "key features" in lowered
+        and "specifications" in lowered
+        and "#1f2329" in value
+        and "attribute" in lowered
+        and "ships from us warehouse" in lowered
+        and not any(marker in lowered for marker in _FURNITURE_DECOR_MARKERS)
+        and not _ASSEMBLY_RE.search(value)
+    )
+
+
+def _first_aspect_value(aspects: Mapping[str, Any], *names: str) -> str:
+    lowered = {str(key).strip().lower(): key for key in (aspects or {})}
+    for name in names:
+        key = lowered.get(name.lower())
+        if not key:
+            continue
+        value = aspects.get(key)
+        if isinstance(value, (list, tuple)):
+            text = ", ".join(str(item).strip() for item in value if str(item).strip())
+        else:
+            text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+_BOM_LINE_RE = re.compile(r"(?m)^\s*(\d+)\s*pcs?\s+(.+?)\s*$", re.IGNORECASE)
+
+
+def extract_source_bom_lines(source_description: str) -> list[str]:
+    """Pull supplier BOM lines like ``1pc utility knife`` from GIGA HTML/text.
+
+    Used for Source Spec + PACKAGE INCLUDES so multi-item kits are not truncated
+    by the old ``source_plain[:220]`` snip or collapsed to ``1 x <Type>``.
+    """
+    raw = str(source_description or "")
+    raw = re.sub(r"<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"</li>", "\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = html.unescape(raw)
+    lines: list[str] = []
+    seen: set[str] = set()
+    for match in _BOM_LINE_RE.finditer(raw):
+        qty = match.group(1).strip()
+        rest = match.group(2).strip().rstrip(" ,.;")
+        if not rest:
+            continue
+        # A GIGA title like "4pcs Running Boards For 2024 2025 Toyota …" is
+        # not a BOM line (S3). Keep only short component rows.
+        if re.search(r"\b(?:for|fits?|compatible with)\b", rest, re.I) and re.search(
+            r"\b(?:19|20)\d{2}\b", rest
+        ):
+            continue
+        if len(rest) > 80:
+            continue
+        # Keep supplier wording; normalize only the qty token spacing.
+        unit = "pc" if qty == "1" else "pcs"
+        line = f"{qty}{unit} {rest}"
+        key = line.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(line)
+    return lines
+
+
+def extract_source_mpn(source_description: str) -> str:
+    """Return supplier MPN from GIGA copy when present (e.g. ``MPN: 49901095-23``)."""
+    raw = html.unescape(re.sub(r"<[^>]+>", " ", str(source_description or "")))
+    match = re.search(r"\bMPN\s*[:：]\s*([A-Za-z0-9][A-Za-z0-9\-_/]{1,40})", raw, re.IGNORECASE)
+    return (match.group(1).strip() if match else "")
+
+
+_SNIPPET_MAX = 300
+_SET_WORD_TAIL_RE = re.compile(r"\s*\b(?:set|kit)\b\s*$", re.IGNORECASE)
+# Piece-count numbers followed by a unit are dimensions, not kit sizes.
+_TITLE_COUNT_UNIT_AFTER_RE = re.compile(
+    r"""\s*[-–—]?\s*(?:in(?:ch(?:es)?)?\b|cm\b|mm\b|lbs?\b|pounds?\b|kg\b|ft\b|feet\b|foot\b|v\b|volts?\b|"|'')""",
+    re.IGNORECASE,
+)
+_TITLE_PIECE_COUNT_RE = re.compile(
+    r"\b(\d{1,3})\s*-?\s*(?:piece|pcs?|packs?|pk)\b|\bset\s+of\s+(\d{1,3})\b",
+    re.IGNORECASE,
+)
+
+
+def _count_is_dimension_bound(text: str, match: re.Match[str], group: int) -> bool:
+    """True when the captured number is a size/voltage, not a piece count."""
+    from src.utils.publish_aspect_completion import number_is_dimension_bound
+
+    if number_is_dimension_bound(text, match, group):
+        return True
+    return bool(_TITLE_COUNT_UNIT_AFTER_RE.match(text[match.end(group):]))
+
+
+def whole_sentence_snippet(source_plain: str, max_chars: int = _SNIPPET_MAX) -> str:
+    """First whole sentence(s) of supplier prose, never cut mid-word.
+
+    Replaces the old ``source_plain[:220]`` snip. Returns "" (omit Source Spec)
+    when even the first sentence exceeds ``max_chars``.
+    """
+    text = re.sub(r"\s+", " ", str(source_plain or "")).strip()
+    text = re.sub(r"^(?:key\s+features|features|description|product\s+description)\s*[:\-]?\s*", "", text, flags=re.I)
+    sentences = re.findall(r"[^.!?]+[.!?]+(?=\s|$)", text)
+    out = ""
+    for sentence in sentences:
+        candidate = (out + " " + sentence.strip()).strip()
+        if len(candidate) > max_chars:
+            break
+        out = candidate
+    return out
+
+
+def _title_piece_count(title: str, aspects: Mapping[str, Any]) -> int | None:
+    for key in ("Number of Pieces", "Number of Items in Set"):
+        m = re.search(r"\d+", _first_aspect_value(aspects, key) or "")
+        if m and int(m.group()) >= 2:
+            return int(m.group())
+    text = str(title or "")
+    for match in _TITLE_PIECE_COUNT_RE.finditer(text):
+        group = 1 if match.group(1) is not None else 2
+        if _count_is_dimension_bound(text, match, group):
+            continue
+        value = int(match.group(group))
+        if value >= 2:
+            return value
+    return None
+
+
+def build_package_lines_without_bom(
+    *, title: str, item_type: str, aspects: Mapping[str, Any], source_description: str = ""
+) -> list[str] | None:
+    """Box lines when GIGA has no ``Npc`` BOM. Never invents.
+
+    - multi-piece (title / Number of Pieces): ``N x {Type minus Set/Kit}`` plus
+      extra Included Components that the GIGA source also mentions.
+    - plain single item: ``1 x {Type}``.
+    - Set/Kit wording with no count anywhere: ``None`` (cannot expand honestly;
+      QC will block instead of shipping a generic ``1 x ... Set``).
+    """
+    base_type = (item_type or "").split(",")[0].strip()
+    base_type = re.sub(r"\s*,?\s*mixed set\s*$", "", base_type, flags=re.I).strip()
+    count = _title_piece_count(title, aspects)
+    source_low = html.unescape(re.sub(r"<[^>]+>", " ", source_description or "")).lower()
+    has_set_word = bool(re.search(r"\b(set|kit)\b", f"{title} {base_type}", re.I))
+    if count:
+        unit = _SET_WORD_TAIL_RE.sub("", base_type).strip() or "Piece"
+        lines = [f"{count} x {unit}"]
+        comps = _first_aspect_value(aspects, "Included Components") or ""
+        for comp in (c.strip() for c in comps.split(",")):
+            if not comp or comp.lower() == base_type.lower() or _SET_WORD_TAIL_RE.search(comp):
+                continue
+            stem_u, stem_c = unit.lower().rstrip("s"), comp.lower().rstrip("s")
+            if stem_u in stem_c or stem_c in stem_u:
+                continue
+            if comp.lower() in source_low:
+                lines.append(f"1 x {comp}")
+        return lines
+    if has_set_word:
+        return None
+    return [f"1 x {base_type or 'Item'}"]
+
+
+def _auto_middle_html(
+    *,
+    title: str,
+    source_description: str,
+    aspects: Mapping[str, Any],
+    mode: str,
+) -> str:
+    """Source-grounded middle prose. Banner/table/footer come from finalize."""
+    safe_title = html.escape((title or "").strip().rstrip("."))
+    intro = (
+        f'<p style="margin:0 0 14px;font-size:14px;color:#14161a;line-height:1.7;">'
+        f"{safe_title}.</p>"
+    )
+    features: list[tuple[str, str]] = []
+    material = _first_aspect_value(aspects, "Material")
+    finish = _first_aspect_value(aspects, "Finish")
+    fitment = _first_aspect_value(aspects, "Fitment Type")
+    placement = _first_aspect_value(aspects, "Placement on Vehicle")
+    item_type = _first_aspect_value(aspects, "Type")
+    if fitment:
+        features.append(("Vehicle Fit", fitment))
+    if placement:
+        features.append(("Placement", placement))
+    if material:
+        features.append(("Material", material))
+    if finish:
+        features.append(("Finish", finish))
+    if item_type and len(features) < 4:
+        features.append(("Type", item_type))
+    bom_lines = extract_source_bom_lines(source_description)
+    source_plain = html.unescape(source_description or "")
+    source_plain = re.sub(r"<[^>]+>", " ", source_plain)
+    source_plain = re.sub(r"\s+", " ", source_plain).strip()
+    if bom_lines and len(features) < 5:
+        # Full supplier BOM — never mid-word truncate multi-item kits.
+        features.append(("Source Spec", "; ".join(bom_lines)))
+    elif source_plain and len(features) < 5:
+        snippet = whole_sentence_snippet(source_plain)
+        if snippet and not any(marker in snippet.lower() for marker in _FURNITURE_DECOR_MARKERS):
+            features.append(("Source Spec", snippet))
+    items = []
+    for label, detail in features[:6]:
+        items.append(
+            '<p style="margin:0 0 12px 0;font-size:14px;color:#14161a;line-height:1.7;">'
+            f"<strong>{html.escape(label)}:</strong> {html.escape(detail)}</p>"
+        )
+    box_label = "WHAT'S IN THE BOX" if mode == AUTO_MODE_TOOL else "PACKAGE INCLUDES"
+    if bom_lines:
+        package_html = "<br/>".join(html.escape(line) for line in bom_lines)
+    else:
+        pkg_lines = build_package_lines_without_bom(
+            title=title, item_type=item_type, aspects=aspects, source_description=source_description
+        )
+        if pkg_lines is None:
+            raise ValueError(
+                "package includes cannot be expanded honestly (set/kit with no source count)"
+            )
+        package_html = "<br/>".join(html.escape(line) for line in pkg_lines)
+    return (
+        "<div>"
+        f"{intro}"
+        '<div style="font-size:15px;font-weight:bold;color:#ff5722;text-transform:uppercase;'
+        'letter-spacing:.5px;border-bottom:1px solid #e5e7eb;padding-bottom:6px;margin:0 0 12px 0;">'
+        "KEY FEATURES</div>"
+        f"{''.join(items)}"
+        f'<div style="font-size:15px;font-weight:bold;color:#14161a;margin:16px 0 8px 0;">{box_label}</div>'
+        f'<p style="margin:0;font-size:14px;color:#14161a;line-height:1.7;">{package_html}</p>'
+        "</div>"
+    )
+
+
+def build_auto_gold_description(
+    *,
+    title: str,
+    source_description: str = "",
+    attributes: Optional[Mapping[str, Any]] = None,
+    specs: Optional[Mapping[str, Any]] = None,
+    aspects: Optional[Mapping[str, Any]] = None,
+    profile: Any = None,
+    mode: Optional[str] = None,
+    compatibility: Any = None,
+) -> str:
+    """Deterministic W3611/AquaRides description. Shared by generate, QC, and align."""
+    if profile is None:
+        from src.utils.store_profile import get_store_profile
+
+        profile = get_store_profile()
+    resolved_mode = mode or detect_auto_mode(title, source_description, aspects, compatibility)
+    clean_aspects = dict(aspects or {})
+    clean_aspects.pop("Assembly Required", None)
+    clean_aspects.pop("Assembly Status", None)
+    try:
+        from src.utils.listing_quality_gate import _fill_measurement_aspects
+
+        _fill_measurement_aspects(clean_aspects, {**(attributes or {}), **(specs or {})})
+    except Exception:
+        pass
+    middle = _auto_middle_html(
+        title=title,
+        source_description=source_description,
+        aspects=clean_aspects,
+        mode=resolved_mode,
+    )
+    finalized = finalize_auto_technical_listing(
+        {"title": title, "description": middle, "aspects": clean_aspects},
+        profile,
+        resolved_mode,
+    )
+    return str(finalized.get("description") or "")

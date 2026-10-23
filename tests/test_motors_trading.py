@@ -5,6 +5,7 @@ import re
 import pytest
 
 from src.services.motors_trading import (
+    ascii_safe,
     build_add_fixed_price_item_xml,
     build_revise_fixed_price_item_xml,
     format_compatibility_list,
@@ -318,3 +319,47 @@ class TestClientWrapper:
         assert "<ReplaceAll>true</ReplaceAll>" in revise_xml
         assert "<Name>Make</Name><Value>Land Rover</Value>" in revise_xml
         assert "<Name>Model</Name><Value>Defender</Value>" in revise_xml
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("12×8 in", "12x8 in"),
+        ("Café", "Cafe"),
+        ("2019–2026", "2019-2026"),
+        ("90° bend", "90 deg bend"),
+        ('½" drive', '1/2" drive'),
+        ("AquaRides®", "AquaRides(R)"),
+        ("“Heavy” duty", '"Heavy" duty'),
+        ("16″ wheel", '16" wheel'),
+        ("钢制", ""),
+        (None, ""),
+        ("", ""),
+        ('Hitch Pin 5/8"', 'Hitch Pin 5/8"'),
+    ],
+    ids=[
+        "times",
+        "cafe",
+        "en-dash",
+        "degree",
+        "half",
+        "registered",
+        "quotes",
+        "inch-mark",
+        "cjk-dropped",
+        "none",
+        "empty",
+        "plain-ascii",
+    ],
+)
+def test_ascii_safe_character_table(raw, expected):
+    assert ascii_safe(raw) == expected
+
+
+def test_description_cdata_splits_literal_closer():
+    xml = build_revise_fixed_price_item_xml(
+        item_id="1",
+        description="before ]]> after",
+    )
+    assert "<![CDATA[before ]]]]><![CDATA[> after]]>" in xml
+    assert "<ItemSpecifics>" not in xml
