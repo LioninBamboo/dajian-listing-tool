@@ -17,10 +17,11 @@ class SmartRepriceEmailTests(unittest.TestCase):
     def test_changed_skus_include_thumbnail_and_reason(self):
         captured = {}
 
-        def fake_send_email(subject, body, attachments=None):
+        def fake_send_email(subject, body, attachments=None, send_smtp=True, **kwargs):
             captured["subject"] = subject
             captured["body"] = body
             captured["attachments"] = attachments or []
+            captured["send_smtp"] = send_smtp
             return True
 
         result_row = {
@@ -64,6 +65,7 @@ class SmartRepriceEmailTests(unittest.TestCase):
         self.assertIn("市场均价 $120.00", body)
         self.assertIn("<th>Product</th>", body)
         self.assertIn("<th>Reason</th>", body)
+        self.assertTrue(captured["send_smtp"])  # n_changes=1 → SMTP on
 
 
 if __name__ == "__main__":

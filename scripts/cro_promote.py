@@ -31,7 +31,8 @@ from src.services.cro_email_digest import render_promote_email  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BID_INCREMENT = 5.0  # %
+DEFAULT_BID_INCREMENT = 5.0  # % (new-ad initial bid; raises capped by MAX_BID_STEP)
+MAX_BID_STEP = 2.0           # 2026-10-13: single raise at most +2.0pp
 MAX_BID_PCT = 25.0           # 安全上限
 
 
@@ -76,10 +77,53 @@ def _select_campaign_id(ad_service, preferred_campaign_id: Optional[str] = None)
     return None
 
 
+def _ad_floor_check(sku: str, new_bid_pct: float,
+                    economics: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """2026-10-14: post-raise profit gate (PricingEngine floor = cost*1.10 + fees).
+
+    profit = merch - fee_base*(FVF+intl+new_rate) - fixed - cost, same formula as
+    PricingEngine.required_ad_rate_for / absolute_floor_price. ok=False when
+    profit < cost*MIN_NET_MARGIN_ON_COST (or no cost data).
+    """
+    from decimal import Decimal
+    from src.services.pricing_engine import PricingEngine as PE
+    eco = economics
+    if eco is None:
+        try:
+            from src.services.cro_sku_economics import load_sku_economics
+            eco = load_sku_economics(sku)
+        except Exception:
+            eco = None
+    price = float((eco or {}).get('price') or 0)
+    cost = float((eco or {}).get('cost') or 0)
+    if price <= 0 or cost <= 0:
+        return {'ok': False, 'reason': 'no_cost', 'sku': sku,
+                'price': price or None, 'cost': cost or None,
+                'new_rate': new_bid_pct}
+    p, c = Decimal(str(price)), Decimal(str(cost))
+    rate = Decimal(str(new_bid_pct)) / Decimal('100')
+    merch = p * (Decimal('1') - PE.STORE_DISCOUNT_RATE)
+    fee_base = merch * (Decimal('1') + PE.LISTING_TAX_PAD)
+    fees = fee_base * (PE.marketplace_fee_rate() + rate) + PE.FIXED_FEE
+    profit = merch - fees - c
+    min_profit = c * PE.MIN_NET_MARGIN_ON_COST
+    try:
+        floor = PE.absolute_floor_price(float(c * (Decimal('1') + PE.MIN_NET_MARGIN_ON_COST)),
+                                        ad_rate=float(rate))
+    except Exception:
+        floor = None
+    return {'ok': profit >= min_profit,
+            'reason': None if profit >= min_profit else 'below_floor_after_ad',
+            'sku': sku, 'price': round(price, 2), 'cost': round(cost, 2),
+            'new_rate': new_bid_pct, 'profit': float(round(profit, 2)),
+            'min_profit': float(round(min_profit, 2)), 'floor_price': floor}
+
+
 def _promote_one(ad_service, sku: str, suggested_bid_pct: float,
                  *, listing_id: Optional[str] = None,
                  campaign_id: Optional[str] = None,
-                 create_if_missing: bool = False) -> Dict[str, Any]:
+                 create_if_missing: bool = False,
+                 economics: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
     listing_id = str(listing_id or _lookup_listing_id(sku) or '').strip()
     if not listing_id:
         return {'sku': sku, 'status': 'skipped',
@@ -95,11 +139,18 @@ def _promote_one(ad_service, sku: str, suggested_bid_pct: float,
             return {'sku': sku, 'status': 'skipped',
                     'reason': 'not promoted and no running campaign',
                     'listing_id': listing_id}
+        # Spec D1: initial bid for a new ad is min(suggested, MAX_BID_STEP).
+        # Aligns create path with dry-run floor gate (which also uses min(inc, MAX_BID_STEP)).
+        initial_bid = min(float(suggested_bid_pct or DEFAULT_BID_INCREMENT), MAX_BID_STEP)
+        gate = _ad_floor_check(sku, initial_bid, economics)
+        if not gate['ok']:
+            return {'status': 'skipped', 'listing_id': listing_id,
+                    'terminal': False, **gate}
         res = ad_service.create_ad_safe(
             target_campaign,
             listing_id,
             sku=sku,
-            bid_percentage=suggested_bid_pct,
+            bid_percentage=initial_bid,
         )
         if not res or not res.get('success'):
             guard_reason = (res or {}).get('reason') or ''
@@ -116,7 +167,7 @@ def _promote_one(ad_service, sku: str, suggested_bid_pct: float,
         return {'sku': sku, 'status': 'done',
                 'listing_id': listing_id,
                 'campaign_id': target_campaign,
-                'new_bid': suggested_bid_pct,
+                'new_bid': initial_bid,
                 'created_ad': True}
     cur_bid = float(ad.get('bid_percentage') or 0.0)
     # S36: \u5229\u6da6\u611f\u77e5\u52a8\u6001\u4e0a\u9650; \u627e\u4e0d\u5230\u6210\u672c\u4ef7 \u2192 fallback \u5230 HARD_FLOOR_PCT
@@ -129,6 +180,7 @@ def _promote_one(ad_service, sku: str, suggested_bid_pct: float,
     # eBay Marketing API \u53ea\u63a5\u53d7 1 \u4f4d\u5c0f\u6570\u7684 bidPercentage (35007);
     # \u5411\u4e0b\u53d6\u6574\u5230 0.1, \u4e0d\u8d8a\u5229\u6da6 cap. margin cap \u4fee\u590d\u540e\u4ea7\u51fa 7.05/13.93
     # \u8fd9\u7c7b\u4e24\u4f4d\u5c0f\u6570, 2026-07-12 \u66fe\u5bfc\u81f4\u5168\u90e8 update 400 \u7a7a\u8f6c.
+    suggested_bid_pct = min(float(suggested_bid_pct or DEFAULT_BID_INCREMENT), MAX_BID_STEP)
     import math
     new_bid = math.floor(
         min(cur_bid + suggested_bid_pct, effective_cap) * 10) / 10
@@ -137,6 +189,10 @@ def _promote_one(ad_service, sku: str, suggested_bid_pct: float,
                 'reason': f'already at cap ({cur_bid}% + {suggested_bid_pct}% > {effective_cap}%)',
                 'cur_bid': cur_bid, 'dyn_cap': dyn_cap,
                 'terminal': True}
+    gate = _ad_floor_check(sku, new_bid, economics)
+    if not gate['ok']:
+        return {'status': 'skipped', 'listing_id': listing_id,
+                'cur_bid': cur_bid, 'terminal': False, **gate}
     res = ad_service.update_ad_bid(ad['campaign_id'], listing_id, new_bid)
     if not res or not res.get('success'):
         err = str((res or {}).get('error') or 'update_ad_bid failed')
@@ -186,8 +242,16 @@ def run(apply_changes: bool, limit: int,
         except (TypeError, ValueError):
             inc = DEFAULT_BID_INCREMENT
         if not apply_changes:
+            gate = _ad_floor_check(sku, min(inc, MAX_BID_STEP) + float(detail.get('cur_bid_pct') or 0),
+                                   action.get('economics'))
+            if not gate['ok']:
+                row = {'status': 'skipped', **gate}
+                rep['rows'].append(row); rep['skipped'].append(sku)
+                rep.setdefault('below_floor', []).append(gate)
+                continue
             row = {'sku': sku, 'status': 'dry_run',
-                   'reason': 'would apply', 'increment': inc,
+                   'reason': 'would apply', 'increment': min(inc, MAX_BID_STEP),
+                   'new_ad_bid': min(inc, MAX_BID_STEP),
                    'auto_create_missing_ads': auto_create_missing_ads}
         else:
             try:
@@ -195,12 +259,15 @@ def run(apply_changes: bool, limit: int,
                     ad_service,
                     sku,
                     inc,
+                    economics=action.get('economics'),
                     listing_id=action.get('listing_id'),
                     campaign_id=campaign_id,
                     create_if_missing=auto_create_missing_ads,
                 )
             except Exception as e:
                 row = {'sku': sku, 'status': 'failed', 'reason': f'unhandled: {e}'}
+        if row.get('reason') in ('below_floor_after_ad', 'no_cost'):
+            rep.setdefault('below_floor', []).append({k: row.get(k) for k in ('sku', 'reason', 'price', 'cost', 'new_rate', 'profit', 'min_profit')})
         rep['rows'].append(row)
         bucket = row['status'] if row['status'] in ('done', 'failed', 'skipped') else 'skipped'
         rep[bucket].append(sku)
@@ -246,6 +313,7 @@ def main():
         'done': len(rep['done']),
         'failed': len(rep['failed']),
         'skipped': len(rep['skipped']),
+        'below_floor': rep.get('below_floor', []),
         'apply': rep['apply'],
     }, indent=2))
 
