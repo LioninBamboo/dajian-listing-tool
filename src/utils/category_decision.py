@@ -311,11 +311,33 @@ _SPORTS_KEEP_RE = re.compile(
     r"table\s+tennis)\b",
     re.IGNORECASE,
 )
+_GRILL_TABLE_RE = re.compile(
+    r"\b(?:grill|bbq|barbecue)\s+tables?\b",
+    re.IGNORECASE,
+)
 _TREE_UNAVAILABLE_WARNED = False
 
 # Ship empty. Optional JSON override: data/config/approved_auto_remaps.json
 # Each pair is (stored_or_empty, target_id) or (reason, target_id).
 APPROVED_AUTO_REMAPS: frozenset[tuple[str, str]] = frozenset()
+
+# Shared with batch_publish.KNOWN_PUBLISHABLE_CATEGORY_IDS so a cache snapshot
+# that omitted these production leaves cannot hold a matching stored id.
+TREE_KNOWN_PUBLISHABLE_LEAVES: frozenset[str] = frozenset({"38217", "79694"})
+_TREE_KNOWN_PUBLISHABLE_INDEX = {
+    "79694": ("Porch Swings", "900003"),
+    "38217": ("China Cabinets", "900007"),
+}
+
+# High-confidence title kinds: stored leaf must be one of these or hold.
+_KIND_ALLOWED_STORED = {
+    "display_cabinet": frozenset({DISPLAY_CABINET_LEAF, "38217"}),
+    "hall_tree": frozenset({HALL_TREE, "32880"}),
+}
+
+HOLD_EMPTY_PUBLISH_ERROR = (
+    "Stored category is empty or invalid; holding publish. No category write."
+)
 
 _SUGGESTED_ALTERNATIVES = {
     "38200": "38204",
@@ -330,7 +352,12 @@ def _category_index(index=None):
 
     if index is not None:
         return dict(index)
-    return load_category_index()
+    flat = load_category_index()
+    if not flat:
+        return {}
+    for cid, meta in _TREE_KNOWN_PUBLISHABLE_INDEX.items():
+        flat.setdefault(cid, meta)
+    return flat
 
 
 def category_tree_is_available(index=None) -> bool:
@@ -355,7 +382,12 @@ def warn_once_tree_unavailable(log=None) -> None:
 
 
 def unpublished_listing_status(status: str = "") -> bool:
-    return str(status or "").strip().upper() in {"", "READY", "PENDING"}
+    return str(status or "").strip().upper() in {
+        "",
+        "READY",
+        "PENDING",
+        "READY_TO_PUBLISH",
+    }
 
 
 def _looks_like_tool_title(title: str) -> bool:
@@ -364,6 +396,40 @@ def _looks_like_tool_title(title: str) -> bool:
 
 def _looks_like_kitchen_island_title(title: str) -> bool:
     return bool(_KITCHEN_ISLAND_TITLE_RE.search(as_safe_text(title)))
+
+
+def _looks_like_grill_table_title(title: str) -> bool:
+    return bool(_GRILL_TABLE_RE.search(as_safe_text(title)))
+
+
+def _confident_title_kind(title: str) -> str:
+    """Kinds we will hold on when the stored leaf is the wrong family.
+
+    Intentionally narrow so tools/vanities/cabinets/hutches/desks/sports
+    titles keep a fitting stored leaf (PR #29 false-flag set).
+    """
+    hay = as_safe_text(title)
+    if not hay:
+        return ""
+    if _display_cabinet_title(hay):
+        return "display_cabinet"
+    if _looks_like_grill_table_title(hay):
+        return "outdoor_table"
+    if _looks_like_kitchen_island_title(hay):
+        return "kitchen_island"
+    head = first_product_noun(hay)
+    if head == "hall tree" or re.search(r"\bhall\s+tree\b", hay, re.IGNORECASE):
+        return "hall_tree"
+    return ""
+
+
+def hold_implausible_publish_error(stored: str, title: str = "") -> str:
+    stored_id = as_safe_category_id(stored)
+    alt = suggested_alternative_for(stored_id, _confident_title_kind(title), title)
+    msg = f"Stored category {stored_id or '(empty)'} is not publishable"
+    if alt:
+        msg += f"; suggested {alt}"
+    return msg
 
 
 def _title_agrees_with_stored(title: str, stored: str, index=None) -> bool:
@@ -404,6 +470,8 @@ def suggested_alternative_for(cid: str | None, kind: str = "", title: str = "") 
         return DISPLAY_CABINET_LEAF
     if kind in {"kitchen_island"} or "kitchen island" in as_safe_text(title).lower():
         return KITCHEN_ISLAND_LEAF
+    if kind in {"outdoor_table"} or _looks_like_grill_table_title(title):
+        return OUTDOOR_TABLE
     if kind in {"hall_tree"}:
         return HALL_TREE
     return None
@@ -465,6 +533,9 @@ def validate_target_category(
         return False, "tree_unavailable"
     from src.utils.category_tree_cache import is_cached_leaf_category
 
+    if target in TREE_KNOWN_PUBLISHABLE_LEAVES and target not in flat:
+        flat = dict(flat)
+        flat[target] = _TREE_KNOWN_PUBLISHABLE_INDEX[target]
     if not is_cached_leaf_category(target, index=flat):
         return False, "invalid_target_leaf"
     path = _category_path(target, index=flat)
@@ -473,28 +544,37 @@ def validate_target_category(
     species = pet_species_mismatch_reason(title, path)
     if species:
         return False, species
+    if kind in _FURNITURE_KINDS:
+        effective_kind = kind
+    else:
+        effective_kind = _confident_title_kind(title) or kind
     tools_path = path.startswith("Home & Garden > Tools & Workshop Equipment")
     if tools_path:
-        if kind in _FURNITURE_KINDS or _looks_like_kitchen_island_title(title):
+        if effective_kind in _FURNITURE_KINDS or _looks_like_kitchen_island_title(title):
             if not _looks_like_tool_title(title):
                 return False, "implausible_target_path"
         elif target == KITCHEN_ISLAND and "Power Tool" in path:
-            if _looks_like_kitchen_island_title(title) or kind in {
+            if _looks_like_kitchen_island_title(title) or effective_kind in {
                 "kitchen_island",
                 "side_table",
                 "display_cabinet",
+                "outdoor_table",
             }:
                 return False, "implausible_target_path"
-    if kind in _FURNITURE_KINDS:
+    if effective_kind in _FURNITURE_KINDS:
         if not any(path.startswith(prefix) for prefix in FURNITURE_PATH_PREFIXES):
             return False, "implausible_target_path"
     if target == KITCHEN_ISLAND and "Power Tool" in path:
-        if _looks_like_kitchen_island_title(title) or kind in {
+        if _looks_like_kitchen_island_title(title) or effective_kind in {
             "kitchen_island",
             "side_table",
             "display_cabinet",
+            "outdoor_table",
         }:
             return False, "implausible_target_path"
+    allowed = _KIND_ALLOWED_STORED.get(effective_kind)
+    if allowed is not None and target not in allowed:
+        return False, "implausible_target_path"
     return True, ""
 
 
@@ -900,8 +980,8 @@ def apply_category_write_gate(
     Returns (category_id_or_None_to_hold, action) where action is
     ``remap``, ``keep``, ``hold_empty``, or ``hold_implausible``.
     Unapproved remaps keep the original stored id. Empty stored holds.
-    Invalid/implausible stored holds READY/PENDING and stays manifest-only
-    for PUBLISHED.
+    Invalid/implausible stored holds READY/PENDING/READY_TO_PUBLISH and
+    stays manifest-only for PUBLISHED.
     """
     stored = as_safe_category_id(original_stored)
     candidate = as_safe_category_id(candidate_id)
@@ -935,3 +1015,35 @@ def apply_category_write_gate(
         if not stored_ok and unpublished:
             return None, "hold_implausible"
     return chosen or None, action
+
+
+def gate_publish_category_choice(
+    original_stored: Any,
+    candidate_id: Any,
+    title: str = "",
+    listing_status: str = "READY",
+    *,
+    reason: str = "publish_candidate",
+    kind: str = "classified",
+    index=None,
+) -> tuple[str | None, str, str]:
+    """Shared choke point for every manual/API publish category write.
+
+    Returns ``(category_id, action, error)``. ``error`` is set on hold;
+    callers must not publish or write a category when it is non-empty.
+    Unapproved remaps keep the stored id (report-only).
+    """
+    gated, action = apply_category_write_gate(
+        original_stored,
+        candidate_id,
+        title,
+        listing_status=listing_status,
+        reason=reason,
+        kind=kind,
+        index=index,
+    )
+    if action == "hold_empty":
+        return None, action, HOLD_EMPTY_PUBLISH_ERROR
+    if action == "hold_implausible":
+        return None, action, hold_implausible_publish_error(original_stored, title)
+    return gated, action, ""

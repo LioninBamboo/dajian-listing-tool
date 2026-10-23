@@ -455,7 +455,13 @@ def test_batch_publish_path_gates_named_skus():
         result = _emulate_publish(row)
         stored = str(row.get("stored_category") or "") or None
         got = result.get("category_id")
-        if sku in {"N707S300277B", "N707S186617W", "W3190S00002"}:
+        if sku in {
+            "N707S300277B",
+            "N707S186617W",
+            "W3190S00002",
+            "T3971P401872",
+            "W1580S00491",
+        }:
             assert result.get("held") is True
             assert got is None
             continue

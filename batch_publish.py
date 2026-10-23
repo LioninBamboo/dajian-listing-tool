@@ -74,6 +74,7 @@ from src.utils.approved_category import (
     mark_category_approved,
 )
 from src.utils.publish_fee_preview import evaluate_insertion_fee_preview
+from src.utils.category_decision import TREE_KNOWN_PUBLISHABLE_LEAVES
 from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP, PROTECTED_STORED_CATEGORY_IDS
 from src.utils.dimension_helpers import (
     extract_all_dimensions, find_dimension,
@@ -147,6 +148,7 @@ KNOWN_PUBLISHABLE_CATEGORY_IDS = {
     "173950", # Air Compressors (Motors tree-100)
     "34999",  # Other Automotive Air Tools (Motors tree-100)
     *TREE0_FORCE_INVENTORY_CATEGORIES,
+    *TREE_KNOWN_PUBLISHABLE_LEAVES,
 }
 # ═══════════════════════════════════════════════════════════════
 # Data Layer
@@ -338,6 +340,49 @@ def _target_marketplace(category_id: str):
 def _is_invalid_category_error(error_msg: str) -> bool:
     """Match eBay category validation errors robustly."""
     return is_invalid_category_error(error_msg)
+
+
+MOTORS_INVALID_NORMALIZE_LEAVES = frozenset({"262980", "38208", "38204", "107578", "20456"})
+MOTORS_FALLBACK_CATEGORY_ID = "63700"
+
+
+def apply_motors_tool_category_restore(
+    stored_cat,
+    category_id,
+    title="",
+    listing_status="READY",
+    *,
+    is_motors=False,
+):
+    """Gate the Aqua-only Motors 63700 fallback.
+
+    Unapproved remap keeps stored (report-only). Empty/implausible stored holds.
+    """
+    from src.utils.category_decision import gate_publish_category_choice
+
+    current = str(category_id or "").strip()
+    stored = str(stored_cat or "").strip()
+    if not is_motors or current in TREE0_FORCE_INVENTORY_CATEGORIES:
+        return current, "keep", ""
+    restore_cat = ""
+    restore_name = ""
+    if stored in MOTORS_TOOL_UNIVERSAL_CATEGORIES and current != stored:
+        restore_cat, restore_name = stored, ""
+    elif current in MOTORS_INVALID_NORMALIZE_LEAVES:
+        restore_cat = stored if stored in MOTORS_TOOL_UNIVERSAL_CATEGORIES else MOTORS_FALLBACK_CATEGORY_ID
+        restore_name = "Other Shop Equipment" if restore_cat == MOTORS_FALLBACK_CATEGORY_ID else ""
+    if not restore_cat or restore_cat == current:
+        return current, "keep", ""
+    gated, action, hold_err = gate_publish_category_choice(
+        stored,
+        restore_cat,
+        title,
+        listing_status,
+        reason="motors_63700_fallback",
+    )
+    if hold_err:
+        return None, action, hold_err
+    return gated or stored or current, action, restore_name
 
 
 def _is_sellable_leaf_category(oauth, category_id: str) -> bool:
@@ -1226,30 +1271,43 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     # 262980 Benches). Restore the audited Motors tool category before fitment
     # + Trading publish. Also fall back to Other Shop Equipment when the leaf
     # is known-invalid on SiteID 100.
-    _motors_invalid_leaves = {"262980", "38208", "38204", "107578", "20456"}
-    if get_store_profile().is_motors and category_id not in TREE0_FORCE_INVENTORY_CATEGORIES:
-        restore_cat = ""
-        restore_name = ""
-        if stored_cat in MOTORS_TOOL_UNIVERSAL_CATEGORIES and category_id != stored_cat:
-            restore_cat, restore_name = stored_cat, (stored_cat_name or category_name)
-        elif category_id in _motors_invalid_leaves:
-            restore_cat = (
-                stored_cat if stored_cat in MOTORS_TOOL_UNIVERSAL_CATEGORIES else "63700"
-            )
-            restore_name = (
-                stored_cat_name
-                if stored_cat in MOTORS_TOOL_UNIVERSAL_CATEGORIES
-                else "Other Shop Equipment"
-            )
-        if restore_cat and category_id != restore_cat:
+    restored_id, restore_action, restore_detail = apply_motors_tool_category_restore(
+        stored_cat,
+        category_id,
+        title,
+        listing_status,
+        is_motors=get_store_profile().is_motors,
+    )
+    if restore_action in {"hold_empty", "hold_implausible"}:
+        msg = restore_detail or f"Stored category {stored_cat} is not publishable"
+        record_error(sku, msg)
+        return {"status": "error", "message": msg}
+    if restored_id and restored_id != category_id:
+        if restore_action == "remap":
             logger.info(
-                f"  [CAT] Restoring Motors tool category {restore_cat} after normalize "
+                f"  [CAT] Restoring Motors tool category {restored_id} after normalize "
                 f"remapped to {category_id}"
             )
-            category_id = restore_cat
-            category_name = restore_name or f"Category {restore_cat}"
-            quality_opt["categoryId"] = category_id
-            quality_opt["categoryName"] = category_name
+            category_name = (
+                stored_cat_name
+                if restored_id == stored_cat
+                else (restore_detail or f"Category {restored_id}")
+            )
+        elif restored_id == stored_cat:
+            logger.info(
+                f"  [CAT] Keeping stored Motors category {restored_id} after normalize "
+                f"remapped to {category_id}"
+            )
+            category_name = stored_cat_name or category_name or f"Category {restored_id}"
+        else:
+            logger.warning(
+                f"  [CAT] Unapproved Motors 63700 fallback; keeping stored "
+                f"{restored_id} (report-only)"
+            )
+            category_name = stored_cat_name or category_name or f"Category {restored_id}"
+        category_id = restored_id
+        quality_opt["categoryId"] = category_id
+        quality_opt["categoryName"] = category_name
     compatibility = analyze_ebay_motors_compatibility(
         category_id=category_id,
         title=title,

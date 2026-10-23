@@ -695,7 +695,8 @@ def publish_to_ebay(product: dict) -> dict:
             source_title=product.get('title', ''),
         )
         description = opt_data.get("description", product.get('description', ''))
-        category_id = remap_legacy_category_id(opt_data.get("categoryId", ""))
+        original_stored = remap_legacy_category_id(opt_data.get("categoryId", ""))
+        category_id = original_stored
         if not is_sellable_leaf_category(oauth, category_id):
             from src.services.ebay_category_matcher import EbayCategoryMatcher
             matcher = EbayCategoryMatcher(oauth)
@@ -705,8 +706,18 @@ def publish_to_ebay(product: dict) -> dict:
                 description,
             )
             category_id = remap_legacy_category_id(matched_id)
-        if not is_sellable_leaf_category(oauth, category_id):
-            return {"status": "error", "message": f"类目无效: {category_id or '空'}"}
+        from src.utils.category_decision import gate_publish_category_choice
+
+        category_id, _gate_action, hold_err = gate_publish_category_choice(
+            original_stored,
+            category_id,
+            title,
+            product.get("status") or "READY",
+        )
+        if hold_err:
+            return {"status": "error", "message": hold_err}
+        if not category_id:
+            return {"status": "error", "message": f"类目无效: {original_stored or '空'}"}
         aspects = apply_compatibility_aspects(
             category_id,
             opt_data.get("aspects", _default_brand_aspects()),
@@ -967,7 +978,8 @@ def publish_with_auto_category(product: dict) -> dict:
                 product.get('description', '')
             )
             category_id = remap_legacy_category_id(category_id)
-            stored_cat = remap_legacy_category_id(opt_data.get("categoryId", ""))
+            original_stored = remap_legacy_category_id(opt_data.get("categoryId", ""))
+            stored_cat = original_stored
             from src.utils.approved_category import evaluate_approved_category
 
             approved_decision = evaluate_approved_category(stored_cat, opt_data)
@@ -1002,6 +1014,18 @@ def publish_with_auto_category(product: dict) -> dict:
                     print(f"[AUTO] Fallback to stored category: {category_id}")
                 else:
                     return {"status": "error", "message": "无法确定有效类目，请先运行草稿审计修复"}
+            from src.utils.category_decision import gate_publish_category_choice
+
+            category_id, _gate_action, hold_err = gate_publish_category_choice(
+                original_stored,
+                category_id,
+                opt_data.get("title", product.get("title", "")),
+                product.get("status") or "READY",
+            )
+            if hold_err:
+                return {"status": "error", "message": hold_err}
+            if not category_id:
+                return {"status": "error", "message": "无法确定有效类目，请先运行草稿审计修复"}
             
             completed_aspects = complete_publish_aspects(
                 completed_aspects,
@@ -1126,11 +1150,28 @@ def publish_with_auto_category(product: dict) -> dict:
                 if is_invalid_category_error(error_msg):
                     remapped = remap_legacy_category_id(category_id)
                     if remapped and remapped != category_id and is_sellable_leaf_category(oauth, remapped):
-                        print(f"[AUTO-FIX] 类目重映射: {category_id} -> {remapped}")
-                        category_id = remapped
+                        gated_fix, fix_action, fix_hold = gate_publish_category_choice(
+                            original_stored,
+                            remapped,
+                            opt_data.get("title", product.get("title", "")),
+                            product.get("status") or "READY",
+                            reason="app_invalid_category_autofix",
+                        )
+                        if fix_hold:
+                            return {"status": "error", "message": fix_hold}
+                        if fix_action != "remap" or not gated_fix or gated_fix == original_stored:
+                            return {
+                                "status": "error",
+                                "message": (
+                                    f"Unapproved category remap {category_id} -> {remapped}; "
+                                    "keeping stored (report-only). No publish."
+                                ),
+                            }
+                        print(f"[AUTO-FIX] 类目重映射: {category_id} -> {gated_fix}")
+                        category_id = gated_fix
                         if 'optimization' not in product or not isinstance(product['optimization'], dict):
                             product['optimization'] = {}
-                        product['optimization']['categoryId'] = remapped
+                        product['optimization']['categoryId'] = gated_fix
                         continue
             
             import traceback

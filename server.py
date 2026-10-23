@@ -1593,7 +1593,8 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         
         # ===== AUTO CATEGORY & ITEM SPECIFICS MATCHING =====
         category_matcher = EbayCategoryMatcher(ebay_client.oauth)
-        stored_cat = str(opt_data.get("categoryId") or "").strip() or None
+        original_stored = str(opt_data.get("categoryId") or "").strip() or None
+        stored_cat = original_stored
         stored_cat_name = opt_data.get("categoryName")
         from src.utils.approved_category import evaluate_approved_category
 
@@ -1784,6 +1785,19 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                 "errors": [HUMAN_GATE_ERROR],
             }
         category_id, category_name, completed_aspects = gated
+        from src.utils.category_decision import gate_publish_category_choice
+
+        category_id, _gate_action, hold_err = gate_publish_category_choice(
+            original_stored,
+            category_id,
+            title_context or listing_title,
+            getattr(product, "status", "") or "READY",
+        )
+        if hold_err:
+            if original_stored:
+                opt_data["categoryId"] = original_stored
+                product.optimization = opt_data
+            raise HTTPException(status_code=400, detail=hold_err)
         opt_data["categoryId"] = category_id
         if category_name:
             opt_data["categoryName"] = category_name
@@ -1962,8 +1976,19 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                             flag_modified(product, "optimization")
                             break
                         new_id, new_name, _kept_aspects = remapped
-                        if new_id and str(new_id) != str(category_id):
-                            category_id, category_name = new_id, new_name
+                        gated_retry, retry_action, retry_hold = gate_publish_category_choice(
+                            original_stored,
+                            new_id,
+                            title_context or listing_title,
+                            getattr(product, "status", "") or "READY",
+                        )
+                        if retry_hold:
+                            last_error = retry_hold
+                            product.status = "READY"
+                            flag_modified(product, "logs")
+                            break
+                        if retry_action == "remap" and gated_retry and str(gated_retry) != str(original_stored):
+                            category_id, category_name = gated_retry, new_name
                             opt_data["categoryId"] = category_id
                             opt_data["categoryName"] = category_name
                             product.optimization = opt_data
