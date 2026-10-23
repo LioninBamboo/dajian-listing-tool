@@ -414,11 +414,23 @@ def run(apply: bool = False, send_email: bool = False) -> Dict[str, Any]:
             from src.utils.email_policy import should_smtp
             subject = (f"🎯 Smart Bid {'应用' if apply else '预览'} - "
                        f"调整{summary['by_decision'].get('adjust', 0)} / 总{summary['total']}")
+            # MF-1: summary has no 'errors' key. Mail when any adjust is planned,
+            # any apply failed, or experiment bids were applied live (incl. success).
+            # Silence only fully clean no_change runs; local report always via _send.
             n_adjust = int(summary['by_decision'].get('adjust', 0) or 0)
+            n_experiment = int(summary['by_decision'].get('experiment', 0) or 0)
+            apply_failed = int(apply_result.get('applied_failed') or 0)
+            apply_errors = apply_result.get('errors') or []
+            has_issues = bool(
+                n_adjust
+                or apply_failed
+                or apply_errors
+                or (apply and n_experiment > 0)
+            )
             _send(
                 subject,
                 render_email_html(report),
-                send_smtp=should_smtp(has_issues=bool(n_adjust or summary.get('errors'))),
+                send_smtp=should_smtp(has_issues=has_issues),
             )
         except Exception as exc:
             logger.warning(f"邮件发送失败: {exc}")

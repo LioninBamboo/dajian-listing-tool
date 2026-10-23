@@ -20,8 +20,7 @@ from src.utils.claim_diff_engine import build_source_constraints, detect_claim_v
 def test_aluminium_synonym_table(case_id, source_text, generated, expect_material_upgrade):
     # All rows SYNTHETIC text on real synonym logic.
     source = build_source_constraints({}, {}, source_text, "Frame")
-    # Ensure source_text carries the fixture phrase (aspects empty).
-    assert source_text.lower() in source["source_text"].lower() or True
+    assert source_text.lower() in source["source_text"].lower()
     violations = detect_claim_violations(source, generated, generated, {})
     upgrades = [v for v in violations if v.claim_type == "material_upgrade"]
     if expect_material_upgrade:
