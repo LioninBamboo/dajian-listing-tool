@@ -77,6 +77,11 @@ class EbayCategoryMatcher:
         if not cid:
             return None, category_name
 
+        # Motors publishes against tree 100. Tree-0 furniture remaps
+        # (pantry → 20487, etc.) must not replace a stored leaf.
+        if get_store_profile().is_motors:
+            return cid, category_name
+
         text_lower = self._normalize_keyword_text(
             " ".join(part for part in (title or "", description or "", category_name or "") if part)
         )
@@ -900,46 +905,27 @@ class EbayCategoryMatcher:
             logging.warning(f"[WARN] Taxonomy API failed: {e}")
         
         # Step 3: Cross-validate and decide
-        # Motors stores publish against category tree 100. The keyword fallback map
-        # holds tree-0 ids (e.g. 174020 Trailer Hitches) that do not exist in tree
-        # 100; the Taxonomy API is queried against the store's OWN tree, so its
-        # suggestion is usually the correct tree-100 leaf (e.g. 33653). Prefer the
-        # API when it is plausible — but when Taxonomy drifts (e.g. motorcycle
-        # hitch carrier → 184478 motorcycle accessory), fall back to the keyword
-        # match remapped onto known tree-100 leaves.
-        _MOTORS_TREE0_TO_TREE100 = {
-            "174020": ("33653", "Trailer Hitches"),
-            "174021": ("33653", "Trailer Hitches"),  # hitch cargo / scooter hauler
-            "262210": ("33650", "Running Boards & Step Bars"),
-            "262216": ("33651", "Roof Racks & Cross Bars"),
-            "262093": ("33654", "Body Moldings & Trims"),
-        }
-        if get_store_profile().is_motors and api_cat_id:
-            if self._is_api_category_plausible(title, api_cat_id, api_cat_name):
-                if kw_cat_id and kw_cat_id != api_cat_id:
+        # Motors: accept an API suggestion only if it is a tree-100 leaf;
+        # never fall back to a tree-0 keyword id.
+        if get_store_profile().is_motors:
+            from src.utils.category_tree_cache import is_cached_leaf_in_tree
+
+            if api_cat_id and is_cached_leaf_in_tree(str(api_cat_id), "100"):
+                if kw_cat_id and str(kw_cat_id) != str(api_cat_id):
                     logging.info(
                         f"[CAT] Motors tree 100: using API={api_cat_id} ({api_cat_name}) "
                         f"over tree-0 keyword={kw_cat_id} ({kw_cat_name})"
                     )
-                return api_cat_id, api_cat_name
-            mapped = _MOTORS_TREE0_TO_TREE100.get(str(kw_cat_id or "").strip())
-            if mapped:
-                logging.warning(
-                    f"[CAT] Motors API={api_cat_id} ({api_cat_name}) implausible for "
-                    f"title; using tree-100 keyword map {mapped[0]} ({mapped[1]})"
-                )
-                return mapped
-            if kw_cat_id:
-                logging.warning(
-                    f"[CAT] Motors API={api_cat_id} ({api_cat_name}) implausible; "
-                    f"falling back to keyword={kw_cat_id} ({kw_cat_name})"
-                )
-                return kw_cat_id, kw_cat_name
+                return str(api_cat_id), api_cat_name
             logging.warning(
-                f"[CAT] Motors API={api_cat_id} ({api_cat_name}) implausible and no "
-                f"keyword fallback; returning API anyway"
+                "[CAT] Motors tree 100: rejecting category %s (%s); "
+                "not falling back to tree-0 keyword %s (%s)",
+                api_cat_id,
+                api_cat_name,
+                kw_cat_id,
+                kw_cat_name,
             )
-            return api_cat_id, api_cat_name
+            return None, None
 
         if kw_cat_id and kw_cat_id != "38208":  # Not the generic fallback default
             # Strong keyword match — trust it over API

@@ -1630,12 +1630,25 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         original_stored = str(opt_data.get("categoryId") or "").strip() or None
         stored_cat = original_stored
         stored_cat_name = opt_data.get("categoryName")
-        from src.utils.approved_category import evaluate_approved_category
+        from src.utils.approved_category import (
+            blocks_automated_category_change,
+            evaluate_approved_category,
+            is_valid_category_id,
+            locked_category_write_error,
+        )
 
         approved_decision = evaluate_approved_category(stored_cat or "", opt_data)
         if approved_decision.approved and approved_decision.error:
             raise HTTPException(status_code=400, detail=approved_decision.error)
         preserve_approved_category = approved_decision.preserve
+        if blocks_automated_category_change(opt_data):
+            preserve_approved_category = True
+            if not is_valid_category_id(stored_cat):
+                raise HTTPException(
+                    status_code=400,
+                    detail=locked_category_write_error(opt_data)
+                    or "category lock is set with blank/invalid categoryId; refusing rematch",
+                )
         if stored_cat and not preserve_approved_category:
             stored_cat, stored_cat_name = category_matcher.canonicalize_category(
                 title_context,
@@ -1643,18 +1656,23 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                 stored_cat_name,
                 product.description,
             )
-        category_id, category_name, completed_aspects = category_matcher.get_category_and_aspects(
-            category_lookup_title,
-            existing_aspects,
-            product.description
-        )
-        if category_id:
-            category_id, category_name = category_matcher.canonicalize_category(
+        if blocks_automated_category_change(opt_data):
+            category_id = stored_cat
+            category_name = stored_cat_name or f"Category {stored_cat}"
+            completed_aspects = existing_aspects
+        else:
+            category_id, category_name, completed_aspects = category_matcher.get_category_and_aspects(
                 category_lookup_title,
-                category_id,
-                category_name,
-                product.description,
+                existing_aspects,
+                product.description
             )
+            if category_id:
+                category_id, category_name = category_matcher.canonicalize_category(
+                    category_lookup_title,
+                    category_id,
+                    category_name,
+                    product.description,
+                )
         
         stored_plausible = bool(
             stored_cat and (
@@ -1969,7 +1987,8 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                         opt_data["publishedCategoryId"] = str(category_id or "")
                         if live_category_id:
                             opt_data["liveCategoryId"] = live_category_id
-                            opt_data["categoryId"] = live_category_id
+                            if not blocks_automated_category_change(opt_data):
+                                opt_data["categoryId"] = live_category_id
                         product.optimization = opt_data
                         flag_modified(product, 'optimization')
                         break  # Success!

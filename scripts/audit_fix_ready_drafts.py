@@ -28,7 +28,7 @@ from src.utils.dimension_helpers import (
 from src.utils.publish_autofix import sanitize_placeholder_aspects
 from src.utils.report_images import normalize_image_list
 from src.utils.publish_validation import first_aspect_text, measurement_issue
-from src.utils.approved_category import is_category_approved
+from src.utils.approved_category import blocks_automated_category_change
 from src.utils.listing_quality_gate import (
     normalize_generated_listing,
 )
@@ -579,7 +579,8 @@ def choose_ready_category(
     optimization=None,
     listing_status="READY",
 ):
-    if is_category_approved(optimization) and str(current_category_id or "").strip():
+    if blocks_automated_category_change(optimization):
+        # Flag set (including blank/mismatched pin): fail closed — do not rematch.
         return current_category_id, current_category_name, aspects
 
     from src.utils.category_decision import apply_category_write_gate

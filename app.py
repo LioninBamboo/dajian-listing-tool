@@ -699,6 +699,11 @@ def publish_to_ebay(product: dict) -> dict:
         )
         description = opt_data.get("description", product.get('description', ''))
         original_stored = str(opt_data.get("categoryId") or "").strip()
+        from src.utils.approved_category import (
+            blocks_automated_category_change,
+            is_valid_category_id,
+            locked_category_write_error,
+        )
         from src.utils.category_decision import (
             gate_publish_category_choice,
             legacy_remap_candidate,
@@ -707,7 +712,16 @@ def publish_to_ebay(product: dict) -> dict:
 
         remapped, gate_reason = legacy_remap_candidate(original_stored)
         category_id = remapped or original_stored
-        if gate_reason != "legacy_invalid_remap" and not is_sellable_leaf_category(oauth, category_id):
+        if blocks_automated_category_change(opt_data):
+            if not is_valid_category_id(original_stored):
+                return {
+                    "status": "error",
+                    "message": locked_category_write_error(opt_data)
+                    or "category lock is set with blank/invalid categoryId; refusing rematch",
+                }
+            category_id = original_stored
+            gate_reason = "publish_candidate"
+        elif gate_reason != "legacy_invalid_remap" and not is_sellable_leaf_category(oauth, category_id):
             from src.services.ebay_category_matcher import EbayCategoryMatcher
             matcher = EbayCategoryMatcher(oauth)
             matched_id, _, _ = matcher.get_category_and_aspects(
@@ -982,12 +996,6 @@ def publish_with_auto_category(product: dict) -> dict:
             
             # ===== AUTO CATEGORY & ITEM SPECIFICS MATCHING =====
             category_matcher = EbayCategoryMatcher(oauth)
-            category_id, category_name, completed_aspects = category_matcher.get_category_and_aspects(
-                opt_data.get("title", product.get('title', '')),
-                existing_aspects,
-                product.get('description', '')
-            )
-            category_id = remap_legacy_category_id(category_id)
             original_stored = str(opt_data.get("categoryId") or "").strip()
             stored_cat = original_stored
             from src.utils.category_decision import (
@@ -997,12 +1005,34 @@ def publish_with_auto_category(product: dict) -> dict:
                 stored_category_name_for_keep,
             )
             _legacy_candidate, _legacy_reason = legacy_remap_candidate(original_stored)
-            from src.utils.approved_category import evaluate_approved_category
+            from src.utils.approved_category import (
+                blocks_automated_category_change,
+                evaluate_approved_category,
+                is_valid_category_id,
+                locked_category_write_error,
+            )
 
             approved_decision = evaluate_approved_category(stored_cat, opt_data)
             if approved_decision.approved and approved_decision.error:
                 return {"status": "error", "message": approved_decision.error}
-            if stored_cat and not approved_decision.preserve and not is_sellable_leaf_category(oauth, stored_cat):
+            if blocks_automated_category_change(opt_data) and not is_valid_category_id(stored_cat):
+                return {
+                    "status": "error",
+                    "message": locked_category_write_error(opt_data)
+                    or "category lock is set with blank/invalid categoryId; refusing rematch",
+                }
+            if blocks_automated_category_change(opt_data):
+                category_id = stored_cat
+                category_name = opt_data.get("categoryName") or f"Category {stored_cat}"
+                completed_aspects = existing_aspects
+            else:
+                category_id, category_name, completed_aspects = category_matcher.get_category_and_aspects(
+                    opt_data.get("title", product.get('title', '')),
+                    existing_aspects,
+                    product.get('description', '')
+                )
+                category_id = remap_legacy_category_id(category_id)
+            if stored_cat and not approved_decision.preserve and not blocks_automated_category_change(opt_data) and not is_sellable_leaf_category(oauth, stored_cat):
                 print(f"[AUTO] Stored category {stored_cat} is invalid in current taxonomy, ignoring")
                 stored_cat = ""
             if category_id and not is_sellable_leaf_category(oauth, category_id):

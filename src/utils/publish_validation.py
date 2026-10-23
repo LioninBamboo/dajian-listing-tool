@@ -79,6 +79,33 @@ def measurement_validation_errors(aspects: dict) -> list[str]:
     return errors
 
 
+def _motors_keep_stored_after_canonicalize(stored: str, canonical: str) -> bool:
+    """A Motors canonicalize that lands on a tree-0 id must not replace a valid stored leaf."""
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        if not get_store_profile().is_motors:
+            return False
+    except Exception:
+        return False
+    stored_id = str(stored or "").strip()
+    canonical_id = str(canonical or "").strip()
+    if not stored_id or not canonical_id or stored_id == canonical_id:
+        return False
+    from src.services.vehicle_compatibility import TREE0_FORCE_INVENTORY_CATEGORIES
+    from src.utils.category_tree_cache import is_cached_leaf_in_tree
+
+    if canonical_id in TREE0_FORCE_INVENTORY_CATEGORIES:
+        return False
+    if is_cached_leaf_in_tree(canonical_id, "100"):
+        return False
+    if is_cached_leaf_in_tree(canonical_id, "0") and (
+        is_cached_leaf_in_tree(stored_id, "100") or is_cached_leaf_in_tree(stored_id, "0")
+    ):
+        return True
+    return False
+
+
 def category_validation_errors(
     category_matcher,
     title_context: str,
@@ -92,11 +119,16 @@ def category_validation_errors(
         return ["missing categoryId"]
 
     if category_matcher and not skip_canonicalize:
-        normalized_category_id, category_name = category_matcher.canonicalize_category(
+        stored_before = normalized_category_id
+        canonical_id, canonical_name = category_matcher.canonicalize_category(
             title_context,
             normalized_category_id,
             category_name,
         )
+        if _motors_keep_stored_after_canonicalize(stored_before, canonical_id):
+            pass
+        elif canonical_id:
+            normalized_category_id, category_name = canonical_id, canonical_name
 
     if (
         category_matcher

@@ -359,6 +359,12 @@ HOLD_EMPTY_PUBLISH_ERROR = (
 HOLD_TREE_UNAVAILABLE_ERROR = (
     "category tree unavailable; refresh failed; no publish"
 )
+NEEDS_MANUAL_MOTORS_LEAF_REVIEW = "needs_manual_motors_leaf_review"
+# Aqua READY tool items sitting in tree-0 furniture leaves (R7–R11).
+# Decision B3 default: do not hold; only report.
+MOTORS_FURNITURE_REVIEW_LEAVES: frozenset[str] = frozenset(
+    {"20487", "88057", "262980"}
+)
 
 _SUGGESTED_ALTERNATIVES = {
     "38200": "38204",
@@ -1455,6 +1461,106 @@ def decision_category_id(
     return decision.category_id
 
 
+def publish_tree_id_for_target(
+    category_id: Any = "",
+    *,
+    is_motors: bool | None = None,
+) -> str:
+    """Tree the existing routing will publish this id to.
+
+    Aqua Trading/SiteID-100 → tree 100; Aqua ``TREE0_FORCE_INVENTORY_CATEGORIES``
+    / Inventory path → tree 0; Main/GP → tree 0.
+    """
+    from src.services.vehicle_compatibility import TREE0_FORCE_INVENTORY_CATEGORIES
+
+    cid = as_safe_category_id(category_id)
+    if cid in TREE0_FORCE_INVENTORY_CATEGORIES:
+        return "0"
+    if is_motors is None:
+        try:
+            from src.utils.store_profile import get_store_profile
+
+            is_motors = bool(get_store_profile().is_motors)
+        except Exception:
+            is_motors = False
+    return "100" if is_motors else "0"
+
+
+def validate_new_target_publish_tree(
+    cid: Any,
+    *,
+    is_motors: bool | None = None,
+    indexes=None,
+) -> tuple[bool, str]:
+    """Reject a new target that is only a leaf in the other tree.
+
+    Report-only: never substitutes another id. Stored-id validation stays
+    on the 4250f71 flat index (R7–R12 keep their keep/hold).
+    """
+    target = as_safe_category_id(cid)
+    if not target:
+        return False, "invalid_target_leaf"
+    tree_id = publish_tree_id_for_target(target, is_motors=is_motors)
+    from src.utils.category_tree_cache import is_cached_leaf_in_tree
+
+    if is_cached_leaf_in_tree(target, tree_id, indexes=indexes):
+        return True, ""
+    other = "0" if tree_id == "100" else "100"
+    if is_cached_leaf_in_tree(target, other, indexes=indexes):
+        return False, "wrong_tree_leaf"
+    return True, ""
+
+
+def needs_manual_motors_leaf_review(
+    stored: Any,
+    *,
+    is_motors: bool | None = None,
+    indexes=None,
+) -> bool:
+    """B3 default: flag Aqua READY furniture leaves; do not change outcome."""
+    if is_motors is None:
+        try:
+            from src.utils.store_profile import get_store_profile
+
+            is_motors = bool(get_store_profile().is_motors)
+        except Exception:
+            return False
+    if not is_motors:
+        return False
+    cid = as_safe_category_id(stored)
+    if not cid:
+        return False
+    from src.services.vehicle_compatibility import TREE0_FORCE_INVENTORY_CATEGORIES
+
+    if cid in TREE0_FORCE_INVENTORY_CATEGORIES:
+        return False
+    if cid in MOTORS_FURNITURE_REVIEW_LEAVES:
+        return True
+    from src.utils.category_tree_cache import is_cached_leaf_in_tree
+
+    return is_cached_leaf_in_tree(cid, "0", indexes=indexes) and not is_cached_leaf_in_tree(
+        cid, "100", indexes=indexes
+    )
+
+
+def category_gate_report_flags(
+    stored: Any,
+    *,
+    optimization: Any = None,
+    is_motors: bool | None = None,
+    indexes=None,
+) -> list[str]:
+    flags: list[str] = []
+    from src.utils.approved_category import pin_mismatch_reason
+
+    pin = pin_mismatch_reason(optimization, stored)
+    if pin:
+        flags.append(pin)
+    if needs_manual_motors_leaf_review(stored, is_motors=is_motors, indexes=indexes):
+        flags.append(NEEDS_MANUAL_MOTORS_LEAF_REVIEW)
+    return flags
+
+
 def apply_category_write_gate(
     original_stored: Any,
     candidate_id: Any,
@@ -1478,6 +1584,8 @@ def apply_category_write_gate(
     candidate = as_safe_category_id(candidate_id)
     unpublished = unpublished_listing_status(listing_status)
     if not category_tree_is_available(index):
+        # TODO(decision B1): approved leaf keeps publishing without a tree?
+        # Default: no — unpublished still hold_tree_unavailable (PR #32 r3 (f)).
         warn_once_tree_unavailable()
         if unpublished:
             return None, "hold_tree_unavailable"
@@ -1489,6 +1597,10 @@ def apply_category_write_gate(
     chosen = stored
     if candidate and candidate != stored:
         ok, _reason = validate_target_category(candidate, kind, title, index=index)
+        if ok:
+            tree_ok, _tree_reason = validate_new_target_publish_tree(candidate)
+            if not tree_ok:
+                ok = False
         if ok and is_approved_auto_remap(stored, candidate, reason):
             chosen = candidate
             action = "remap"
@@ -1506,6 +1618,7 @@ def apply_category_write_gate(
     if chosen == stored and stored:
         stored_ok, stored_reason = validate_target_category(stored, "", title, index=index)
         if stored_reason == "tree_unavailable":
+            # TODO(decision B1): no approved-leaf exception when the tree is down.
             warn_once_tree_unavailable()
             if unpublished:
                 return None, "hold_tree_unavailable"

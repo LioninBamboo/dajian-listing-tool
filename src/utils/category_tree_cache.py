@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 # Process-level flatten. None means "not loaded yet".
 _INDEX: Optional[dict[str, tuple[str, str]]] = None
+_INDEX_BY_TREE: Optional[dict[str, dict[str, tuple[str, str]]]] = None
 _INDEX_DIR: Optional[Path] = None
 _INDEX_EXPIRES_AT: Optional[float] = None
 _CACHE_WARNED: set[str] = set()
@@ -86,8 +87,9 @@ def category_tree_cache_path(tree_id: str, cache_dir: Optional[Path] = None) -> 
 
 
 def _invalidate_index_cache() -> None:
-    global _INDEX, _INDEX_DIR, _INDEX_EXPIRES_AT
+    global _INDEX, _INDEX_BY_TREE, _INDEX_DIR, _INDEX_EXPIRES_AT
     _INDEX = None
+    _INDEX_BY_TREE = None
     _INDEX_DIR = None
     _INDEX_EXPIRES_AT = None
 
@@ -296,36 +298,111 @@ def _load_one_tree(tree_id: str, cache_dir: Path) -> dict[str, tuple[str, str]]:
     return flatten_category_tree(payload)
 
 
+def _merge_flat_index(
+    by_tree: Mapping[str, Mapping[str, tuple[str, str]]],
+) -> dict[str, tuple[str, str]]:
+    """Merged id -> (name, parent) for stored-id 4250f71 lookups.
+
+    Tree 100 still wins collisions (same as 4250f71). New-target validation
+    must use ``lookup_category_in_tree`` / ``is_cached_leaf_in_tree``.
+    """
+    index: dict[str, tuple[str, str]] = {}
+    for tree_id in DEFAULT_TREE_IDS:
+        piece = by_tree.get(str(tree_id)) or {}
+        index.update(piece)
+    return index
+
+
+def load_category_indexes(
+    cache_dir: Optional[Path] = None,
+) -> dict[str, dict[str, tuple[str, str]]]:
+    """Load trees 0 and 100 keyed by tree id so colliding ids stay distinct."""
+    global _INDEX, _INDEX_BY_TREE, _INDEX_DIR, _INDEX_EXPIRES_AT
+    directory = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
+    now = _now()
+    if _INDEX_BY_TREE is not None and _INDEX_DIR == directory:
+        if _INDEX_EXPIRES_AT is None or now < _INDEX_EXPIRES_AT:
+            return {
+                tid: dict(piece) for tid, piece in _INDEX_BY_TREE.items()
+            }
+        _invalidate_index_cache()
+    by_tree: dict[str, dict[str, tuple[str, str]]] = {}
+    owned = {str(tid) for tid in store_runtime_tree_ids()}
+    unavailable: set[str] = set()
+    for tree_id in DEFAULT_TREE_IDS:
+        piece = _load_one_tree(tree_id, directory)
+        by_tree[str(tree_id)] = piece
+        if str(tree_id) in owned and not piece:
+            unavailable.add(str(tree_id))
+    _UNAVAILABLE_TREES.clear()
+    _UNAVAILABLE_TREES.update(unavailable)
+    _INDEX_BY_TREE = {tid: dict(piece) for tid, piece in by_tree.items()}
+    _INDEX = _merge_flat_index(by_tree)
+    _INDEX_DIR = directory
+    _INDEX_EXPIRES_AT = (
+        (now + RUNTIME_REFRESH_RETRY_SECONDS) if unavailable else None
+    )
+    return {tid: dict(piece) for tid, piece in by_tree.items()}
+
+
 def load_category_index(cache_dir: Optional[Path] = None) -> dict[str, tuple[str, str]]:
     """Load tree 0 and 100 once per process into id -> (name, parent_id).
 
     A failed or partial refresh is cached only until the 30-minute retry
     window expires, so long-lived server/Streamlit processes re-attempt
     getCategoryTree instead of holding every publish until restart.
+
+    Colliding ids (present in both trees) resolve to tree 100 in this flat
+    view — same as 4250f71. Use ``load_category_indexes`` for tree-aware
+    new-target validation.
     """
-    global _INDEX, _INDEX_DIR, _INDEX_EXPIRES_AT
-    directory = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
-    now = _now()
-    if _INDEX is not None and _INDEX_DIR == directory:
-        if _INDEX_EXPIRES_AT is None or now < _INDEX_EXPIRES_AT:
-            return _INDEX
-        _invalidate_index_cache()
-    index: dict[str, tuple[str, str]] = {}
-    owned = {str(tid) for tid in store_runtime_tree_ids()}
-    unavailable: set[str] = set()
-    for tree_id in DEFAULT_TREE_IDS:
-        piece = _load_one_tree(tree_id, directory)
-        if str(tree_id) in owned and not piece:
-            unavailable.add(str(tree_id))
-        index.update(piece)
-    _UNAVAILABLE_TREES.clear()
-    _UNAVAILABLE_TREES.update(unavailable)
-    _INDEX = index
-    _INDEX_DIR = directory
-    _INDEX_EXPIRES_AT = (
-        (now + RUNTIME_REFRESH_RETRY_SECONDS) if unavailable else None
-    )
-    return index
+    load_category_indexes(cache_dir)
+    return dict(_INDEX or {})
+
+
+def lookup_category_in_tree(
+    category_id: str,
+    tree_id: str,
+    cache_dir: Optional[Path] = None,
+    indexes: Optional[Mapping[str, Mapping[str, tuple[str, str]]]] = None,
+) -> Optional[tuple[str, str]]:
+    cid = str(category_id or "").strip()
+    tid = str(tree_id or "").strip()
+    if not cid or not tid:
+        return None
+    trees = dict(indexes) if indexes is not None else load_category_indexes(cache_dir)
+    flat = trees.get(tid) or {}
+    if cid not in flat:
+        return None
+    name, parent = flat[cid]
+    return str(name or ""), str(parent or "")
+
+
+def is_cached_leaf_in_tree(
+    category_id: str,
+    tree_id: str,
+    cache_dir: Optional[Path] = None,
+    indexes: Optional[Mapping[str, Mapping[str, tuple[str, str]]]] = None,
+) -> bool:
+    cid = str(category_id or "").strip()
+    tid = str(tree_id or "").strip()
+    if not cid or not tid:
+        return False
+    trees = dict(indexes) if indexes is not None else load_category_indexes(cache_dir)
+    flat = trees.get(tid) or {}
+    if cid not in flat:
+        return False
+    return all(parent != cid for _name, parent in flat.values() if parent)
+
+
+def colliding_category_ids(
+    cache_dir: Optional[Path] = None,
+    indexes: Optional[Mapping[str, Mapping[str, tuple[str, str]]]] = None,
+) -> list[str]:
+    trees = dict(indexes) if indexes is not None else load_category_indexes(cache_dir)
+    ids0 = set(trees.get("0") or {})
+    ids100 = set(trees.get("100") or {})
+    return sorted(ids0 & ids100)
 
 
 def build_category_path(

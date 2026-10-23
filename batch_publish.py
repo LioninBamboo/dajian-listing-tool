@@ -69,9 +69,13 @@ from src.utils.publish_source_aspect_guard import (
     restore_sourced_aspects,
 )
 from src.utils.approved_category import (
+    blocks_automated_category_change,
     evaluate_approved_category,
     is_category_approved,
+    is_valid_category_id,
+    locked_category_write_error,
     mark_category_approved,
+    should_auto_remap_invalid_category,
 )
 from src.utils.publish_fee_preview import evaluate_insertion_fee_preview
 from src.utils.category_decision import TREE_KNOWN_PUBLISHABLE_LEAVES
@@ -476,6 +480,19 @@ def select_batch_publish_category(
     candidate = original_stored
     candidate_name = original_name
     completed_aspects = existing_aspects
+    locked = blocks_automated_category_change(opt)
+    if locked:
+        preserve_approved_category = True
+        if not is_valid_category_id(original_stored):
+            return {
+                "category_id": None,
+                "category_name": None,
+                "aspects": completed_aspects,
+                "action": "hold_empty",
+                "original_stored": original_stored,
+                "held": True,
+                "selected": None,
+            }
 
     if original_stored in INVALID_CATEGORY_REMAP and not preserve_approved_category:
         candidate = INVALID_CATEGORY_REMAP[original_stored]
@@ -1182,6 +1199,14 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             result["copy_skip_reasons"] = ["high_insertion_fee"]
         return result
     preserve_approved_category = approved_decision.preserve
+    if blocks_automated_category_change(opt):
+        preserve_approved_category = True
+        if not is_valid_category_id(stored_cat):
+            msg = locked_category_write_error(opt) or (
+                "category lock is set with blank/invalid categoryId; refusing rematch"
+            )
+            record_error(sku, msg)
+            return {"status": "error", "message": msg}
     listing_status = str(product.get('status') or opt.get('status') or opt.get('listingStatus') or 'READY')
     choice = select_batch_publish_category(
         stored_cat=stored_cat,
@@ -1852,7 +1877,13 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                     if deleted:
                         logger.info(f"  [FIX] Deleted {deleted} stale offer(s) after category error")
 
-                    if category_id not in protected_stored_categories and not category_reselected:
+                    if (
+                        category_id not in protected_stored_categories
+                        and not category_reselected
+                        and should_auto_remap_invalid_category(
+                            opt, preserve=preserve_approved_category
+                        )
+                    ):
                         new_id, new_name, new_aspects = category_matcher.get_category_and_aspects(
                             title, completed_aspects, description
                         )

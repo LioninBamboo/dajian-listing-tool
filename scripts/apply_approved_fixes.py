@@ -59,7 +59,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.utils.approved_category import mark_category_approved
+from src.utils.approved_category import locked_category_write_error, mark_category_approved
 from src.utils.publish_fee_preview import guard_category_write_high_fee, high_fee_category_block_reason
 
 AUDIT = ROOT / "scripts" / "audit_fix_active_listings.py"
@@ -174,10 +174,10 @@ def can_stamp_after_remap(
     return True, ""
 
 
-def load_stored_category_id(sku: str, db_path: Path | None = None) -> str:
+def load_stored_optimization(sku: str, db_path: Path | None = None) -> dict:
     path = Path(db_path) if db_path is not None else DEFAULT_DB
     if not path.is_file():
-        return ""
+        return {}
     conn = sqlite3.connect(path)
     try:
         row = conn.execute(
@@ -185,10 +185,16 @@ def load_stored_category_id(sku: str, db_path: Path | None = None) -> str:
             (sku,),
         ).fetchone()
         if not row:
-            return ""
-        return str(_parse_optimization(row[0]).get("categoryId") or "").strip()
+            return {}
+        return _parse_optimization(row[0])
+    except sqlite3.Error:
+        return {}
     finally:
         conn.close()
+
+
+def load_stored_category_id(sku: str, db_path: Path | None = None) -> str:
+    return str(load_stored_optimization(sku, db_path=db_path).get("categoryId") or "").strip()
 
 
 def stamp_local_category_approved(
@@ -239,7 +245,13 @@ def stamp_local_category_approved(
         conn.close()
 
 
-def build_command(sku: str, fix_keys: list[str], apply: bool) -> list[str]:
+def build_command(
+    sku: str,
+    fix_keys: list[str],
+    apply: bool,
+    *,
+    override_category_lock: bool = False,
+) -> list[str]:
     # --ignore-clean-freeze is not optional here: a listing fixed earlier gets
     # frozen as "clean" and the audit then skips it entirely, so a scoped repair
     # run silently finds nothing to do (2026-07-28, W3098P470268).
@@ -248,6 +260,8 @@ def build_command(sku: str, fix_keys: list[str], apply: bool) -> list[str]:
         cmd += ["--fix-key", key]
     if apply:
         cmd.append("--fix")
+    if override_category_lock:
+        cmd.append("--override-category-lock")
     # The runner stamps categoryApprovedId itself after verifying the
     # explicit target. Do not let the audit infer and pin the stored leaf.
     return cmd
@@ -322,6 +336,11 @@ def main() -> int:
             "approve-only row whose stored leaf already matches"
         ),
     )
+    parser.add_argument(
+        "--override-category-lock",
+        action="store_true",
+        help="Allow remapping a listing whose optimization.categoryApproved flag is set",
+    )
     parser.add_argument("--stop-on-error", action="store_true", default=True)
     parser.add_argument(
         "--max-consecutive-errors",
@@ -359,11 +378,12 @@ def main() -> int:
         mark_category_approved=args.mark_category_approved,
         stop_on_error=args.stop_on_error,
         max_consecutive_errors=args.max_consecutive_errors,
+        override_category_lock=args.override_category_lock,
     )
 
 
-def _default_run_audit(sku: str, keys: list[str], apply: bool):
-    cmd = build_command(sku, keys, apply)
+def _default_run_audit(sku: str, keys: list[str], apply: bool, *, override_category_lock: bool = False):
+    cmd = build_command(sku, keys, apply, override_category_lock=override_category_lock)
     # encoding is explicit: the audit prints the store footer (✦) and Chinese
     # summaries, and Windows' default cp936 decode raised inside subprocess's
     # reader thread — the output was lost and every row still reported OK.
@@ -422,8 +442,13 @@ def process_rows(
     max_consecutive_errors: int = 3,
     db_path: Path | None = None,
     run_audit=None,
+    override_category_lock: bool = False,
 ) -> int:
-    run_audit = run_audit or _default_run_audit
+    run_audit = run_audit or (
+        lambda sku, keys, apply: _default_run_audit(
+            sku, keys, apply, override_category_lock=override_category_lock
+        )
+    )
     failures = 0
     consecutive = 0
     item_errors: list[str] = []
@@ -432,6 +457,23 @@ def process_rows(
         requested = requested_category_id(row)
         wants_stamp = wants_approval_stamp(row, mark_category_approved)
         print(f"[{index}/{len(rows)}] {sku}  keys={keys}" + (f"  # {row['note']}" if row.get("note") else ""))
+        if any(key in REMAP_KEYS for key in keys):
+            stored_opt = load_stored_optimization(sku, db_path=db_path)
+            lock_error = locked_category_write_error(
+                stored_opt, override=override_category_lock
+            )
+            if lock_error:
+                failures, should_stop = _fail_row(
+                    sku,
+                    failures=failures,
+                    stop_on_error=stop_on_error,
+                    message=lock_error,
+                    stop_label="category lock blocked remap.",
+                )
+                if should_stop:
+                    return 1
+                print()
+                continue
 
         if requested and any(key in GUARDED_KEYS for key in keys):
             blocked = guard_category_write_high_fee(

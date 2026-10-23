@@ -7,9 +7,12 @@ from src.utils.approved_category import (
     CATEGORY_APPROVED_ID_KEY,
     CATEGORY_APPROVED_KEY,
     backfill_approved_category_id,
+    blocks_automated_category_change,
     evaluate_approved_category,
     is_category_approved,
+    locked_category_write_error,
     mark_category_approved,
+    pin_mismatch_reason,
 )
 from src.utils.publish_validation import get_publish_blockers
 from src.utils.listing_quality_gate import (
@@ -126,6 +129,20 @@ def test_legacy_flag_backfills_approved_id_explicitly():
     assert backfill_approved_category_id(opt) == "176991"
     assert opt[CATEGORY_APPROVED_ID_KEY] == "176991"
     assert is_category_approved(opt) is True
+
+
+def test_blocks_automated_change_when_pin_blank_or_mismatched():
+    blank = {"categoryId": "176991", CATEGORY_APPROVED_KEY: True}
+    mismatch = {
+        "categoryId": "176991",
+        CATEGORY_APPROVED_KEY: True,
+        CATEGORY_APPROVED_ID_KEY: "99999",
+    }
+    assert blocks_automated_category_change(blank) is True
+    assert blocks_automated_category_change(mismatch) is True
+    assert pin_mismatch_reason(mismatch) == "pin_mismatch"
+    assert locked_category_write_error(mismatch)
+    assert blocks_automated_category_change(mismatch, override=True) is False
 
 
 def test_mismatched_approved_id_is_treated_as_unapproved(caplog):
