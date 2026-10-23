@@ -17,12 +17,21 @@ HIGH_FEE_PATH_SEGMENTS = (
     "cars & trucks",
     "cars and trucks",
 )
+# Anchored Motors prefixes (not bare "Boats & Ships" under Collectibles / Toys).
+HIGH_FEE_PATH_PREFIXES = (
+    "ebay motors > powersports",
+    "ebay motors > boats",
+    "ebay motors > motorcycles",
+    "ebay motors > other vehicles & trailers",
+    "ebay motors > cars & trucks",
+)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_HIGH_FEE_BLACKLIST_RELATIVE = Path("data") / "config" / "high_fee_category_blacklist.json"
 DEFAULT_HIGH_FEE_BLACKLIST_CANDIDATES = (
     DEFAULT_HIGH_FEE_BLACKLIST_RELATIVE,
     Path("data") / "config" / "publish_skip_categories.json",
     Path("data") / "config" / "publish_skip_category_ids.json",
+    Path("..") / "Dajian_Listing_Tool" / "data" / "config" / "high_fee_category_blacklist.json",
 )
 _BLACKLIST_ID_KEYS = (
     "publish_skip_category_ids",
@@ -38,6 +47,35 @@ def normalize_fee_type(value: str) -> str:
     return str(value or "").replace("_", "").upper()
 
 
+def _current_store_aliases() -> set[str]:
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        brand = str(get_store_profile().brand_name or "")
+    except Exception:
+        brand = ""
+    aliases = {
+        "AquaVerve": {"main", "aquaverve", "aqua"},
+        "GrovePop": {"grovepop", "gp"},
+        "AquaRides": {"aqua", "aquarides", "autoparts"},
+    }
+    names = {brand.lower()} if brand else set()
+    names.update(aliases.get(brand, set()))
+    return {item for item in names if item}
+
+
+def _blacklist_applies_to_store(data: Any) -> bool:
+    if not isinstance(data, Mapping):
+        return True
+    applies = data.get("applies_to_stores")
+    if not applies:
+        return True
+    aliases = _current_store_aliases()
+    if not aliases:
+        return True
+    return any(str(item).strip().lower() in aliases for item in applies)
+
+
 def resolve_high_fee_blacklist_path(path: Optional[str] = None) -> Path:
     if path:
         return Path(path)
@@ -45,7 +83,7 @@ def resolve_high_fee_blacklist_path(path: Optional[str] = None) -> Path:
     if env_path:
         return Path(env_path)
     for relative in DEFAULT_HIGH_FEE_BLACKLIST_CANDIDATES:
-        candidate = REPO_ROOT / relative
+        candidate = (REPO_ROOT / relative).resolve()
         if candidate.is_file():
             return candidate
     return REPO_ROOT / DEFAULT_HIGH_FEE_BLACKLIST_RELATIVE
@@ -131,6 +169,8 @@ def load_high_fee_category_blacklist(path: Optional[str] = None) -> set[str]:
     data = _read_blacklist_payload(path)
     if data is None:
         return set()
+    if not _blacklist_applies_to_store(data):
+        return set()
     ids = _ids_from_blacklist_payload(data)
     if not ids and not _path_entries_from_blacklist_payload(data):
         _warn_empty_blacklist(str(resolve_high_fee_blacklist_path(path)))
@@ -172,6 +212,9 @@ def category_is_high_fee(
 
     segments = _path_segments(category_path, category_name)
     if any(segment in HIGH_FEE_PATH_SEGMENTS for segment in segments):
+        return True
+    path_norm = re.sub(r"\s+", " ", str(category_path or "")).strip().lower()
+    if path_norm and any(path_norm.startswith(prefix) for prefix in HIGH_FEE_PATH_PREFIXES):
         return True
 
     incoming = _path_segments(category_path)

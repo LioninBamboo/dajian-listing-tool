@@ -993,7 +993,35 @@ def audit_single_product(
         fixes["categoryId"] = write_id
         if decision.category_name:
             fixes["categoryName"] = decision.category_name
-    elif not skip_category_remap and stored_category and not write_id:
+    elif not skip_category_remap and not write_id and decision.kind not in {"keep"} and (
+        decision.category_id
+        or decision.reason
+        in {
+            "unknown_head_noun",
+            "pet_species_mismatch",
+            "invalid_target_leaf",
+            "implausible_target_path",
+            "stored_category_implausible",
+            "tree_unavailable",
+            "accessory",
+        }
+    ):
+        issues.append({
+            "type": "category_remap_pending_review",
+            "severity": "WARNING",
+            "current": stored_category or None,
+            "expected": decision.category_id,
+            "detail": (
+                f"remap {stored_category or 'empty'} → {decision.category_id or 'none'} "
+                f"reason={decision.reason}"
+                + (
+                    f" suggested_alternative={decision.suggested_alternative}"
+                    if decision.suggested_alternative
+                    else ""
+                )
+            ),
+        })
+    if not skip_category_remap and stored_category and not write_id:
         try:
             matcher = get_category_matcher()
             plausible = matcher.is_category_plausible_for_text(

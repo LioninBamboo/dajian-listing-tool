@@ -217,8 +217,8 @@ def test_normalize_still_remaps_unapproved_bathroom_cabinet():
         specs={},
         images=["img1", "img2"],
     )
-    assert normalized["categoryId"] == "20487"
-    assert normalized["categoryName"] == "Cabinets & Cupboards"
+    assert normalized["categoryId"] == "176991"
+    assert normalized.get("_category_remap_review")
 
 
 def test_normalize_does_not_preserve_rewritten_unpinned_category():
@@ -237,7 +237,7 @@ def test_normalize_does_not_preserve_rewritten_unpinned_category():
         specs={},
         images=["img1", "img2"],
     )
-    assert normalized["categoryId"] == "20487"
+    assert normalized["categoryId"] == "38204"
 
 
 def test_quality_gate_skips_mismatch_for_approved_category():

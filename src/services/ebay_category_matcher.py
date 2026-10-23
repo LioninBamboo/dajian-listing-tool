@@ -311,13 +311,26 @@ class EbayCategoryMatcher:
                         "outdoor dining chairs",
                         "patio dining chair",
                         "patio dining chairs",
-                        "outdoor lounge chair",
-                        "outdoor lounge chairs",
-                        "patio lounge",
-                        "sun lounger",
                         "camping chair",
                         "camping chairs",
                     )
+                )
+            )
+        )
+        has_outdoor_lounger = (
+            title_allows_outdoor_chair_remap(title_lower)
+            and not has_outdoor_daybed
+            and any(
+                kw in title_lower
+                for kw in (
+                    "outdoor chaise",
+                    "patio chaise",
+                    "chaise lounge",
+                    "sun lounger",
+                    "outdoor recliner",
+                    "patio lounge",
+                    "outdoor lounge chair",
+                    "outdoor lounge chairs",
                 )
             )
         )
@@ -545,9 +558,19 @@ class EbayCategoryMatcher:
         )
 
         # Outdoor rockers must win over the retired 20877→66690 leaf remap.
-        if has_outdoor_rocker and cid != "79684":
-            return "79684", "Outdoor Chairs"
+        if has_outdoor_lounger and cid != "79684":
+            return "79684", "Loungers"
 
+        if has_outdoor_rocker and cid != "79682":
+            return "79682", "Patio Chairs"
+
+        _pet_legacy_beds = {"20751", "20743"}
+        if cid in _pet_legacy_beds and re.search(
+            r"\b(?:cat|kitten|litter|cat\s+tree)s?\b", title_lower
+        ) and not re.search(r"\b(?:dog|puppy|puppies|canine)s?\b", title_lower):
+            if re.search(r"\b(?:litter|cat\s+tree|cat\s+furniture)\b", title_lower):
+                return "20740", "Furniture & Scratchers"
+            return cid, category_name
         direct_replacements = {
             "116363": ("100411", "Litter Boxes"),
             "20751": ("20744", "Beds"),
@@ -620,8 +643,8 @@ class EbayCategoryMatcher:
         if has_outdoor_daybed and cid != "138996":
             return "138996", "Outdoor Daybeds"
 
-        if has_outdoor_chair and cid != "79684":
-            return "79684", "Outdoor Chairs"
+        if has_outdoor_chair and cid != "79682":
+            return "79682", "Patio Chairs"
 
         if has_shade_sail and cid != "180997":
             return "180997", "Shade Sails"
@@ -646,8 +669,8 @@ class EbayCategoryMatcher:
         if has_wine_storage and not has_display_cabinet and cid != "20689":
             return "20689", "Wine Racks & Bottle Holders"
 
-        if has_hall_tree and cid != "261263":
-            return "261263", "Hall Trees & Stands"
+        if has_hall_tree and cid != "22656":
+            return "22656", "Coat & Hat Racks"
 
         # Aqua/Motors: garage tool cabinets stay on tree-100 shop leaves.
         if (
@@ -1032,7 +1055,7 @@ class EbayCategoryMatcher:
         if title_is_dining_set_bundle(title_lower):
             outdoor_table_categories = {"112590", "139849", "107578"}
         wine_storage_categories = {"20689"}
-        hall_tree_categories = {"261263"}
+        hall_tree_categories = {"22656", "261263"}
         patio_furniture_set_categories = {"139849"}
         dining_set_categories = {"107578"}
         cooler_categories = {"79691"}
@@ -1528,7 +1551,7 @@ class EbayCategoryMatcher:
             if cid not in motors_categories:
                 return False
 
-        if "adirondack" in title_lower and cid != "79684":
+        if "adirondack" in title_lower and cid != "79682":
             return False
 
         outdoor_rocker_markers = (
@@ -1741,7 +1764,7 @@ class EbayCategoryMatcher:
         ):
             return "139849", "Patio & Garden Furniture Sets"
         if outdoor_title and "dining chair" in title_lower and title_allows_outdoor_chair_remap(title_lower):
-            return "79684", "Outdoor Chairs"
+            return "79682", "Patio Chairs"
         if outdoor_title and any(
             kw in title_lower for kw in ("side table", "end table", "dining table")
         ) and not any(kw in title_lower for kw in ("coffee table", "nesting table", "cocktail table")):
@@ -1822,7 +1845,8 @@ class EbayCategoryMatcher:
             (["egg chair", "egg swing chair", "hanging egg chair", "hanging swing chair", "hanging chair with stand", "wicker hanging swing chair", "patio hammock swing chair", "hanging basket chair"], "79682", "Patio Chairs"),
             (["outdoor daybed", "patio daybed", "sunbed"], "138996", "Outdoor Daybeds"),
             (["outdoor chair set", "patio chair set", "armchair set", "rattan chair set", "outdoor armchair", "outdoor armchairs", "patio armchair", "patio armchairs", "armchairs set"], "79682", "Patio Chairs"),
-            (["outdoor folding chair", "patio folding chair", "outdoor folding chair set", "patio folding chair set", "camping chair", "camping chairs", "outdoor lounge chair", "outdoor lounge chairs", "patio lounge", "sun lounger"], "79684", "Outdoor Chairs"),
+            (["outdoor folding chair", "patio folding chair", "outdoor folding chair set", "patio folding chair set", "camping chair", "camping chairs"], "79682", "Patio Chairs"),
+            (["outdoor lounge chair", "outdoor lounge chairs", "patio lounge", "sun lounger", "outdoor chaise", "patio chaise"], "79684", "Loungers"),
             (["porch swing bed", "patio swing bed", "garden swing bed"], "79694", "Porch Swings"),
             
             # ==================== SOFA BEDS (before Bedroom to avoid false match) ====================
@@ -1865,7 +1889,7 @@ class EbayCategoryMatcher:
             (["round chair", "cushioned backrest", "compressible chair"], "54235", "Chairs"),
             (["accent chair", "arm chair", "lounge chair", "club chair"], "54235", "Chairs"),
             # Outdoor rockers before indoor Rockers/Gliders — see has_outdoor_rocker.
-            (["outdoor rocking chair", "outdoor rocker", "patio rocking chair", "patio rocker", "porch rocker", "porch rocking chair", "garden rocker", "rockers for outside"], "79684", "Outdoor Chairs"),
+            (["outdoor rocking chair", "outdoor rocker", "patio rocking chair", "patio rocker", "porch rocker", "porch rocking chair", "garden rocker", "rockers for outside"], "79682", "Patio Chairs"),
             (["rocking chair", "glider"], "66690", "Rockers, Gliders"),
             (["ottoman", "footstool", "pouf"], "20490", "Ottomans, Footstools & Poufs"),
             
@@ -1928,14 +1952,14 @@ class EbayCategoryMatcher:
             (["camping tent", "camping tents", "inflatable tent", "inflatable tents", "inflatabletent", "glamping tent", "glamping tents", "blow up tent", "blow-up tent", "air tent", "suv tent"], "179010", "Tents"),
             (["egg chair", "egg swing chair", "hanging egg chair", "hanging swing chair", "hanging chair with stand", "wicker hanging swing chair", "patio hammock swing chair", "hanging basket chair"], "79682", "Patio Chairs"),
             (["outdoor chair set", "patio chair set", "armchair set", "rattan chair set", "outdoor armchair", "outdoor armchairs", "patio armchair", "patio armchairs", "armchairs set"], "79682", "Patio Chairs"),
-            (["outdoor chaise", "patio chaise", "outdoor lounge chair", "outdoor lounge chairs", "patio lounge", "sun lounger"], "79684", "Outdoor Chairs"),
+            (["outdoor chaise", "patio chaise", "outdoor lounge chair", "outdoor lounge chairs", "patio lounge", "sun lounger"], "79684", "Loungers"),
             (["patio chat set", "patio conversation"], "139849", "Patio & Garden Furniture Sets"),
             (["patio set", "patio furniture", "outdoor sofa", "outdoor sectional"], "139849", "Patio & Garden Furniture Sets"),
-            (["outdoor chair", "patio chair", "adirondack"], "79684", "Outdoor Chairs"),
+            (["outdoor chair", "patio chair", "adirondack"], "79682", "Patio Chairs"),
             (["outdoor table", "patio table"], "112590", "Patio & Garden Tables"),
             (["garden bench", "park bench", "outdoor bench"], "79683", "Garden Benches"),
             (["porch swing bed", "patio swing bed", "garden swing bed"], "79694", "Porch Swings"),
-            (["hall tree", "coat rack bench", "hall stand"], "261263", "Hall Trees & Stands"),
+            (["hall tree", "coat rack bench", "hall stand"], "22656", "Coat & Hat Racks"),
             (["storage bench", "entryway bench", "shoe bench"], "262980", "Benches"),
             (["porch swing"], "79694", "Porch Swings"),
             (["hammock"], "79693", "Hammocks"),
@@ -1982,7 +2006,7 @@ class EbayCategoryMatcher:
             
             # ==================== STORAGE ====================
             (["storage cabinet", "utility cabinet", "garage cabinet"], "20487", "Cabinets & Cupboards"),
-            (["hall tree"], "261263", "Hall Trees & Stands"),
+            (["hall tree"], "22656", "Coat & Hat Racks"),
             (["dining bench", "long bench", "upholstered bench", "mid century bench", "bench with", "end of bed", "footrest stool"], "262980", "Benches"),
             (["storage bench", "entryway bench", "shoe bench"], "262980", "Benches"),
             (["shoe rack", "shoe cabinet", "shoe bench", "shoe storage"], "38221", "Shoe Racks"),

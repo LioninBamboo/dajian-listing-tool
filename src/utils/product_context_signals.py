@@ -209,6 +209,8 @@ _FIRST_NOUN_PHRASES: tuple[str, ...] = (
     "planter",
     "steel wagon",
     "console table",
+    "chaise lounge cushion",
+    "lounger cushion",
     "chaise lounge",
     "sun lounger",
     "lounger",
@@ -246,8 +248,17 @@ _FIRST_NOUN_PHRASES: tuple[str, ...] = (
     "ottoman",
     "dining chair",
     "club armchair",
+    "papasan chair",
+    "egg chair",
+    "rocking chair",
+    "adirondack chair",
+    "folding chair",
+    "patio chair",
+    "outdoor chair",
+    "garden stool",
     "armchair",
     "lounge chair",
+    "hutch desk",
     "chair cushion",
     "chair cover",
     "seat cushion",
@@ -256,6 +267,58 @@ _FIRST_NOUN_PHRASES: tuple[str, ...] = (
     "couch",
     "loveseat",
     "wagon",
+    "tv stand",
+    "media console",
+    "entertainment center",
+    "dining set",
+)
+
+# Real product heads that must not be skipped so a later whitelist noun wins.
+_DENY_HEAD_NOUNS: tuple[str, ...] = (
+    "hutch",
+    "pantry",
+    "cupboard",
+    "cabinet",
+    "tv stand",
+    "media console",
+    "entertainment center",
+    "cushion",
+    "pad",
+    "cover",
+    "slipcover",
+    "mattress",
+    "vanity",
+)
+
+_ACCESSORY_HEAD_NOUNS: frozenset[str] = frozenset(
+    {
+        "chaise lounge cushion",
+        "lounger cushion",
+        "chair cushion",
+        "chair cover",
+        "seat cushion",
+        "slipcover",
+        "cushion",
+        "pad",
+        "cover",
+    }
+)
+
+UNKNOWN_HEAD_PREFIX = "__unknown_head__:"
+
+_FIRST_GROUP_SPLIT_RE = re.compile(
+    r"\s+(?:with|for|and)\s+|[,|+]| \| |\s+-\s+",
+    re.IGNORECASE,
+)
+_TV_STAND_HYPHEN_RE = re.compile(r"\btv\s*-\s*stand\b", re.IGNORECASE)
+_ACCESSORY_ONLY_RE = re.compile(
+    r"\b(?:cushion|cover|pad|slipcover|mattress)\s+only\b",
+    re.IGNORECASE,
+)
+_FURNITURE_THEN_ACCESSORY_RE = re.compile(
+    r"\b(?:chaise(?:\s+lounge)?|lounger|sun\s+lounger|chair|sofa|couch)"
+    r"s?\s+(?:cushion|cover|pad|slipcover)s?\b",
+    re.IGNORECASE,
 )
 
 
@@ -324,13 +387,21 @@ def title_has_clear_outdoor_word(text: str) -> bool:
     return bool(_OUTDOOR_MARKER_RE.search(clause))
 
 
-def first_product_noun(text: str) -> str | None:
-    """Leftmost product noun in the live head clause. Never invents a leaf."""
+def _first_product_noun_clause(text: str) -> str:
+    """Head-clause product group before with/for/and/,/|/+ / spaced hyphen."""
     core = strip_room_location_lists(head_clause(as_safe_text(text)) or as_safe_text(text))
     if not core:
-        return None
+        return ""
+    core = _TV_STAND_HYPHEN_RE.sub("tv stand", core)
+    split = _FIRST_GROUP_SPLIT_RE.search(core)
+    if split:
+        core = core[: split.start()].strip()
+    return core
+
+
+def _scan_head_phrases(core: str, phrases: tuple[str, ...]) -> tuple[int, int, str] | None:
     best: tuple[int, int, str] | None = None
-    for phrase in _FIRST_NOUN_PHRASES:
+    for phrase in phrases:
         match = re.search(
             rf"(?<![A-Za-z0-9]){re.escape(phrase)}s?(?![A-Za-z0-9])",
             core,
@@ -341,7 +412,68 @@ def first_product_noun(text: str) -> str | None:
         candidate = (match.start(), -len(phrase), phrase)
         if best is None or candidate < best:
             best = candidate
-    return best[2] if best else None
+    return best
+
+
+def first_product_noun(text: str) -> str | None:
+    """Head noun of the first product group. Deny-list heads fail closed.
+
+    Does not skip a real head (hutch, tv stand, cushion, …) to reach a later
+    whitelisted noun such as buffet or sideboard. Accessory heads stay
+    accessories. Word boundaries only: stable/Tablet are not table.
+    """
+    core = _first_product_noun_clause(text)
+    if not core:
+        return None
+    if _ACCESSORY_ONLY_RE.search(as_safe_text(text)) or _FURNITURE_THEN_ACCESSORY_RE.search(core):
+        accessory = _scan_head_phrases(
+            core + " cushion",
+            tuple(_ACCESSORY_HEAD_NOUNS),
+        )
+        if accessory:
+            return accessory[2]
+        return f"{UNKNOWN_HEAD_PREFIX}cushion"
+
+    whitelist = _FIRST_NOUN_PHRASES
+    deny = tuple(noun for noun in _DENY_HEAD_NOUNS if noun not in whitelist)
+    combined = whitelist + deny
+    best = _scan_head_phrases(core, combined)
+    if best is None:
+        return None
+    phrase = best[2]
+    # "Hutch Desk": deny noun used as a modifier before a known product noun.
+    if phrase in _DENY_HEAD_NOUNS and phrase not in {
+        "tv stand",
+        "media console",
+        "entertainment center",
+        "chaise lounge cushion",
+        "lounger cushion",
+        "chair cushion",
+        "chair cover",
+        "seat cushion",
+        "slipcover",
+    }:
+        remainder = core[best[0] + len(phrase) :].strip()
+        later = _scan_head_phrases(remainder, whitelist)
+        if later is not None and later[0] <= 1:
+            return later[2]
+        return f"{UNKNOWN_HEAD_PREFIX}{phrase}"
+    if phrase in _ACCESSORY_HEAD_NOUNS:
+        return phrase
+    if phrase in _DENY_HEAD_NOUNS and phrase not in {
+        "tv stand",
+        "media console",
+        "entertainment center",
+    }:
+        return f"{UNKNOWN_HEAD_PREFIX}{phrase}"
+    return phrase
+
+
+def unknown_head_noun(head: str | None) -> str | None:
+    """Return the deny-list noun when ``first_product_noun`` failed closed."""
+    if not head or not head.startswith(UNKNOWN_HEAD_PREFIX):
+        return None
+    return head[len(UNKNOWN_HEAD_PREFIX) :]
 
 
 def title_is_chair_accessory(text: str) -> bool:
@@ -370,9 +502,16 @@ def title_is_chair_accessory(text: str) -> bool:
         "sofa",
         "couch",
         "loveseat",
+        "papasan chair",
+        "egg chair",
+        "rocking chair",
+        "adirondack chair",
+        "folding chair",
+        "patio chair",
+        "outdoor chair",
     }:
         return False
-    if head in {"chair cushion", "chair cover", "seat cushion", "slipcover"}:
+    if head in _ACCESSORY_HEAD_NOUNS or (head and head.startswith(UNKNOWN_HEAD_PREFIX) and unknown_head_noun(head) in _ACCESSORY_HEAD_NOUNS):
         return True
     if re.search(r"\bonly\b.{0,24}\b(?:chair\s+)?cushions?\b", hay, re.IGNORECASE):
         return True
