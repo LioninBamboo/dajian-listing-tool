@@ -25,6 +25,36 @@ from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
 
 
+def landed_cost_from_breakdown(
+    cost_data: Optional[Dict] = None,
+    *,
+    shipping_fallback: float = 0.0,
+    specs: Optional[Dict] = None,
+    attributes: Optional[Dict] = None,
+) -> float:
+    """Resolve a usable landed cost from a collected_products cost snapshot.
+
+    Returns ``PricingEngine.resolve_landed_cost`` when it is > 0, else ``0.0``
+    so the MI candidate is excluded. Does not fall back to raw ``base_cost``
+    or ``product_price`` (those omit freight and understate cost).
+    """
+    breakdown = cost_data or {}
+    try:
+        from src.services.pricing_engine import PricingEngine
+
+        resolved = PricingEngine.resolve_landed_cost(
+            breakdown,
+            shipping_fallback=shipping_fallback,
+            specs=specs,
+            attributes=attributes,
+        )
+        if resolved and float(resolved) > 0:
+            return float(resolved)
+    except Exception:
+        pass
+    return 0.0
+
+
 @dataclass
 class MarketAnalysis:
     """市场水位分析结果"""
@@ -319,9 +349,15 @@ class IntelligenceService:
         
         # 只扫描未刊登候选：PENDING / COLLECTED / READY。
         # PUBLISHED 已经在线，不应再进入“推荐刊登”或 MI 日报候选池。
-        cur.execute("""
-            SELECT sku, title, url, cost_breakdown, status, images, listing_id
-            FROM collected_products 
+        column_names = {
+            str(info[1])
+            for info in cur.execute("PRAGMA table_info(collected_products)").fetchall()
+        }
+        have_extra = {"shipping", "attributes", "specs"}.issubset(column_names)
+        extra_cols = ", shipping, attributes, specs" if have_extra else ""
+        cur.execute(f"""
+            SELECT sku, title, url, cost_breakdown, status, images, listing_id{extra_cols}
+            FROM collected_products
             WHERE status IN ('PENDING', 'COLLECTED', 'READY')
               AND cost_breakdown IS NOT NULL
         """)
@@ -335,6 +371,32 @@ class IntelligenceService:
                 images = []
             if not isinstance(images, list):
                 images = []
+            attributes: Dict = {}
+            specs: Dict = {}
+            shipping_fallback = 0.0
+            if have_extra:
+                try:
+                    attributes = json.loads(row['attributes']) if row['attributes'] else {}
+                except (TypeError, ValueError):
+                    attributes = {}
+                try:
+                    specs = json.loads(row['specs']) if row['specs'] else {}
+                except (TypeError, ValueError):
+                    specs = {}
+                try:
+                    shipping_fallback = float(row['shipping'] or 0)
+                except (TypeError, ValueError):
+                    shipping_fallback = 0.0
+            if not isinstance(attributes, dict):
+                attributes = {}
+            if not isinstance(specs, dict):
+                specs = {}
+            total_cost = landed_cost_from_breakdown(
+                cost_data,
+                shipping_fallback=shipping_fallback,
+                specs=specs,
+                attributes=attributes,
+            )
             products.append({
                 'sku': row['sku'],
                 'title': row['title'],
@@ -344,7 +406,7 @@ class IntelligenceService:
                 'image_url': images[0] if images else '',
                 'product_price': cost_data.get('product_price', 0),
                 'shipping_cost': cost_data.get('shipping_cost', 0),
-                'total_cost': cost_data.get('total_dajian_cost', 0),
+                'total_cost': total_cost,
                 'listing_id': row['listing_id'] or '',
             })
         

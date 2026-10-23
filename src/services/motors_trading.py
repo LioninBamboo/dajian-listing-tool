@@ -13,11 +13,37 @@ docs/HANDOFF_MULTI_STORE_20260723.md §6.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 from xml.sax.saxutils import escape
 
 # eBay ConditionID for "New". Motors parts are almost always new here.
 CONDITION_NEW = "1000"
+
+_ASCII_MAP = {
+    "×": "x", "é": "e", "è": "e", "ñ": "n",
+    "–": "-", "—": "-", "−": "-",
+    "“": '"', "”": '"', "‘": "'", "’": "'",
+    "°": " deg", "²": "2", "³": "3",
+    "½": "1/2", "¼": "1/4", "¾": "3/4", "″": '"', "′": "'",
+    "®": "(R)", "™": "(TM)", "©": "(C)", " ": " ",
+}
+
+
+def ascii_safe(text: Optional[str]) -> str:
+    """Render text with only ASCII so the Trading CDATA round-trips cleanly."""
+    if not text:
+        return ""
+    for k, v in _ASCII_MAP.items():
+        text = text.replace(k, v)
+    # NFKD then drop any remaining non-ASCII (accents decompose, symbols drop)
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+
+
+def _description_cdata(description: Optional[str]) -> str:
+    """ASCII-safe description wrapped so a literal `]]>` cannot close CDATA."""
+    text = ascii_safe(description).replace("]]>", "]]]]><![CDATA[>")
+    return f"<![CDATA[{text}]]>"
 
 
 def format_compatibility_list(
@@ -152,7 +178,7 @@ def build_revise_fixed_price_item_xml(
     if start_price is not None:
         parts.append(f"<StartPrice>{float(start_price):.2f}</StartPrice>")
     if description is not None:
-        parts.append(f"<Description><![CDATA[{description}]]></Description>")
+        parts.append(f"<Description>{_description_cdata(description)}</Description>")
     compatibility_xml = format_compatibility_list(
         compatibility,
         replace_all=replace_all_compatibility,
@@ -214,7 +240,7 @@ def build_add_fixed_price_item_xml(
         "<AddFixedPriceItemRequest xmlns=\"urn:ebay:apis:eBLBaseComponents\">"
         "<Item>"
         f"<Title>{escape(str(title)[:80])}</Title>"
-        f"<Description><![CDATA[{description or ''}]]></Description>"
+        f"<Description>{_description_cdata(description)}</Description>"
         f"<PrimaryCategory><CategoryID>{escape(str(category_id))}</CategoryID></PrimaryCategory>"
         f"<StartPrice currencyID=\"{currency}\">{float(price):.2f}</StartPrice>"
         f"<Quantity>{int(quantity)}</Quantity>"

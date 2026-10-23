@@ -31,7 +31,7 @@ server:
 
 These are Task Scheduler entries, not `scheduler_daemon` jobs. `KNOWN_SCHEDULER_JOBS` does not include them. PR-A must not register, gate, or change them.
 
-Aqua (Trading / fitment / finance):
+Aqua (Trading / fitment / finance). The in-repo entry points are `scripts/trading_content_qc.py` and `scripts/fitment_audit.py`; this allowlist still does not gate them:
 
 - `AquaRides Content QC` (`trading_content_qc.py --email`)
 - `AquaRides Content QC Fix` (`--fix --email --limit 30`, live Trading writes)
