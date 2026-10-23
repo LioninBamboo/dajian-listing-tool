@@ -69,9 +69,13 @@ from src.utils.publish_source_aspect_guard import (
     restore_sourced_aspects,
 )
 from src.utils.approved_category import (
+    blocks_automated_category_change,
     evaluate_approved_category,
     is_category_approved,
+    is_valid_category_id,
+    locked_category_write_error,
     mark_category_approved,
+    should_auto_remap_invalid_category,
 )
 from src.utils.publish_fee_preview import evaluate_insertion_fee_preview
 from src.utils.category_decision import TREE_KNOWN_PUBLISHABLE_LEAVES
@@ -466,16 +470,34 @@ def select_batch_publish_category(
     stored id (report-only). Empty stored holds. Implausible stored on
     READY/PENDING holds.
     """
-    from src.utils.category_decision import apply_category_write_gate
+    from src.utils.category_decision import (
+        apply_category_write_gate,
+        category_gate_report_flags,
+    )
 
     original_stored = str(stored_cat or "").strip() or None
     original_name = stored_cat_name
+    report_flags = category_gate_report_flags(original_stored, optimization=opt)
     title_context = title or ""
     existing_aspects = dict(existing_aspects or {})
     opt = opt or {}
     candidate = original_stored
     candidate_name = original_name
     completed_aspects = existing_aspects
+    locked = blocks_automated_category_change(opt)
+    if locked:
+        preserve_approved_category = True
+        if not is_valid_category_id(original_stored):
+            return {
+                "category_id": None,
+                "category_name": None,
+                "aspects": completed_aspects,
+                "action": "hold_empty",
+                "original_stored": original_stored,
+                "held": True,
+                "selected": None,
+                "flags": report_flags,
+            }
 
     if original_stored in INVALID_CATEGORY_REMAP and not preserve_approved_category:
         candidate = INVALID_CATEGORY_REMAP[original_stored]
@@ -597,6 +619,7 @@ def select_batch_publish_category(
             "original_stored": original_stored,
             "held": True,
             "selected": selected,
+            "flags": report_flags,
         }
     if gated_id and gated_id == original_stored:
         selected_name = original_name or selected_name or f"Category {gated_id}"
@@ -622,6 +645,7 @@ def select_batch_publish_category(
         "original_stored": original_stored,
         "held": False,
         "selected": selected,
+        "flags": report_flags,
     }
 
 
@@ -1182,6 +1206,14 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             result["copy_skip_reasons"] = ["high_insertion_fee"]
         return result
     preserve_approved_category = approved_decision.preserve
+    if blocks_automated_category_change(opt):
+        preserve_approved_category = True
+        if not is_valid_category_id(stored_cat):
+            msg = locked_category_write_error(opt) or (
+                "category lock is set with blank/invalid categoryId; refusing rematch"
+            )
+            record_error(sku, msg)
+            return {"status": "error", "message": msg}
     listing_status = str(product.get('status') or opt.get('status') or opt.get('listingStatus') or 'READY')
     choice = select_batch_publish_category(
         stored_cat=stored_cat,
@@ -1201,6 +1233,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     )
     stored_cat = choice.get("original_stored") or stored_cat
     completed_aspects = choice.get("aspects") or existing_aspects
+    category_flags = list(choice.get("flags") or [])
     if choice.get("held"):
         if choice.get("action") == "hold_empty":
             msg = "Cannot determine eBay category"
@@ -1213,11 +1246,16 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             from src.utils.category_decision import tree_unavailable_publish_error
 
             msg = tree_unavailable_publish_error()
-            return {"status": "error", "message": msg, "action": "hold_tree_unavailable"}
+            return {
+                "status": "error",
+                "message": msg,
+                "action": "hold_tree_unavailable",
+                "flags": category_flags,
+            }
         else:
             msg = f"Stored category {stored_cat} is not plausible for title '{title_context[:120]}'"
         record_error(sku, msg)
-        return {"status": "error", "message": msg}
+        return {"status": "error", "message": msg, "flags": category_flags}
     category_id = choice.get("category_id")
     category_name = choice.get("category_name")
     if not category_id:
@@ -1785,6 +1823,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 "listing_id": listing_id,
                 "offer_id": offer_id,
                 "category_id": category_id,
+                "flags": category_flags,
                 "write_state": "verified",
                 "readback": readback,
                 "qc_rule_ids": qc_result.get("rule_ids", []),
@@ -1852,7 +1891,13 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                     if deleted:
                         logger.info(f"  [FIX] Deleted {deleted} stale offer(s) after category error")
 
-                    if category_id not in protected_stored_categories and not category_reselected:
+                    if (
+                        category_id not in protected_stored_categories
+                        and not category_reselected
+                        and should_auto_remap_invalid_category(
+                            opt, preserve=preserve_approved_category
+                        )
+                    ):
                         new_id, new_name, new_aspects = category_matcher.get_category_and_aspects(
                             title, completed_aspects, description
                         )

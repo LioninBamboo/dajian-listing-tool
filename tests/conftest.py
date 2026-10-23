@@ -57,6 +57,7 @@ def _offline_category_tree(monkeypatch, request):
     from src.utils import category_tree_cache
 
     real_load = category_tree_cache.load_category_index
+    real_load_indexes = category_tree_cache.load_category_indexes
     default_dir = category_tree_cache.DEFAULT_CACHE_DIR
 
     def _load(cache_dir=None):
@@ -64,7 +65,13 @@ def _offline_category_tree(monkeypatch, request):
             return real_load(cache_dir)
         return dict(index)
 
+    def _load_indexes(cache_dir=None):
+        if cache_dir is not None or category_tree_cache.DEFAULT_CACHE_DIR != default_dir:
+            return real_load_indexes(cache_dir)
+        return {"0": dict(index), "100": {}}
+
     monkeypatch.setattr(category_tree_cache, "load_category_index", _load)
+    monkeypatch.setattr(category_tree_cache, "load_category_indexes", _load_indexes)
     yield
 
 

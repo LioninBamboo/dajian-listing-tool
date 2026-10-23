@@ -98,7 +98,12 @@ from src.utils.dimension_helpers import (
     find_dimension,
     replace_description_measurements,
 )
-from src.utils.approved_category import is_category_approved
+from src.utils.approved_category import (
+    blocks_automated_category_change,
+    is_category_approved,
+    locked_category_write_error,
+)
+from src.utils.category_decision import category_gate_report_flags
 from src.utils.publish_validation import first_aspect_text, measurement_issue
 from src.utils.publish_autofix import (
     SINGLE_VALUE_ASPECTS,
@@ -957,7 +962,7 @@ def audit_single_product(
     # ── 1. Category Check — one decision contract, same as the publish path ──
     # A human-approved stored category is not remapped. API-suggest is not a
     # second leaf source: uncertain stays unknown.
-    skip_category_remap = is_category_approved(opt) and bool(stored_category)
+    skip_category_remap = blocks_automated_category_change(opt)
     from src.utils.category_decision import decision_category_id, resolve_category_decision
 
     decision = resolve_category_decision(
@@ -1046,6 +1051,14 @@ def audit_single_product(
                     f"'{(opt_title or title)[:80]}'"
                 ),
             })
+
+    for flag in category_gate_report_flags(stored_category, optimization=opt):
+        issues.append({
+            "type": flag,
+            "severity": "INFO",
+            "current": stored_category or None,
+            "detail": flag,
+        })
 
     # ── 2. Dimension Accuracy ──
     source_dims = extract_all_dimensions(attrs)
@@ -2062,6 +2075,11 @@ def create_parser():
         choices=["description", "features", "aspects", "all"],
         default="all",
         help="Limit __strip_claims_from_manifest__ to description, Features, other aspects, or all",
+    )
+    parser.add_argument(
+        "--override-category-lock",
+        action="store_true",
+        help="Allow applying categoryId/categoryName fixes on listings whose categoryApproved flag is set",
     )
     return parser
 
@@ -3518,6 +3536,7 @@ def fix_listing_on_ebay(
     *,
     base_opt_raw=None,
     source_detail_cache: dict[str, dict] | None = None,
+    override_category_lock: bool = False,
 ):
     """Apply fixes to a published eBay listing."""
     results = []
@@ -3606,6 +3625,11 @@ def fix_listing_on_ebay(
         if key == "categoryId":
             from src.utils.publish_fee_preview import guard_category_write_high_fee
 
+            lock_error = locked_category_write_error(
+                stored_opt, override=override_category_lock
+            )
+            if lock_error:
+                return [f"ERROR [{sku}]: {lock_error}"]
             # get_listing_fees(offer_id) reflects the offer's current category,
             # not this target leaf, so it is not used as a $20 preview here.
             blocked = guard_category_write_high_fee(
@@ -5624,6 +5648,7 @@ def main(argv=None):
                 conn,
                 base_opt_raw=audit_opt_raw if args.live else None,
                 source_detail_cache=semantic_source_detail_cache,
+                override_category_lock=bool(getattr(args, "override_category_lock", False)),
             )
             for r in fix_results:
                 if "ERROR" in r:

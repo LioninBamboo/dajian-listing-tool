@@ -1445,6 +1445,19 @@ class EbayPublisher:
                     
                     # 更新 offer 类目与 buyer-facing 描述
                     current_category = existing_offer.get("categoryId", "")
+                    from src.utils.approved_category import blocks_automated_category_change
+
+                    locked_opt = product.get("optimization") if isinstance(product, dict) else None
+                    if (
+                        blocks_automated_category_change(locked_opt)
+                        and current_category
+                        and str(current_category) != str(category_id or "")
+                    ):
+                        self.logger.info(
+                            "[CATEGORY] lock set; keeping live offer category %s",
+                            current_category,
+                        )
+                        category_id = str(current_category)
                     if current_category != category_id:
                         self.logger.info(f"[INFO] Updating offer category: {current_category} -> {category_id}")
                     self.ebay_client.update_offer_category(
@@ -1784,7 +1797,35 @@ class EbayPublisher:
         suggested_id: Optional[str] = None
     ) -> Tuple[str, str, Dict[str, List[str]]]:
         """获取类目和完整的 Item Specifics"""
-        
+        from src.utils.approved_category import (
+            blocks_automated_category_change,
+            is_valid_category_id,
+        )
+
+        opt = product.get("optimization") if isinstance(product, dict) else None
+        if isinstance(opt, str) and opt.strip():
+            try:
+                parsed = json.loads(opt)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                opt = parsed
+        if not isinstance(opt, dict):
+            opt = {}
+        if blocks_automated_category_change(opt):
+            locked_id = str(opt.get("categoryId") or "").strip()
+            if is_valid_category_id(locked_id):
+                self.logger.info("[CATEGORY] Preserving locked category %s", locked_id)
+                cat_name = str(opt.get("categoryName") or f"Category {locked_id}")
+                aspects = self._ensure_required_aspects(
+                    locked_id, existing_aspects, title, product
+                )
+                return locked_id, cat_name, aspects
+            self.logger.warning(
+                "[CATEGORY] lock set but categoryId is blank; refusing rematch"
+            )
+            return "", str(opt.get("categoryName") or ""), existing_aspects
+
         # Collect all known category IDs from our verified maps
         known_ids = set(self.CATEGORY_REQUIRED_ASPECTS.keys())
         for rule in self.CATEGORY_RULES:

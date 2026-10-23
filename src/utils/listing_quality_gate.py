@@ -43,7 +43,7 @@ from src.utils.publish_aspect_completion import (
     seating_item_counts,
     seating_plus_table_item_count,
 )
-from src.utils.approved_category import is_category_approved
+from src.utils.approved_category import blocks_automated_category_change
 from src.utils.publish_autofix import sanitize_placeholder_aspects, sanitize_single_value_aspects
 from src.utils.publish_validation import (
     REQUIRED_MEASUREMENT_ASPECT_KEYS,
@@ -2521,7 +2521,7 @@ def normalize_generated_listing(
         stored_category,
         source_title="",
     )
-    preserve_category = is_category_approved(opt)
+    preserve_category = blocks_automated_category_change(opt)
     if not preserve_category:
         from src.utils.category_decision import decision_category_id, resolve_category_decision
 
@@ -3535,7 +3535,7 @@ def validate_listing_quality(
         )
 
     category_id = str(opt.get("categoryId") or "").strip()
-    preserve_category = is_category_approved(opt)
+    preserve_category = blocks_automated_category_change(opt)
     from src.utils.category_decision import decision_category_id, resolve_category_decision
 
     profile = classify_listing_profile(
