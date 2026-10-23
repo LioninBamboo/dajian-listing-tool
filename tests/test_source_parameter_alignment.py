@@ -168,6 +168,13 @@ class TestResolveMaterialWrite:
         assert result["status"] == "write"
         assert result["expected"] == ["Fabric+Metal"]
 
+    def test_custom_aspect_over_65_needs_review(self):
+        result = resolve_material_write(
+            "Y" * 70, aspect_meta=None, metadata_available=True
+        )
+        assert result["status"] == "needs_review"
+        assert result["reason"] == "value_too_long"
+
     def test_selection_only_single_not_allowed_is_review(self):
         result = resolve_material_write(
             "Steel/Plastic",
@@ -448,27 +455,17 @@ class TestMaterialEdgeCasesAdded:
             "Wood+", aspect_meta=None, metadata_available=True
         )["expected"] == ["Wood+"]
 
-    def test_edge_duplicate_tokens_steel_steel_token_set_pass(self):
-        """Duplicate tokens collapse under rule (b); live ``[Steel]`` is exact token-set match."""
-        assert material_exactly_matches_source("Steel+Steel", ["Steel"])
-        assert (
-            _material_row(
-                {"Main Material": "Steel+Steel"},
-                {"Material": ["Steel"]},
-                material_aspect={"mode": "FREE_TEXT", "cardinality": "SINGLE"},
-                aspect_metadata_available=True,
-            )
-            is None
-        )
-        # A genuinely wrong live value still gets the exact composite write.
-        wrong = _material_row(
+    def test_edge_duplicate_tokens_steel_steel_vs_steel_fails(self):
+        """SYNTHETIC: ``Steel+Steel`` vs live ``[Steel]`` must FAIL (B2 — single live)."""
+        assert not material_exactly_matches_source("Steel+Steel", ["Steel"])
+        row = _material_row(
             {"Main Material": "Steel+Steel"},
-            {"Material": ["Plastic"]},
+            {"Material": ["Steel"]},
             material_aspect={"mode": "FREE_TEXT", "cardinality": "SINGLE"},
             aspect_metadata_available=True,
         )
-        assert wrong is not None
-        assert wrong["expected"] == ["Steel+Steel"]
+        assert row is not None
+        assert row["expected"] == ["Steel+Steel"]
 
     def test_edge_case_only_difference_passes(self):
         """Case-only difference is not a mismatch (compare is case-insensitive)."""
@@ -500,15 +497,18 @@ class TestMaterialNullSafety:
             is None
         )
 
-    def test_list_source_does_not_crash(self):
+    def test_list_source_uses_all_elements(self):
+        """SYNTHETIC / B4: list ``['Fabric','Metal']`` must keep both elements."""
         row = _material_row(
-            {"Main Material": ["Fabric+Metal"]},
+            {"Main Material": ["Fabric", "Metal"]},
             {"Material": ["Linen"]},
             material_aspect=None,
             aspect_metadata_available=True,
         )
         assert row is not None
         assert row["expected"] == ["Fabric+Metal"]
+        assert "Fabric" in row["source_value"]
+        assert "Metal" in row["source_value"]
 
     def test_non_string_source_does_not_crash(self):
         row = _material_row(
@@ -519,3 +519,150 @@ class TestMaterialNullSafety:
         )
         assert row is not None
         assert row["expected"] == ["12345"]
+
+
+class TestMaterialReviewFixesB2B3B4:
+    """Targeted regressions from PR #28 review (B2/B3/B4 + empty aspects)."""
+
+    def test_b2_single_live_reordered_composite_does_not_pass(self):
+        assert not material_exactly_matches_source("Metal & Wood", ["Wood/Metal"])
+        assert not material_exactly_matches_source(
+            "Glass,MDF,Melamine", ["Melamine+MDF+Glass"]
+        )
+
+    def test_b2_multi_value_split_write_still_passes(self):
+        assert material_exactly_matches_source("Fabric+Metal", ["Fabric", "Metal"])
+        assert material_exactly_matches_source("Metal & Wood", ["Metal", "Wood"])
+
+    def test_b3_custom_aspect_over_65_needs_review(self):
+        """SYNTHETIC: 70-char material → needs_review, never hard-truncate."""
+        long_value = "X" * 70
+        result = resolve_material_write(
+            long_value, aspect_meta=None, metadata_available=True
+        )
+        assert result["status"] == "needs_review"
+        assert result["reason"] == "value_too_long"
+        row = _material_row(
+            {"Main Material": long_value},
+            {"Material": ["Steel"]},
+            material_aspect=None,
+            aspect_metadata_available=True,
+        )
+        assert row is not None
+        assert row.get("needs_human") is True
+        assert row.get("reason") == "value_too_long"
+        assert row.get("expected") is None
+
+    def test_b4_list_source_selection_only_multi_writes_both(self):
+        row = _material_row(
+            {"Main Material": ["Fabric", "Metal"]},
+            {"Material": ["Linen"]},
+            material_aspect={
+                "mode": "SELECTION_ONLY",
+                "cardinality": "MULTI",
+                "allowed_values": ["Fabric", "Metal", "Wood"],
+            },
+            aspect_metadata_available=True,
+        )
+        assert row is not None
+        assert row["expected"] == ["Fabric", "Metal"]
+
+
+class TestReviewRealSkuCases:
+    def test_w3916_fabric_plus_metal(self):
+        row = _material_row(
+            {"Main Material": "Fabric+Metal"},
+            {"Material": ["Linen"]},
+            category_id="54235",
+            material_aspect=None,
+            aspect_metadata_available=True,
+        )
+        assert row is not None
+        assert row["expected"] == ["Fabric+Metal"]
+
+    def test_n752_glass_mdf_melamine(self):
+        row = _material_row(
+            {"Main Material": "Glass,MDF,Melamine"},
+            {"Material": ["Glass"]},
+            category_id="20689",
+            material_aspect={
+                "mode": "FREE_TEXT",
+                "cardinality": "MULTI",
+                "allowed_values": [],
+            },
+            aspect_metadata_available=True,
+        )
+        assert row is not None
+        assert row["expected"] == ["Glass,MDF,Melamine"]
+        assert row.get("legacy_partial_match") is True
+
+    def test_w882_metal_and_wood(self):
+        row = _material_row(
+            {"Main Material": "Metal & Wood"},
+            {"Material": ["Metal"]},
+            category_id="176937",
+            material_aspect={
+                "mode": "FREE_TEXT",
+                "cardinality": "MULTI",
+                "allowed_values": [],
+            },
+            aspect_metadata_available=True,
+        )
+        assert row is not None
+        assert row["expected"] == ["Metal & Wood"]
+
+    def test_w465_pu_steel(self):
+        row = _material_row(
+            {"Main Material": "PU,Steel"},
+            {"Material": ["Polyurethane (PU)"]},
+            category_id="173950",
+            material_aspect={
+                "mode": "FREE_TEXT",
+                "cardinality": "SINGLE",
+                "allowed_values": [],
+            },
+            aspect_metadata_available=True,
+        )
+        assert row is not None
+        assert row["expected"] == ["PU,Steel"]
+
+
+class TestAddedEdgeCasesRound2:
+    """Three additional edge cases beyond the review checklist."""
+
+    def test_edge_list_source_skips_blank_elements(self):
+        row = _material_row(
+            {"Main Material": ["Fabric", "  ", "Metal"]},
+            {"Material": ["Linen"]},
+            material_aspect=None,
+            aspect_metadata_available=True,
+        )
+        assert row is not None
+        assert row["expected"] == ["Fabric+Metal"]
+
+    def test_edge_exact_pass_does_not_churn_when_already_correct(self):
+        assert (
+            _material_row(
+                {"Main Material": "Fabric+Metal"},
+                {"Material": ["Fabric+Metal"]},
+                material_aspect=None,
+                aspect_metadata_available=True,
+            )
+            is None
+        )
+
+    def test_edge_selection_only_partial_tokens_needs_review_no_subset_write(self):
+        row = _material_row(
+            {"Main Material": "Fabric+Metal+Wood"},
+            {"Material": ["Fabric"]},
+            material_aspect={
+                "mode": "SELECTION_ONLY",
+                "cardinality": "MULTI",
+                "allowed_values": ["Fabric", "Metal"],  # Wood missing
+            },
+            aspect_metadata_available=True,
+        )
+        assert row is not None
+        assert row.get("needs_human") is True
+        assert row.get("expected") is None
+        assert row.get("reason") == "selection_only_value_not_allowed"

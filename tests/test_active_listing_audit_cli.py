@@ -783,6 +783,92 @@ def test_scheduled_material_partial_match_is_gated_operator_writes():
     assert operator["Material"] == ["Glass,MDF,Melamine"]
 
 
+def test_empty_aspects_taxonomy_is_metadata_unavailable():
+    """SYNTHETIC: HTTP 200 with empty aspects list → needs_review, not custom."""
+
+    class _Matcher:
+        def __init__(self):
+            self._aspects_cache = {}
+
+        def _get_category_aspects(self, category_id):
+            self._aspects_cache[str(category_id)] = []
+            return [], []
+
+    material, available = audit_fix_active_listings.resolve_material_aspect_metadata(
+        _Matcher(), "99999"
+    )
+    assert material is None
+    assert available is False
+
+    from src.utils.source_parameter_alignment import find_source_parameter_mismatches
+
+    rows = find_source_parameter_mismatches(
+        source_attributes={"Main Material": "Wood+Metal"},
+        source_title="Chair",
+        source_description="",
+        candidate_aspects={"Material": ["Wood"]},
+        category_id="99999",
+        material_aspect=None,
+        aspect_metadata_available=False,
+    )
+    material_row = next(r for r in rows if r["field"] == "Material")
+    assert material_row.get("needs_human") is True
+    assert material_row.get("reason") == "aspect_metadata_unavailable"
+    assert material_row.get("expected") is None
+
+
+def test_publish_sanitize_preserves_glass_mdf_melamine_full_value():
+    """B1: new-listing sanitize must not truncate Glass,MDF,Melamine → Glass."""
+    from src.utils.publish_autofix import (
+        prepare_ebay_aspects,
+        sanitize_single_value_aspects,
+        try_fix_publish_error,
+    )
+
+    aspects = {
+        "Material": ["Glass,MDF,Melamine"],
+        "Color": ["Black,White"],
+        "Type": ["Cabinet"],
+    }
+    sanitize_single_value_aspects(aspects)
+    assert aspects["Material"] == ["Glass,MDF,Melamine"]
+    # Color may still collapse; Material must not.
+    assert aspects["Color"] == ["Black"]
+
+    prepare_ebay_aspects(aspects, required_aspect_names=())
+    assert aspects["Material"] == ["Glass,MDF,Melamine"]
+
+    refused = try_fix_publish_error(
+        'The item specific Material should contain only one value',
+        {"Material": ["Glass,MDF,Melamine"]},
+        "20689",
+        {},
+        (),
+    )
+    assert refused is False
+    assert {"Material": ["Glass,MDF,Melamine"]}["Material"] == ["Glass,MDF,Melamine"]
+
+    long_material = {"Material": ["X" * 70]}
+    refused_len = try_fix_publish_error(
+        'Material\'s value of "' + ("X" * 70) + '" is too long',
+        long_material,
+        "20689",
+        {},
+        (),
+    )
+    assert refused_len is False
+    assert long_material["Material"] == ["X" * 70]
+
+
+def test_publish_sanitize_preserves_w3916_and_w882_composites():
+    from src.utils.publish_autofix import sanitize_single_value_aspects
+
+    for value in ("Fabric+Metal", "Metal & Wood", "PU,Steel"):
+        aspects = {"Material": [value], "Type": ["Chair"]}
+        sanitize_single_value_aspects(aspects)
+        assert aspects["Material"] == [value]
+
+
 def test_audit_parser_supports_scheduled_live_email_mode():
     parser = audit_fix_active_listings.create_parser()
 

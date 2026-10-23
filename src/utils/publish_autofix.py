@@ -60,7 +60,9 @@ def sanitize_single_value_aspects(
     log: LogFn | None = None,
     multi_value_aspects: Iterable[str] = MULTI_VALUE_ASPECTS,
 ) -> MutableMapping[str, Any]:
-    multi_value_keys = set(multi_value_aspects)
+    # Material must always reach eBay as the exact GIGA value (or an explicit
+    # MULTI token list). Never collapse ``Glass,MDF,Melamine`` → ``Glass``.
+    multi_value_keys = set(multi_value_aspects) | {"Material"}
 
     for aspect_name, values in list(aspects.items()):
         if aspect_name in multi_value_keys:
@@ -217,6 +219,10 @@ def try_fix_publish_error(
     match = re.search(r'([\w\s/]+?) should contain only one value', normalized_error)
     if match:
         field = match.group(1).strip()
+        # Never truncate / first-token Material — needs_review, not auto-repair.
+        if field == "Material":
+            _emit(log, "[AUTO-FIX] Refusing to truncate Material on single-value error")
+            return False
         if field in aspects:
             current = aspects[field]
             if isinstance(current, list):
@@ -238,6 +244,11 @@ def try_fix_publish_error(
         field = match.group(1).strip()
         long_value = match.group(2).strip()
         _emit(log, f'[AUTO-FIX] {field}: value too long ({len(long_value)} chars)')
+
+        # Material over 65 chars is needs_review — never hard-truncate.
+        if field == "Material":
+            _emit(log, "[AUTO-FIX] Refusing to truncate Material on length error")
+            return False
 
         if field in aspects:
             current = aspects[field]
@@ -332,10 +343,13 @@ def truncate_aspect_values(
     """Truncate each aspect value in-place to EBAY_MAX_ASPECT_VALUE_LEN (65 chars).
 
     For capacity/weight fields, attempts to extract the leading numeric portion
-    instead of hard-cutting mid-string.
+    instead of hard-cutting mid-string. Material is never truncated — over-limit
+    values must fail closed as needs_review upstream, not be silently cut.
     """
     for k, vals in aspects.items():
         if not isinstance(vals, list):
+            continue
+        if str(k) == "Material":
             continue
         for idx, val in enumerate(vals):
             if not isinstance(val, str) or len(val) <= EBAY_MAX_ASPECT_VALUE_LEN:

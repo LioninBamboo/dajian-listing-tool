@@ -2202,6 +2202,10 @@ def resolve_material_aspect_metadata(matcher, category_id: str):
         # Fallback path does not populate the cache — treat as unavailable.
         return None, False
     aspects = list(getattr(matcher, "_aspects_cache", {}).get(cat) or [])
+    # HTTP 200 with an empty aspects list is not trustworthy "custom" — treat as
+    # metadata unavailable so Material fails closed (needs_review).
+    if not aspects:
+        return None, False
     material = next(
         (
             aspect

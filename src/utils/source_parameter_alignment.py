@@ -68,6 +68,21 @@ def _source_value(attributes: Mapping[str, Any], *keys: str) -> str:
     return ""
 
 
+def _source_material_value(attributes: Mapping[str, Any]) -> str:
+    """GIGA Material source: join list elements so none are dropped (B4)."""
+    for key in ("Main Material", "Material", "材质"):
+        value = attributes.get(key)
+        if isinstance(value, (list, tuple, set)):
+            parts = [re.sub(r"\s+", " ", str(item)).strip() for item in value if str(item).strip()]
+            if not parts:
+                continue
+            # Preserve every element; ``+`` matches common GIGA composites.
+            return "+".join(parts)
+        if value not in (None, "") and str(value).strip():
+            return re.sub(r"\s+", " ", str(value)).strip()
+    return ""
+
+
 def _split_components(value: Any) -> list[str]:
     text = re.sub(r"\s+", " ", str(value or "")).strip().lower()
     if not text:
@@ -140,10 +155,15 @@ def material_exactly_matches_source(source_value: str, live_values: list[str]) -
     """Exact Material fidelity check (detection and post-fix verify).
 
     Passes only when:
-    (a) the live list is exactly ``[GIGA string]`` after separator-spacing
-        normalisation, or
-    (b) the live token set equals the GIGA token set exactly (MULTI / split
-        writes). Not a superset, not a subset. Aliases do not count.
+    (a) live is a single value that equals the full GIGA string after
+        case/whitespace/separator-spacing normalisation, or
+    (b) live is a **multi-value** list (a split write from the GIGA value) whose
+        token set equals the GIGA token set exactly. Not a superset, not a
+        subset. Aliases do not count.
+
+    Rule (b) must not apply when live is a single composite string — otherwise
+    ``Steel+Steel`` vs ``["Steel"]`` or ``Metal & Wood`` vs ``["Wood/Metal"]``
+    would falsely pass.
     """
     source_text = re.sub(r"\s+", " ", str(source_value or "")).strip()
     if not source_text:
@@ -153,9 +173,10 @@ def material_exactly_matches_source(source_value: str, live_values: list[str]) -
         return False
 
     source_norm = normalize_material_compare_text(source_text)
-    if len(live) == 1 and normalize_material_compare_text(live[0]) == source_norm:
-        return True
+    if len(live) == 1:
+        return normalize_material_compare_text(live[0]) == source_norm
 
+    # Multi-value live only: compare token sets from the split write.
     source_tokens = set(_exact_material_tokens(source_text))
     live_tokens: set[str] = set()
     for value in live:
@@ -319,7 +340,16 @@ def resolve_material_write(
         }
 
     # Custom aspect: name not present in the category aspect list.
+    # Still enforce eBay's 65-char value limit — never hard-truncate (B3).
     if aspect_meta is None:
+        if len(exact) > _EBAY_MAX_ASPECT_VALUE_LEN:
+            return {
+                "status": "needs_review",
+                "expected": None,
+                "reason": "value_too_long",
+                "aspect_mode": "CUSTOM",
+                "cardinality": None,
+            }
         return {
             "status": "write",
             "expected": [exact],
@@ -396,7 +426,7 @@ def find_source_parameter_mismatches(
     aspects = candidate_aspects if isinstance(candidate_aspects, Mapping) else {}
     mismatches: list[dict[str, Any]] = []
 
-    source_material = _source_value(attributes, "Main Material", "Material", "材质")
+    source_material = _source_material_value(attributes)
     specific_upholstery = _source_value(
         attributes,
         "Upholstery Material",
