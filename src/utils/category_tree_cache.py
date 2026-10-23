@@ -34,9 +34,22 @@ logger = logging.getLogger(__name__)
 # Process-level flatten. None means "not loaded yet".
 _INDEX: Optional[dict[str, tuple[str, str]]] = None
 _INDEX_DIR: Optional[Path] = None
+_INDEX_EXPIRES_AT: Optional[float] = None
 _CACHE_WARNED: set[str] = set()
 _RUNTIME_REFRESH_ATTEMPTED: dict[str, float] = {}
+_UNAVAILABLE_TREES: set[str] = set()
 _REFRESH_FAIL_WARNED = False
+_clock: Callable[[], float] = time.time
+
+
+def _now() -> float:
+    return float(_clock())
+
+
+def set_category_tree_clock(clock: Optional[Callable[[], float]] = None) -> None:
+    """Tests inject a fake clock so the 30-minute retry can be advanced."""
+    global _clock
+    _clock = clock or time.time
 
 
 def normalize_api_base(api_base: str) -> str:
@@ -72,13 +85,24 @@ def category_tree_cache_path(tree_id: str, cache_dir: Optional[Path] = None) -> 
     return directory / f"category_tree_{tree_id}.json"
 
 
-def reset_category_tree_cache() -> None:
-    global _INDEX, _INDEX_DIR, _REFRESH_FAIL_WARNED
+def _invalidate_index_cache() -> None:
+    global _INDEX, _INDEX_DIR, _INDEX_EXPIRES_AT
     _INDEX = None
     _INDEX_DIR = None
+    _INDEX_EXPIRES_AT = None
+
+
+def reset_category_tree_cache() -> None:
+    global _REFRESH_FAIL_WARNED
+    _invalidate_index_cache()
     _CACHE_WARNED.clear()
     _RUNTIME_REFRESH_ATTEMPTED.clear()
+    _UNAVAILABLE_TREES.clear()
     _REFRESH_FAIL_WARNED = False
+
+
+def unavailable_runtime_trees() -> frozenset[str]:
+    return frozenset(_UNAVAILABLE_TREES)
 
 
 def flatten_category_tree(payload: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
@@ -128,17 +152,8 @@ def _warn_cache_unavailable(tree_id: str, path: Path, reason: str) -> None:
 
 
 def store_runtime_tree_ids() -> tuple[str, ...]:
-    """Tree 0 for Main/GP; trees 100 and 0 for AquaRides Motors."""
-    try:
-        from src.utils.store_profile import get_store_profile
-
-        profile = get_store_profile()
-        tid = str(getattr(profile, "category_tree_id", None) or "0").strip() or "0"
-        if bool(getattr(profile, "is_motors", False)) or tid == "100":
-            return ("100", "0")
-        return ("0",)
-    except Exception:
-        return ("0",)
+    """Every store refreshes both EBAY_US (0) and Motors (100)."""
+    return ("0", "100")
 
 
 def _warn_refresh_failed_once() -> None:
@@ -231,7 +246,7 @@ def try_runtime_refresh_tree(tree_id: str, cache_dir: Optional[Path] = None) -> 
     """Refresh one missing/stale tree. Mock this in tests; never hit live eBay."""
     directory = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
     key = f"{directory}:{tree_id}"
-    now = time.time()
+    now = _now()
     last = _RUNTIME_REFRESH_ATTEMPTED.get(key)
     if last is not None and (now - last) < RUNTIME_REFRESH_RETRY_SECONDS:
         return False
@@ -282,16 +297,34 @@ def _load_one_tree(tree_id: str, cache_dir: Path) -> dict[str, tuple[str, str]]:
 
 
 def load_category_index(cache_dir: Optional[Path] = None) -> dict[str, tuple[str, str]]:
-    """Load tree 0 and 100 once per process into id -> (name, parent_id)."""
-    global _INDEX, _INDEX_DIR
+    """Load tree 0 and 100 once per process into id -> (name, parent_id).
+
+    A failed or partial refresh is cached only until the 30-minute retry
+    window expires, so long-lived server/Streamlit processes re-attempt
+    getCategoryTree instead of holding every publish until restart.
+    """
+    global _INDEX, _INDEX_DIR, _INDEX_EXPIRES_AT
     directory = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
+    now = _now()
     if _INDEX is not None and _INDEX_DIR == directory:
-        return _INDEX
+        if _INDEX_EXPIRES_AT is None or now < _INDEX_EXPIRES_AT:
+            return _INDEX
+        _invalidate_index_cache()
     index: dict[str, tuple[str, str]] = {}
+    owned = {str(tid) for tid in store_runtime_tree_ids()}
+    unavailable: set[str] = set()
     for tree_id in DEFAULT_TREE_IDS:
-        index.update(_load_one_tree(tree_id, directory))
+        piece = _load_one_tree(tree_id, directory)
+        if str(tree_id) in owned and not piece:
+            unavailable.add(str(tree_id))
+        index.update(piece)
+    _UNAVAILABLE_TREES.clear()
+    _UNAVAILABLE_TREES.update(unavailable)
     _INDEX = index
     _INDEX_DIR = directory
+    _INDEX_EXPIRES_AT = (
+        (now + RUNTIME_REFRESH_RETRY_SECONDS) if unavailable else None
+    )
     return index
 
 
@@ -353,7 +386,9 @@ def write_category_tree_cache(
         except OSError:
             pass
         raise
-    reset_category_tree_cache()
+    # Invalidate the flattened index only. A mid-load write must not clear
+    # per-tree unavailability recorded for a sibling that already failed.
+    _invalidate_index_cache()
     return path
 
 

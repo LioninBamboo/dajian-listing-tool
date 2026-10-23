@@ -244,6 +244,16 @@ def update_product_status(sku: str, listing_id: str, offer_id: str = None,
         db.close()
 
 
+def is_tree_unavailable_hold(result):
+    """True when a publish result should abort the rest of the batch."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("action") == "hold_tree_unavailable":
+        return True
+    message = str(result.get("message") or "").lower()
+    return "tree" in message and "unavailable" in message
+
+
 def record_error(sku: str, error_msg: str):
     """Append error to product logs without changing status."""
     from src.db.collection_db import SessionLocal
@@ -1203,9 +1213,10 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 f"'{title_context[:120]}'"
             )
         elif choice.get("action") == "hold_tree_unavailable":
-            from src.utils.category_decision import HOLD_TREE_UNAVAILABLE_ERROR
+            from src.utils.category_decision import tree_unavailable_publish_error
 
-            msg = HOLD_TREE_UNAVAILABLE_ERROR
+            msg = tree_unavailable_publish_error()
+            return {"status": "error", "message": msg, "action": "hold_tree_unavailable"}
         else:
             msg = f"Stored category {stored_cat} is not plausible for title '{title_context[:120]}'"
         record_error(sku, msg)
@@ -1282,7 +1293,15 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         listing_status,
         is_motors=get_store_profile().is_motors,
     )
-    if restore_action in {"hold_empty", "hold_implausible", "hold_tree_unavailable"}:
+    if restore_action == "hold_tree_unavailable":
+        from src.utils.category_decision import tree_unavailable_publish_error
+
+        return {
+            "status": "error",
+            "message": restore_detail or tree_unavailable_publish_error(),
+            "action": "hold_tree_unavailable",
+        }
+    if restore_action in {"hold_empty", "hold_implausible"}:
         msg = restore_detail or f"Stored category {stored_cat} is not publishable"
         record_error(sku, msg)
         return {"status": "error", "message": msg}
@@ -2199,6 +2218,13 @@ def main():
         else:
             fail += 1
             logger.error(f"  FAIL: {result['message']}\n")
+
+        if is_tree_unavailable_hold(result):
+            logger.error(
+                "Category tree unavailable; stopping batch: %s",
+                result.get("message"),
+            )
+            break
 
         if not args.dry_run and i < len(products):
             time.sleep(PUBLISH_DELAY_SECS)

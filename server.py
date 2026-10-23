@@ -50,6 +50,40 @@ from src.utils.title_sanitizer import normalize_listing_title_for_ebay, strip_su
 _QUALITY_GATE_CATEGORY_MATCHER = None
 
 
+def apply_publish_source_dimensions(completed_aspects, attrs, sku, *, log=print):
+    """Force source-attribute and DaJian dimensions over AI-generated values."""
+    from src.utils.dimension_helpers import populate_dimension_aspects
+
+    aspects = dict(completed_aspects or {})
+    populate_dimension_aspects(aspects, attrs or {})
+    existing_weight = _first_aspect_text(aspects, "Item Weight")
+    if existing_weight and _measurement_issue(existing_weight) in {"placeholder", "non-positive"}:
+        aspects.pop("Item Weight", None)
+        log(f"[SANITIZE] Dropped invalid Item Weight: {existing_weight}")
+    dim_keys = ["Item Length", "Item Width", "Item Height", "Item Weight"]
+    if not any(aspects.get(k) for k in dim_keys):
+        try:
+            from src.clients.dajian_client import DaJianClient
+
+            dj = DaJianClient(os.getenv("DAJIAN_API_KEY"), os.getenv("DAJIAN_API_SECRET"))
+            detail = dj.get_product_detail_by_sku(sku)
+            if detail:
+                dj_dims = {
+                    "Item Length": detail.get("assembledLength") or detail.get("length"),
+                    "Item Width": detail.get("assembledWidth") or detail.get("width"),
+                    "Item Height": detail.get("assembledHeight") or detail.get("height"),
+                    "Item Weight": detail.get("assembledWeight") or detail.get("weight"),
+                }
+                for key, value in dj_dims.items():
+                    if value and not aspects.get(key):
+                        unit = "lbs" if "Weight" in key else "in"
+                        aspects[key] = [f"{value} {unit}"]
+                        log(f"[DAJIAN-DIM] {key} = {value} {unit}")
+        except Exception as exc:
+            log(f"[WARN] DaJian dimension fallback failed: {exc}")
+    return aspects
+
+
 def _get_quality_gate_category_matcher():
     global _QUALITY_GATE_CATEGORY_MATCHER
     if _QUALITY_GATE_CATEGORY_MATCHER is None:
@@ -1680,12 +1714,9 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         title_lower = listing_title.lower()
         
         # FORCE dimensions from source attributes (overwrite AI values)
-        populate_dimension_aspects(completed_aspects, attrs)
-
-        existing_weight = _first_aspect_text(completed_aspects, 'Item Weight')
-        if existing_weight and _measurement_issue(existing_weight) in {'placeholder', 'non-positive'}:
-            completed_aspects.pop('Item Weight', None)
-            print(f"[SANITIZE] Dropped invalid Item Weight: {existing_weight}")
+        completed_aspects = apply_publish_source_dimensions(
+            completed_aspects, attrs, sku, log=print
+        )
         
         # ===== PRE-PUBLISH VALIDATION =====
         validation_warnings = _validate_listing_before_publish(
@@ -1695,28 +1726,6 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         if validation_warnings:
             for w in validation_warnings:
                 print(f"[PRE-PUBLISH WARNING] {sku}: {w}")
-        
-        # Fallback: fetch dimensions from DaJian API when attrs have none
-        dim_keys = ['Item Length', 'Item Width', 'Item Height', 'Item Weight']
-        if not any(completed_aspects.get(k) for k in dim_keys):
-            try:
-                from src.clients.dajian_client import DaJianClient
-                dj = DaJianClient(os.getenv('DAJIAN_API_KEY'), os.getenv('DAJIAN_API_SECRET'))
-                detail = dj.get_product_detail_by_sku(sku)
-                if detail:
-                    dj_dims = {
-                        'Item Length': detail.get('assembledLength') or detail.get('length'),
-                        'Item Width':  detail.get('assembledWidth')  or detail.get('width'),
-                        'Item Height': detail.get('assembledHeight') or detail.get('height'),
-                        'Item Weight': detail.get('assembledWeight') or detail.get('weight'),
-                    }
-                    for k, v in dj_dims.items():
-                        if v and not completed_aspects.get(k):
-                            unit = 'lbs' if 'Weight' in k else 'in'
-                            completed_aspects[k] = [f"{v} {unit}"]
-                            print(f"[DAJIAN-DIM] {k} = {v} {unit}")
-            except Exception as e:
-                print(f"[WARN] DaJian dimension fallback failed: {e}")
         
         completed_aspects = complete_publish_aspects(
             completed_aspects,
@@ -1784,7 +1793,9 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             if not gated_id or str(gated_id) == str(candidate_id or "").strip():
                 return
             category_name = stored_category_name_for_keep(original_stored, original_name)
-            completed_aspects = dict(existing_aspects)
+            completed_aspects = apply_publish_source_dimensions(
+                dict(existing_aspects), attrs, sku, log=print
+            )
             completed_aspects = complete_publish_aspects(
                 completed_aspects,
                 title=listing_title,

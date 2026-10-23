@@ -237,6 +237,9 @@ def get_category_display(product: dict) -> str:
 
 def get_db_path():
     """Get database path"""
+    override = os.getenv("DAJIAN_COLLECTION_DB")
+    if override:
+        return override
     return str(root_dir / "ebay_collection.db")
 
 def init_db():
@@ -1253,7 +1256,10 @@ def delist_from_ebay(product: dict) -> dict:
 # Initialize
 # ============================================================================
 
-init_db()
+if os.getenv("DAJIAN_COLLECTION_DB"):
+    init_db()
+elif "pytest" not in sys.modules and not os.getenv("PYTEST_CURRENT_TEST"):
+    init_db()
 
 # ============================================================================
 # Plugin System - 加载插件

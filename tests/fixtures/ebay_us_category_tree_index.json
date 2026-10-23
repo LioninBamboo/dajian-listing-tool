@@ -77,5 +77,9 @@
   "63700": ["Other Shop Equipment", "900015"],
   "900018": ["Outdoor Heating, Cooking & Eating", "900002"],
   "20725": ["Barbecue Tools", "900018"],
-  "260150": ["Manual Juicers", "900006"]
+  "260150": ["Manual Juicers", "900006"],
+  "900019": ["Sporting Goods", ""],
+  "900020": ["Cycling", "900019"],
+  "177815": ["Forks", "900020"],
+  "177816": ["Handlebar Grips", "900020"]
 }

@@ -492,6 +492,16 @@ def _title_is_hall_tree_head(title: str) -> bool:
     return False
 
 
+def _legacy_remap_target(stored: str) -> str:
+    from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP
+
+    return str(INVALID_CATEGORY_REMAP.get(as_safe_category_id(stored) or stored, "") or "")
+
+
+def is_legacy_remap_stored(stored: Any) -> bool:
+    return bool(_legacy_remap_target(as_safe_category_id(stored)))
+
+
 def hold_implausible_publish_error(stored: str, title: str = "") -> str:
     stored_id = as_safe_category_id(stored)
     alt = suggested_alternative_for(stored_id, _confident_title_kind(title), title)
@@ -499,6 +509,18 @@ def hold_implausible_publish_error(stored: str, title: str = "") -> str:
     if alt:
         msg += f"; suggested {alt}"
     return msg
+
+
+def tree_unavailable_publish_error() -> str:
+    from src.utils.category_tree_cache import store_runtime_tree_ids, unavailable_runtime_trees
+
+    missing = sorted(unavailable_runtime_trees())
+    owned = {str(tid) for tid in store_runtime_tree_ids()}
+    if missing and set(missing) != owned:
+        if len(missing) == 1:
+            return f"tree {missing[0]} unavailable"
+        return f"trees {', '.join(missing)} unavailable; refresh failed; no publish"
+    return HOLD_TREE_UNAVAILABLE_ERROR
 
 
 def _title_agrees_with_stored(title: str, stored: str, index=None) -> bool:
@@ -533,6 +555,9 @@ def _category_path(cid: str, index=None) -> str:
 
 def suggested_alternative_for(cid: str | None, kind: str = "", title: str = "") -> str | None:
     stored = as_safe_category_id(cid)
+    remapped = _legacy_remap_target(stored)
+    if remapped:
+        return remapped
     if stored in _SUGGESTED_ALTERNATIVES:
         return _SUGGESTED_ALTERNATIVES[stored]
     if kind in {"side_table"} or first_product_noun(title) in _SIDE_END_HEADS:
@@ -608,6 +633,10 @@ def validate_target_category(
         flat = dict(flat)
         flat[target] = _TREE_KNOWN_PUBLISHABLE_INDEX[target]
     if not is_cached_leaf_category(target, index=flat):
+        from src.utils.category_tree_cache import unavailable_runtime_trees
+
+        if unavailable_runtime_trees():
+            return False, "tree_unavailable"
         return False, "invalid_target_leaf"
     path = _category_path(target, index=flat)
     if path.startswith(ANTIQUES_PREFIX):
@@ -1083,6 +1112,9 @@ def apply_category_write_gate(
     elif not stored:
         return None, "hold_empty"
 
+    if unpublished and stored and is_legacy_remap_stored(stored):
+        return None, "hold_implausible"
+
     if chosen == stored and stored:
         stored_ok, stored_reason = validate_target_category(stored, "", title, index=index)
         if stored_reason == "tree_unavailable":
@@ -1125,5 +1157,5 @@ def gate_publish_category_choice(
     if action == "hold_implausible":
         return None, action, hold_implausible_publish_error(original_stored, title)
     if action == "hold_tree_unavailable":
-        return None, action, HOLD_TREE_UNAVAILABLE_ERROR
+        return None, action, tree_unavailable_publish_error()
     return gated, action, ""
