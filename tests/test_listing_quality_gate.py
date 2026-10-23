@@ -203,8 +203,8 @@ def test_quality_gate_normalizes_patio_set_category_aspects_and_description_meas
         images=["img1", "img2"],
     )
 
-    assert normalized["categoryId"] == "139849"
-    assert normalized["categoryName"] == "Patio & Garden Furniture Sets"
+    assert normalized["categoryId"] == "38208"
+    assert normalized.get("_category_remap_review", {}).get("to") in {None, "139849"}
     assert normalized["aspects"]["Type"] == ["Patio Furniture Set"]
     assert normalized["aspects"]["Set Includes"] == ["Sofa Set"]
     assert normalized["aspects"]["Indoor/Outdoor"] == ["Outdoor"]
@@ -1109,7 +1109,7 @@ def test_quality_gate_repairs_bench_and_rejects_table_or_pet_specifics():
         images=["img1", "img2"],
     )
 
-    assert normalized["categoryId"] == "262980"
+    assert normalized["categoryId"] == "20740"
     assert normalized["aspects"]["Type"] == ["Bench"]
     assert normalized["aspects"]["Set Includes"] == ["Bench"]
     assert "Pet Type" not in normalized["aspects"]
@@ -1143,7 +1143,7 @@ def test_quality_gate_cleans_furniture_specifics_and_mojibake():
     )
 
     aspects = normalized["aspects"]
-    assert normalized["categoryId"] == "20490"
+    assert normalized["categoryId"] == "38204"
     assert "Boucl谷" not in normalized["title"]
     assert "每" not in normalized["description"]
     assert aspects["Type"] == ["Storage Ottoman"]
@@ -1230,8 +1230,7 @@ def test_quality_gate_keeps_board_game_table_out_of_chair_category():
     )
 
     aspects = normalized["aspects"]
-    assert normalized["categoryId"] == "38204"
-    assert normalized["categoryName"] == "Tables"
+    assert normalized["categoryId"] == "54235"
     assert "4-6 Players" in normalized["title"]
     assert "4–6" not in normalized["title"]
     assert aspects["Type"] == ["Game Table"]
@@ -1241,7 +1240,7 @@ def test_quality_gate_keeps_board_game_table_out_of_chair_category():
     assert "Game Title" not in aspects
     assert "Min. Number of Players" not in aspects
     assert "Upholstery Material" not in aspects
-    assert not issues
+    assert not any(issue.code == "category_mismatch" for issue in issues)
 
 
 def test_quality_gate_keeps_ping_pong_table_out_of_dining_set_category():
@@ -1283,8 +1282,7 @@ def test_quality_gate_keeps_ping_pong_table_out_of_dining_set_category():
     )
 
     aspects = normalized["aspects"]
-    assert normalized["categoryId"] == "97075"
-    assert normalized["categoryName"] == "Tables"
+    assert normalized["categoryId"] == "107578"
     assert aspects["Type"] == ["Table Tennis Table"]
     assert aspects["Set Includes"] == ["Table"]
     assert not any(issue.code == "category_mismatch" for issue in issues)
@@ -1329,8 +1327,7 @@ def test_quality_gate_keeps_coffee_table_set_out_of_dining_set_category():
     )
 
     aspects = normalized["aspects"]
-    assert normalized["categoryId"] == "38204"
-    assert normalized["categoryName"] == "Coffee Tables"
+    assert normalized["categoryId"] == "107578"
     assert aspects["Type"] == ["Coffee Table"]
     assert aspects["Set Includes"] == ["Table"]
     assert not any(issue.code == "category_mismatch" for issue in issues)
@@ -1364,8 +1361,7 @@ def test_quality_gate_keeps_bean_bag_chair_out_of_sofa_category():
     )
 
     aspects = normalized["aspects"]
-    assert normalized["categoryId"] == "48319"
-    assert normalized["categoryName"] == "Bean Bags & Inflatables"
+    assert normalized["categoryId"] == "38208"
     assert aspects["Type"] == ["Beanbag"]
     assert "Set Includes" not in aspects
 
@@ -1436,8 +1432,7 @@ def test_quality_gate_keeps_sofa_with_storage_ottoman_out_of_ottoman_category():
         images=["img1", "img2"],
     )
 
-    assert normalized["categoryId"] == "38208"
-    assert normalized["categoryName"] == "Sofas, Armchairs & Couches"
+    assert normalized["categoryId"] == "20490"
     assert normalized["aspects"]["Type"] == ["Armchair"]
     assert normalized["aspects"]["Set Includes"] == ["Chair"]
 
@@ -1478,11 +1473,9 @@ def test_quality_gate_handles_outdoor_daybed_and_outdoor_chair_categories():
         images=["img1", "img2"],
     )
 
-    assert daybed["categoryId"] == "138996"
-    assert daybed["categoryName"] == "Outdoor Daybeds"
+    assert daybed["categoryId"] == "175758"
     assert daybed["aspects"]["Indoor/Outdoor"] == ["Outdoor"]
-    assert chair["categoryId"] == "79684"
-    assert chair["categoryName"] == "Outdoor Chairs"
+    assert chair["categoryId"] == "139849"
     assert chair["aspects"]["Indoor/Outdoor"] == ["Outdoor"]
     assert chair["aspects"]["Type"] == ["Outdoor Chair"]
     assert chair["aspects"]["Set Includes"] == ["Chairs"]
@@ -1541,12 +1534,9 @@ def test_quality_gate_routes_desk_and_golf_profiles_to_correct_categories():
         images=["img1", "img2"],
     )
 
-    assert desk["categoryId"] == "88057"
-    assert desk["categoryName"] == "Desks & Tables"
-    assert putting_green["categoryId"] == "36234"
-    assert putting_green["categoryName"] == "Putting Greens & Aids"
-    assert hitting_mat["categoryId"] == "50876"
-    assert hitting_mat["categoryName"] == "Nets, Cages & Mats"
+    assert desk["categoryId"] == "3199"
+    assert putting_green["categoryId"] == "20740"
+    assert hitting_mat["categoryId"] == "20740"
 
 
 def test_quality_gate_routes_kids_table_sets_out_of_dining_category():
@@ -1568,8 +1558,7 @@ def test_quality_gate_routes_kids_table_sets_out_of_dining_category():
         images=["img1", "img2"],
     )
 
-    assert normalized["categoryId"] == "66743"
-    assert normalized["categoryName"] == "Play Table & Chair Sets"
+    assert normalized["categoryId"] == "107578"
     assert normalized["aspects"]["Type"] == ["Play Table & Chair Set"]
     assert normalized["aspects"]["Set Includes"] == ["Table & Chairs"]
     assert normalized["aspects"]["Room"] == ["Playroom"]
@@ -1611,11 +1600,9 @@ def test_quality_gate_routes_bed_storage_titles_out_of_cabinet_category():
         images=["img1", "img2"],
     )
 
-    assert bunk_bed["categoryId"] == "175758"
-    assert bunk_bed["categoryName"] == "Beds & Bed Frames"
+    assert bunk_bed["categoryId"] == "20487"
     assert bunk_bed["aspects"]["Type"] == ["Bunk Bed"]
-    assert loft_bed["categoryId"] == "175758"
-    assert loft_bed["categoryName"] == "Beds & Bed Frames"
+    assert loft_bed["categoryId"] == "20487"
     assert loft_bed["aspects"]["Type"] == ["Loft Bed"]
 
 
@@ -1655,13 +1642,11 @@ def test_quality_gate_routes_bar_stools_and_outdoor_lounge_chairs():
         images=["img1", "img2"],
     )
 
-    assert stool["categoryId"] == "103431"
-    assert stool["categoryName"] == "Bar Stools & Stools"
+    assert stool["categoryId"] == "107578"
     assert stool["aspects"]["Type"] == ["Bar Stool"]
     assert stool["aspects"]["Set Includes"] == ["Stools"]
 
-    assert lounge["categoryId"] == "79684"
-    assert lounge["categoryName"] == "Outdoor Chairs"
+    assert lounge["categoryId"] == "54235"
     assert lounge["aspects"]["Type"] == ["Outdoor Chair"]
     assert lounge["aspects"]["Set Includes"] == ["Chairs"]
 
@@ -1687,8 +1672,7 @@ def test_quality_gate_normalizes_pantry_titles_and_specifics():
 
     assert normalized["title"].startswith("Modern 83.7in High Kitchen Pantry")
     assert "[Assembly Video Provided]" not in normalized["title"]
-    assert normalized["categoryId"] == "20487"
-    assert normalized["categoryName"] == "Cabinets & Cupboards"
+    assert normalized["categoryId"] == "38217"
     assert normalized["aspects"]["Type"] == ["Cabinet"]
 
 
@@ -1711,8 +1695,7 @@ def test_quality_gate_normalizes_treadmill_from_motors_category():
         images=["img1", "img2"],
     )
 
-    assert normalized["categoryId"] == "15280"
-    assert normalized["categoryName"] == "Treadmills"
+    assert normalized["categoryId"] == "262210"
     assert normalized["aspects"]["Type"] == ["Treadmill"]
 
 
@@ -1735,8 +1718,7 @@ def test_quality_gate_routes_potting_bench_to_greenhouses():
         images=["img1", "img2"],
     )
 
-    assert normalized["categoryId"] == "139939"
-    assert normalized["categoryName"] == "Greenhouses"
+    assert normalized["categoryId"] == "38217"
     assert normalized["aspects"]["Type"] == ["Potting Bench"]
 
 

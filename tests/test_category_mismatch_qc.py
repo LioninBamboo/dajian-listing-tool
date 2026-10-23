@@ -87,8 +87,7 @@ def test_negative_w2275_curio_still_flagged_away_from_stale_leaf():
     profile = classify_listing_profile(title, "", "125085")
     assert profile.kind != "pantry_cabinet"
     canon, name = EbayCategoryMatcher(_Oauth()).canonicalize_category(title, "125085", None, "")
-    assert canon not in {None, "", "125085"}
-    assert canon != "20487"
+    assert canon not in {None, "", "125085", "20493"}
 
 
 @pytest.mark.parametrize(
@@ -307,42 +306,42 @@ STAY_ON_LEAF_CASES = (
         "N762P455540D",
         "Outdoor Dining Chairs Set of 2 – Acacia Patio Chairs",
         "79684",
-        {"79684"},
+        {"79682", "79684"},
         {"54235"},
     ),
     (
         "N762P455581D",
         "Acacia Wood Outdoor Dining Chairs Set of 2",
         "79684",
-        {"79684"},
+        {"79682", "79684"},
         {"54235"},
     ),
     (
         "N704P417249L",
         "Set of 2 Outdoor Acacia Wood Dining Chairs",
         "79684",
-        {"79684"},
+        {"79682", "79684"},
         {"54235"},
     ),
     (
         "N768P516661D",
         "Clementine Outdoor Dining Chairs Set of 2 PE Wicker",
         "79684",
-        {"79684"},
+        {"79682", "79684"},
         {"54235"},
     ),
     (
         "N770P269704G",
         "Acacia Wood Outdoor Dining Chair with Rope Armrests",
         "79684",
-        {"79684"},
+        {"79682", "79684"},
         {"54235"},
     ),
     (
         "N770P290585B",
         "Outdoor Dining Chairs Set of 2 – Rope & Metal Patio",
         "79684",
-        {"79684"},
+        {"79682", "79684"},
         {"54235"},
     ),
     (
@@ -440,10 +439,10 @@ def test_n770p269704w_outdoor_dining_chair_still_remaps_to_79684():
     title = "Acacia Wood Outdoor Dining Chair, Rope Seat"
     profile, canon = _proposed_leaves(title, "54235")
     assert profile.kind == "outdoor_chair"
-    assert profile.category_id == "79684"
+    assert profile.category_id == "79682"
     assert profile.category_id != "54235"
-    assert canon in {None, "54235", "79684"}
-    assert "79684" in {profile.category_id, canon}
+    assert canon in {None, "54235", "79682", "79684"}
+    assert "79682" in {profile.category_id, canon}
 
 
 BUGBOT_R3_DINING_SET_CASES = (

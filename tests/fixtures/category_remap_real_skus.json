@@ -285,12 +285,13 @@
   "live_title": "Lighted Glass Curio Cabinet with Adjustable Shelves 25.98 x 11.81 x 49.4 MDF",
   "giga_title": "Lighted Glass Cabinet Glass Wine Cabinet Curio Display Cabinet with Adjustable Glass Shelves 2 Doors and 1 drawer Cabinet Bulb Included Cherry",
   "expected": [
-   "20493"
+   "KEEP"
   ],
   "must_not": [
+   "20493",
    "20689"
   ],
-  "note": "curio display cabinet; 'Wine Cabinet' in GIGA is not a wine rack"
+  "note": "curio display cabinet; 20493 is not a leaf"
  },
  {
   "sku": "W3190S00002",
@@ -300,13 +301,13 @@
   "live_title": "5-Shelf Glass Display Cabinet 71 Inch Tall with Tempered Glass Shelves",
   "giga_title": "Glass Display Cabinet with 5 - 5-Shelf Glass Display Cabinet",
   "expected": [
-   "20493",
    "KEEP"
   ],
   "must_not": [
+   "20493",
    "20689"
   ],
-  "note": "glass display cabinet"
+  "note": "glass display cabinet; 20493 is not a leaf"
  },
  {
   "sku": "N719P380278S",
@@ -549,12 +550,12 @@
   "live_title": "100% Solid Wood 2-Tier Side Table Sofa Side Table Living Room End Table",
   "giga_title": "100% Solid Wood 2-Tier Side Table Sofa Side Table Living Room End Table Bedside Table,Solid Wood Round End Table, 2-Tier Small Side Table with Lower Storage Shelf",
   "expected": [
-   "38200"
+   "KEEP"
   ],
   "must_not": [
-   "38199"
+   "38200"
   ],
-  "note": "POSITIVE: indoor side/end table"
+  "note": "indoor side/end table; 38200 is not a leaf"
  },
  {
   "sku": "W2105P584379",
@@ -715,18 +716,18 @@
   "store": "gp",
   "status": "PENDING",
   "stored_category": "",
-  "live_title": "",
-  "giga_title": "Outdoor Wicker Chaise Lounge Chairs Set of 2 with Cushions Pull-out Side Table",
+  "live_title": "K&K 80'' Outdoor Wicker Chaise Lounge Chairs Set of 2",
+  "giga_title": "K&K 80'' Outdoor Wicker Chaise Lounge Chairs Set of 2 with Cushions Pull-out Side Table",
   "expected": [
-   "79682",
    "79684",
    "NONE"
   ],
   "must_not": [
+   "79682",
    "139849",
    "112590"
   ],
-  "note": "chaise lounge set is never a dining/patio furniture set"
+  "note": "r3 #1 chaise → 79684 report-only, never written"
  },
  {
   "sku": "N770P264304T",
@@ -870,17 +871,18 @@
  {
   "sku": "T3971P401872",
   "store": "main",
-  "status": "PUBLISHED",
+  "status": "PENDING",
   "stored_category": "103431",
-  "live_title": "Corner Coat Rack Hall Tree with Shoe Rack",
-  "giga_title": "Corner Coat Rack Hall Tree with Shoe Rack",
+  "live_title": "Corner Coat Rack Hall Tree with Shoe Rack and Shelves 71 Inch",
+  "giga_title": "Corner Coat Rack Hall Tree with Shoe Rack and Shelves 71 Inch",
   "expected": [
-   "261263"
+   "KEEP",
+   "22656"
   ],
   "must_not": [
-   "103431"
+   "261263"
   ],
-  "note": "hall tree head recovers 261263"
+  "note": "hall tree head proposes 22656, report-only"
  },
  {
   "sku": "SYNTHETIC_CHAISE_SET",
@@ -927,5 +929,324 @@
    "139849"
   ],
   "note": "indoor furniture set is not patio 139849"
+ },
+ {
+  "sku": "WF321204AAE",
+  "store": "gp",
+  "status": "PENDING",
+  "stored_category": "",
+  "live_title": "K&K 80'' Outdoor Wicker Chaise Lounge Chairs Set of 2 Grey",
+  "giga_title": "K&K 80'' Outdoor Wicker Chaise Lounge Chairs Set of 2 Grey",
+  "expected": ["NONE", "79684"],
+  "must_not": ["79682"],
+  "note": "r3 #2 chaise → 79684 report-only"
+ },
+ {
+  "sku": "N770P281696C",
+  "store": "gp",
+  "status": "PENDING",
+  "stored_category": "",
+  "live_title": "Outdoor Chaise Lounge Chair with 6-Position Adjustable Backrest, Acacia",
+  "giga_title": "Outdoor Chaise Lounge Chair with 6-Position Adjustable Backrest, Acacia",
+  "expected": ["NONE", "79684"],
+  "must_not": ["79682"],
+  "note": "r3 #3 adjustable chaise → 79684"
+ },
+ {
+  "sku": "W2887P511377",
+  "store": "gp",
+  "status": "PUBLISHED",
+  "stored_category": "79682",
+  "live_title": "39.37\"Papasan Rocking Chair Outdoor, Oversized Patio Egg Chair",
+  "giga_title": "39.37\"Papasan Rocking Chair Outdoor, Oversized Patio Egg Chair",
+  "expected": ["KEEP"],
+  "must_not": ["79684"],
+  "note": "r3 #4 papasan in 79682 stays KEEP"
+ },
+ {
+  "sku": "W2887P511379",
+  "store": "gp",
+  "status": "PUBLISHED",
+  "stored_category": "79682",
+  "live_title": "39.37\"Papasan Rocking Chair Outdoor, Oversized Patio Egg Chair Grey",
+  "giga_title": "39.37\"Papasan Rocking Chair Outdoor, Oversized Patio Egg Chair Grey",
+  "expected": ["KEEP"],
+  "must_not": ["79684"],
+  "note": "r3 #5 papasan KEEP 79682"
+ },
+ {
+  "sku": "W2887P511381",
+  "store": "gp",
+  "status": "PUBLISHED",
+  "stored_category": "79682",
+  "live_title": "Oversized Outdoor Rocking Chair - Wicker Egg Lounge with Thick Green Cushion",
+  "giga_title": "Oversized Outdoor Rocking Chair - Wicker Egg Lounge with Thick Green Cushion",
+  "expected": ["KEEP"],
+  "must_not": ["79684"],
+  "note": "r3 #6 rocking chair head; lounge/cushion are modifiers"
+ },
+ {
+  "sku": "N770P272405T",
+  "store": "gp",
+  "status": "PENDING",
+  "stored_category": "",
+  "live_title": "ACACIA WOOD ADJUSTABLE LOUNGE CHAIR, TEAK FINISH UNCUSHIONED PATIO CHAIR",
+  "giga_title": "ACACIA WOOD ADJUSTABLE LOUNGE CHAIR, TEAK FINISH UNCUSHIONED PATIO CHAIR",
+  "expected": ["NONE", "79684"],
+  "must_not": ["79682"],
+  "note": "r3 #7 adjustable lounge chair = lounger"
+ },
+ {
+  "sku": "W331P309435",
+  "store": "main",
+  "status": "PENDING",
+  "stored_category": "20487",
+  "live_title": "Kitchen Pantry Hutch Storage Cabinet, Farmhouse Kitchen Hutch Buffet Cabinet",
+  "giga_title": "Kitchen Pantry Hutch Storage Cabinet, Farmhouse Kitchen Hutch Buffet Cabinet",
+  "expected": ["KEEP"],
+  "must_not": ["183322"],
+  "note": "r3 #8 hutch head → unknown_head_noun"
+ },
+ {
+  "sku": "W331P498875",
+  "store": "main",
+  "status": "PUBLISHED",
+  "stored_category": "20487",
+  "live_title": "Kitchen Storage Cabinet Countertop Pantry Sideboard with Glass Doors",
+  "giga_title": "Glass Door Cupboard",
+  "expected": ["KEEP"],
+  "must_not": ["183322"],
+  "note": "r3 #9 storage cabinet head; sideboard is later"
+ },
+ {
+  "sku": "W2263P395490",
+  "store": "main",
+  "status": "PUBLISHED",
+  "stored_category": "20488",
+  "live_title": "Natural Wood TV Stand 59 Inch Sideboard Cabinet with Storage Buffet",
+  "giga_title": "Natural Wood TV Stand 59 Inch Sideboard Cabinet with Storage Buffet",
+  "expected": ["KEEP"],
+  "must_not": ["183322"],
+  "note": "r3 #10 TV stand head locks 20488"
+ },
+ {
+  "sku": "N770P253018C",
+  "store": "gp",
+  "status": "DRAFT",
+  "stored_category": "",
+  "live_title": "2\" THICK CHAISE LOUNGE CUSHION IN CREAM - WATERPROOF",
+  "giga_title": "2\" THICK CHAISE LOUNGE CUSHION IN CREAM - WATERPROOF",
+  "expected": ["NONE"],
+  "must_not": ["79684", "79682"],
+  "note": "r3 #11 cushion accessory"
+ },
+ {
+  "sku": "W1162P407684",
+  "store": "main",
+  "status": "PENDING",
+  "stored_category": "20751",
+  "live_title": "Cat Litter Cabinet with Cat Tree 31.5 in Walnut",
+  "giga_title": "Cat Litter Cabinet with Cat Tree 31.5 in Walnut",
+  "expected": ["KEEP", "20740"],
+  "must_not": ["20744"],
+  "note": "r3 #12 cat litter never dog beds"
+ },
+ {
+  "sku": "W1162P407685",
+  "store": "main",
+  "status": "PENDING",
+  "stored_category": "20751",
+  "live_title": "Cat Litter Cabinet with Cat Tree 31.5 in Natural Wood Finish",
+  "giga_title": "Cat Litter Cabinet with Cat Tree 31.5 in Natural Wood Finish",
+  "expected": ["KEEP", "20740"],
+  "must_not": ["20744"],
+  "note": "r3 #13 cat litter never dog beds"
+ },
+ {
+  "sku": "N770P248135N",
+  "store": "gp",
+  "status": "PUBLISHED",
+  "stored_category": "54235",
+  "live_title": "SELMA Acacia Wood Side Table - Rectangular",
+  "giga_title": "SELMA Acacia Wood Side Table - Rectangular",
+  "expected": ["KEEP"],
+  "must_not": ["38200"],
+  "note": "r3 #17 38200 is not a leaf"
+ },
+ {
+  "sku": "W5709P565684",
+  "store": "main",
+  "status": "PUBLISHED",
+  "stored_category": "54235",
+  "live_title": "14'' Stacked Donut Stool, Colorful Dessert Character Side Table Decor",
+  "giga_title": "14'' Stacked Donut Stool, Colorful Dessert Character Side Table Decor",
+  "expected": ["KEEP"],
+  "must_not": ["38200"],
+  "note": "r3 #18 stool head is not side table"
+ },
+ {
+  "sku": "N707S300277B",
+  "store": "main",
+  "status": "PENDING",
+  "stored_category": "177000",
+  "live_title": "Kitchen Island with Drop Leaf Power Outlet Rolling Storage Cart",
+  "giga_title": "Kitchen Island with Drop Leaf Power Outlet Rolling Storage Cart",
+  "expected": ["KEEP"],
+  "must_not": ["177000"],
+  "note": "r3 #19 stored 177000 implausible; no lock"
+ },
+ {
+  "sku": "N707S186617W",
+  "store": "main",
+  "status": "PENDING",
+  "stored_category": "177000",
+  "live_title": "Drop Leaf Kitchen Island Cart Rolling with Power Outlet",
+  "giga_title": "Drop Leaf Kitchen Island Cart Rolling with Power Outlet",
+  "expected": ["KEEP"],
+  "must_not": ["177000"],
+  "note": "r3 #20 stored 177000 implausible"
+ },
+ {
+  "sku": "W1580S00491",
+  "store": "main",
+  "status": "PENDING",
+  "stored_category": "20487",
+  "live_title": "4-in-1 Detachable Hall Tree with Storage Drawers Cabinet & 7 Hooks",
+  "giga_title": "4-in-1 Detachable Hall Tree with Storage Drawers Cabinet & 7 Hooks",
+  "expected": ["KEEP", "22656"],
+  "must_not": ["261263"],
+  "note": "r3 #22 hall tree → 22656 report-only"
+ },
+ {
+  "sku": "W2899P372739",
+  "store": "main",
+  "status": "PENDING",
+  "stored_category": "20580",
+  "live_title": "Elegant 34 Inch Sideboard Cabinet with Mirrored Doors",
+  "giga_title": "Elegant 34 Inch Sideboard Cabinet with Mirrored Doors",
+  "expected": ["KEEP", "183322"],
+  "must_not": [],
+  "note": "r3 #23 sideboard proposal report-only"
+ },
+ {
+  "sku": "N759S006011B",
+  "store": "main",
+  "status": "PENDING",
+  "stored_category": "",
+  "live_title": "5-Piece Dining Set 1 Table 4 Chairs, Rubberwood",
+  "giga_title": "5-Piece Dining Set 1 Table 4 Chairs, Rubberwood",
+  "expected": ["NONE", "107578"],
+  "must_not": [],
+  "note": "r3 #24 empty stored held, not published uncategorised"
+ },
+ {
+  "sku": "W640P443554",
+  "store": "gp",
+  "status": "PUBLISHED",
+  "stored_category": "54235",
+  "live_title": "Papasan Chair with 360° Swivel Indoor Outdoor Rattan",
+  "giga_title": "Papasan Chair with 360° Swivel Indoor Outdoor Rattan",
+  "expected": ["KEEP"],
+  "must_not": ["79684"],
+  "note": "r3 #25 mixed indoor/outdoor unknown/KEEP"
+ },
+ {
+  "sku": "W2987P351728",
+  "store": "main",
+  "status": "READY",
+  "stored_category": "32880",
+  "live_title": "Coat Racks Solid Wood Hanger Freestanding",
+  "giga_title": "Coat Racks Solid Wood Hanger Freestanding",
+  "expected": ["KEEP", "22656"],
+  "must_not": ["261263"],
+  "note": "r3 #26 coat rack → 22656 report-only"
+ },
+ {
+  "sku": "SYNTHETIC_SUN_LOUNGER_CUSHION",
+  "store": "synthetic",
+  "status": "SYNTHETIC",
+  "stored_category": "",
+  "live_title": "Outdoor Sun Lounger Chaise Cushion Only Waterproof",
+  "giga_title": "",
+  "expected": ["NONE"],
+  "must_not": ["79684", "79682"],
+  "note": "S1 accessory"
+ },
+ {
+  "sku": "SYNTHETIC_VANITY_HUTCH",
+  "store": "synthetic",
+  "status": "SYNTHETIC",
+  "stored_category": "",
+  "live_title": "Bathroom Vanity Hutch with Mirror 30 Inch Buffet Style",
+  "giga_title": "",
+  "expected": ["NONE"],
+  "must_not": ["183322"],
+  "note": "S2 unknown_head_noun"
+ },
+ {
+  "sku": "SYNTHETIC_ADIRONDACK",
+  "store": "synthetic",
+  "status": "SYNTHETIC",
+  "stored_category": "",
+  "live_title": "Outdoor Adirondack Chair Set of 2 Acacia Wood",
+  "giga_title": "",
+  "expected": ["NONE", "79682"],
+  "must_not": ["79684"],
+  "note": "S3 adirondack is patio chair"
+ },
+ {
+  "sku": "SYNTHETIC_47_INCH_CHAIRS",
+  "store": "synthetic",
+  "status": "SYNTHETIC",
+  "stored_category": "",
+  "live_title": "47 Inch Chairs Stable Tablet Stand",
+  "giga_title": "",
+  "expected": ["NONE"],
+  "must_not": ["38200", "38204", "112590"],
+  "note": "S4 dimension is inches; stable≠table"
+ },
+ {
+  "sku": "SYNTHETIC_END_TABLE_38200",
+  "store": "synthetic",
+  "status": "SYNTHETIC",
+  "stored_category": "38200",
+  "live_title": "Modern End Table",
+  "giga_title": "",
+  "expected": ["KEEP"],
+  "must_not": ["38200"],
+  "note": "S5 stored 38200 lock does not apply"
+ },
+ {
+  "sku": "SYNTHETIC_HUTCH_DESK",
+  "store": "synthetic",
+  "status": "SYNTHETIC",
+  "stored_category": "",
+  "live_title": "Hutch Desk with Drawers 48 Inch Oak",
+  "giga_title": "",
+  "expected": ["NONE", "88057"],
+  "must_not": ["183322"],
+  "note": "edge: hutch is a modifier on desk"
+ },
+ {
+  "sku": "SYNTHETIC_LOUNGE_SOFA",
+  "store": "synthetic",
+  "status": "SYNTHETIC",
+  "stored_category": "38208",
+  "live_title": "Mid Century Lounge Sofa Velvet",
+  "giga_title": "",
+  "expected": ["KEEP"],
+  "must_not": ["79684"],
+  "note": "edge: lounge in a sofa title is not a lounger"
+ },
+ {
+  "sku": "SYNTHETIC_TV_STAND_HYPHEN",
+  "store": "synthetic",
+  "status": "SYNTHETIC",
+  "stored_category": "20488",
+  "live_title": "NATURAL WOOD TV-STAND 59 INCH SIDEBOARD CABINET",
+  "giga_title": "",
+  "expected": ["KEEP"],
+  "must_not": ["183322"],
+  "note": "edge: hyphenated all-caps TV-Stand"
  }
 ]

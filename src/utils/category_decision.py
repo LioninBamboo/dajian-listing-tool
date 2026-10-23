@@ -14,10 +14,12 @@ Hard rules:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from src.utils.product_context_signals import (
+    UNKNOWN_HEAD_PREFIX,
     as_safe_category_id,
     as_safe_text,
     compound_product_family,
@@ -29,25 +31,32 @@ from src.utils.product_context_signals import (
     title_has_mixed_indoor_outdoor,
     title_is_chair_accessory,
     title_is_dining_set_bundle,
+    unknown_head_noun,
 )
 
 logger = logging.getLogger(__name__)
 
-OUTDOOR_CHAIR = "79684"
+OUTDOOR_CHAIR = "79682"  # Patio Chairs (production leaf)
 INDOOR_CHAIR = "54235"
 INDOOR_SEATING = "38208"
 OTTOMAN = "20490"
 BENCH = "262980"
 INDOOR_TABLE = "38204"
-END_TABLE = "38200"
+END_TABLE = "38200"  # not in the production tree — never write
 NIGHTSTAND = "38199"
 OUTDOOR_TABLE = "112590"
 PATIO_SET = "139849"
 DINING_SET = "107578"
-DISPLAY_CABINET = "20493"
+DISPLAY_CABINET = "20493"  # not in the production tree — never write
 WINE_RACK = "20689"
 DESK = "88057"
-KITCHEN_ISLAND = "177000"
+KITCHEN_ISLAND = "177000"  # Power Tool Sets — implausible for furniture
+CAT_FURNITURE = "20740"
+HALL_TREE = "22656"  # Coat & Hat Racks; never write Antiques 261263
+SIDEBOARD = "183322"
+OUTDOOR_CHAISE = "79684"  # Loungers (production leaf)
+KITCHEN_ISLAND_LEAF = "260157"
+DISPLAY_CABINET_LEAF = "20487"
 
 _LEAF_FAMILY = {
     OUTDOOR_CHAIR: "outdoor_chair",
@@ -64,6 +73,7 @@ _LEAF_FAMILY = {
     DISPLAY_CABINET: "display",
     WINE_RACK: "wine",
     DESK: "desk",
+    OUTDOOR_CHAISE: "outdoor_chair",
     "79682": "outdoor_chair",
     "175761": "table",
     "175758": "bed",
@@ -81,6 +91,11 @@ _LEAF_FAMILY = {
     "42428": "medicine",
     "183322": "sideboard",
     "63557": "sideboard",
+    "22656": "hall_tree",
+    "261263": "hall_tree",
+    "20740": "cat_furniture",
+    "20744": "dog_beds",
+    "100411": "cat_litter",
 }
 
 _KIND_FAMILY = {
@@ -104,6 +119,9 @@ _KIND_FAMILY = {
     "bed": "bed",
     "kitchen_island": "kitchen_island",
     "display_cabinet": "display",
+    "hall_tree": "hall_tree",
+    "sideboard": "sideboard",
+    "cat_furniture": "cat_furniture",
     "unknown": "unknown",
     "keep": "keep",
 }
@@ -116,6 +134,7 @@ class CategoryDecision:
     reason: str
     category_name: str | None = None
     conflict: bool = False
+    suggested_alternative: str | None = None
 
     @property
     def keep(self) -> bool:
@@ -151,10 +170,7 @@ _BAR_CABINET_HEADS = {"bar cabinet", "liquor cabinet", "wine cabinet", "coffee b
 _WINE_RACK_HEADS = {"wine rack", "bottle holder", "stemware rack"}
 _SIDE_END_HEADS = {"end table", "side table"}
 _COFFEE_HEADS = {"coffee table", "cocktail table", "nesting table", "nesting coffee table"}
-_SIDE_TABLE_LOCK_STORED = frozenset({"121851", "79682", "138996", "75671"})
-HALL_TREE = "261263"
-SIDEBOARD = "183322"
-OUTDOOR_CHAISE = "79682"
+_SIDE_TABLE_LOCK_STORED = frozenset({"121851", "79682", "79684", "138996", "75671"})
 
 
 def _display_cabinet_title(title: str) -> bool:
@@ -199,11 +215,336 @@ def _side_or_end_table_head(title: str, stored: str = "") -> bool:
         "chaise lounge",
         "lounger",
         "sun lounger",
+        "papasan chair",
+        "egg chair",
+        "rocking chair",
+        "adirondack chair",
+        "tv stand",
+        "hutch desk",
     }:
+        return False
+    if head and str(head).startswith(UNKNOWN_HEAD_PREFIX):
         return False
     if head in _SIDE_END_HEADS:
         return True
     return False
+
+
+FURNITURE_PATH_PREFIXES = (
+    "Home & Garden > Furniture",
+    "Home & Garden > Yard, Garden & Outdoor Living > Patio & Garden Furniture",
+    "Home & Garden > Kitchen, Dining & Bar",
+    "Home & Garden > Household Supplies & Cleaning > Home Organization",
+)
+PET_DOG_PREFIX = "Pet Supplies > Dog Supplies"
+PET_CAT_PREFIX = "Pet Supplies > Cat Supplies"
+ANTIQUES_PREFIX = "Antiques"
+
+_CAT_TITLE_RE = re.compile(r"\b(?:cat|kitten|litter|cat\s+tree)s?\b", re.IGNORECASE)
+_DOG_TITLE_RE = re.compile(r"\b(?:dog|puppy|puppies|canine)s?\b", re.IGNORECASE)
+_LOUNGER_HEADS = frozenset({"chaise", "chaise lounge", "lounger", "sun lounger", "outdoor recliner"})
+_PATIO_CHAIR_HEADS = frozenset(
+    {
+        "armchair",
+        "club armchair",
+        "papasan chair",
+        "egg chair",
+        "rocking chair",
+        "adirondack chair",
+        "adirondack",
+        "folding chair",
+        "garden stool",
+        "patio chair",
+        "outdoor chair",
+        "dining chair",
+    }
+)
+_ADJUSTABLE_LOUNGE_RE = re.compile(r"\b(?:adjustable|reclin(?:e|er|ing))\b", re.IGNORECASE)
+_TV_STAND_HEADS = frozenset({"tv stand", "media console", "entertainment center"})
+_FURNITURE_KINDS = frozenset(
+    {
+        "outdoor_chair",
+        "outdoor_chaise",
+        "dining_chair",
+        "armchair",
+        "sofa",
+        "ottoman",
+        "storage_ottoman",
+        "ottoman_bench",
+        "indoor_bench",
+        "dining_table",
+        "coffee_table",
+        "side_table",
+        "nightstand",
+        "outdoor_table",
+        "patio_furniture_set",
+        "dining_set",
+        "desk",
+        "bed",
+        "kitchen_island",
+        "display_cabinet",
+        "hall_tree",
+        "sideboard",
+        "wine_rack",
+    }
+)
+_HEAD_FITS_STORED = {
+    "vanity": frozenset({"32878", "176991"}),
+    "cabinet": frozenset({"20487", "176991", "42428", "38217"}),
+    "pantry": frozenset({"20487", "42428", "176991"}),
+    "hutch": frozenset({"20487", "63108", "176991"}),
+    "mattress": frozenset({"131588"}),
+    "tv stand": frozenset({"20488"}),
+}
+_TOOL_TITLE_RE = re.compile(
+    r"\b(?:bolt\s+cutters?|vises?|clamps?|workbenches?|work\s+bench|"
+    r"tool\s+sets?|air\s+tanks?|air\s+compressors?|tool\s+chest|"
+    r"tool\s+cabinet|power\s+tools?|impact\s+wrench)\b",
+    re.IGNORECASE,
+)
+_KITCHEN_ISLAND_TITLE_RE = re.compile(
+    r"\b(?:kitchen\s+island|kitchen\s+cart|prep\s+station|baker(?:'s)?\s+rack)\b",
+    re.IGNORECASE,
+)
+_SPORTS_KEEP_RE = re.compile(
+    r"\b(?:treadmill|golf\s+mat|putting\s+(?:green|mat)|ping[\s-]*pong\s+table|"
+    r"table\s+tennis)\b",
+    re.IGNORECASE,
+)
+_TREE_UNAVAILABLE_WARNED = False
+
+# Ship empty. Optional JSON override: data/config/approved_auto_remaps.json
+# Each pair is (stored_or_empty, target_id) or (reason, target_id).
+APPROVED_AUTO_REMAPS: frozenset[tuple[str, str]] = frozenset()
+
+_SUGGESTED_ALTERNATIVES = {
+    "38200": "38204",
+    "20493": "20487",
+    "177000": "260157",
+    "261263": "22656",
+}
+
+
+def _category_index(index=None):
+    from src.utils.category_tree_cache import load_category_index
+
+    if index is not None:
+        return dict(index)
+    return load_category_index()
+
+
+def category_tree_is_available(index=None) -> bool:
+    return bool(_category_index(index))
+
+
+def reset_tree_unavailable_warning() -> None:
+    global _TREE_UNAVAILABLE_WARNED
+    _TREE_UNAVAILABLE_WARNED = False
+
+
+def warn_once_tree_unavailable(log=None) -> None:
+    """One run-level warning when the tree cache is missing or stale."""
+    global _TREE_UNAVAILABLE_WARNED
+    if _TREE_UNAVAILABLE_WARNED:
+        return
+    _TREE_UNAVAILABLE_WARNED = True
+    (log or logger).warning(
+        "Category tree cache missing or stale; skipping per-row plausibility "
+        "flags; category writes fail closed"
+    )
+
+
+def unpublished_listing_status(status: str = "") -> bool:
+    return str(status or "").strip().upper() in {"", "READY", "PENDING"}
+
+
+def _looks_like_tool_title(title: str) -> bool:
+    return bool(_TOOL_TITLE_RE.search(as_safe_text(title)))
+
+
+def _looks_like_kitchen_island_title(title: str) -> bool:
+    return bool(_KITCHEN_ISLAND_TITLE_RE.search(as_safe_text(title)))
+
+
+def _title_agrees_with_stored(title: str, stored: str, index=None) -> bool:
+    """True when the stored leaf already fits the live head (do not flag)."""
+    stored_id = as_safe_category_id(stored)
+    hay = as_safe_text(title)
+    if not stored_id or not hay:
+        return False
+    if stored_leaf_locked(hay, stored_id):
+        return True
+    head = first_product_noun(hay)
+    deny = unknown_head_noun(head) or head
+    if deny and stored_id in _HEAD_FITS_STORED.get(str(deny), ()):
+        return True
+    if deny == "mattress" or head == "mattress":
+        return stored_id in _HEAD_FITS_STORED["mattress"]
+    if _SPORTS_KEEP_RE.search(hay):
+        return True
+    if _looks_like_tool_title(hay):
+        path = _category_path(stored_id, index=index)
+        return path.startswith("Home & Garden > Tools & Workshop Equipment")
+    return False
+
+
+def _category_path(cid: str, index=None) -> str:
+    from src.utils.category_tree_cache import build_category_path
+
+    return str(build_category_path(str(cid or "").strip(), index=index) or "")
+
+
+def suggested_alternative_for(cid: str | None, kind: str = "", title: str = "") -> str | None:
+    stored = as_safe_category_id(cid)
+    if stored in _SUGGESTED_ALTERNATIVES:
+        return _SUGGESTED_ALTERNATIVES[stored]
+    if kind in {"side_table"} or first_product_noun(title) in _SIDE_END_HEADS:
+        return "38204"
+    if kind in {"display_cabinet"}:
+        return DISPLAY_CABINET_LEAF
+    if kind in {"kitchen_island"} or "kitchen island" in as_safe_text(title).lower():
+        return KITCHEN_ISLAND_LEAF
+    if kind in {"hall_tree"}:
+        return HALL_TREE
+    return None
+
+
+def _title_has_cat_token(title: str) -> bool:
+    return bool(_CAT_TITLE_RE.search(as_safe_text(title)))
+
+
+def _title_has_dog_token(title: str) -> bool:
+    return bool(_DOG_TITLE_RE.search(as_safe_text(title)))
+
+
+def _is_lounger_head(head: str | None, title: str) -> bool:
+    if head in _LOUNGER_HEADS:
+        return True
+    if head == "lounge chair" and _ADJUSTABLE_LOUNGE_RE.search(as_safe_text(title)):
+        return True
+    return False
+
+
+def _is_patio_chair_head(head: str | None, title: str) -> bool:
+    if head in _PATIO_CHAIR_HEADS:
+        if head == "lounge chair" and _ADJUSTABLE_LOUNGE_RE.search(as_safe_text(title)):
+            return False
+        return True
+    hay = as_safe_text(title).lower()
+    if re.search(r"\b(?:papasan|egg|adirondack|rocking)\s+chairs?\b", hay):
+        return True
+    return False
+
+
+def pet_species_mismatch_reason(title: str, path: str) -> str | None:
+    hay = as_safe_text(title)
+    if not hay or not path:
+        return None
+    has_cat = _title_has_cat_token(hay)
+    has_dog = _title_has_dog_token(hay)
+    if has_cat and not has_dog and f"> Dog Supplies" in path:
+        return "pet_species_mismatch"
+    if has_dog and not has_cat and f"> Cat Supplies" in path:
+        return "pet_species_mismatch"
+    return None
+
+
+def validate_target_category(
+    cid: str | None,
+    kind: str = "",
+    title: str = "",
+    *,
+    index=None,
+) -> tuple[bool, str]:
+    """Fail closed before any category write. Never substitutes another id."""
+    target = as_safe_category_id(cid)
+    if not target:
+        return False, "invalid_target_leaf"
+    flat = _category_index(index)
+    if not flat:
+        return False, "tree_unavailable"
+    from src.utils.category_tree_cache import is_cached_leaf_category
+
+    if not is_cached_leaf_category(target, index=flat):
+        return False, "invalid_target_leaf"
+    path = _category_path(target, index=flat)
+    if path.startswith(ANTIQUES_PREFIX):
+        return False, "implausible_target_path"
+    species = pet_species_mismatch_reason(title, path)
+    if species:
+        return False, species
+    tools_path = path.startswith("Home & Garden > Tools & Workshop Equipment")
+    if tools_path:
+        if kind in _FURNITURE_KINDS or _looks_like_kitchen_island_title(title):
+            if not _looks_like_tool_title(title):
+                return False, "implausible_target_path"
+        elif target == KITCHEN_ISLAND and "Power Tool" in path:
+            if _looks_like_kitchen_island_title(title) or kind in {
+                "kitchen_island",
+                "side_table",
+                "display_cabinet",
+            }:
+                return False, "implausible_target_path"
+    if kind in _FURNITURE_KINDS:
+        if not any(path.startswith(prefix) for prefix in FURNITURE_PATH_PREFIXES):
+            return False, "implausible_target_path"
+    if target == KITCHEN_ISLAND and "Power Tool" in path:
+        if _looks_like_kitchen_island_title(title) or kind in {
+            "kitchen_island",
+            "side_table",
+            "display_cabinet",
+        }:
+            return False, "implausible_target_path"
+    return True, ""
+
+
+def load_approved_auto_remaps() -> frozenset[tuple[str, str]]:
+    approved = set(APPROVED_AUTO_REMAPS)
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "data" / "config" / "approved_auto_remaps.json"
+    if not path.is_file():
+        return frozenset(approved)
+    try:
+        import json
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return frozenset(approved)
+    pairs = payload.get("pairs") if isinstance(payload, dict) else payload
+    if isinstance(pairs, list):
+        for item in pairs:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                approved.add((str(item[0] or ""), str(item[1] or "")))
+    return frozenset(approved)
+
+
+def is_approved_auto_remap(stored: str, target: str, reason: str = "") -> bool:
+    approved = load_approved_auto_remaps()
+    stored_id = as_safe_category_id(stored)
+    target_id = as_safe_category_id(target)
+    if not target_id:
+        return False
+    return (stored_id, target_id) in approved or (reason, target_id) in approved
+
+
+def _decision(
+    category_id: str | None,
+    kind: str,
+    reason: str,
+    name: str | None = None,
+    *,
+    conflict: bool = False,
+    suggested_alternative: str | None = None,
+) -> CategoryDecision:
+    return CategoryDecision(
+        category_id,
+        kind,
+        reason,
+        name,
+        conflict,
+        suggested_alternative,
+    )
 
 
 def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDecision:
@@ -220,23 +561,82 @@ def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDe
             return CategoryDecision(None, "keep", "sewing_table_lock")
         return CategoryDecision(None, "unknown", "sewing_or_craft_table")
 
+    if _title_has_cat_token(hay) and not _title_has_dog_token(hay) and re.search(
+        r"\b(?:litter|cat\s+tree|cat\s+furniture)\b", hay, re.IGNORECASE
+    ):
+        from src.utils.category_tree_cache import is_cached_leaf_category
+
+        idx = _category_index()
+        cat_path = _category_path(CAT_FURNITURE, index=idx)
+        if is_cached_leaf_category(CAT_FURNITURE, index=idx) and cat_path.startswith(PET_CAT_PREFIX):
+            return CategoryDecision(CAT_FURNITURE, "cat_furniture", "cat_litter_cabinet", "Furniture & Scratchers")
+        return CategoryDecision(None, "unknown", "pet_species_mismatch")
+
     head = first_product_noun(hay)
+    deny_noun = unknown_head_noun(head)
+    if deny_noun:
+        stored_id = as_safe_category_id(stored)
+        if deny_noun == "mattress":
+            if stored_id in _HEAD_FITS_STORED["mattress"]:
+                return CategoryDecision(None, "keep", "stored_head_fit")
+            return CategoryDecision(None, "unknown", "mattress_not_accessory")
+        if stored_id and stored_id in _HEAD_FITS_STORED.get(deny_noun, ()):
+            return CategoryDecision(None, "keep", "stored_head_fit")
+        if deny_noun in {"cushion", "pad", "cover", "slipcover"} or title_is_chair_accessory(hay):
+            return CategoryDecision(None, "unknown", "accessory")
+        return CategoryDecision(None, "unknown", "unknown_head_noun")
+    if head in {
+        "chaise lounge cushion",
+        "lounger cushion",
+        "chair cushion",
+        "chair cover",
+        "seat cushion",
+        "slipcover",
+    }:
+        return CategoryDecision(None, "unknown", "accessory")
+    if head == "hutch desk":
+        return CategoryDecision(DESK, "desk", "hutch_desk", "Desks & Tables")
+    if head in _TV_STAND_HEADS:
+        if as_safe_category_id(stored) == "20488":
+            return CategoryDecision(None, "keep", "tv_stand_lock")
+        return CategoryDecision(None, "unknown", "unknown_head_noun")
     if head in _BAR_CABINET_HEADS:
         if as_safe_category_id(stored) == "20487":
             return CategoryDecision(None, "keep", "bar_cabinet_lock")
         return CategoryDecision(None, "unknown", "bar_cabinet_not_wine_rack")
     if head in _WINE_RACK_HEADS:
         return CategoryDecision(WINE_RACK, "wine_rack", "wine_rack_head", "Wine Racks & Bottle Holders")
-    if head == "hall tree":
-        return CategoryDecision(HALL_TREE, "hall_tree", "hall_tree_head", "Hall Trees & Stands")
+    if head == "hall tree" or re.search(r"\bhall\s+tree\b", hay, re.IGNORECASE):
+        return CategoryDecision(HALL_TREE, "hall_tree", "hall_tree_head", "Coat & Hat Racks")
     if head in {"sideboard", "buffet"} and as_safe_category_id(stored) not in {"183322", "63557"}:
         return CategoryDecision(SIDEBOARD, "sideboard", "sideboard_head", "Sideboards & Buffets")
-    if head in {"chaise", "chaise lounge", "lounger", "sun lounger"}:
-        if as_safe_category_id(stored) in {"79682", "79684", "138996"}:
+    if _is_lounger_head(head, hay):
+        stored_id = as_safe_category_id(stored)
+        if stored_id == OUTDOOR_CHAISE:
+            return CategoryDecision(None, "keep", "outdoor_chaise_lock")
+        if stored_id == "138996":
             return CategoryDecision(None, "keep", "outdoor_chaise_lock")
         if title_has_clear_outdoor_word(hay) and not title_has_mixed_indoor_outdoor(hay):
-            return CategoryDecision(OUTDOOR_CHAISE, "outdoor_chaise", "chaise_lounge", "Outdoor Chaise Lounges")
+            return CategoryDecision(OUTDOOR_CHAISE, "outdoor_chaise", "chaise_lounge", "Loungers")
         return CategoryDecision(None, "unknown", "chaise_not_dining_set")
+    if _SPORTS_KEEP_RE.search(hay) and as_safe_category_id(stored):
+        return CategoryDecision(None, "keep", "stored_head_fit")
+    if _looks_like_tool_title(hay) and as_safe_category_id(stored):
+        tool_path = _category_path(stored)
+        if tool_path.startswith("Home & Garden > Tools & Workshop Equipment"):
+            return CategoryDecision(None, "keep", "stored_head_fit")
+    if _is_patio_chair_head(head, hay) or re.search(
+        r"\b(?:papasan|adirondack|egg)\s+chairs?\b", hay, re.IGNORECASE
+    ):
+        stored_id = as_safe_category_id(stored)
+        if title_has_mixed_indoor_outdoor(hay):
+            return CategoryDecision(None, "unknown", "mixed_indoor_outdoor")
+        if title_has_clear_outdoor_word(hay):
+            if stored_id == OUTDOOR_CHAIR:
+                return CategoryDecision(None, "keep", "outdoor_chair_lock")
+            return CategoryDecision(OUTDOOR_CHAIR, "outdoor_chair", "patio_chair_head", "Patio Chairs")
+    if re.search(r"\bcoat\s+racks?\b|\bcoat\s+stand\b", hay, re.IGNORECASE):
+        return CategoryDecision(HALL_TREE, "hall_tree", "coat_rack_head", "Coat & Hat Racks")
 
     if _display_cabinet_title(hay):
         return CategoryDecision(DISPLAY_CABINET, "display_cabinet", "display_cabinet", "Display Cabinets")
@@ -329,12 +729,84 @@ def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDe
     return CategoryDecision(proposed or None, kind, "classified", name)
 
 
+def _finalize_decision(
+    decision: CategoryDecision,
+    title: str,
+    stored: str,
+    *,
+    index=None,
+) -> CategoryDecision:
+    stored_ok, stored_reason = (True, "")
+    if stored:
+        stored_ok, stored_reason = validate_target_category(
+            stored, decision.kind, title, index=index
+        )
+        if stored_reason == "tree_unavailable":
+            warn_once_tree_unavailable()
+            return CategoryDecision(None, "keep", "tree_cache_unavailable")
+
+    if stored and stored_ok and stored_leaf_locked(title, stored):
+        return CategoryDecision(None, "keep", "stored_leaf_lock")
+
+    if decision.category_id and is_outdoor_to_indoor_downgrade(stored, decision.category_id, title):
+        return CategoryDecision(None, "keep", "no_outdoor_indoor_downgrade")
+
+    if decision.category_id:
+        ok, reason = validate_target_category(
+            decision.category_id, decision.kind, title, index=index
+        )
+        if not ok:
+            alt = suggested_alternative_for(decision.category_id, decision.kind, title)
+            if stored and not stored_ok and decision.category_id == stored:
+                return CategoryDecision(
+                    None,
+                    "unknown",
+                    "stored_category_implausible",
+                    suggested_alternative=alt,
+                )
+            return CategoryDecision(None, "unknown", reason, suggested_alternative=alt)
+
+    if stored and not stored_ok and (decision.kind == "keep" or not decision.category_id):
+        if stored_reason == "tree_unavailable":
+            warn_once_tree_unavailable()
+            return CategoryDecision(None, "keep", "tree_cache_unavailable")
+        return CategoryDecision(
+            None,
+            "unknown",
+            "stored_category_implausible",
+            suggested_alternative=suggested_alternative_for(stored, decision.kind, title),
+        )
+
+    if decision.kind == "keep":
+        return CategoryDecision(None, "keep", decision.reason, decision.category_name)
+
+    if stored and stored_ok and (decision.kind == "unknown" or not decision.category_id):
+        if _title_agrees_with_stored(title, stored, index=index):
+            return CategoryDecision(None, "keep", "stored_head_fit")
+
+    if decision.kind == "unknown" or not decision.category_id:
+        return CategoryDecision(
+            None,
+            "unknown",
+            decision.reason,
+            conflict=decision.conflict,
+            suggested_alternative=decision.suggested_alternative,
+        )
+
+    if decision.category_id == stored:
+        return CategoryDecision(None, "keep", decision.reason, decision.category_name)
+
+    return decision
+
+
 def resolve_category_decision(
     live_title: Any = "",
     giga_title: Any = "",
     description: Any = "",
     stored_category: Any = "",
     stored_name: Any = "",
+    *,
+    index=None,
 ) -> CategoryDecision:
     """Pure category decision. Description is accepted but never used for the leaf."""
     try:
@@ -346,8 +818,16 @@ def resolve_category_decision(
         if not title:
             return CategoryDecision(None, "unknown", "empty_title")
 
-        if stored_leaf_locked(title, stored):
-            return CategoryDecision(None, "keep", "stored_leaf_lock")
+        stored_ok = True
+        if stored:
+            stored_ok, stored_reason = validate_target_category(stored, "", title, index=index)
+            if stored_reason == "tree_unavailable":
+                warn_once_tree_unavailable()
+                return CategoryDecision(None, "keep", "tree_cache_unavailable")
+            if stored_ok and stored_leaf_locked(title, stored):
+                return CategoryDecision(None, "keep", "stored_leaf_lock")
+            if stored_ok and _title_agrees_with_stored(title, stored, index=index):
+                return CategoryDecision(None, "keep", "stored_head_fit")
 
         if live and giga:
             live_dec = _propose_from_title(live, stored, name)
@@ -373,30 +853,85 @@ def resolve_category_decision(
                 return CategoryDecision(None, "unknown", "title_source_conflict", conflict=True)
 
         decision = _propose_from_title(title, stored, name)
-
-        if stored_leaf_locked(title, stored):
-            return CategoryDecision(None, "keep", "stored_leaf_lock")
-
-        if decision.category_id and is_outdoor_to_indoor_downgrade(stored, decision.category_id, title):
-            return CategoryDecision(None, "keep", "no_outdoor_indoor_downgrade")
-
-        if decision.kind == "unknown" or not decision.category_id:
-            return CategoryDecision(None, "unknown", decision.reason, conflict=decision.conflict)
-
-        if decision.category_id == stored:
-            return CategoryDecision(None, "keep", decision.reason, decision.category_name)
-
-        return decision
+        return _finalize_decision(decision, title, stored, index=index)
     except Exception as exc:
         logger.warning("resolve_category_decision failed closed: %s", exc)
         return CategoryDecision(None, "unknown", "error")
 
 
-def decision_category_id(decision: CategoryDecision, stored_category: Any = "") -> str | None:
-    """The leaf to write, or None when the stored leaf should stay / stay empty."""
+def decision_category_id(
+    decision: CategoryDecision,
+    stored_category: Any = "",
+    *,
+    index=None,
+) -> str | None:
+    """The leaf to write, or None when the stored leaf should stay / stay empty.
+
+    Validation and the empty APPROVED_AUTO_REMAPS human gate live here so
+    audit and publish cannot disagree.
+    """
     stored = as_safe_category_id(stored_category)
     if decision.kind in {"keep", "unknown"} or not decision.category_id:
         return None
     if decision.category_id == stored:
         return None
+    ok, _reason = validate_target_category(
+        decision.category_id, decision.kind, "", index=index
+    )
+    if not ok:
+        return None
+    if not is_approved_auto_remap(stored, decision.category_id, decision.reason):
+        return None
     return decision.category_id
+
+
+def apply_category_write_gate(
+    original_stored: Any,
+    candidate_id: Any,
+    title: str = "",
+    *,
+    listing_status: str = "",
+    reason: str = "publish_candidate",
+    kind: str = "classified",
+    index=None,
+) -> tuple[str | None, str]:
+    """Gate every publish/draft category choice.
+
+    Returns (category_id_or_None_to_hold, action) where action is
+    ``remap``, ``keep``, ``hold_empty``, or ``hold_implausible``.
+    Unapproved remaps keep the original stored id. Empty stored holds.
+    Invalid/implausible stored holds READY/PENDING and stays manifest-only
+    for PUBLISHED.
+    """
+    stored = as_safe_category_id(original_stored)
+    candidate = as_safe_category_id(candidate_id)
+    unpublished = unpublished_listing_status(listing_status)
+    if not category_tree_is_available(index):
+        warn_once_tree_unavailable()
+        if stored:
+            return stored, "keep"
+        return (None, "hold_empty") if unpublished else (candidate or None, "keep")
+
+    action = "keep"
+    chosen = stored
+    if candidate and candidate != stored:
+        ok, _reason = validate_target_category(candidate, kind, title, index=index)
+        if ok and is_approved_auto_remap(stored, candidate, reason):
+            chosen = candidate
+            action = "remap"
+        elif not stored:
+            return None, "hold_empty"
+        else:
+            chosen = stored
+            action = "keep"
+    elif not stored:
+        return None, "hold_empty"
+
+    if chosen == stored and stored:
+        stored_ok, stored_reason = validate_target_category(stored, "", title, index=index)
+        if stored_reason == "tree_unavailable":
+            warn_once_tree_unavailable()
+            return stored, "keep"
+        if not stored_ok and unpublished:
+            return None, "hold_implausible"
+    return chosen or None, action

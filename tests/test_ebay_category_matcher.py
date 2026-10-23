@@ -5,6 +5,8 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -126,17 +128,17 @@ def test_outdoor_porch_rocker_canonicalizes_to_outdoor_chairs():
         "Patio Rockers for Outside, Light Gray"
     )
 
-    assert matcher._fallback_category(title) == ("79684", "Outdoor Chairs")
+    assert matcher._fallback_category(title) == ("79682", "Patio Chairs")
     assert matcher.canonicalize_category(title, "66690", "Rockers, Gliders") == (
-        "79684",
-        "Outdoor Chairs",
+        "79682",
+        "Patio Chairs",
     )
     assert matcher.canonicalize_category(title, "20877", "Rocking Chairs") == (
-        "79684",
-        "Outdoor Chairs",
+        "79682",
+        "Patio Chairs",
     )
-    # plausible() canonicalizes first, so a stale 66690 input becomes 79684 and passes.
-    assert matcher.is_category_plausible_for_text(title, "79684", "Outdoor Chairs") is True
+    # plausible() canonicalizes first, so a stale 66690 input becomes 79682 and passes.
+    assert matcher.is_category_plausible_for_text(title, "79682", "Patio Chairs") is True
 
 
 def test_legacy_laundry_hamper_category_uses_current_leaf():
@@ -260,6 +262,7 @@ def _install_tree_cache(monkeypatch, tmp_path, trees=None):
     return cache_dir
 
 
+@pytest.mark.real_category_tree
 def test_get_category_path_builds_from_cached_tree(monkeypatch, tmp_path):
     http_calls = []
 
@@ -279,6 +282,7 @@ def test_get_category_path_builds_from_cached_tree(monkeypatch, tmp_path):
     assert http_calls == []
 
 
+@pytest.mark.real_category_tree
 def test_get_category_path_stale_cache_returns_empty(monkeypatch, tmp_path):
     import time
 
@@ -408,6 +412,7 @@ def test_refresh_script_refuses_sandbox_host_without_flag(monkeypatch, tmp_path)
     assert list(tmp_path.glob("category_tree_*.json")) == []
 
 
+@pytest.mark.real_category_tree
 def test_loader_rejects_sandbox_snapshot(monkeypatch, tmp_path):
     from src.utils import category_tree_cache
 
@@ -428,6 +433,7 @@ def test_loader_rejects_sandbox_snapshot(monkeypatch, tmp_path):
     assert "6038" not in matcher._path_cache
 
 
+@pytest.mark.real_category_tree
 def test_get_category_path_missing_cache_returns_empty(monkeypatch, tmp_path):
     from src.utils import category_tree_cache
 

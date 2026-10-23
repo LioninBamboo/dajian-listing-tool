@@ -258,7 +258,7 @@ def _title_has_outdoor_table_signal(text: str) -> bool:
 
 
 def _outdoor_dining_set_profile(title_text: str) -> ListingProfile:
-    """Patio dining set leaf. Never 79684 Outdoor Chairs or 54235 Chairs."""
+    """Patio dining set leaf. Never 79682 Patio Chairs or 54235 Chairs."""
     stool = _has_marker(title_text, "stool", "stools")
     return ListingProfile(
         kind="dining_set",
@@ -1484,6 +1484,39 @@ def _seed_attributes_from_description(
     return seeded
 
 
+def _outdoor_seating_profile(title_text: str) -> ListingProfile:
+    """Patio Chairs 79682 vs Loungers 79684. Never invert those leaves."""
+    hay = str(title_text or "")
+    lounger = bool(
+        re.search(
+            r"\b(?:chaise|lounger|sun\s+lounger|outdoor\s+recliner)\b",
+            hay,
+            re.IGNORECASE,
+        )
+        or (
+            re.search(r"\blounge\s+chairs?\b", hay, re.IGNORECASE)
+            and re.search(r"\b(?:adjustable|reclin(?:e|er|ing))\b", hay, re.IGNORECASE)
+        )
+    )
+    if lounger:
+        return ListingProfile(
+            kind="outdoor_chaise",
+            category_id="79684",
+            category_name="Loungers",
+            type_value="Chaise Lounge",
+            set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
+            indoor_outdoor="Outdoor",
+        )
+    return ListingProfile(
+        kind="outdoor_chair",
+        category_id="79682",
+        category_name="Patio Chairs",
+        type_value="Outdoor Chair",
+        set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
+        indoor_outdoor="Outdoor",
+    )
+
+
 def classify_listing_profile(
     title: str,
     description: str = "",
@@ -1550,14 +1583,7 @@ def classify_listing_profile(
         if title_allows_outdoor_chair_remap(title_text) and _has_marker(
             title_text, "outdoor", "patio", "garden", "wicker"
         ):
-            return ListingProfile(
-                kind="outdoor_chair",
-                category_id="79684",
-                category_name="Outdoor Chairs",
-                type_value="Outdoor Chair",
-                set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
-                indoor_outdoor="Outdoor",
-            )
+            return _outdoor_seating_profile(title_text)
         return ListingProfile(
             kind="armchair",
             category_id="38208",
@@ -1574,14 +1600,7 @@ def classify_listing_profile(
         if title_is_dining_set_bundle(title_text):
             return _dining_set_bundle_profile(title_text)
         if title_allows_outdoor_chair_remap(title_text):
-            return ListingProfile(
-                kind="outdoor_chair",
-                category_id="79684",
-                category_name="Outdoor Chairs",
-                type_value="Outdoor Chair",
-                set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
-                indoor_outdoor="Outdoor",
-            )
+            return _outdoor_seating_profile(title_text)
         if title_has_mixed_indoor_outdoor(title_text):
             return ListingProfile(kind="unknown")
         return ListingProfile(
@@ -1596,14 +1615,7 @@ def classify_listing_profile(
         if title_is_chair_accessory(title_text) or title_is_dining_set_bundle(title_text):
             return ListingProfile(kind="unknown")
         if title_allows_outdoor_chair_remap(title_text):
-            return ListingProfile(
-                kind="outdoor_chair",
-                category_id="79684",
-                category_name="Outdoor Chairs",
-                type_value="Outdoor Chair",
-                set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
-                indoor_outdoor="Outdoor",
-            )
+            return _outdoor_seating_profile(title_text)
         return ListingProfile(kind="unknown")
     if primary == "pantry":
         return ListingProfile(
@@ -1958,14 +1970,7 @@ def classify_listing_profile(
             "camping chairs",
         )
     ):
-        return ListingProfile(
-            kind="outdoor_chair",
-            category_id="79684",
-            category_name="Outdoor Chairs",
-            type_value="Outdoor Chair",
-            set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
-            indoor_outdoor="Outdoor",
-        )
+        return _outdoor_seating_profile(title_text)
 
     if _has_marker(title_text, "bar stool", "bar stools", "counter stool", "counter stools", "barstool", "barstools"):
         return ListingProfile(
@@ -2083,14 +2088,7 @@ def classify_listing_profile(
         if title_is_dining_set_bundle(title_text):
             return _dining_set_bundle_profile(title_text)
         if title_allows_outdoor_chair_remap(title_text):
-            return ListingProfile(
-                kind="outdoor_chair",
-                category_id="79684",
-                category_name="Outdoor Chairs",
-                type_value="Outdoor Chair",
-                set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
-                indoor_outdoor="Outdoor",
-            )
+            return _outdoor_seating_profile(title_text)
         if title_has_mixed_indoor_outdoor(title_text):
             return ListingProfile(kind="unknown")
         return ListingProfile(
@@ -2557,6 +2555,15 @@ def normalize_generated_listing(
                 indoor_outdoor=profile.indoor_outdoor,
                 remove_aspects=profile.remove_aspects,
             )
+            if decision.kind not in {"keep"} and (
+                decision.category_id or decision.reason not in {"", "classified", "empty_title", "tree_cache_unavailable"}
+            ):
+                opt["_category_remap_review"] = {
+                    "from": stored_category or "",
+                    "to": decision.category_id or "",
+                    "reason": decision.reason,
+                    "suggested_alternative": decision.suggested_alternative or "",
+                }
 
     seeded_attributes = _seed_attributes_from_description(attributes, opt.get("description", ""))
     updates = _fill_measurement_aspects(opt["aspects"], seeded_attributes)
@@ -3422,6 +3429,7 @@ def validate_listing_quality(
     images: list[str] | None = None,
     videos: list[str] | None = None,
     category_matcher: Any = None,
+    listing_status: str = "",
 ) -> list[ListingQualityIssue]:
     """Return quality issues that should block READY/publish."""
     opt = dict(optimization or {})
@@ -3536,6 +3544,33 @@ def validate_listing_quality(
         opt.get("categoryName"),
     )
     write_id = decision_category_id(decision, category_id)
+    from src.utils.category_decision import (
+        unpublished_listing_status,
+        validate_target_category,
+        warn_once_tree_unavailable,
+    )
+
+    status = str(listing_status or opt.get("listingStatus") or opt.get("status") or "")
+    stored_ok, stored_reason = (True, "")
+    if category_id:
+        stored_ok, stored_reason = validate_target_category(category_id, "", title or source_title)
+    if stored_reason == "tree_unavailable" or decision.reason in {"tree_unavailable", "tree_cache_unavailable"}:
+        warn_once_tree_unavailable()
+    elif (
+        not preserve_category
+        and category_id
+        and not stored_ok
+        and stored_reason in {"stored_category_implausible", "invalid_target_leaf", "implausible_target_path"}
+    ):
+        if unpublished_listing_status(status):
+            issues.append(
+                ListingQualityIssue(
+                    "stored_category_unpublishable",
+                    f"stored category {category_id} is {stored_reason}; holding READY/PENDING publish",
+                    severity="BLOCKER",
+                    field="categoryId",
+                )
+            )
     if decision.conflict or decision.reason == "title_source_conflict":
         issues.append(
             ListingQualityIssue(
@@ -3543,6 +3578,43 @@ def validate_listing_quality(
                 "live title and GIGA title disagree on the product leaf; holding stored category",
                 severity="INFO",
                 field="title",
+            )
+        )
+    pending_remap = (
+        not preserve_category
+        and not write_id
+        and decision.kind not in {"keep"}
+        and decision.reason not in {"tree_unavailable", "tree_cache_unavailable"}
+        and (
+            bool(decision.category_id)
+            or decision.reason
+            in {
+                "unknown_head_noun",
+                "pet_species_mismatch",
+                "invalid_target_leaf",
+                "implausible_target_path",
+                "stored_category_implausible",
+                "accessory",
+                "mattress_not_accessory",
+            }
+        )
+    )
+    review = opt.get("_category_remap_review") if isinstance(opt.get("_category_remap_review"), dict) else None
+    if pending_remap or (review and not preserve_category and not write_id and decision.kind not in {"keep"}):
+        issues.append(
+            ListingQualityIssue(
+                "category_remap_pending_review",
+                (
+                    f"remap {category_id or 'empty'} → {decision.category_id or 'none'} "
+                    f"reason={decision.reason}"
+                    + (
+                        f" suggested_alternative={decision.suggested_alternative}"
+                        if decision.suggested_alternative
+                        else ""
+                    )
+                ),
+                severity="WARNING",
+                field="categoryId",
             )
         )
     if not preserve_category and write_id and category_id != write_id:
