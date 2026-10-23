@@ -284,10 +284,15 @@ def source_combined_aspect_keys(aspects: Mapping[str, Any]) -> set[str]:
     """Return source fields whose combined value must stay one eBay value.
 
     GIGA source parameters commonly encode multiple material/color components in
-    one string (for example ``MDF,Rubber Wood``).  eBay still expects these as a
-    single aspect value in this pipeline.  The generic single-value sanitizer
-    splits comma/semicolon/slash/pipe-delimited values, so callers that write
-    source-backed aspects must explicitly preserve these fields.
+    one string (for example ``MDF,Rubber Wood`` or ``Fabric+Metal``).  eBay still
+    expects these as a single aspect value in this pipeline unless taxonomy
+    explicitly asked for a MULTI token list.  The generic single-value sanitizer
+    splits comma/semicolon/slash/pipe-delimited values and would also mangle
+    ``&``-joined forms, so callers that write source-backed aspects must
+    explicitly preserve these fields.
+
+    Material is always preserved when present: Sergey's rule requires the exact
+    GIGA string to reach eBay, including ``+`` / ``&`` composites.
     """
     preserved: set[str] = set()
     if not isinstance(aspects, Mapping):
@@ -295,7 +300,14 @@ def source_combined_aspect_keys(aspects: Mapping[str, Any]) -> set[str]:
     for key in SOURCE_COMBINED_ASPECT_KEYS:
         values = aspects.get(key)
         raw_values = values if isinstance(values, (list, tuple, set)) else [values]
-        if any(re.search(r"[,;/|]", str(value or "")) for value in raw_values):
+        has_value = any(str(value or "").strip() for value in raw_values)
+        if not has_value:
+            continue
+        if key == "Material":
+            preserved.add(key)
+            continue
+        # Color: treat + and & like the existing [,;/|] splitters.
+        if any(re.search(r"[,;/|+&]", str(value or "")) for value in raw_values):
             preserved.add(key)
     return preserved
 

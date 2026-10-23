@@ -91,11 +91,29 @@ def test_live_listing_snapshot_prefers_ebay_title_description_aspects_and_catego
 
 def test_active_audit_flags_live_source_parameter_drift_for_trash_cabinet(monkeypatch):
     class _Matcher:
+        def __init__(self):
+            self._aspects_cache = {}
+
         def canonicalize_category(self, title_context, category_id, category_name, description=None):
             return category_id, category_name
 
         def is_category_plausible_for_text(self, title, category_id, category_name):
             return True
+
+        def _get_category_aspects(self, category_id):
+            # Mock successful taxonomy: Material is FREE_TEXT/SINGLE so the exact
+            # GIGA string is writable (no live eBay call).
+            parsed = [
+                {
+                    "name": "Material",
+                    "required": False,
+                    "mode": "FREE_TEXT",
+                    "cardinality": "SINGLE",
+                    "allowed_values": [],
+                }
+            ]
+            self._aspects_cache[str(category_id)] = parsed
+            return [], parsed
 
     monkeypatch.setattr(audit_fix_active_listings, "get_category_matcher", lambda: _Matcher())
 
@@ -674,6 +692,95 @@ def test_source_parameter_alignment_prefers_specific_faux_leather_source_field()
     )
 
     assert not any(item["field"] == "Material" for item in mismatches)
+
+
+def _put_material_payload(material_values):
+    from types import SimpleNamespace
+
+    captured = {}
+
+    class _Session:
+        def put(self, url, headers=None, json=None, timeout=None):
+            captured["payload"] = json
+            return SimpleNamespace(status_code=204, text="")
+
+    class _Client:
+        base_url = "https://api.ebay.example"
+        oauth = SimpleNamespace(get_valid_token=lambda: "token")
+        session = _Session()
+
+        def get_inventory_item(self, sku):
+            return {
+                "condition": "NEW",
+                "availability": {"shipToLocationAvailability": {"quantity": 1}},
+                "product": {
+                    "title": "Chair",
+                    "description": "<div>old</div>",
+                    "imageUrls": ["https://example.test/image.jpg"],
+                    "aspects": {"Material": ["Linen"], "Type": ["Chair"]},
+                },
+            }
+
+    _, _, cleaned = audit_fix_active_listings._put_inventory_product_only(
+        _Client(),
+        "SKU-MATERIAL",
+        "Chair",
+        "<div>updated</div>",
+        {"Material": material_values, "Type": ["Chair"]},
+    )
+    return captured["payload"]["product"]["aspects"]["Material"], cleaned["Material"]
+
+
+def test_put_payload_preserves_fabric_plus_metal_row1():
+    payload_material, cleaned = _put_material_payload(["Fabric+Metal"])
+    assert payload_material == ["Fabric+Metal"]
+    assert cleaned == ["Fabric+Metal"]
+
+
+def test_put_payload_preserves_metal_and_wood_row4():
+    payload_material, cleaned = _put_material_payload(["Metal & Wood"])
+    assert payload_material == ["Metal & Wood"]
+    assert cleaned == ["Metal & Wood"]
+    assert "&" in payload_material[0]
+
+
+def test_put_payload_preserves_abs_steel_suffix_row7():
+    payload_material, cleaned = _put_material_payload(["ABS+Steel(Q235)"])
+    assert payload_material == ["ABS+Steel(Q235)"]
+    assert cleaned == ["ABS+Steel(Q235)"]
+
+
+def test_scheduled_material_partial_match_is_gated_operator_writes():
+    from types import SimpleNamespace
+
+    from listing_qc import SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS
+
+    issues = [
+        {
+            "type": "source_aspect_mismatch",
+            "field": "Material",
+            "legacy_partial_match": True,
+            "severity": "CRITICAL",
+        }
+    ]
+    fixes = {
+        "Material": ["Glass,MDF,Melamine"],
+        "__source_parameter_rebuild__": True,
+        "Color": ["Black"],
+    }
+
+    scheduled_args = SimpleNamespace(fix_keys=sorted(SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS))
+    gated = audit_fix_active_listings.gate_scheduled_material_partial_fixes(
+        fixes, issues, scheduled_args
+    )
+    assert "Material" not in gated
+    assert "Color" in gated
+
+    operator_args = SimpleNamespace(fix_keys=["Material"])
+    operator = audit_fix_active_listings.gate_scheduled_material_partial_fixes(
+        fixes, issues, operator_args
+    )
+    assert operator["Material"] == ["Glass,MDF,Melamine"]
 
 
 def test_audit_parser_supports_scheduled_live_email_mode():

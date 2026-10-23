@@ -19,6 +19,9 @@ FIX_KEY_ISSUE_TYPES = {
         "wrong_weight",
     },
     "__source_parameter_rebuild__": {"source_aspect_mismatch"},
+    # Report-only Material / source review — never mapped to a writable fix key.
+    # Listed here so residual / needs-Sergey rendering can classify it.
+    "__source_aspect_needs_review__": {"source_aspect_needs_review"},
     "Assembly Required": {
         "assembly_required_mismatch",
         "assembly_package_conflict",
@@ -59,6 +62,8 @@ def fix_key_matches_issue(key: str, issue_type: str) -> bool:
     if key == "Item Weight":
         return issue_type in {"missing_weight", "wrong_weight"}
     if key == "Material":
+        # source_aspect_needs_review is report-only — it must not be treated as
+        # covered by a Material write.
         return issue_type in {"source_aspect_mismatch", "semantic_material"}
     return issue_type in FIX_KEY_ISSUE_TYPES.get(key, set())
 

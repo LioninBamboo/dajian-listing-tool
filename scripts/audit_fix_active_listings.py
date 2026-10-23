@@ -1133,26 +1133,72 @@ def audit_single_product(
     # small set of deterministic product-family types need the same live-vs-
     # source reconciliation; otherwise stale optimizer defaults can ship while
     # the text-only claim checks still pass (W808P477209).
+    #
+    # Prefer the live offer categoryId when the opt snapshot already carries it
+    # (build_live_listing_opt_snapshot). Material write format is decided from
+    # that live category's taxonomy metadata; taxonomy miss → fail closed.
+    material_category_id = stored_category
+    material_aspect_meta, aspect_metadata_available = resolve_material_aspect_metadata(
+        matcher,
+        material_category_id,
+    )
     source_parameter_rebuild_needed = False
     for parameter in find_source_parameter_mismatches(
         source_attributes=attrs,
         source_title=title,
         source_description=description or "",
         candidate_aspects=aspects,
-        category_id=stored_category,
+        category_id=material_category_id,
+        material_aspect=material_aspect_meta,
+        aspect_metadata_available=aspect_metadata_available,
     ):
         field = parameter["field"]
-        issues.append(
-            {
-                "type": "source_aspect_mismatch",
-                "severity": "CRITICAL",
-                "field": field,
-                "current": parameter["current"],
-                "expected": parameter["expected"],
-                "detail": f"[SourceParameter] {parameter['detail']}",
-            }
-        )
-        fixes[field] = [str(parameter["expected"])]
+        if field == "Material" and parameter.get("needs_human"):
+            issues.append(
+                {
+                    "type": "source_aspect_needs_review",
+                    "severity": "CRITICAL",
+                    "field": field,
+                    "current": parameter.get("current"),
+                    "source_value": parameter.get("source_value"),
+                    "category_id": parameter.get("category_id") or material_category_id,
+                    "aspect_mode": parameter.get("aspect_mode"),
+                    "cardinality": parameter.get("cardinality"),
+                    "reason": parameter.get("reason"),
+                    "needs_human": True,
+                    "detail": (
+                        f"[SourceParameter] {parameter['detail']} "
+                        f"(needs_review reason={parameter.get('reason')})"
+                    ),
+                }
+            )
+            # Fail closed: no fixes entry, so nothing can be written.
+            continue
+
+        expected = parameter.get("expected")
+        issue_payload = {
+            "type": "source_aspect_mismatch",
+            "severity": "CRITICAL",
+            "field": field,
+            "current": parameter["current"],
+            "expected": expected,
+            "detail": f"[SourceParameter] {parameter['detail']}",
+        }
+        if field == "Material":
+            issue_payload["source_value"] = parameter.get("source_value")
+            issue_payload["category_id"] = parameter.get("category_id") or material_category_id
+            issue_payload["aspect_mode"] = parameter.get("aspect_mode")
+            issue_payload["cardinality"] = parameter.get("cardinality")
+            issue_payload["legacy_partial_match"] = bool(
+                parameter.get("legacy_partial_match")
+            )
+            issue_payload["needs_human"] = False
+        issues.append(issue_payload)
+
+        if isinstance(expected, list):
+            fixes[field] = [str(item).strip() for item in expected if str(item).strip()]
+        else:
+            fixes[field] = [str(expected)]
         source_parameter_rebuild_needed = True
     if source_parameter_rebuild_needed:
         # Insert after every direct aspect fix so the rebuilt description sees
@@ -2132,6 +2178,76 @@ def filter_fixes_by_key(fixes: dict, allowed_keys: set[str] | None) -> dict:
         return dict(fixes or {})
     allowed = {str(key) for key in allowed_keys}
     return {key: value for key, value in (fixes or {}).items() if key in allowed}
+
+
+def resolve_material_aspect_metadata(matcher, category_id: str):
+    """Return ``(material_aspect_or_None, metadata_available)``.
+
+    ``material_aspect`` is ``None`` when Material is a custom item specific
+    (name absent from the category list) **and** taxonomy succeeded. When
+    taxonomy fails or the category is unknown, ``metadata_available`` is False
+    so Material resolution fails closed instead of guessing via fallbacks.
+    """
+    cat = str(category_id or "").strip()
+    if not cat or matcher is None:
+        return None, False
+    cache = getattr(matcher, "_aspects_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+    try:
+        matcher._get_category_aspects(cat)
+    except Exception:
+        return None, False
+    if cat not in cache and cat not in getattr(matcher, "_aspects_cache", {}):
+        # Fallback path does not populate the cache — treat as unavailable.
+        return None, False
+    aspects = list(getattr(matcher, "_aspects_cache", {}).get(cat) or [])
+    material = next(
+        (
+            aspect
+            for aspect in aspects
+            if str(aspect.get("name") or "").strip().casefold() == "material"
+        ),
+        None,
+    )
+    return material, True
+
+
+def gate_scheduled_material_partial_fixes(fixes: dict, issues: list, args) -> dict:
+    """Drop Material writes that are legacy subset/family matches on scheduled runs.
+
+    Newly exact-flagged rows whose live value previously "passed" via primary or
+    family match must stay report-only for the 12:10 bulk job. An explicit
+    operator ``--fix --fix-key Material`` run (fix-key set does not contain the
+    full scheduled whitelist) still writes them.
+    """
+    selected = dict(fixes or {})
+    if "Material" not in selected:
+        return selected
+
+    fix_keys = {str(key) for key in (getattr(args, "fix_keys", None) or []) if str(key).strip()}
+    scheduled_bundle = bool(fix_keys) and SCHEDULED_SOURCE_ASPECT_AUTOFIX_FIX_KEYS.issubset(fix_keys)
+    if not scheduled_bundle:
+        return selected
+
+    partial = any(
+        isinstance(issue, dict)
+        and str(issue.get("field") or "") == "Material"
+        and issue.get("legacy_partial_match")
+        for issue in (issues or [])
+    )
+    if not partial:
+        return selected
+
+    selected.pop("Material", None)
+    # If Material was the only source-parameter write, drop the rebuild hook too
+    # so the scheduled job does not churn description for a report-only row.
+    other_source_fields = {
+        key for key in selected if key in {"Color", "Type", "Material"}
+    }
+    if not other_source_fields and "__source_parameter_rebuild__" in selected:
+        selected.pop("__source_parameter_rebuild__", None)
+    return selected
 
 
 def filter_fixes_by_severity(
@@ -5389,6 +5505,11 @@ def main(argv=None):
             selected_fixes,
             issues,
             set(args.severity_levels or []),
+        )
+        selected_fixes = gate_scheduled_material_partial_fixes(
+            selected_fixes,
+            issues,
+            args,
         )
         fix_succeeded = False
         post_fix_issues = None
