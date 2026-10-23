@@ -128,6 +128,15 @@ _KIND_FAMILY = {
 
 
 @dataclass(frozen=True)
+class CategorySuggestion:
+    category_id: str
+    path: str
+    confidence: str
+    source: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class CategoryDecision:
     category_id: str | None
     kind: str
@@ -358,6 +367,137 @@ _SUGGESTED_ALTERNATIVES = {
     "261263": "22656",
 }
 
+# Head-noun → (leaf, family, default confidence). Tree 0 only.
+_HEAD_NOUN_SUGGESTED_LEAF: dict[str, tuple[str, str, str]] = {
+    "office chair": ("54235", "chair", "med"),
+    "gaming chair": ("54235", "chair", "med"),
+    "dining chair": ("54235", "chair", "high"),
+    "accent chair": ("38208", "seating", "high"),
+    "loveseat": ("38208", "seating", "high"),
+    "sofa": ("38208", "seating", "high"),
+    "couch": ("38208", "seating", "high"),
+    "sideboard": ("183322", "sideboard", "high"),
+    "buffet": ("183322", "sideboard", "high"),
+    "bar stool": ("103431", "stool", "med"),
+    "vanity table": ("32878", "vanity", "high"),
+    "makeup vanity": ("32878", "vanity", "high"),
+    "kitchen cart": ("115753", "kitchen_cart", "high"),
+    "kitchen island": ("260157", "kitchen_island", "high"),
+    "kitchen island cart": ("260157", "kitchen_island", "high"),
+    "medicine cabinet": ("176991", "medicine", "high"),
+    "trimming tool": ("71277", "trimmer", "med"),
+    "string trimmer": ("71277", "trimmer", "med"),
+    "fogger": ("181037", "fogger", "med"),
+    "drill press": ("71296", "drill_press", "high"),
+    "fruit press": ("260139", "brewing", "med"),
+    "wine press": ("260139", "brewing", "med"),
+    "fruit and wine press": ("260139", "brewing", "med"),
+    "fruit and wine": ("260139", "brewing", "med"),
+    "grill cart": ("260931", "grill_cart", "med"),
+    "grill table": ("112590", "outdoor_table", "med"),
+    "fireplace screen": ("38221", "fireplace", "high"),
+    "filing cabinet": ("3299", "filing", "med"),
+    "dome climber": ("16515", "playground", "med"),
+    "jungle gym": ("16515", "playground", "med"),
+    "console table": ("38204", "table", "high"),
+    "side table": ("38204", "table", "high"),
+    "end table": ("38204", "table", "high"),
+    "dining set": ("107578", "dining_set", "high"),
+    "nook dining set": ("107578", "dining_set", "high"),
+    "table set": ("107578", "dining_set", "high"),
+    "dining table set": ("107578", "dining_set", "high"),
+    "bar table set": ("107578", "dining_set", "med"),
+    "wardrobe": ("103430", "wardrobe", "high"),
+    "hall tree": ("22656", "hall_tree", "high"),
+    "coat rack": ("22656", "hall_tree", "high"),
+    "coat stand": ("22656", "hall_tree", "high"),
+    "chaise lounge": ("79684", "lounger", "high"),
+    "chaise": ("79684", "lounger", "high"),
+    "lounger": ("79684", "lounger", "high"),
+    "sun lounger": ("79684", "lounger", "high"),
+    "armchair": ("38208", "seating", "high"),
+    "club armchair": ("38208", "seating", "high"),
+    "patio chair": ("79682", "outdoor_chair", "high"),
+    "outdoor chair": ("79682", "outdoor_chair", "high"),
+    "display cabinet": ("20487", "display", "high"),
+    "glass display cabinet": ("20487", "display", "high"),
+    "curio cabinet": ("20487", "display", "high"),
+    "bench": ("262980", "bench", "high"),
+    "dresser": ("114397", "dresser", "high"),
+    "dining table": ("38204", "table", "high"),
+    "bar table": ("38204", "table", "med"),
+}
+
+_SUGGESTION_LEAF_FAMILY: dict[str, str] = {
+    "54235": "chair",
+    "38208": "seating",
+    "183322": "sideboard",
+    "63557": "sideboard",
+    "103431": "stool",
+    "32878": "vanity",
+    "115753": "kitchen_cart",
+    "260157": "kitchen_island",
+    "176991": "medicine",
+    "42425": "medicine",
+    "42428": "medicine",
+    "71277": "trimmer",
+    "181037": "fogger",
+    "71296": "drill_press",
+    "260139": "brewing",
+    "260931": "grill_cart",
+    "20725": "grill_cart",
+    "112590": "outdoor_table",
+    "38221": "fireplace",
+    "3299": "filing",
+    "16515": "playground",
+    "38204": "table",
+    "38200": "table",
+    "175761": "table",
+    "107578": "dining_set",
+    "103430": "wardrobe",
+    "22656": "hall_tree",
+    "261263": "hall_tree",
+    "32880": "hall_tree",
+    "79682": "outdoor_chair",
+    "79684": "lounger",
+    "20487": "display",
+    "20493": "display",
+    "38217": "display",
+    "114397": "dresser",
+    "20466": "dresser",
+    "262980": "bench",
+    "88057": "desk",
+    "20744": "dog_beds",
+}
+
+_TOOL_APPLIANCE_TOY_FAMILIES = frozenset(
+    {
+        "trimmer",
+        "fogger",
+        "drill_press",
+        "brewing",
+        "playground",
+        "garlic_press",
+    }
+)
+_FURNITURE_LEAVES_FORBIDDEN_FOR_TOOLS = frozenset(
+    {"38208", "88057", "20487", "38204", "54235", "107578", "262980"}
+)
+_GENERIC_MED_HEADS = frozenset({"chair", "cabinet", "tool system"})
+_ACCESSORY_SUGGESTION_HEADS = frozenset(
+    {
+        "cushion",
+        "cover",
+        "pad",
+        "slipcover",
+        "chair mat",
+        "office chair mat",
+        "table top",
+        "tabletop",
+        "garlic press",
+    }
+)
+
 
 def _category_index(index=None):
     from src.utils.category_tree_cache import load_category_index
@@ -553,24 +693,272 @@ def _category_path(cid: str, index=None) -> str:
     return str(build_category_path(str(cid or "").strip(), index=index) or "")
 
 
-def suggested_alternative_for(cid: str | None, kind: str = "", title: str = "") -> str | None:
+def _default_suggestion_tree_id() -> str:
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        return str(get_store_profile().category_tree_id or "0")
+    except Exception:
+        return "0"
+
+
+def _suggestion_family_of(cid: str | None, head: str | None = None) -> str:
     stored = as_safe_category_id(cid)
-    remapped = _legacy_remap_target(stored)
-    if remapped:
-        return remapped
-    if stored in _SUGGESTED_ALTERNATIVES:
-        return _SUGGESTED_ALTERNATIVES[stored]
-    if kind in {"side_table"} or first_product_noun(title) in _SIDE_END_HEADS:
-        return "38204"
-    if kind in {"display_cabinet"}:
-        return DISPLAY_CABINET_LEAF
-    if kind in {"kitchen_island"} or "kitchen island" in as_safe_text(title).lower():
-        return KITCHEN_ISLAND_LEAF
-    if kind in {"outdoor_table"} or _looks_like_grill_table_title(title):
-        return OUTDOOR_TABLE
-    if kind in {"hall_tree"}:
-        return HALL_TREE
-    return None
+    if stored and stored in _SUGGESTION_LEAF_FAMILY:
+        return _SUGGESTION_LEAF_FAMILY[stored]
+    if head and head in _HEAD_NOUN_SUGGESTED_LEAF:
+        return _HEAD_NOUN_SUGGESTED_LEAF[head][1]
+    return ""
+
+
+def _leaf_is_in_store_tree(cid: str, tree_id: str, index=None) -> bool:
+    target = as_safe_category_id(cid)
+    if not target:
+        return False
+    path = _category_path(target, index=index)
+    if not path:
+        return False
+    is_motors = path.startswith("eBay Motors")
+    if str(tree_id) == "100":
+        return is_motors
+    return not is_motors
+
+
+def _suggestion_hits_high_fee(cid: str, index=None) -> bool:
+    from src.utils.publish_fee_preview import category_is_high_fee
+
+    target = as_safe_category_id(cid)
+    flat = _category_index(index)
+    seen: set[str] = set()
+    current = target
+    while current and current not in seen:
+        seen.add(current)
+        path = _category_path(current, index=flat)
+        name = ""
+        if current in flat:
+            name = str(flat[current][0] or "")
+        if category_is_high_fee(category_id=current, category_path=path, category_name=name):
+            return True
+        _name, parent = flat.get(current, ("", ""))
+        current = str(parent or "")
+    return False
+
+
+def _suggestion_is_valid(cid: str | None, title: str, *, tree_id: str, index=None) -> bool:
+    target = as_safe_category_id(cid)
+    if not target:
+        return False
+    ok, _reason = validate_target_category(target, "", title, index=index)
+    if not ok:
+        return False
+    if not _leaf_is_in_store_tree(target, tree_id, index=index):
+        return False
+    if _suggestion_hits_high_fee(target, index=index):
+        return False
+    return True
+
+
+def _path_shares_family(cid: str, family: str, index=None) -> bool:
+    if not family:
+        return False
+    if _suggestion_family_of(cid) == family:
+        return True
+    path = _category_path(cid, index=index).lower()
+    name = ""
+    flat = _category_index(index)
+    if cid in flat:
+        name = str(flat[cid][0] or "").lower()
+    tokens = {
+        "chair": ("chair", "stool"),
+        "seating": ("sofa", "armchair", "couch", "loveseat"),
+        "sideboard": ("sideboard", "buffet"),
+        "stool": ("stool",),
+        "vanity": ("vanity", "makeup"),
+        "kitchen_cart": ("kitchen cart",),
+        "kitchen_island": ("kitchen island",),
+        "medicine": ("bathroom cabinet", "medicine"),
+        "trimmer": ("trimmer",),
+        "fogger": ("fogger",),
+        "drill_press": ("drill press",),
+        "brewing": ("brewing", "wine making", "equipment"),
+        "grill_cart": ("barbecue", "grill"),
+        "outdoor_table": ("patio", "garden table"),
+        "fireplace": ("fireplace",),
+        "filing": ("filing",),
+        "playground": ("swing", "slide", "gym", "playground"),
+        "table": ("table",),
+        "dining_set": ("dining set",),
+        "wardrobe": ("wardrobe", "armoire"),
+        "hall_tree": ("coat", "hat rack", "hall tree"),
+        "outdoor_chair": ("patio chair",),
+        "lounger": ("lounger", "chaise"),
+        "display": ("cabinet", "cupboard"),
+        "dresser": ("dresser",),
+        "bench": ("bench",),
+    }
+    needles = tokens.get(family, (family.replace("_", " "),))
+    blob = f"{path} {name}"
+    return any(needle in blob for needle in needles)
+
+
+def _stored_id_candidates(stored: str) -> list[str]:
+    out: list[str] = []
+    remapped = as_safe_category_id(_legacy_remap_target(stored))
+    if remapped and remapped != stored:
+        out.append(remapped)
+    mapped = as_safe_category_id(_SUGGESTED_ALTERNATIVES.get(stored, ""))
+    if mapped and mapped not in out:
+        out.append(mapped)
+    return out
+
+
+def _matcher_hold_candidate(title: str, stored: str) -> str:
+    hay = as_safe_text(title)
+    if not hay:
+        return ""
+    try:
+        matcher = _offline_matcher()
+        cid, _name = matcher.canonicalize_category(hay, stored or "", None, "")
+        cid = as_safe_category_id(cid)
+        if cid and cid != stored:
+            return cid
+        fallback = matcher._fallback_category(hay)
+        if fallback:
+            return as_safe_category_id(fallback[0] if isinstance(fallback, (tuple, list)) else fallback)
+    except Exception as exc:
+        logger.warning("hold matcher fallback failed closed: %s", exc)
+    return ""
+
+
+def _apply_outdoor_head_override(head: str, title: str, leaf: str, family: str) -> tuple[str, str]:
+    hay = as_safe_text(title)
+    outdoor = title_has_clear_outdoor_word(hay) and not title_has_mixed_indoor_outdoor(hay)
+    if _is_lounger_head(head, hay) or head in _LOUNGER_HEADS:
+        return OUTDOOR_CHAISE, "lounger"
+    if outdoor and (_is_patio_chair_head(head, hay) or head in _PATIO_CHAIR_HEADS):
+        return OUTDOOR_CHAIR, "outdoor_chair"
+    return leaf, family
+
+
+def suggest_category_for_hold(
+    title: str,
+    stored_id: str | None,
+    *,
+    tree_id: str | None = None,
+    index=None,
+) -> CategorySuggestion | None:
+    """Head-noun-first hold suggestion. Never writes a category."""
+    hay = as_safe_text(title)
+    stored = as_safe_category_id(stored_id)
+    runtime_tree = str(tree_id or _default_suggestion_tree_id() or "0")
+    flat = _category_index(index)
+
+    if re.search(r"\bhuman\s+dog\s+beds?\b", hay, re.IGNORECASE):
+        chosen = INDOOR_SEATING
+        if _suggestion_is_valid(chosen, hay, tree_id=runtime_tree, index=flat):
+            return CategorySuggestion(
+                chosen,
+                _category_path(chosen, index=flat),
+                "low",
+                "head_noun",
+                "ambiguous_human_dog_bed",
+            )
+        return None
+    if re.search(r"\bonly\s+table\s+tops?\b", hay, re.IGNORECASE):
+        chosen = INDOOR_TABLE
+        if _suggestion_is_valid(chosen, hay, tree_id=runtime_tree, index=flat):
+            return CategorySuggestion(
+                chosen,
+                _category_path(chosen, index=flat),
+                "low",
+                "head_noun",
+                "ambiguous_table_top",
+            )
+        return None
+
+    head = first_product_noun(hay)
+    deny = unknown_head_noun(head)
+    raw_head = deny or head
+    if deny and deny in _ACCESSORY_SUGGESTION_HEADS:
+        return None
+    if head in _ACCESSORY_SUGGESTION_HEADS:
+        return None
+    if not raw_head or (head and str(head).startswith(UNKNOWN_HEAD_PREFIX) and deny not in _HEAD_NOUN_SUGGESTED_LEAF):
+        return None
+
+    table_row = _HEAD_NOUN_SUGGESTED_LEAF.get(str(raw_head or ""))
+    family = table_row[1] if table_row else ""
+    table_leaf = table_row[0] if table_row else ""
+    confidence = table_row[2] if table_row else "med"
+    source = "head_noun"
+    reason = f"head_noun:{raw_head}"
+
+    if table_leaf:
+        table_leaf, family = _apply_outdoor_head_override(str(raw_head), hay, table_leaf, family)
+        if table_leaf == KITCHEN_ISLAND_LEAF and re.search(
+            r"\b(?:extendable|dining\s+table)\b", hay, re.IGNORECASE
+        ):
+            confidence = "med"
+        if str(raw_head) in _GENERIC_MED_HEADS:
+            confidence = "med"
+        chosen = table_leaf
+        agreeing = [
+            cand
+            for cand in _stored_id_candidates(stored)
+            if _suggestion_family_of(cand) == family
+        ]
+        if agreeing and agreeing[0] == table_leaf:
+            chosen = agreeing[0]
+            source = "stored_id_map"
+            reason = f"stored_id_agrees:{raw_head}"
+            if confidence != "med":
+                confidence = "high"
+        else:
+            chosen = table_leaf
+            source = "head_noun"
+    else:
+        matcher_cid = _matcher_hold_candidate(hay, stored)
+        if (
+            matcher_cid
+            and family
+            and _path_shares_family(matcher_cid, family, index=flat)
+            and matcher_cid not in _FURNITURE_LEAVES_FORBIDDEN_FOR_TOOLS
+        ):
+            chosen = matcher_cid
+            source = "matcher"
+            reason = f"matcher:{raw_head}"
+            confidence = "med"
+        else:
+            return None
+
+    if family in _TOOL_APPLIANCE_TOY_FAMILIES and chosen in _FURNITURE_LEAVES_FORBIDDEN_FOR_TOOLS:
+        return None
+    if not _suggestion_is_valid(chosen, hay, tree_id=runtime_tree, index=flat):
+        return None
+    return CategorySuggestion(
+        chosen,
+        _category_path(chosen, index=flat),
+        confidence,
+        source,
+        reason,
+    )
+
+
+def suggested_alternative_for(
+    cid: str | None,
+    kind: str = "",
+    title: str = "",
+    *,
+    tree_id: str | None = None,
+    index=None,
+) -> str | None:
+    suggestion = suggest_category_for_hold(
+        title,
+        cid,
+        tree_id=tree_id,
+        index=index,
+    )
+    return suggestion.category_id if suggestion else None
 
 
 def _title_has_cat_token(title: str) -> bool:

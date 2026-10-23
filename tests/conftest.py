@@ -15,6 +15,28 @@ def load_fixture_category_index() -> dict[str, tuple[str, str]]:
     return {str(cid): (str(name), str(parent)) for cid, (name, parent) in raw.items()}
 
 
+def _repo_root_db_paths() -> tuple[Path, Path]:
+    root = Path(__file__).resolve().parents[1]
+    return root / "ebay_collection.db", root / "ebay_tokens.db"
+
+
+def _remove_empty_repo_root_dbs() -> None:
+    for path in _repo_root_db_paths():
+        try:
+            if path.is_file() and path.stat().st_size == 0:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def pytest_sessionstart(session):
+    _remove_empty_repo_root_dbs()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    _remove_empty_repo_root_dbs()
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
@@ -43,6 +65,40 @@ def _offline_category_tree(monkeypatch, request):
         return dict(index)
 
     monkeypatch.setattr(category_tree_cache, "load_category_index", _load)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_test_databases(tmp_path, monkeypatch):
+    """Keep tests from creating repo-root ebay_collection.db / ebay_tokens.db."""
+    collection = tmp_path / "ebay_collection.db"
+    tokens = tmp_path / "ebay_tokens.db"
+    monkeypatch.setenv("DAJIAN_COLLECTION_DB", str(collection))
+    import src.services.ebay_auth as ebay_auth
+
+    monkeypatch.setattr(ebay_auth, "_TOKEN_DB_PATH", str(tokens))
+    import src.services.ebay_category_validator as validator_mod
+
+    monkeypatch.setattr(validator_mod, "default_cache_db_path", lambda: str(collection))
+    try:
+        import src.db.collection_db as cdb
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        url = f"sqlite:///{collection}"
+        engine = create_engine(url, connect_args={"check_same_thread": False})
+        monkeypatch.setattr(cdb, "DATABASE_PATH", str(collection))
+        monkeypatch.setattr(cdb, "DATABASE_URL", url)
+        monkeypatch.setattr(cdb, "engine", engine)
+        monkeypatch.setattr(cdb, "SessionLocal", sessionmaker(bind=engine))
+    except Exception:
+        pass
+    try:
+        import src.services.ebay_policy_manager as epm
+
+        monkeypatch.setattr(epm, "_POLICY_DB_PATH", str(collection))
+    except Exception:
+        pass
     yield
 
 

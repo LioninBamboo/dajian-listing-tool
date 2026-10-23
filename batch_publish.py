@@ -248,10 +248,7 @@ def is_tree_unavailable_hold(result):
     """True when a publish result should abort the rest of the batch."""
     if not isinstance(result, dict):
         return False
-    if result.get("action") == "hold_tree_unavailable":
-        return True
-    message = str(result.get("message") or "").lower()
-    return "tree" in message and "unavailable" in message
+    return result.get("action") == "hold_tree_unavailable"
 
 
 def record_error(sku: str, error_msg: str):
