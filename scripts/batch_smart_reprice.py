@@ -1509,7 +1509,11 @@ Changed SKU HTML: <code>{changes_html_path or ''}</code>
             str(path) for path in (report_path, changes_csv_path, changes_html_path)
             if path
         ]
-        delivered = bool(send_email(subject, body, attachments=attachments))
+        from src.utils.email_policy import should_smtp
+        delivered = bool(send_email(
+            subject, body, attachments=attachments,
+            send_smtp=should_smtp(has_issues=bool(n_changes or n_errors)),
+        ))
         if delivered:
             if claimed:
                 mark_reprice_email_delivery(delivered=True)

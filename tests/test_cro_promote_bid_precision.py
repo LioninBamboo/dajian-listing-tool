@@ -6,6 +6,9 @@ listing 已结束 (35037) 之前被记为 failed, 每天无意义重试.
 """
 from __future__ import annotations
 
+# SYNTHETIC — clears ad-floor gate so precision / terminal paths can run.
+_SAFE_ECO = {'price': 199.99, 'cost': 50.0}
+
 
 def test_bid_quantized_to_one_decimal_below_cap(monkeypatch):
     from scripts import cro_promote as cp
@@ -17,12 +20,15 @@ def test_bid_quantized_to_one_decimal_below_cap(monkeypatch):
 
     class FakeAd:
         def find_ad_for_listing(self, lid):
-            return {'campaign_id': 'C1', 'ad_id': 'A1', 'bid_percentage': 10.0}
+            # Within MAX_BID_STEP of dyn_cap so one raise reaches the quantized cap.
+            return {'campaign_id': 'C1', 'ad_id': 'A1', 'bid_percentage': 12.0}
         def update_ad_bid(self, cid, lid, new_bid):
             captured['new_bid'] = new_bid
             return {'success': True}
 
-    rep = cp._promote_one(ad_service=FakeAd(), sku='S1', suggested_bid_pct=5.0)
+    rep = cp._promote_one(
+        ad_service=FakeAd(), sku='S1', suggested_bid_pct=5.0, economics=_SAFE_ECO,
+    )
     assert rep['status'] == 'done'
     nb = captured['new_bid']
     assert nb == round(nb, 1)          # 最多 1 位小数
@@ -45,7 +51,9 @@ def test_bid_cap_705_quantizes_to_70(monkeypatch):
             captured['new_bid'] = new_bid
             return {'success': True}
 
-    rep = cp._promote_one(ad_service=FakeAd(), sku='S1', suggested_bid_pct=5.0)
+    rep = cp._promote_one(
+        ad_service=FakeAd(), sku='S1', suggested_bid_pct=5.0, economics=_SAFE_ECO,
+    )
     assert rep['status'] == 'done'
     assert captured['new_bid'] == 7.0  # 7.05 → 7.0, 不是 7.1
 
@@ -64,7 +72,9 @@ def test_update_ended_listing_is_terminal_skip(monkeypatch):
                     'error': 'HTTP 400: {"errors":[{"errorId":35037,'
                              '"message":"The listing ... has ended."}]}'}
 
-    rep = cp._promote_one(ad_service=FakeAd(), sku='S1', suggested_bid_pct=5.0)
+    rep = cp._promote_one(
+        ad_service=FakeAd(), sku='S1', suggested_bid_pct=5.0, economics=_SAFE_ECO,
+    )
     assert rep['status'] == 'skipped'
     assert rep['terminal'] is True
     assert 'ended' in rep['reason']
@@ -85,7 +95,9 @@ def test_create_ended_listing_is_terminal_skip(monkeypatch):
                     'error': '35037: The listing associated with listing Id '
                              '366417646376 has ended.'}
 
-    rep = cp._promote_one(ad_service=FakeAd(), sku='S1',
-                          suggested_bid_pct=5.0, create_if_missing=True)
+    rep = cp._promote_one(
+        ad_service=FakeAd(), sku='S1', suggested_bid_pct=5.0,
+        create_if_missing=True, economics=_SAFE_ECO,
+    )
     assert rep['status'] == 'skipped'
     assert rep['terminal'] is True

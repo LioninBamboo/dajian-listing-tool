@@ -4,6 +4,9 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+# SYNTHETIC economics that clear the ad-floor gate at typical bid rates.
+_SAFE_ECO = {'price': 199.99, 'cost': 50.0}
+
 
 def test_promote_skips_when_no_listing_id(monkeypatch):
     from scripts import cro_promote as cp
@@ -52,10 +55,13 @@ def test_promote_creates_missing_ad_safely(monkeypatch):
         sku='S1',
         suggested_bid_pct=5.0,
         create_if_missing=True,
+        economics=_SAFE_ECO,
     )
     assert rep['status'] == 'done'
     assert rep['created_ad'] is True
-    assert captured['args'] == ('C1', '12345', 'S1', 5.0)
+    # Spec D1: new-ad initial bid = min(suggested, MAX_BID_STEP)
+    assert captured['args'] == ('C1', '12345', 'S1', cp.MAX_BID_STEP)
+    assert rep['new_bid'] == cp.MAX_BID_STEP
 
 
 def test_promote_increases_bid(monkeypatch):
@@ -75,11 +81,12 @@ def test_promote_increases_bid(monkeypatch):
             return {'success': True}
 
     rep = cp._promote_one(ad_service=FakeAd(), sku='S1',
-                          suggested_bid_pct=4.0)
+                          suggested_bid_pct=4.0, economics=_SAFE_ECO)
     assert rep['status'] == 'done'
     assert rep['cur_bid'] == 5.0
-    assert rep['new_bid'] == 9.0
-    assert captured['args'] == ('C1', '99', 9.0)
+    # Spec D1 / N8: raise capped by MAX_BID_STEP (2.0), not full increment 4.0
+    assert rep['new_bid'] == 7.0
+    assert captured['args'] == ('C1', '99', 7.0)
 
 
 def test_promote_caps_at_max(monkeypatch):
@@ -92,21 +99,24 @@ def test_promote_caps_at_max(monkeypatch):
     class FakeAd:
         def find_ad_for_listing(self, lid):
             return {'campaign_id': 'C1', 'ad_id': 'A1',
-                    'bid_percentage': 22.0}
+                    'bid_percentage': 23.5}
         def update_ad_bid(self, cid, lid, new_bid):
             return {'success': True}
 
     rep = cp._promote_one(ad_service=FakeAd(), sku='S1',
-                          suggested_bid_pct=10.0)
+                          suggested_bid_pct=10.0, economics=_SAFE_ECO)
     assert rep['status'] == 'done'
-    assert rep['new_bid'] == 25.0  # capped
+    # step cap 2.0 → 23.5+2.0=25.0, then hard MAX_BID_PCT
+    assert rep['new_bid'] == 25.0
 
 
 def test_run_dry_run_does_not_call_ad_service(monkeypatch):
     from scripts import cro_promote as cp
     monkeypatch.setattr(cp, 'load_pending', lambda action_type:
-                        [{'sku': 'S1', 'detail': {'suggested_bid_pct': 5.0}},
-                         {'sku': 'S2', 'detail': {}}])
+                        [{'sku': 'S1', 'detail': {'suggested_bid_pct': 5.0},
+                          'economics': _SAFE_ECO},
+                         {'sku': 'S2', 'detail': {},
+                          'economics': _SAFE_ECO}])
     rep = cp.run(apply_changes=False, limit=10)
     assert rep['pending_total'] == 2
     assert all(r['status'] == 'dry_run' for r in rep['rows'])

@@ -2077,10 +2077,14 @@ def run_health_check(auto_fix=False, send_email=False):
             </body></html>
             """
 
+            from src.utils.email_policy import should_smtp
+            do_smtp = should_smtp(has_issues=bool(s.get('problems')))
             send_mail(
                 subject=subject,
                 html_body=full_html,
+                send_smtp=do_smtp,
             )
+            log.info("health report archived" + (" + SMTP" if do_smtp else " (clean; SMTP silenced)"))
             log.info("📧 健康报告邮件已发送")
         except Exception as e:
             log.warning(f"发送邮件失败: {e}")

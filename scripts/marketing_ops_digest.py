@@ -179,7 +179,9 @@ def main():
         return
     from src.utils.email_sender import send_email
     subject = f"📣 {brand} 营销任务日报 - {n_ok} 成功" + (f" / {n_fail} 失败" if n_fail else "")
-    send_email(subject, html)
+    from src.utils.email_policy import should_smtp
+    # 2026-10: per-store marketing digest folded into daily_ops_digest
+    send_email(subject, html, send_smtp=should_smtp(has_issues=False))
     print(f"digest sent: {n_ok} ok, {n_fail} fail")
 
 
