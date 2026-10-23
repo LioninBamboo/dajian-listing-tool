@@ -221,6 +221,8 @@ def check_and_restart():
             f"message={stale['message']})"
         )
         stop_pid(stale_pid, f"stale heartbeat > {STALE_HEARTBEAT_MINUTES}m")
+        if old_pid and old_pid != stale_pid:
+            stop_pid(old_pid, "pidfile process while heartbeat stale")
         daemon_alive = False
 
     # Fallback: PID file may be missing, but the daemon recorded in health is still alive.

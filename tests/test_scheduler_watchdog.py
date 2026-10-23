@@ -463,6 +463,49 @@ def test_watchdog_restarts_stale_daemon_without_restoring_old_health_pid(tmp_pat
     assert launched == [[scheduler_watchdog.PYTHONW, scheduler_watchdog.DAEMON_SCRIPT]]
 
 
+def test_watchdog_stops_differing_old_pidfile_pid_on_stale_heartbeat(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    pid_path = tmp_path / '_scheduler.pid'
+    stale_pid = 35108
+    old_pid = 42424
+    health_path.write_text(
+        json.dumps({
+            'daemon_pid': stale_pid,
+            'daemon_alive_at': '2026-05-11T22:30:00',
+            'tasks': {
+                '_daemon': {
+                    'status': 'running',
+                    'message': 'Heartbeat OK | Next: 2026-05-11 22:44:30',
+                },
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    pid_path.write_text(str(old_pid), encoding='utf-8')
+
+    stopped = []
+
+    monkeypatch.setattr(scheduler_watchdog, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_watchdog, 'PID_FILE', pid_path)
+    monkeypatch.setattr(scheduler_watchdog, 'datetime', FixedTuesdayNoonDateTime)
+    monkeypatch.setattr(scheduler_watchdog, 'log', lambda msg: None)
+    monkeypatch.setattr(scheduler_watchdog, 'is_pid_alive', lambda pid: pid == old_pid)
+    monkeypatch.setattr(scheduler_watchdog, 'stop_pid', lambda pid, reason: stopped.append((pid, reason)))
+    # Avoid Windows-only creationflags blowing up on Linux after stop_pid assertions.
+    monkeypatch.setattr(
+        scheduler_watchdog.subprocess,
+        'Popen',
+        lambda *args, **kwargs: type('P', (), {'pid': 99999})(),
+    )
+
+    scheduler_watchdog.check_and_restart()
+
+    assert stopped == [
+        (stale_pid, 'stale heartbeat > 15m'),
+        (old_pid, 'pidfile process while heartbeat stale'),
+    ]
+
+
 def test_watchdog_tick_skips_all_recovery_during_maintenance(tmp_path, monkeypatch):
     maintenance_file = tmp_path / '_maintenance.lock'
     maintenance_file.write_text('database recovery in progress', encoding='utf-8')

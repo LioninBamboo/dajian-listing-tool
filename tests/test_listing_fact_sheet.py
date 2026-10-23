@@ -357,6 +357,12 @@ def test_pp_supports_polypropylene_material():
     assert compare_fact_sheets(source, live) == []
 
 
+def test_pc_supports_polycarbonate_material():
+    source = dict(SOURCE_SHEET, materials=["steel", "pc"])
+    live = dict(SOURCE_SHEET, materials=["polycarbonate", "steel"])
+    assert compare_fact_sheets(source, live) == []
+
+
 def test_microsuede_supports_microfiber_material():
     source = dict(SOURCE_SHEET, materials=["artificial rabbit velvet fabric", "microsuede", "velvet"])
     live = dict(SOURCE_SHEET, materials=["microfiber"])
