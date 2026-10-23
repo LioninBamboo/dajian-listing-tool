@@ -455,7 +455,13 @@ def test_batch_publish_path_gates_named_skus():
         result = _emulate_publish(row)
         stored = str(row.get("stored_category") or "") or None
         got = result.get("category_id")
-        if sku in {"N707S300277B", "N707S186617W", "W3190S00002"}:
+        if sku in {
+            "N707S300277B",
+            "N707S186617W",
+            "W3190S00002",
+            "T3971P401872",
+            "W1580S00491",
+        }:
             assert result.get("held") is True
             assert got is None
             continue
@@ -537,7 +543,11 @@ def test_m1_tree_unavailable_is_run_level_only(monkeypatch, caplog):
     warnings = [rec.message for rec in caplog.records if "tree cache" in rec.message.lower()]
     assert len(warnings) == 1
     gated, action = cd.apply_category_write_gate("79682", "54235", "Patio Chair", listing_status="READY", index={})
-    assert (gated, action) == ("79682", "keep")
+    assert (gated, action) == (None, "hold_tree_unavailable")
+    pub_gated, pub_action = cd.apply_category_write_gate(
+        "79682", "54235", "Patio Chair", listing_status="PUBLISHED", index={}
+    )
+    assert (pub_gated, pub_action) == ("79682", "keep")
 
 
 def test_m2_correct_stored_leaves_are_kept():

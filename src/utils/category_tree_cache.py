@@ -1,15 +1,19 @@
 """On-disk eBay category-tree cache for publish path resolution.
 
-Publish and dry-run never call get_category_subtree / get_category_tree.
-A separate refresh helper writes ``data/cache/category_tree_<id>.json``.
-This module loads those snapshots once per process into an
-``id -> (name, parent_id)`` map and walks parents in memory.
+Publish and dry-run read ``data/cache/category_tree_<id>.json``. When that
+snapshot is missing or stale they refresh it in-process via read-only
+``getCategoryTree`` (tree 0 for Main/GP; trees 100 and 0 for AquaRides
+Motors) using the store app-token path, then write the snapshot back
+atomically. Refresh failure uses a last-good snapshot (<=30 days) or
+fail-closes. No scheduled task is required.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -18,6 +22,8 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CACHE_DIR = REPO_ROOT / "data" / "cache"
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+LAST_GOOD_SNAPSHOT_SECONDS = 30 * 24 * 60 * 60
+RUNTIME_REFRESH_RETRY_SECONDS = 30 * 60
 DEFAULT_TREE_IDS = ("0", "100")
 PATH_SEPARATOR = " > "
 PRODUCTION_API_BASE = "https://api.ebay.com"
@@ -28,7 +34,22 @@ logger = logging.getLogger(__name__)
 # Process-level flatten. None means "not loaded yet".
 _INDEX: Optional[dict[str, tuple[str, str]]] = None
 _INDEX_DIR: Optional[Path] = None
+_INDEX_EXPIRES_AT: Optional[float] = None
 _CACHE_WARNED: set[str] = set()
+_RUNTIME_REFRESH_ATTEMPTED: dict[str, float] = {}
+_UNAVAILABLE_TREES: set[str] = set()
+_REFRESH_FAIL_WARNED = False
+_clock: Callable[[], float] = time.time
+
+
+def _now() -> float:
+    return float(_clock())
+
+
+def set_category_tree_clock(clock: Optional[Callable[[], float]] = None) -> None:
+    """Tests inject a fake clock so the 30-minute retry can be advanced."""
+    global _clock
+    _clock = clock or time.time
 
 
 def normalize_api_base(api_base: str) -> str:
@@ -64,11 +85,24 @@ def category_tree_cache_path(tree_id: str, cache_dir: Optional[Path] = None) -> 
     return directory / f"category_tree_{tree_id}.json"
 
 
-def reset_category_tree_cache() -> None:
-    global _INDEX, _INDEX_DIR
+def _invalidate_index_cache() -> None:
+    global _INDEX, _INDEX_DIR, _INDEX_EXPIRES_AT
     _INDEX = None
     _INDEX_DIR = None
+    _INDEX_EXPIRES_AT = None
+
+
+def reset_category_tree_cache() -> None:
+    global _REFRESH_FAIL_WARNED
+    _invalidate_index_cache()
     _CACHE_WARNED.clear()
+    _RUNTIME_REFRESH_ATTEMPTED.clear()
+    _UNAVAILABLE_TREES.clear()
+    _REFRESH_FAIL_WARNED = False
+
+
+def unavailable_runtime_trees() -> frozenset[str]:
+    return frozenset(_UNAVAILABLE_TREES)
 
 
 def flatten_category_tree(payload: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
@@ -117,12 +151,135 @@ def _warn_cache_unavailable(tree_id: str, path: Path, reason: str) -> None:
     )
 
 
+def store_runtime_tree_ids() -> tuple[str, ...]:
+    """Every store refreshes both EBAY_US (0) and Motors (100)."""
+    return ("0", "100")
+
+
+def _warn_refresh_failed_once() -> None:
+    """One run-level warning after a failed runtime refresh."""
+    global _REFRESH_FAIL_WARNED
+    if _REFRESH_FAIL_WARNED:
+        return
+    _REFRESH_FAIL_WARNED = True
+    logger.warning(
+        "Category tree cache missing or stale and runtime refresh failed; "
+        "skipping per-row plausibility flags; category writes fail closed"
+    )
+    try:
+        from src.utils.category_decision import warn_once_tree_unavailable
+
+        warn_once_tree_unavailable()
+    except Exception:
+        pass
+
+
+def _snapshot_age_seconds(path: Path, now: Optional[float] = None) -> Optional[float]:
+    if not path.is_file():
+        return None
+    age = (now if now is not None else time.time()) - path.stat().st_mtime
+    if age < 0:
+        return None
+    return age
+
+
+def _cache_is_last_good(path: Path, now: Optional[float] = None) -> bool:
+    age = _snapshot_age_seconds(path, now)
+    return age is not None and age <= LAST_GOOD_SNAPSHOT_SECONDS
+
+
+def _refresh_failure_reason(exc: BaseException) -> str:
+    text = str(exc or "")
+    if "missing EBAY_APP_ID" in text or "CERT_ID" in text:
+        return "missing EBAY_APP_ID/CERT_ID"
+    http = re.search(r"HTTP\s+(\d+)", text)
+    if http:
+        return f"{type(exc).__name__} HTTP {http.group(1)}"
+    return type(exc).__name__
+
+
+def _log_refresh_failure(tree_id: str, exc: BaseException) -> None:
+    logger.warning(
+        "Runtime category-tree refresh failed for tree %s: %s",
+        tree_id,
+        _refresh_failure_reason(exc),
+    )
+
+
+def _warn_last_good(tree_id: str, path: Path, now: Optional[float] = None) -> None:
+    age = _snapshot_age_seconds(path, now) or 0.0
+    logger.warning(
+        "Category tree %s refresh failed; using last-good snapshot (%.1f days old) at %s",
+        tree_id,
+        age / 86400,
+        path,
+    )
+
+
+def _default_runtime_refresh(tree_id: str, cache_dir: Optional[Path]) -> bool:
+    """GET getCategoryTree with the store app token; write data/cache."""
+    import requests
+
+    from src.services.ebay_auth import EbayOAuthService
+
+    if not os.getenv("EBAY_APP_ID") or not os.getenv("EBAY_CERT_ID"):
+        raise RuntimeError("missing EBAY_APP_ID/CERT_ID")
+    env = os.getenv("EBAY_ENVIRONMENT", "PRODUCTION").upper()
+    oauth = EbayOAuthService(env)
+    api_base = getattr(oauth, "api_base", "") or PRODUCTION_API_BASE
+    require_production_api_base(api_base)
+    token = oauth.get_application_token()
+    payload = fetch_category_tree(
+        tree_id,
+        session=requests.Session(),
+        token=token,
+        api_base=api_base,
+    )
+    write_category_tree_cache(tree_id, payload, cache_dir, source_host=api_base)
+    return True
+
+
+_runtime_refresh_impl: Callable[[str, Optional[Path]], bool] = _default_runtime_refresh
+
+
+def try_runtime_refresh_tree(tree_id: str, cache_dir: Optional[Path] = None) -> bool:
+    """Refresh one missing/stale tree. Mock this in tests; never hit live eBay."""
+    directory = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
+    key = f"{directory}:{tree_id}"
+    now = _now()
+    last = _RUNTIME_REFRESH_ATTEMPTED.get(key)
+    if last is not None and (now - last) < RUNTIME_REFRESH_RETRY_SECONDS:
+        return False
+    _RUNTIME_REFRESH_ATTEMPTED[key] = now
+    try:
+        return bool(_runtime_refresh_impl(str(tree_id), directory))
+    except Exception as exc:
+        _log_refresh_failure(tree_id, exc)
+        return False
+
+
 def _load_one_tree(tree_id: str, cache_dir: Path) -> dict[str, tuple[str, str]]:
     path = category_tree_cache_path(tree_id, cache_dir)
+    owned = str(tree_id) in {str(tid) for tid in store_runtime_tree_ids()}
+    needs_refresh = (not path.is_file()) or (not _cache_is_fresh(path))
+    used_last_good = False
+    if needs_refresh and owned:
+        if try_runtime_refresh_tree(tree_id, cache_dir):
+            path = category_tree_cache_path(tree_id, cache_dir)
+        elif _cache_is_last_good(path):
+            _warn_last_good(tree_id, path)
+            used_last_good = True
+        else:
+            _warn_refresh_failed_once()
+            return {}
     if not path.is_file():
+        if not owned:
+            return {}
         _warn_cache_unavailable(tree_id, path, "missing")
         return {}
-    if not _cache_is_fresh(path):
+    if not _cache_is_fresh(path) and not used_last_good:
+        if not owned:
+            return {}
         _warn_cache_unavailable(tree_id, path, "stale")
         return {}
     try:
@@ -140,16 +297,34 @@ def _load_one_tree(tree_id: str, cache_dir: Path) -> dict[str, tuple[str, str]]:
 
 
 def load_category_index(cache_dir: Optional[Path] = None) -> dict[str, tuple[str, str]]:
-    """Load tree 0 and 100 once per process into id -> (name, parent_id)."""
-    global _INDEX, _INDEX_DIR
+    """Load tree 0 and 100 once per process into id -> (name, parent_id).
+
+    A failed or partial refresh is cached only until the 30-minute retry
+    window expires, so long-lived server/Streamlit processes re-attempt
+    getCategoryTree instead of holding every publish until restart.
+    """
+    global _INDEX, _INDEX_DIR, _INDEX_EXPIRES_AT
     directory = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
+    now = _now()
     if _INDEX is not None and _INDEX_DIR == directory:
-        return _INDEX
+        if _INDEX_EXPIRES_AT is None or now < _INDEX_EXPIRES_AT:
+            return _INDEX
+        _invalidate_index_cache()
     index: dict[str, tuple[str, str]] = {}
+    owned = {str(tid) for tid in store_runtime_tree_ids()}
+    unavailable: set[str] = set()
     for tree_id in DEFAULT_TREE_IDS:
-        index.update(_load_one_tree(tree_id, directory))
+        piece = _load_one_tree(tree_id, directory)
+        if str(tree_id) in owned and not piece:
+            unavailable.add(str(tree_id))
+        index.update(piece)
+    _UNAVAILABLE_TREES.clear()
+    _UNAVAILABLE_TREES.update(unavailable)
     _INDEX = index
     _INDEX_DIR = directory
+    _INDEX_EXPIRES_AT = (
+        (now + RUNTIME_REFRESH_RETRY_SECONDS) if unavailable else None
+    )
     return index
 
 
@@ -201,8 +376,19 @@ def write_category_tree_cache(
     stamped[SOURCE_HOST_FIELD] = host
     path = category_tree_cache_path(tree_id, cache_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(stamped), encoding="utf-8")
-    reset_category_tree_cache()
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(stamped), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    # Invalidate the flattened index only. A mid-load write must not clear
+    # per-tree unavailability recorded for a sibling that already failed.
+    _invalidate_index_cache()
     return path
 
 
@@ -214,7 +400,7 @@ def fetch_category_tree(
     api_base: str,
     timeout: int = 120,
 ) -> Mapping[str, Any]:
-    """GET get_category_tree only. Used by the refresh helper, never publish."""
+    """GET get_category_tree only. Used by the refresh helper and runtime refresh."""
     url = f"{str(api_base).rstrip('/')}/commerce/taxonomy/v1/category_tree/{tree_id}"
     response = session.get(
         url,

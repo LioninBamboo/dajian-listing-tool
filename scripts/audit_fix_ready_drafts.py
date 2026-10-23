@@ -577,6 +577,7 @@ def choose_ready_category(
     current_category_id,
     current_category_name,
     optimization=None,
+    listing_status="READY",
 ):
     if is_category_approved(optimization) and str(current_category_id or "").strip():
         return current_category_id, current_category_name, aspects
@@ -657,10 +658,10 @@ def choose_ready_category(
             original_id,
             chosen_id,
             title_context or source_title or draft_title,
-            listing_status="READY",
+            listing_status=listing_status or "READY",
             reason="ready_draft_candidate",
         )
-        if action in {"hold_empty", "hold_implausible"}:
+        if action in {"hold_empty", "hold_implausible", "hold_tree_unavailable"}:
             return original_id or None, original_name if original_id else None, aspects
         if gated == original_id:
             if not original_id:
@@ -983,6 +984,7 @@ def audit_and_fix_ready_drafts(
             original_opt.get("categoryId"),
             original_opt.get("categoryName"),
             original_opt,
+            listing_status=row["status"] or "READY",
         )
         if completed_aspects:
             aspects = completed_aspects

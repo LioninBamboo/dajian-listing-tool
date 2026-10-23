@@ -2556,7 +2556,15 @@ def normalize_generated_listing(
                 remove_aspects=profile.remove_aspects,
             )
             if decision.kind not in {"keep"} and (
-                decision.category_id or decision.reason not in {"", "classified", "empty_title", "tree_cache_unavailable"}
+                decision.category_id
+                or decision.reason
+                not in {
+                    "",
+                    "classified",
+                    "empty_title",
+                    "tree_cache_unavailable",
+                    "tree_unavailable",
+                }
             ):
                 opt["_category_remap_review"] = {
                     "from": stored_category or "",
@@ -3566,7 +3574,7 @@ def validate_listing_quality(
             issues.append(
                 ListingQualityIssue(
                     "stored_category_unpublishable",
-                    f"stored category {category_id} is {stored_reason}; holding READY/PENDING publish",
+                    f"stored category {category_id} is {stored_reason}; holding READY/PENDING/READY_TO_PUBLISH publish",
                     severity="BLOCKER",
                     field="categoryId",
                 )

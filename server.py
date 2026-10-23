@@ -50,6 +50,40 @@ from src.utils.title_sanitizer import normalize_listing_title_for_ebay, strip_su
 _QUALITY_GATE_CATEGORY_MATCHER = None
 
 
+def apply_publish_source_dimensions(completed_aspects, attrs, sku, *, log=print):
+    """Force source-attribute and DaJian dimensions over AI-generated values."""
+    from src.utils.dimension_helpers import populate_dimension_aspects
+
+    aspects = dict(completed_aspects or {})
+    populate_dimension_aspects(aspects, attrs or {})
+    existing_weight = _first_aspect_text(aspects, "Item Weight")
+    if existing_weight and _measurement_issue(existing_weight) in {"placeholder", "non-positive"}:
+        aspects.pop("Item Weight", None)
+        log(f"[SANITIZE] Dropped invalid Item Weight: {existing_weight}")
+    dim_keys = ["Item Length", "Item Width", "Item Height", "Item Weight"]
+    if not any(aspects.get(k) for k in dim_keys):
+        try:
+            from src.clients.dajian_client import DaJianClient
+
+            dj = DaJianClient(os.getenv("DAJIAN_API_KEY"), os.getenv("DAJIAN_API_SECRET"))
+            detail = dj.get_product_detail_by_sku(sku)
+            if detail:
+                dj_dims = {
+                    "Item Length": detail.get("assembledLength") or detail.get("length"),
+                    "Item Width": detail.get("assembledWidth") or detail.get("width"),
+                    "Item Height": detail.get("assembledHeight") or detail.get("height"),
+                    "Item Weight": detail.get("assembledWeight") or detail.get("weight"),
+                }
+                for key, value in dj_dims.items():
+                    if value and not aspects.get(key):
+                        unit = "lbs" if "Weight" in key else "in"
+                        aspects[key] = [f"{value} {unit}"]
+                        log(f"[DAJIAN-DIM] {key} = {value} {unit}")
+        except Exception as exc:
+            log(f"[WARN] DaJian dimension fallback failed: {exc}")
+    return aspects
+
+
 def _get_quality_gate_category_matcher():
     global _QUALITY_GATE_CATEGORY_MATCHER
     if _QUALITY_GATE_CATEGORY_MATCHER is None:
@@ -1593,7 +1627,8 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         
         # ===== AUTO CATEGORY & ITEM SPECIFICS MATCHING =====
         category_matcher = EbayCategoryMatcher(ebay_client.oauth)
-        stored_cat = str(opt_data.get("categoryId") or "").strip() or None
+        original_stored = str(opt_data.get("categoryId") or "").strip() or None
+        stored_cat = original_stored
         stored_cat_name = opt_data.get("categoryName")
         from src.utils.approved_category import evaluate_approved_category
 
@@ -1679,12 +1714,9 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         title_lower = listing_title.lower()
         
         # FORCE dimensions from source attributes (overwrite AI values)
-        populate_dimension_aspects(completed_aspects, attrs)
-
-        existing_weight = _first_aspect_text(completed_aspects, 'Item Weight')
-        if existing_weight and _measurement_issue(existing_weight) in {'placeholder', 'non-positive'}:
-            completed_aspects.pop('Item Weight', None)
-            print(f"[SANITIZE] Dropped invalid Item Weight: {existing_weight}")
+        completed_aspects = apply_publish_source_dimensions(
+            completed_aspects, attrs, sku, log=print
+        )
         
         # ===== PRE-PUBLISH VALIDATION =====
         validation_warnings = _validate_listing_before_publish(
@@ -1694,28 +1726,6 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         if validation_warnings:
             for w in validation_warnings:
                 print(f"[PRE-PUBLISH WARNING] {sku}: {w}")
-        
-        # Fallback: fetch dimensions from DaJian API when attrs have none
-        dim_keys = ['Item Length', 'Item Width', 'Item Height', 'Item Weight']
-        if not any(completed_aspects.get(k) for k in dim_keys):
-            try:
-                from src.clients.dajian_client import DaJianClient
-                dj = DaJianClient(os.getenv('DAJIAN_API_KEY'), os.getenv('DAJIAN_API_SECRET'))
-                detail = dj.get_product_detail_by_sku(sku)
-                if detail:
-                    dj_dims = {
-                        'Item Length': detail.get('assembledLength') or detail.get('length'),
-                        'Item Width':  detail.get('assembledWidth')  or detail.get('width'),
-                        'Item Height': detail.get('assembledHeight') or detail.get('height'),
-                        'Item Weight': detail.get('assembledWeight') or detail.get('weight'),
-                    }
-                    for k, v in dj_dims.items():
-                        if v and not completed_aspects.get(k):
-                            unit = 'lbs' if 'Weight' in k else 'in'
-                            completed_aspects[k] = [f"{v} {unit}"]
-                            print(f"[DAJIAN-DIM] {k} = {v} {unit}")
-            except Exception as e:
-                print(f"[WARN] DaJian dimension fallback failed: {e}")
         
         completed_aspects = complete_publish_aspects(
             completed_aspects,
@@ -1758,11 +1768,64 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             except Exception:
                 return ebay_client.oauth.get_valid_token()
 
+        from src.utils.category_decision import (
+            gate_publish_category_choice,
+            publish_listing_status,
+            stored_category_name_for_keep,
+        )
+
+        gate_status = publish_listing_status(getattr(product, "status", ""))
+        original_name = stored_cat_name
+
+        def _restore_original_category():
+            if not original_stored:
+                return
+            opt_data["categoryId"] = original_stored
+            opt_data["categoryName"] = stored_category_name_for_keep(
+                original_stored, original_name
+            )
+            product.optimization = opt_data
+            flag_modified(product, "optimization")
+
+        def _rebind_kept_stored(gated_id, candidate_id):
+            nonlocal category_id, category_name, completed_aspects
+            category_id = gated_id
+            if not gated_id or str(gated_id) == str(candidate_id or "").strip():
+                return
+            category_name = stored_category_name_for_keep(original_stored, original_name)
+            completed_aspects = apply_publish_source_dimensions(
+                dict(existing_aspects), attrs, sku, log=print
+            )
+            completed_aspects = complete_publish_aspects(
+                completed_aspects,
+                title=listing_title,
+                category_id=category_id,
+                attrs=attrs,
+                description=description,
+                category_required_aspects=EbayPublisher.CATEGORY_REQUIRED_ASPECTS,
+                log=print,
+            )
+            enforce_store_brand_aspect(completed_aspects)
+            sanitize_single_value_aspects(completed_aspects, log=print)
+            rebound_blockers = _get_publish_blockers(
+                category_matcher,
+                title_context,
+                completed_aspects,
+                category_id,
+                category_name,
+                skip_canonicalize=preserve_approved_category,
+            )
+            if rebound_blockers:
+                raise HTTPException(
+                    status_code=400,
+                    detail="; ".join(rebound_blockers),
+                )
+
         gated = apply_category_publish_gate(
             category_id=category_id,
             category_name=category_name,
             title=title_context or listing_title,
-            product=product,
+            product=None,
             aspects=completed_aspects,
             ebay_client=ebay_client,
             oauth=ebay_client.oauth,
@@ -1774,6 +1837,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             matcher=category_matcher,
         )
         if not isinstance(gated, tuple):
+            _restore_original_category()
             product.status = "READY"
             flag_modified(product, "optimization")
             flag_modified(product, "logs")
@@ -1784,6 +1848,17 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                 "errors": [HUMAN_GATE_ERROR],
             }
         category_id, category_name, completed_aspects = gated
+        candidate_before_gate = category_id
+        category_id, _gate_action, hold_err = gate_publish_category_choice(
+            original_stored,
+            category_id,
+            title_context or listing_title,
+            gate_status,
+        )
+        if hold_err:
+            _restore_original_category()
+            raise HTTPException(status_code=400, detail=hold_err)
+        _rebind_kept_stored(category_id, candidate_before_gate)
         opt_data["categoryId"] = category_id
         if category_name:
             opt_data["categoryName"] = category_name
@@ -1941,7 +2016,7 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                                 category_id=category_id,
                                 category_name=category_name,
                                 title=title_context or listing_title,
-                                product=product,
+                                product=None,
                                 aspects=completed_aspects,
                                 ebay_client=ebay_client,
                                 oauth=ebay_client.oauth,
@@ -1957,23 +2032,42 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                             remapped = None
                         if not isinstance(remapped, tuple):
                             last_error = HUMAN_GATE_ERROR
+                            _restore_original_category()
                             product.status = "READY"
                             flag_modified(product, "logs")
                             flag_modified(product, "optimization")
                             break
                         new_id, new_name, _kept_aspects = remapped
-                        if new_id and str(new_id) != str(category_id):
-                            category_id, category_name = new_id, new_name
-                            opt_data["categoryId"] = category_id
-                            opt_data["categoryName"] = category_name
-                            product.optimization = opt_data
-                            flag_modified(product, "optimization")
-                            print(f"[CAT_REMAP] retry category: {category_id}")
-                            fixed = True
-                        else:
-                            last_error = HUMAN_GATE_ERROR
+                        gated_retry, retry_action, retry_hold = gate_publish_category_choice(
+                            original_stored,
+                            new_id,
+                            title_context or listing_title,
+                            gate_status,
+                        )
+                        if retry_hold or retry_action != "remap" or not gated_retry or str(gated_retry) == str(original_stored):
+                            last_error = retry_hold or HUMAN_GATE_ERROR
+                            _restore_original_category()
                             product.status = "READY"
+                            flag_modified(product, "logs")
+                            flag_modified(product, "optimization")
                             break
+                        category_id, category_name = gated_retry, new_name
+                        completed_aspects = dict(existing_aspects)
+                        completed_aspects = complete_publish_aspects(
+                            completed_aspects,
+                            title=listing_title,
+                            category_id=category_id,
+                            attrs=attrs,
+                            description=description,
+                            category_required_aspects=EbayPublisher.CATEGORY_REQUIRED_ASPECTS,
+                            log=print,
+                        )
+                        opt_data["categoryId"] = category_id
+                        opt_data["categoryName"] = category_name
+                        product.optimization = opt_data
+                        flag_modified(product, "optimization")
+                        print(f"[CAT_REMAP] retry category: {category_id}")
+                        fixed = True
                     
                     if fixed:
                         print(f"[AUTO-FIX] Retrying (attempt {attempt+2})...")

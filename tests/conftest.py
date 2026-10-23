@@ -20,6 +20,10 @@ def pytest_configure(config):
         "markers",
         "real_category_tree: use the on-disk category-tree loader instead of the fixture index",
     )
+    config.addinivalue_line(
+        "markers",
+        "allow_runtime_tree_refresh: permit mocked runtime getCategoryTree refresh",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -39,4 +43,16 @@ def _offline_category_tree(monkeypatch, request):
         return dict(index)
 
     monkeypatch.setattr(category_tree_cache, "load_category_index", _load)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_live_taxonomy_refresh(monkeypatch, request):
+    """Never call eBay Taxonomy from tests unless a test opts in and mocks it."""
+    if request.node.get_closest_marker("allow_runtime_tree_refresh"):
+        yield
+        return
+    from src.utils import category_tree_cache
+
+    monkeypatch.setattr(category_tree_cache, "store_runtime_tree_ids", lambda: ())
     yield

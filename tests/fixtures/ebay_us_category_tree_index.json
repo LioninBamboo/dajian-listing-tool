@@ -71,5 +71,15 @@
   "103430": ["Armoires & Wardrobes", "900007"],
   "42428": ["Pantry Cabinets", "900007"],
   "38217": ["China Cabinets", "900007"],
-  "179446": ["Tool Storage Organizers", "900008"]
+  "179446": ["Tool Storage Organizers", "900008"],
+  "79694": ["Porch Swings", "900003"],
+  "125085": ["Trunks & Chests", "900007"],
+  "63700": ["Other Shop Equipment", "900015"],
+  "900018": ["Outdoor Heating, Cooking & Eating", "900002"],
+  "20725": ["Barbecue Tools", "900018"],
+  "260150": ["Manual Juicers", "900006"],
+  "900019": ["Sporting Goods", ""],
+  "900020": ["Cycling", "900019"],
+  "177815": ["Forks", "900020"],
+  "177816": ["Handlebar Grips", "900020"]
 }
