@@ -2062,6 +2062,10 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                             category_required_aspects=EbayPublisher.CATEGORY_REQUIRED_ASPECTS,
                             log=print,
                         )
+                        completed_aspects = apply_publish_source_dimensions(
+                            completed_aspects, attrs, sku, log=print
+                        )
+                        opt_data["aspects"] = completed_aspects
                         opt_data["categoryId"] = category_id
                         opt_data["categoryName"] = category_name
                         product.optimization = opt_data

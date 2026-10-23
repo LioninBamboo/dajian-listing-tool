@@ -246,7 +246,43 @@ _FIRST_NOUN_PHRASES: tuple[str, ...] = (
     "storage footstool",
     "footstool",
     "ottoman",
+    "office chair mat",
+    "office chair",
+    "gaming chair",
+    "accent chair",
     "dining chair",
+    "bar stool",
+    "vanity table",
+    "makeup vanity",
+    "kitchen island cart",
+    "kitchen island",
+    "kitchen cart",
+    "trimming tool",
+    "string trimmer",
+    "drill press",
+    "fruit and wine press",
+    "fruit press",
+    "wine press",
+    "garlic press",
+    "grill cart",
+    "grill table",
+    "fireplace screen",
+    "filing cabinet",
+    "dome climber",
+    "jungle gym",
+    "dining table set",
+    "nook dining set",
+    "bar table set",
+    "table set",
+    "wardrobe",
+    "fogger",
+    "bench",
+    "chair mat",
+    "table top",
+    "tabletop",
+    "tool chest",
+    "dresser",
+    "dog bed",
     "club armchair",
     "papasan chair",
     "egg chair",
@@ -288,6 +324,11 @@ _DENY_HEAD_NOUNS: tuple[str, ...] = (
     "slipcover",
     "mattress",
     "vanity",
+    "office chair mat",
+    "chair mat",
+    "table top",
+    "tabletop",
+    "garlic press",
 )
 
 _ACCESSORY_HEAD_NOUNS: frozenset[str] = frozenset(
@@ -301,14 +342,24 @@ _ACCESSORY_HEAD_NOUNS: frozenset[str] = frozenset(
         "cushion",
         "pad",
         "cover",
+        "office chair mat",
+        "chair mat",
+        "table top",
+        "tabletop",
     }
 )
 
 UNKNOWN_HEAD_PREFIX = "__unknown_head__:"
 
 _FIRST_GROUP_SPLIT_RE = re.compile(
-    r"\s+(?:with|for|and)\s+|[,|+]| \| |\s+-\s+",
+    r"\s+(?:with|for|and)\s+|[,|+]| \| |\s+[-–—]\s+",
     re.IGNORECASE,
+)
+# Phrases that contain a connector; scan the unsplit head so "Fruit and Wine Press"
+# is not split into a bare "Fruit".
+_CONNECTOR_HEAD_PHRASES: tuple[str, ...] = (
+    "fruit and wine press",
+    "fruit and wine",
 )
 _TV_STAND_HYPHEN_RE = re.compile(r"\btv\s*-\s*stand\b", re.IGNORECASE)
 _ACCESSORY_ONLY_RE = re.compile(
@@ -423,8 +474,14 @@ def first_product_noun(text: str) -> str | None:
     accessories. Word boundaries only: stable/Tablet are not table.
     """
     core = _first_product_noun_clause(text)
-    if not core:
+    hay = as_safe_text(text)
+    unsplit = strip_room_location_lists(head_clause(hay) or hay)
+    unsplit = _TV_STAND_HYPHEN_RE.sub("tv stand", unsplit)
+    connector = _scan_head_phrases(unsplit, _CONNECTOR_HEAD_PHRASES) if unsplit else None
+    if not core and connector is None:
         return None
+    if not core:
+        return connector[2]
     if _ACCESSORY_ONLY_RE.search(as_safe_text(text)) or _FURNITURE_THEN_ACCESSORY_RE.search(core):
         accessory = _scan_head_phrases(
             core + " cushion",
@@ -439,8 +496,12 @@ def first_product_noun(text: str) -> str | None:
     combined = whitelist + deny
     best = _scan_head_phrases(core, combined)
     if best is None:
-        return None
+        return connector[2] if connector is not None else None
     phrase = best[2]
+    if connector is not None:
+        phrase_in_unsplit = _scan_head_phrases(unsplit, (phrase,))
+        if phrase_in_unsplit is None or connector[0] < phrase_in_unsplit[0]:
+            return connector[2]
     # "Hutch Desk": deny noun used as a modifier before a known product noun.
     if phrase in _DENY_HEAD_NOUNS and phrase not in {
         "tv stand",

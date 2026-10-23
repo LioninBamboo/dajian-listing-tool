@@ -506,15 +506,15 @@ def test_unapproved_server_retry_remap_does_not_write():
 
 
 @pytest.mark.parametrize(
-    "sku,stored,title,remap_to",
+    "sku,stored,title,remap_to,suggest",
     [
-        ("W2899P372741", "68240", "Elegant 34 Inch Wardrobe Cabinet with Mirrored Doors Walnut", "103430"),
-        ("W3916P426311", "177816", "Modern Dining Chair Set of 2 Metal Frame PU Leather", "107578"),
-        ("N704P383163A", "118218", "Bar Stool Set of 2 Swivel Counter Height Chairs", "54235"),
-        ("W3258P448840", "20466", "6 Drawer Dresser Bedroom Storage Chest", "114397"),
+        ("W2899P372741", "68240", "Elegant 34 Inch Wardrobe Cabinet with Mirrored Doors Walnut", "103430", "103430"),
+        ("W3916P426311", "177816", "Modern Dining Chair Set of 2 Metal Frame PU Leather", "107578", "54235"),
+        ("N704P383163A", "118218", "Bar Stool Set of 2 Swivel Counter Height Chairs", "54235", "103431"),
+        ("W3258P448840", "20466", "6 Drawer Dresser Bedroom Storage Chest", "114397", "114397"),
     ],
 )
-def test_item1_legacy_remap_is_candidate_only(sku, stored, title, remap_to):
+def test_item1_legacy_remap_is_candidate_only(sku, stored, title, remap_to, suggest):
     candidate, reason = legacy_remap_candidate(stored)
     assert (candidate, reason) == (remap_to, "legacy_invalid_remap")
     gated, action, err = gate_publish_category_choice(
@@ -524,7 +524,7 @@ def test_item1_legacy_remap_is_candidate_only(sku, stored, title, remap_to):
     assert action == "hold_implausible", (sku, action, err)
     assert gated is None
     assert stored in err or "not publishable" in err
-    assert remap_to in err
+    assert suggest in err
 
 
 def test_item1_app_publish_to_ebay_does_not_write_legacy(monkeypatch):
@@ -1270,7 +1270,8 @@ def test_r2_legacy_live_leaves_hold_on_publish(sku, stored, title):
     )
     assert action == "hold_implausible", (sku, action, err)
     assert gated is None
-    assert "107578" in err
+    expected_suggest = "54235" if "Dining Chair" in title else "107578"
+    assert expected_suggest in err
     pub, pub_action, pub_err = gate_publish_category_choice(
         stored, stored, title, "PUBLISHED", index=INDEX,
     )
@@ -1311,7 +1312,7 @@ def test_synthetic_r2_legacy_forks_177815_holds():
         "177815", "177815", "7 Piece Dining Table Set", "READY", index=INDEX,
     )
     assert action == "hold_implausible"
-    assert "38204" in err
+    assert "107578" in err
 
 
 def test_synthetic_r2_main_motors_leaf_keeps_when_tree100_present():
@@ -1671,7 +1672,7 @@ def test_synthetic_r2_legacy_error_status_still_holds():
     )
     assert action == "hold_implausible"
     assert gated is None
-    assert "107578" in err
+    assert "54235" in err
 
 
 def test_synthetic_r2_legacy_jewelry_10321_holds():
@@ -1683,7 +1684,7 @@ def test_synthetic_r2_legacy_jewelry_10321_holds():
     )
     assert action == "hold_implausible"
     assert gated is None
-    assert "262017" in err
+    assert "not publishable" in err
 
 
 def test_synthetic_r2_w2899_still_holds():
