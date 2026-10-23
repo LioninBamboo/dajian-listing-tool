@@ -1604,10 +1604,11 @@ def explicit_override_target_allowed(
     )
     if not tree_ok:
         return False, tree_reason
-    from src.utils.publish_fee_preview import category_is_high_fee
+    from src.utils.publish_fee_preview import guard_category_write_high_fee
 
-    if category_is_high_fee(target):
-        return False, "high_insertion_fee"
+    blocked = guard_category_write_high_fee(category_id=target, index=index)
+    if blocked:
+        return False, blocked
     return True, ""
 
 

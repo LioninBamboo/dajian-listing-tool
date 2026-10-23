@@ -32,6 +32,7 @@ from src.utils.approved_category import (
 from src.utils.category_decision import (
     NEEDS_MANUAL_MOTORS_LEAF_REVIEW,
     category_gate_report_flags,
+    explicit_override_target_allowed,
     gate_publish_category_choice,
     needs_manual_motors_leaf_review,
     publish_tree_id_for_target,
@@ -754,8 +755,8 @@ def test_override_explicit_id_and_stored_restore_allowed(monkeypatch, tmp_path):
     import scripts.fix_listing_categories as fix
 
     monkeypatch.setattr(
-        "src.utils.publish_fee_preview.category_is_high_fee",
-        lambda *_a, **_k: False,
+        "src.utils.publish_fee_preview.guard_category_write_high_fee",
+        lambda **_k: None,
     )
     monkeypatch.setattr(
         "src.utils.category_decision.validate_target_category",
@@ -788,6 +789,7 @@ def test_override_explicit_id_and_stored_restore_allowed(monkeypatch, tmp_path):
         "completed_aspects": {},
         "offer_id": "o1",
         "live_category_id": "38208",
+        "explicit_target_id": "54235",
     }
     conn = sqlite3.connect(tmp_path / "ovr.db")
     conn.execute(
@@ -825,6 +827,7 @@ def test_override_explicit_id_and_stored_restore_allowed(monkeypatch, tmp_path):
     restore["target_category_id"] = "38208"
     restore["final_category_id"] = "38208"
     restore["final_category_name"] = "Sofas, Armchairs & Couches"
+    restore["explicit_target_id"] = "38208"
     product_row["optimization"] = dict(opt)
     synced = repair.apply_db_sync(
         conn, product_row, restore, override_category_lock=True
@@ -844,6 +847,7 @@ def test_override_explicit_id_and_stored_restore_allowed(monkeypatch, tmp_path):
         },
         dry_run=True,
         override_category_lock=True,
+        explicit_operator_id="54235",
     )
     assert ok is True
 
@@ -857,6 +861,10 @@ def test_fix_category_id_is_sku_scoped_never_bulk():
     ]
     with pytest.raises(ValueError, match="requires --sku"):
         fix.scope_category_fixes(rows, sku=None, category_id="54235")
+    with pytest.raises(ValueError, match="requires both --sku and --category-id"):
+        fix.scope_category_fixes(rows, sku=None, category_id=None, override=True)
+    with pytest.raises(ValueError, match="requires both --sku and --category-id"):
+        fix.scope_category_fixes(rows, sku="LOCK1", category_id=None, override=True)
     scoped = fix.scope_category_fixes(rows, sku="LOCK1", category_id="54235")
     assert scoped == [{"sku": "LOCK1", "new_cat": "54235"}]
 
@@ -916,3 +924,185 @@ def test_streamlit_live_writeback_nested_fn_is_lock_guarded():
             break
     assert sync_fn is not None
     assert "blocks_automated_category_change" in _call_names(sync_fn)
+
+
+def test_n1_override_without_explicit_id_does_not_remap_hardcoded_tables(tmp_path):
+    """N1: override flag alone must not remap KNOWN_WRONG / locked rows."""
+    import scripts.fix_listing_categories as fix
+
+    assert fix.validate_fix_cli_scope(override=True, sku=None, category_id=None)
+    assert fix.validate_fix_cli_scope(override=True, sku="LOCK1", category_id=None)
+    assert not fix.validate_fix_cli_scope(override=True, sku="LOCK1", category_id="54235")
+
+    conn = sqlite3.connect(tmp_path / "n1.db")
+    conn.execute(
+        "CREATE TABLE collected_products (sku TEXT, title TEXT, listing_id TEXT, optimization TEXT, status TEXT)"
+    )
+    unlocked = {"categoryId": "177816"}
+    locked = {
+        "categoryId": "177816",
+        CATEGORY_APPROVED_KEY: True,
+        CATEGORY_APPROVED_ID_KEY: "177816",
+    }
+    conn.execute(
+        "INSERT INTO collected_products VALUES (?,?,?,?,?)",
+        ("K1", "Dining set", "1", json.dumps(unlocked), "PUBLISHED"),
+    )
+    conn.execute(
+        "INSERT INTO collected_products VALUES (?,?,?,?,?)",
+        ("LOCK1", "Dining set", "2", json.dumps(locked), "PUBLISHED"),
+    )
+    conn.commit()
+
+    table_fixes = {row["sku"]: row for row in fix.get_fixes(conn, include_locked=True)}
+    assert table_fixes["K1"]["new_cat"] == "107578"
+    assert table_fixes["LOCK1"]["new_cat"] == "107578"
+
+    ok_open = fix.apply_fix(
+        None, conn, table_fixes["K1"], dry_run=True, override_category_lock=True
+    )
+    assert ok_open is False
+    assert table_fixes["K1"]["skip_reason"] == "would_remap_report_only"
+
+    ok_lock = fix.apply_fix(
+        None, conn, table_fixes["LOCK1"], dry_run=True, override_category_lock=True
+    )
+    assert ok_lock is False
+    assert table_fixes["LOCK1"]["skip_reason"] == "category_locked"
+
+
+def test_n2_override_high_fee_uses_path_rule(monkeypatch):
+    """N2: path-based high-fee ids (Trailers / Cars & Trucks) are refused."""
+    monkeypatch.setattr(
+        "src.utils.category_decision.validate_target_category",
+        lambda *_a, **_k: (True, ""),
+    )
+    monkeypatch.setattr(
+        "src.utils.category_decision.validate_new_target_publish_tree",
+        lambda *_a, **_k: (True, ""),
+    )
+    for cid in ("85040", "95495", "5331"):
+        ok, reason = explicit_override_target_allowed(cid, "SYNTHETIC trailer", stored="38208")
+        assert ok is False, cid
+        assert reason
+        assert "BLOCKED" in reason or "high" in reason.lower() or "fee" in reason.lower()
+
+
+def test_n3_repair_override_never_writes_live_id(monkeypatch, tmp_path):
+    """N3a/b/c: write only the explicit id; override flag alone is a no-op; --category-id needs --sku."""
+    import scripts.repair_published_taxonomy as repair
+
+    assert repair.validate_repair_cli_scope(sku=None, category_id="54235")
+    assert not repair.validate_repair_cli_scope(sku="W1", category_id="54235")
+
+    monkeypatch.setattr(
+        "src.utils.publish_fee_preview.guard_category_write_high_fee",
+        lambda **_k: None,
+    )
+    monkeypatch.setattr(
+        "src.utils.category_decision.validate_target_category",
+        lambda *_a, **_k: (True, ""),
+    )
+    monkeypatch.setattr(
+        "src.utils.category_decision.validate_new_target_publish_tree",
+        lambda *_a, **_k: (True, ""),
+    )
+
+    locked_opt = {
+        "categoryId": "38208",
+        "categoryName": "Sofas",
+        CATEGORY_APPROVED_KEY: True,
+        CATEGORY_APPROVED_ID_KEY: "38208",
+    }
+    unlocked_opt = {"categoryId": "38208", "categoryName": "Sofas"}
+
+    class _Client:
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "o1", "categoryId": "79682", "category": {"categoryId": "79682", "categoryName": "Patio Chairs"}}]
+
+        def get_inventory_item(self, sku):
+            return {}
+
+        def create_or_replace_inventory_item(self, **kwargs):
+            return True
+
+        def update_offer_category(self, *a, **k):
+            return True
+
+    locked_row = {
+        "sku": "LOCK1",
+        "listing_id": "1",
+        "optimization": dict(locked_opt),
+        "title": R1_TITLE,
+        "description": "",
+    }
+    candidate = repair.audit_candidate(
+        locked_row,
+        matcher=_MatcherKeep(),
+        client=_Client(),
+        override_category_lock=True,
+        explicit_targets={"LOCK1": "54235"},
+    )
+    assert candidate["target_category_id"] == "54235"
+    assert candidate["final_category_id"] == "54235"
+    assert candidate["final_category_id"] != "79682"
+    assert candidate["action"] == "REVISE_LIVE"
+
+    conn = sqlite3.connect(tmp_path / "n3.db")
+    conn.execute("CREATE TABLE collected_products (sku TEXT PRIMARY KEY, optimization TEXT)")
+    conn.execute(
+        "INSERT INTO collected_products VALUES (?,?)",
+        ("LOCK1", json.dumps(locked_opt)),
+    )
+    conn.commit()
+
+    # Even if a stale candidate claims final=live, apply_db_sync must write explicit.
+    stale = dict(candidate)
+    stale["final_category_id"] = "79682"
+    stale["final_category_name"] = "Patio Chairs"
+    stale["explicit_target_id"] = "54235"
+    written = repair.apply_db_sync(
+        conn, locked_row, stale, override_category_lock=True
+    )
+    assert written["category_id"] == "54235"
+    stored = json.loads(
+        conn.execute("SELECT optimization FROM collected_products WHERE sku='LOCK1'").fetchone()[0]
+    )
+    assert stored["categoryId"] == "54235"
+
+    unlocked_row = {
+        "sku": "OPEN1",
+        "listing_id": "2",
+        "optimization": dict(unlocked_opt),
+        "title": R1_TITLE,
+        "description": "",
+    }
+    unlocked_cand = repair.audit_candidate(
+        unlocked_row,
+        matcher=_MatcherKeep(),
+        client=_Client(),
+        override_category_lock=True,
+    )
+    # Override flag alone: unlocked row still report-only / not live-synced as a remap.
+    if unlocked_cand["action"] == "SYNC_DB":
+        with pytest.raises(RuntimeError, match="would_remap_report_only"):
+            repair.apply_db_sync(
+                conn,
+                unlocked_row,
+                {
+                    **unlocked_cand,
+                    "final_category_id": "79682",
+                    "explicit_target_id": "",
+                },
+                override_category_lock=True,
+            )
+    else:
+        assert unlocked_cand["action"] in {"would_remap_report_only", "OK", "SKIP"}
+        if unlocked_cand.get("final_category_id") == "79682":
+            with pytest.raises(RuntimeError, match="would_remap_report_only"):
+                repair.apply_db_sync(
+                    conn,
+                    unlocked_row,
+                    {**unlocked_cand, "final_category_id": "79682"},
+                    override_category_lock=True,
+                )

@@ -169,8 +169,20 @@ def get_fixes(conn, include_locked=False):
     return fixes
 
 
-def apply_fix(ebay_client, conn, fix, dry_run=True, override_category_lock=False):
-    """Apply a single category fix to eBay and local DB."""
+def apply_fix(
+    ebay_client,
+    conn,
+    fix,
+    dry_run=True,
+    override_category_lock=False,
+    explicit_operator_id=None,
+):
+    """Apply a single category fix to eBay and local DB.
+
+    The hardcoded KNOWN_WRONG / MANUAL table always goes through the gate
+    and the lock. ``--override-category-lock`` may write only when the
+    operator also passed ``--sku`` and ``--category-id``.
+    """
     sku = fix['sku']
     new_cat = fix['new_cat']
     old_cat = fix['old_cat']
@@ -182,7 +194,11 @@ def apply_fix(ebay_client, conn, fix, dry_run=True, override_category_lock=False
         ).fetchone()
         opt = json.loads(row[0]) if row and row[0] else {}
 
-    lock_error = locked_category_write_error(opt, override=override_category_lock)
+    explicit = str(explicit_operator_id or "").strip()
+    locked = blocks_automated_category_change(opt)
+    override_ok = bool(override_category_lock and explicit and locked)
+
+    lock_error = locked_category_write_error(opt, override=override_ok)
     if lock_error:
         print(f"  [LOCK] {sku}: {lock_error}")
         fix['skip_reason'] = 'category_locked'
@@ -191,7 +207,11 @@ def apply_fix(ebay_client, conn, fix, dry_run=True, override_category_lock=False
     title = fix.get('title') or ''
     if str(new_cat or '').strip() == str(old_cat or '').strip():
         pass
-    elif override_category_lock:
+    elif override_ok:
+        if str(new_cat or "").strip() != explicit:
+            print(f"  [REPORT] {sku}: override writes only the explicit operator id")
+            fix['skip_reason'] = 'override_requires_explicit_id'
+            return False
         ok, reason = explicit_override_target_allowed(new_cat, title, stored=old_cat)
         if not ok:
             print(f"  [REPORT] {sku}: {reason} ({old_cat} → {new_cat})")
@@ -249,10 +269,46 @@ def apply_fix(ebay_client, conn, fix, dry_run=True, override_category_lock=False
     return True
 
 
-def scope_category_fixes(fixes, sku=None, category_id=None):
-    """Apply ``--category-id`` only to the ``--sku`` row; never bulk."""
+def operator_override_fixes(conn, sku, category_id):
+    """Build the single operator ``--sku`` / ``--category-id`` row."""
+    explicit = str(category_id or "").strip()
+    target_sku = str(sku or "").strip()
+    if not target_sku or not explicit:
+        return []
+    row = conn.execute(
+        "SELECT sku, title, listing_id, optimization FROM collected_products WHERE sku = ?",
+        (target_sku,),
+    ).fetchone()
+    if not row:
+        return []
+    sku_r, title, listing_id, opt_json = row
+    opt = json.loads(opt_json) if opt_json else {}
+    current = str(opt.get("categoryId") or "")
+    return [{
+        "sku": sku_r,
+        "title": (title or "")[:70],
+        "listing_id": listing_id,
+        "old_cat": current,
+        "new_cat": explicit,
+        "reason": "OPERATOR_OVERRIDE",
+        "optimization": opt,
+    }]
+
+
+def validate_fix_cli_scope(*, override=False, sku=None, category_id=None) -> str:
+    """Refuse bulk override / bulk ``--category-id``. Empty string = ok."""
     if category_id and not sku:
-        raise ValueError("--category-id requires --sku (never a bulk remap)")
+        return "--category-id requires --sku (never a bulk remap)"
+    if override and not (sku and category_id):
+        return "--override-category-lock requires both --sku and --category-id"
+    return ""
+
+
+def scope_category_fixes(fixes, sku=None, category_id=None, *, override=False):
+    """Apply ``--category-id`` only to the ``--sku`` row; never bulk."""
+    err = validate_fix_cli_scope(override=override, sku=sku, category_id=category_id)
+    if err:
+        raise ValueError(err)
     scoped = [dict(item) for item in fixes]
     if sku:
         scoped = [item for item in scoped if item.get("sku") == sku]
@@ -278,17 +334,27 @@ def main():
         help='Explicit override target id (never a matcher suggestion)',
     )
     args = parser.parse_args()
-    if args.category_id and not args.sku:
-        parser.error("--category-id requires --sku (never a bulk remap)")
+    scope_err = validate_fix_cli_scope(
+        override=args.override_category_lock,
+        sku=args.sku,
+        category_id=args.category_id,
+    )
+    if scope_err:
+        parser.error(scope_err)
 
     dry_run = not args.apply
 
     conn = sqlite3.connect('ebay_collection.db')
-    fixes = scope_category_fixes(
-        get_fixes(conn, include_locked=args.override_category_lock),
-        sku=args.sku,
-        category_id=args.category_id,
-    )
+    if args.override_category_lock:
+        # Operator path only: never expand to the hardcoded tables.
+        fixes = operator_override_fixes(conn, args.sku, args.category_id)
+    else:
+        fixes = scope_category_fixes(
+            get_fixes(conn, include_locked=False),
+            sku=args.sku,
+            category_id=args.category_id,
+            override=False,
+        )
 
     if not fixes:
         print("No category fixes needed!")
@@ -315,7 +381,14 @@ def main():
         confirmed_skus = []
         unfinished_skus = []
         for item in fixes:
-            ok = apply_fix(None, conn, item, dry_run=True, override_category_lock=args.override_category_lock)
+            ok = apply_fix(
+                None,
+                conn,
+                item,
+                dry_run=True,
+                override_category_lock=args.override_category_lock,
+                explicit_operator_id=args.category_id,
+            )
             if ok:
                 confirmed_skus.append(item['sku'])
             else:
@@ -350,6 +423,7 @@ def main():
             fix,
             dry_run=False,
             override_category_lock=args.override_category_lock,
+            explicit_operator_id=args.category_id,
         )
         if ok:
             success_count += 1

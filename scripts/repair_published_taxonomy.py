@@ -195,6 +195,13 @@ def prepare_inventory_payload(product_row: dict, description: str, aspects: dict
     return payload
 
 
+def validate_repair_cli_scope(*, sku=None, category_id=None) -> str:
+    """``--category-id`` is per-SKU only (same as fix_listing_categories)."""
+    if category_id and not sku:
+        return "--category-id requires --sku (never a bulk remap)"
+    return ""
+
+
 def parse_explicit_targets(values, global_category_id=None):
     targets = {}
     for item in values or []:
@@ -249,6 +256,7 @@ def audit_candidate(
 
     locked = blocks_automated_category_change(opt)
     explicit_target = (explicit_targets or {}).get(product_row["sku"]) or global_category_id
+    override_active = bool(locked and override_category_lock and explicit_target)
     override_plan = (
         plan_locked_override_revision(opt, live_category_id, explicit_target_id=explicit_target)
         if locked
@@ -260,7 +268,7 @@ def audit_candidate(
         # Never use a matcher rematch for locked rows.
         target_id = override_plan["target_id"] or None
         target_name = None
-        if override_category_lock and explicit_target and explicit_target == target_id:
+        if override_active and explicit_target == target_id:
             ok, reason = explicit_override_target_allowed(
                 explicit_target, title, stored=stored
             )
@@ -276,6 +284,7 @@ def audit_candidate(
             skip_reason = "category_locked"
             target_id = None
     else:
+        # Override flag alone changes nothing for unlocked rows.
         target_id = matcher_id
         target_name = matcher_name
         gated, gate_action, hold_err = gate_publish_category_choice(
@@ -301,23 +310,34 @@ def audit_candidate(
         and (live_canonical_matches_target or not live_plausible)
     )
     if action not in {"category_locked", "would_remap_report_only", "SKIP"}:
-        if live_category_id and live_plausible and live_category_id != target_id and not needs_live_revision:
-            final_category_id = live_category_id
-            final_category_name = live_category_name or target_name
-        elif live_matches_target:
-            final_category_id = live_category_id
-            final_category_name = live_category_name or target_name
+        if override_active:
+            # Write only the explicit operator id (or stored restore). Never the live leaf.
+            final_category_id = target_id
+            final_category_name = target_name
+            if live_category_id and live_category_id != target_id:
+                action = "REVISE_LIVE"
+            elif local_category_id != target_id or (
+                target_name and local_category_name != target_name
+            ):
+                action = "SYNC_DB"
+        else:
+            if live_category_id and live_plausible and live_category_id != target_id and not needs_live_revision:
+                final_category_id = live_category_id
+                final_category_name = live_category_name or target_name
+            elif live_matches_target:
+                final_category_id = live_category_id
+                final_category_name = live_category_name or target_name
 
-        needs_db_sync = bool(
-            final_category_id and (
-                local_category_id != final_category_id
-                or (final_category_name and local_category_name != final_category_name)
+            needs_db_sync = bool(
+                final_category_id and (
+                    local_category_id != final_category_id
+                    or (final_category_name and local_category_name != final_category_name)
+                )
             )
-        )
-        if needs_live_revision:
-            action = "REVISE_LIVE"
-        elif needs_db_sync:
-            action = "SYNC_DB"
+            if needs_live_revision:
+                action = "REVISE_LIVE"
+            elif needs_db_sync:
+                action = "SYNC_DB"
 
     return {
         "sku": product_row["sku"],
@@ -344,6 +364,7 @@ def audit_candidate(
         "skip_canonicalize": locked,
         "skip_reason": skip_reason,
         "action": action,
+        "explicit_target_id": explicit_target or None,
         "flags": category_gate_report_flags(stored, optimization=opt),
     }
 
@@ -351,15 +372,18 @@ def audit_candidate(
 def apply_live_revision(conn: sqlite3.Connection, matcher, client, product_row: dict, candidate: dict, *, override_category_lock=False):
     sku = product_row["sku"]
     opt = dict(product_row.get("optimization") or {})
-    lock_error = locked_category_write_error(opt, override=override_category_lock)
+    write_id, override_active = _override_write_plan(
+        opt, candidate, override_category_lock=override_category_lock
+    )
+    lock_error = locked_category_write_error(opt, override=override_active)
     if lock_error:
         raise RuntimeError(lock_error)
-    target = candidate.get("target_category_id")
+    target = write_id or candidate.get("target_category_id")
     stored = opt.get("categoryId")
     title = candidate.get("title") or ""
     if str(target or "").strip() == str(stored or "").strip():
         pass
-    elif override_category_lock:
+    elif override_active:
         ok, reason = explicit_override_target_allowed(target, title, stored=stored)
         if not ok:
             raise RuntimeError(reason)
@@ -376,7 +400,7 @@ def apply_live_revision(conn: sqlite3.Connection, matcher, client, product_row: 
             raise RuntimeError(hold_err or "would_remap_report_only")
     enrich_product_dimensions(product_row)
 
-    opt["categoryId"] = candidate["target_category_id"]
+    opt["categoryId"] = target
     opt["categoryName"] = candidate["target_category_name"]
     opt["aspects"] = candidate["completed_aspects"]
     product_row["optimization"] = opt
@@ -385,12 +409,12 @@ def apply_live_revision(conn: sqlite3.Connection, matcher, client, product_row: 
     title_context = " ".join(part for part in ((product_row.get("title") or "").strip(), candidate["title"]) if part).strip()
     blockers = []
     blockers.extend(measurement_validation_errors(final_aspects))
-    blockers.extend(category_validation_errors(matcher, title_context, candidate["target_category_id"], candidate["target_category_name"]))
+    blockers.extend(category_validation_errors(matcher, title_context, target, candidate["target_category_name"]))
     if blockers:
         raise RuntimeError("; ".join(blockers))
 
     inventory_item = client.get_inventory_item(sku) or {}
-    required_aspects, _ = matcher._get_category_aspects(candidate["target_category_id"])
+    required_aspects, _ = matcher._get_category_aspects(target)
     required_aspect_names = [a.get("name") for a in required_aspects if a.get("name")]
     payload = prepare_inventory_payload(
         product_row,
@@ -404,14 +428,14 @@ def apply_live_revision(conn: sqlite3.Connection, matcher, client, product_row: 
     offer_id = candidate["offer_id"]
     if not offer_id:
         raise RuntimeError("missing live offerId")
-    if not client.update_offer_category(offer_id, candidate["target_category_id"], listing_description=candidate["description"]):
+    if not client.update_offer_category(offer_id, target, listing_description=candidate["description"]):
         raise RuntimeError(f"offer update failed for {offer_id}")
 
     update_local_optimization(
         conn,
         sku,
         opt,
-        candidate["target_category_id"],
+        target,
         candidate["target_category_name"],
         final_aspects,
     )
@@ -421,21 +445,36 @@ def apply_live_revision(conn: sqlite3.Connection, matcher, client, product_row: 
         "offer_id": offer_id,
         "listing_id": product_row.get("listing_id"),
         "from_live": candidate["live_category_id"],
-        "to_live": candidate["target_category_id"],
+        "to_live": target,
     }
+
+
+def _override_write_plan(opt, candidate, *, override_category_lock=False):
+    """Override writes only the operator's explicit id on a locked row."""
+    locked = blocks_automated_category_change(opt)
+    explicit = str(candidate.get("explicit_target_id") or "").strip()
+    if override_category_lock and locked and explicit:
+        return explicit, True
+    return None, False
 
 
 def apply_db_sync(conn: sqlite3.Connection, product_row: dict, candidate: dict, *, override_category_lock=False):
     opt = dict(product_row.get("optimization") or {})
-    lock_error = locked_category_write_error(opt, override=override_category_lock)
+    write_id, override_active = _override_write_plan(
+        opt, candidate, override_category_lock=override_category_lock
+    )
+    lock_error = locked_category_write_error(opt, override=override_active)
     if lock_error:
         raise RuntimeError(lock_error)
-    target = candidate.get("final_category_id") or candidate.get("target_category_id")
     stored = opt.get("categoryId")
     title = candidate.get("title") or ""
+    if override_active:
+        target = write_id
+    else:
+        target = candidate.get("final_category_id") or candidate.get("target_category_id")
     if str(target or "").strip() == str(stored or "").strip():
         pass
-    elif override_category_lock:
+    elif override_active:
         ok, reason = explicit_override_target_allowed(target, title, stored=stored)
         if not ok:
             raise RuntimeError(reason)
@@ -454,14 +493,14 @@ def apply_db_sync(conn: sqlite3.Connection, product_row: dict, candidate: dict, 
         conn,
         product_row["sku"],
         product_row.get("optimization") or {},
-        candidate["final_category_id"],
-        candidate["final_category_name"],
+        target,
+        candidate.get("target_category_name") if override_active else candidate["final_category_name"],
     )
     return {
         "sku": product_row["sku"],
         "action": "SYNCED_DB",
         "listing_id": product_row.get("listing_id"),
-        "category_id": candidate["final_category_id"],
+        "category_id": target,
     }
 
 
@@ -486,6 +525,9 @@ def main():
         help="Explicit per-SKU override as SKU=ID (repeatable)",
     )
     args = parser.parse_args()
+    scope_err = validate_repair_cli_scope(sku=args.sku, category_id=args.category_id)
+    if scope_err:
+        parser.error(scope_err)
     explicit_targets, global_category_id = parse_explicit_targets(
         args.target_category, args.category_id
     )
