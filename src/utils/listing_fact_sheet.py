@@ -78,6 +78,10 @@ _SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
     # PP casters / polypropylene parts. Source specs often say "PP" while the
     # listing expands it; this is the same polymer, not a material upgrade.
     frozenset({"pp", "polypropylene", "pp (polypropylene)", "polypropylene (pp)"}),
+    # PC is the ubiquitous shorthand for polycarbonate (fan cages, lamp shades,
+    # clear panels). Source often writes "PC" / "Crystal,PC" while generated
+    # copy expands to "polycarbonate" - same polymer, not a material upgrade.
+    frozenset({"pc", "polycarbonate", "pc (polycarbonate)", "polycarbonate (pc)"}),
     # eBay upholstery aspect canonicalizes microsuede → Microfiber.
     frozenset({
         "microfiber",

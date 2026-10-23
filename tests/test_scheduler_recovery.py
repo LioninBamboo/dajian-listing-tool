@@ -533,6 +533,24 @@ def test_listing_audit_task_runs_live_email_audit(monkeypatch):
     assert kwargs['timeout_sec'] == scheduler_daemon.TASK_TIMEOUT['listing_audit']
 
 
+def test_promotion_rotate_args_exclude_email(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(scheduler_daemon, 'run_task', lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    scheduler_daemon.task_promotion_rotate()
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0] == 'promotion_rotate'
+    command = [str(part) for part in args[1]]
+    assert command[0].endswith('scripts\\auto_rotate_promotions.py') or command[0].endswith(
+        'scripts/auto_rotate_promotions.py'
+    )
+    assert '--email' not in command
+    assert kwargs['timeout_sec'] == 1800
+
+
 def test_task_mode_health_update_preserves_daemon_pid_and_pid_file(tmp_path, monkeypatch):
     health_path = tmp_path / '_scheduler_health.json'
     pid_path = tmp_path / '_scheduler.pid'

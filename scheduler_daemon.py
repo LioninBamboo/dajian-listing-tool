@@ -1111,7 +1111,7 @@ def task_promotion_rotate():
     """自动轮转 5% 店铺促销 (2天一期)"""
     run_task(
         'promotion_rotate',
-        [str(PROJECT_ROOT / 'scripts' / 'auto_rotate_promotions.py'), '--email'],
+        [str(PROJECT_ROOT / 'scripts' / 'auto_rotate_promotions.py')],  # email silenced; digest covers promo
         timeout_sec=1800,
     )
 
@@ -2172,6 +2172,8 @@ def recover_missed_tasks(log_when_clean=True):
                 )
 
             recovered.append(task_name)
+            if IS_DAEMON_PROCESS:
+                update_health('_daemon', 'running', f'Recovering missed: {task_name}')
             config['func']()
         
         if recovered:
@@ -2564,6 +2566,10 @@ def run_daemon():
     logger.info(f"Python: {sys.executable}")
     logger.info(f"Project: {PROJECT_ROOT}")
     logger.info("=" * 60)
+
+    # Heartbeat first. recover_missed_tasks can run for hours; if health is
+    # still the old PID, watchdog treats this process as dead and respawns.
+    update_health('_daemon', 'running', f'Started at {datetime.now().isoformat()}')
 
     cleanup_stale_processes()
     setup_schedule()
