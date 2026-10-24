@@ -103,6 +103,7 @@ from src.utils.approved_category import (
     is_category_approved,
     locked_category_write_error,
 )
+from src.utils.audit_severity import normalize_severity
 from src.utils.category_decision import category_gate_report_flags
 from src.utils.publish_validation import first_aspect_text, measurement_issue
 from src.utils.publish_autofix import (
@@ -976,7 +977,8 @@ def audit_single_product(
     if decision.conflict or decision.reason == "title_source_conflict":
         issues.append({
             "type": "title_source_conflict",
-            "severity": "INFO",
+            "severity": "LOW",
+            "report_only": True,
             "current": stored_category or None,
             "expected": None,
             "detail": (
@@ -1019,7 +1021,8 @@ def audit_single_product(
         review = opt.get("_category_remap_review") if isinstance(opt, dict) else None
         issues.append({
             "type": "category_remap_pending_review",
-            "severity": "WARNING",
+            "severity": "MEDIUM",
+            "report_only": True,
             "current": stored_category or None,
             "expected": (review or {}).get("to") if review else decision.category_id,
             "detail": (
@@ -1055,7 +1058,8 @@ def audit_single_product(
     for flag in category_gate_report_flags(stored_category, optimization=opt):
         issues.append({
             "type": flag,
-            "severity": "INFO",
+            "severity": "LOW",
+            "report_only": True,
             "current": stored_category or None,
             "detail": flag,
         })
@@ -1565,11 +1569,17 @@ def audit_single_product(
                     continue
                 if _sv["claim_text"].lower() in _existing_details:
                     continue
-                issues.append({
+                fact_issue = {
                     "type": _sv["claim_type"],
                     "severity": _sv["severity"],
                     "detail": f"[FactSheet] {_sv['claim_text']} — source evidence: {_sv['source_evidence']}",
-                })
+                }
+                # count_unverifiable is INFO on the fact sheet and is copied into
+                # this issues list. Keep it report-only so INFO→LOW cannot dirty
+                # the row. The semantic-rebuild hook below is unchanged.
+                if str(_sv.get("claim_type") or "") == "count_unverifiable":
+                    fact_issue["report_only"] = True
+                issues.append(fact_issue)
                 # Add support for semantic rebuild if we encounter FactSheet violations
                 fixes["__semantic_rebuild_from_source__"] = True
                 if (
@@ -1810,6 +1820,9 @@ def audit_single_product(
         })
         fixes["__truncated_html_cleanup__"] = True
 
+    for issue in issues:
+        if isinstance(issue, dict):
+            issue["severity"] = normalize_severity(issue.get("severity"))
 
     return issues, fixes
 
