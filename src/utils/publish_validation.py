@@ -1,0 +1,166 @@
+"""Shared publish-time validation helpers for READY drafts and live publish flows."""
+
+from __future__ import annotations
+
+import re
+
+
+REQUIRED_MEASUREMENT_ASPECT_KEYS = ('Item Length', 'Item Width', 'Item Height')
+OPTIONAL_MEASUREMENT_ASPECT_KEYS = ('Item Weight',)
+MEASUREMENT_ASPECT_KEYS = REQUIRED_MEASUREMENT_ASPECT_KEYS + OPTIONAL_MEASUREMENT_ASPECT_KEYS
+PLACEHOLDER_ASPECT_VALUES = {
+    'see description',
+    'refer to description',
+    'refer to product images',
+    'refer to photos',
+    'not specified',
+    'n/a',
+    'na',
+    'unknown',
+}
+
+
+def first_aspect_text(aspects: dict, key: str) -> str:
+    value = (aspects or {}).get(key)
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return str(value or "").strip()
+
+
+def measurement_issue(value: str, max_value: float | None = None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return "missing"
+    value_lower = text.lower()
+    if value_lower in PLACEHOLDER_ASPECT_VALUES or 'see description' in value_lower or 'refer to' in value_lower:
+        return "placeholder"
+    match = re.search(r'(\d+(?:\.\d+)?)', text)
+    if match:
+        number = float(match.group(1))
+        if number <= 0:
+            return "non-positive"
+        if max_value is not None and number > max_value:
+            return "implausible"
+    return None
+
+
+def measurement_validation_errors(aspects: dict) -> list[str]:
+    errors: list[str] = []
+
+    for key in REQUIRED_MEASUREMENT_ASPECT_KEYS:
+        value = first_aspect_text(aspects, key)
+        issue = measurement_issue(value, max_value=500)
+        if issue == "missing":
+            errors.append(f"missing measurement aspect: {key}")
+            continue
+        if issue == "placeholder":
+            errors.append(f"placeholder measurement aspect: {key}={value}")
+            continue
+        if issue == "non-positive":
+            errors.append(f"non-positive measurement aspect: {key}={value}")
+            continue
+        if issue == "implausible":
+            errors.append(f"implausible measurement aspect: {key}={value}")
+
+    for key in OPTIONAL_MEASUREMENT_ASPECT_KEYS:
+        value = first_aspect_text(aspects, key)
+        if not value:
+            continue
+        issue = measurement_issue(value, max_value=2000)
+        if issue == "placeholder":
+            errors.append(f"placeholder measurement aspect: {key}={value}")
+            continue
+        if issue == "non-positive":
+            errors.append(f"non-positive measurement aspect: {key}={value}")
+            continue
+        if issue == "implausible":
+            errors.append(f"implausible measurement aspect: {key}={value}")
+
+    return errors
+
+
+def _motors_keep_stored_after_canonicalize(stored: str, canonical: str) -> bool:
+    """A Motors canonicalize that lands on a tree-0 id must not replace a valid stored leaf."""
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        if not get_store_profile().is_motors:
+            return False
+    except Exception:
+        return False
+    stored_id = str(stored or "").strip()
+    canonical_id = str(canonical or "").strip()
+    if not stored_id or not canonical_id or stored_id == canonical_id:
+        return False
+    from src.services.vehicle_compatibility import TREE0_FORCE_INVENTORY_CATEGORIES
+    from src.utils.category_tree_cache import is_cached_leaf_in_tree
+
+    if canonical_id in TREE0_FORCE_INVENTORY_CATEGORIES:
+        return False
+    if is_cached_leaf_in_tree(canonical_id, "100"):
+        return False
+    if is_cached_leaf_in_tree(canonical_id, "0") and (
+        is_cached_leaf_in_tree(stored_id, "100") or is_cached_leaf_in_tree(stored_id, "0")
+    ):
+        return True
+    return False
+
+
+def category_validation_errors(
+    category_matcher,
+    title_context: str,
+    category_id: str,
+    category_name: str = None,
+    *,
+    skip_canonicalize: bool = False,
+) -> list[str]:
+    normalized_category_id = str(category_id or '').strip()
+    if not normalized_category_id:
+        return ["missing categoryId"]
+
+    if category_matcher and not skip_canonicalize:
+        stored_before = normalized_category_id
+        canonical_id, canonical_name = category_matcher.canonicalize_category(
+            title_context,
+            normalized_category_id,
+            category_name,
+        )
+        if _motors_keep_stored_after_canonicalize(stored_before, canonical_id):
+            pass
+        elif canonical_id:
+            normalized_category_id, category_name = canonical_id, canonical_name
+
+    if (
+        category_matcher
+        and not skip_canonicalize
+        and not category_matcher.is_category_plausible_for_text(
+            title_context,
+            normalized_category_id,
+            category_name,
+        )
+    ):
+        return [f"implausible category {normalized_category_id} for title '{title_context[:120]}'"]
+
+    return []
+
+
+def get_publish_blockers(
+    category_matcher,
+    title_context: str,
+    aspects: dict,
+    category_id: str,
+    category_name: str = None,
+    *,
+    skip_canonicalize: bool = False,
+) -> list[str]:
+    blockers = measurement_validation_errors(aspects)
+    blockers.extend(
+        category_validation_errors(
+            category_matcher,
+            title_context,
+            category_id,
+            category_name,
+            skip_canonicalize=skip_canonicalize,
+        )
+    )
+    return blockers

@@ -1,0 +1,9 @@
+﻿sku,is_combo,combo_box_count,net_weight_lbs,gross_weight_lbs,child_combo,assembled_length_in,assembled_width_in,assembled_height_in,package_length_in,package_width_in,package_height_in,page_price,page_shipping,giga_url,status,notes
+W714P501023,False,1,94.0,103.0,,71.00,33.00,35.00,34.00,29.00,17.00,205.2,71.73,https://www.gigab2b.com/product/W714P501023,collected,ok
+W714S01975,True,2,116.0,131.0,W714P501023x1 | W714P501029x1,70.8,66,34.6,34.0,29.0,17.0,268.2,91.23,https://www.gigab2b.com/product/W714S01975,collected,ok
+W714S01976,True,3,138.0,159.0,W714P501023 x1 | W714P501029 x2,70.8,66,34.6,34.0,29.0,17.0,331.2,110.72,https://www.gigab2b.com/product/W714S01976,collected,ok
+W714S01977,True,2,153.0,171.0,W714P501023 x1 | W714P501028 x1,103.8,99,34.6,34.0,29.0,17.0,358.2,119.08,https://www.gigab2b.com/product/W714S01977,collected,ok
+W714P500997,False,1,94.0,103.0,,71.00,33.00,35.00,34.00,29.00,17.00,205.2,71.73,https://www.gigab2b.com/product/W714P500997,collected,ok
+W714S01969,True,2,116.0,131.0,W714P500997 x1 | W714P501021 x1,70.8,66,34.6,34.0,29.0,17.0,268.2,91.23,https://www.gigab2b.com/product/W714S01969,collected,ok
+W714S01970,True,3,138.0,159.0,W714P500997 x1 | W714P501021 x2,70.8,46,34.6,34.0,29.0,17.0,331.2,110.72,https://www.gigab2b.com/product/W714S01970,collected,ok
+W714S01971,True,2,153.0,171.0,W714P500997 x1 | W714P501015 x1,103.8,99,34.6,34.0,29.0,17.0,358.2,119.08,https://www.gigab2b.com/product/W714S01971,collected,ok

@@ -1,0 +1,147 @@
+你是接手 Dajian_Listing_Tool 存量 CRITICAL 清理任务的执行方,这是**续作指令**。
+
+仓库：C:\Users\poonx\Dajian_Listing_Tool
+分支：codex/live-audit-semantic-guard（不要切换、不要新建）
+原任务书：docs/HANDOFF_CRITICAL_BACKLOG_20260726.md —— **仍然全部有效,红线不变**
+
+═══════════════════════════════════════════
+【一、先说结论：你上一轮做得对】
+═══════════════════════════════════════════
+
+已验收：
+- Step 1 重跑审计 ✅（正确带了 --ignore-clean-freeze，skipped_clean_frozen 58→0）
+- 新基线 CRITICAL 142 行 / 115 SKU ✅（落在放行区间 110–150 内）
+- Step 3 全量 dry-run ✅（87 份预览：67 可推 / 19 转人工 / 1 跳过）
+- **Step 3 后停下来等放行 ✅ —— 这一条最重要，你没有擅自往下推**
+
+零推送、零提交、无红线违反，全部核实过。
+
+═══════════════════════════════════════════
+【二、但你的 87 份预览作废，必须重跑】
+═══════════════════════════════════════════
+
+不是你的问题。验收时逐条看预览，发现**描述模板本身在制造幻觉**，
+你那 67 条待推里有 42 条带着它：
+
+缺陷 A（28 条）：源里没有场景句时，PERFECT FOR 段的兜底句给每个产品硬套
+  "Ideal for ... where a compact <类型> adds practical seating and everyday comfort"
+  于是圆锯、手推式割草机、花园雕像、雨伞、行李箱、鸡舍、猫爬架、跑步机
+  统统被写成"提供实用座椅"。
+
+缺陷 B（14 条）：HTML 剥离后段标题粘在句首，匹配到含 "ideal" 的句子就整段返回，
+  结果把 "Product Features Built-In Storage Solution:..." 当成场景文案输出。
+
+已修复并提交（`5142754`）：无源据时返回空串，整个 PERFECT FOR 区块条件渲染直接不出；
+标题剥离复用已有规则。新增 5 条负例测试。**全量 2098 passed。**
+
+> 🔴 你的 reports/crit_backlog_preview/ 是修复前生成的，**不可用作放行依据**。
+> 如果照它推，会把"圆锯提供实用座椅"发布到 eBay。
+
+═══════════════════════════════════════════
+【三、这一轮做什么】
+═══════════════════════════════════════════
+
+### Step A — 重跑 Step 3 dry-run（审计不用重跑）
+
+改动只在描述构建，审计基线（142 行 / 115 SKU）仍然有效，**不要重跑审计**。
+直接用你上轮派生的 logs/semantic_rewrite_queue.txt：
+
+```
+PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/semantic_rewrite.py --sku-file logs/semantic_rewrite_queue.txt --preview-dir reports/crit_backlog_preview_v2
+```
+
+写进**新目录 `_v2`**，不要覆盖旧的（要留着对比）。
+
+### Step B — 自检，把结果报回来
+
+在 v2 预览上跑这三条自检，**三条必须全部为 0**：
+
+```bash
+grep -l "adds practical seating" reports/crit_backlog_preview_v2/*.md | wc -l
+grep -c "PERFECT FOR Product Features" reports/crit_backlog_preview_v2/*.md | grep -v ":0" | wc -l
+grep -l "everyday comfort" reports/crit_backlog_preview_v2/*.md | wc -l
+```
+
+**任何一条不为 0 → 停下来报告，不要继续。**
+
+然后报告：pushable / needs_human / skip 的数量，以及 needs_human 的原因分类。
+**等放行，不要自己进 Step 4。**
+
+### Step C — 金丝雀（放行后才做）
+
+从 v2 的 pushable 里挑 10 条，**必须覆盖不同问题类型**，并且**至少包含 2 条
+原本中招 "adds practical seating" 的**（如圆锯 / 割草机 / 花园雕像 / 鸡舍），
+用来验证修复真的生效。写进 logs/_canary10.txt 后：
+
+```
+PYTHONPATH="C:\Users\poonx\Dajian_Listing_Tool" .venv/Scripts/python.exe scripts/semantic_rewrite.py --sku-file logs/_canary10.txt --apply
+```
+
+推完逐条按原任务书第 5 节验收清单核对（重点：**在 offer 的 listingDescription 上验**，
+不是 inventory 那份——后者会被截断到 4000 字符，验它会误判）。
+
+═══════════════════════════════════════════
+【四、附带任务：W3166P455683（鸡舍）】
+═══════════════════════════════════════════
+
+新审计发现一条结构损坏的 live listing，是 7/14 那类事故的复发：
+
+- SKU: `W3166P455683`  listing_id: `366505408103`
+- 症状 1：live 描述是**中文原始 GIGA 数据**，不是店铺模板
+- 症状 2：live 标题就是 `chicken coop` —— 十二个小写字母，直接挂在 eBay 上
+
+**注意：`repair_broken_listings.py` 修不了它。**
+我已 dry-run 验证，它会 `SKIP (title_rebuild_failed)`，因为源标题本身也是
+"chicken coop"，没法当 eBay 标题用。不要在这上面反复试那个脚本。
+
+分两块处理：
+
+**(1) 描述 —— 可以自动修**
+我已直接验证过重建结果：3660 字符、banner + footer 齐全、无中文、
+PERFECT FOR 已按新规则正确省略、无编造的座椅声明。
+用 audit 的 fix-key 路径修（先 dry-run 看 diff，确认后再加 --fix）：
+
+```
+scripts/audit_fix_active_listings.py --sku W3166P455683 --live --fix-key __rebuild_description_from_source__
+```
+
+**(2) 标题 —— 不许自动改，只出建议**
+
+> 🔴 标题必须人工定稿。你的交付是"建议"，不是"已改"。
+
+源里有足够事实可供拟标题（都已核实存在于源描述中）：
+- 尺寸 123"L x 26"W x 44.5"H
+- 容量 4–8 只鸡
+- 含 nesting boxes（产蛋箱）、runways、ramps、elevated main house
+
+提 2–3 个候选标题给验收人选，**每个词都必须能在源里找到依据**。
+不要加源里没有的材质、不要加"waterproof / all-weather"这类未经源证实的形容词。
+
+═══════════════════════════════════════════
+【五、红线（与原任务书一致，只能触发停止）】
+═══════════════════════════════════════════
+
+历史教训：曾有执行方在正确触发"批量回滚>2条则停止"后，自行把它重新解释成
+"批次栅栏——结束本批、继续下一批"。**红线的唯一合法反应是：停下来，报告，等指示。**
+
+- Step B 三条自检任一不为 0 → 停止
+- 转人工的 SKU 被绕过校验推送 → 停止
+- 单批回滚 > 2 条 → 停止
+- 任何 end-listing / relist（必须原位更新 listing_id/offer_id）→ 停止
+- W3166P455683 的标题被自动改写 → 停止
+- 修改或删除既有测试断言 → 禁止（只能新增）
+- `git add -A` / `git add .` → 禁止。工作区有并行 session 的改动，只能 git add <具体路径>
+- 修改 .env / 杀重启调度守护进程 / git push → 禁止
+- 绕过 PricingEngine / RepricingGuard / EbayPublisher → 禁止
+
+═══════════════════════════════════════════
+【六、其他】
+═══════════════════════════════════════════
+
+- 测试基线现在是 **2098 passed**（不是 2068，我这轮加了 5 条负例 + 修了 1 处测试污染）
+  `$env:PYTHONPATH='C:\Users\poonx\Dajian_Listing_Tool'; .\.venv\Scripts\python.exe -m pytest tests/ -q`
+- LLM 提取有 run-to-run 抖动，v2 的数字与上轮有出入是正常的，不要去"修"提取器。
+  只对连续两次都被标记的问题动手。
+- 本次仍**只处理 CRITICAL**，不碰 MEDIUM（那是营销措辞噪声，上千条是预期内的）。
+
+**不要自评"任务完成"。** Step B 报完数据等放行；遇到红线或判断不了的，停下来问。

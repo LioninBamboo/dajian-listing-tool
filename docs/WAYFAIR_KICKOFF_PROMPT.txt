@@ -1,0 +1,36 @@
+你是一个严谨的开发代理，工作目录 C:\Users\poonx\Aquawood Smart ERP-Wayfair（采集 GIGA 源、刊登到 Wayfair 的项目）。
+
+我们已在姊妹项目（eBay 版）建成一整套"源事实驱动的刊登内容质检体系"，并沉淀为可移植 legacy。你的任务：把它适配到本 Wayfair 项目。**先读、再勘、后规划，未经我批准不写任何业务代码、绝不写 Wayfair live。**
+
+═══ 第一步：通读 legacy（必须完整读，含 §5.5 v2 教训）═══
+C:\Users\poonx\Dajian_Listing_Tool\docs\LEGACY_FOR_WAYFAIR.md
+核心方法论：GIGA 源数据是唯一事实基准，刊登内容任何声明必须可回溯到源；LLM 只做验证/提取、绝不做生成；一切 live 写入过"双闸(CLI flag+环境变量) + 金丝雀人工放行 + 推送前快照可回滚"。
+可直接搬的平台无关代码（在 Dajian 仓库，可参考/复制）：
+- src/utils/listing_fact_sheet.py（语义事实表护栏：LLM 提取→确定性 diff→hash 缓存，几乎零改动可用）
+- src/services/source_refresh.py（源刷新：字段级漂移检测 enrichment/normalize/repair/change 四级，媒体 URL 按 path 比较、尺寸 0.1 容差）
+- src/utils/claim_diff_engine.py 与 listing_quality_gate.py（规则层，含 foldable 统一仲裁、源证据必须含标题的修正）
+- scripts/repair_broken_listings.py / semantic_rewrite 系列（重建与改写管线的结构参考）
+eBay 专属需替换为 Wayfair 等价物：offer/inventory 推送三段式、Trading GetOrders、类目/属性体系、republish 语义。
+
+═══ 第二步：勘察本 Wayfair 代码库（只读）═══
+摸清并记录：采集入口与源快照存哪（DB schema）；刊登状态机（对应 eBay 的 COLLECTED→READY→PUBLISHED 是什么）；Wayfair API 客户端有哪些能力（内容更新、订单、媒体）；现有质检/校验（若有）；文案生成用什么（有无 LLM 写手——那就是幻觉风险源）。
+
+═══ 第三步：产出适配方案后【硬停】等我批准 ═══
+写 docs/WAYFAIR_QC_ADOPTION_PLAN.md：
+1. 映射表：legacy 组件 → 本库落点（直接搬 / 适配 / 需新建平台适配层），逐项标注依据
+2. 差距清单：Wayfair 与 eBay 的关键差异点（taxonomy、内容更新 API、订单 API、媒体托管）各自怎么解决
+3. 分阶段计划（照抄 eBay 版的节奏）：P0 事实表护栏离线跑通（纯检测零写入）→ P1 源刷新任务 → P2 安全底座(双闸/快照回滚/金丝雀) → P3 平台适配层+金丝雀实弹（此阶段前必须再次经我放行）
+4. 每阶段的验收标准与产出物
+**写完方案即停，等我批准后才进入 P0。**
+
+═══ 从第一天就要遵守的铁律（全部来自 eBay 版踩过的坑，见 legacy §5.5）═══
+1. 一切队列/校验以 Wayfair live 状态为准，绝不能只扫本地 DB（本地副本会截断/过期）
+2. 任何 claim/feature 源证据检测，文本 = 源标题+描述+属性，缺一不可
+3. 店铺模板文案（banner/footer 等）从第一天就单点定义成常量/配置，不许散落多处
+4. 接调度器的脚本先定义退出码契约："队列空=成功 exit 0"
+5. 质检报表分层：CRITICAL 与营销词级噪声绝不混在同一个头条数字
+6. 红线（回滚失败留坏态/单批回滚超限/验证失效被推送/listing 标识变化）只能触发停止，你无权重新解释或弱化
+7. 大批量改写后次日检测数字会有 LLM 提取波动尖峰，边界判定"复提两次仍在才算真"
+8. 禁 git push；commit 需我批准；禁改凭证/环境配置；发现本库既有 bug 记录不顺手改
+
+现在从第一步开始。

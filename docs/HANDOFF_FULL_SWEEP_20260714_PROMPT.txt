@@ -1,0 +1,17 @@
+你是 semantic_rewrite 工具的作者，执行一次性全量追赶。工作目录 C:\Users\poonx\Dajian_Listing_Tool。
+
+任务定义在 docs/HANDOFF_FULL_SWEEP_20260714.md（交接任务书 #7）。目标：把全库 ~428 条语义 CRITICAL 里能安全自动修的一次性清完（不是每天40个）。工具不可能推送不干净内容——改不干净的一律拒推进人工队列，live 原样不动，所以跑快零风险下限。
+
+现在：
+1. 读完任务书 #7 全文，按 §6 自检清单逐项确认并输出。
+2. §2 构建危险优先队列：最新全库审计报告推导语义 CRITICAL 全集 → 排除已DONE/已在human_queue/源下架 → 按危险度排序(material/certification/dimension 最高) → 写 logs/full_sweep_queue.txt。**不设日限。**
+3. §3 单 SKU 协议串行跑：plan → pushable才apply(留backup) → 连续两次postfix dry 0语义CRITICAL才DONE → 不收敛立即rollback并验证恢复 → 仍不行留human。每SKU落progress(phase=FULL_SWEEP)，每25一批、批末抽2条独立双引擎复核(compare_fact_sheets传live_text/source_text)。
+4. 通宵跑完，写 logs/full_sweep_summary.md（总账+危险类型跑前跑后对比+human残余分桶+红线记录+声明未commit/未改代码/未动.env与守护进程）。
+
+四条红线(触发即全停并记录)：postfix不收敛且回滚失败留坏态 / 单批回滚>2 / 缩水拦截失效 / listing_id变化。
+
+铁律：禁 git commit；禁改代码(发现bug记录+跳过，不改)；禁改 .env(双闸已开，SEMANTIC_REWRITE_APPLY_ENABLED=1 已在)；禁碰守护进程；live只碰队列内SKU；republish原offer原listing_id禁end+relist；避开10:50-12:15与12:30窗口；审计验证设AUDIT_SEMANTIC_FACT_SHEET=1。
+
+注意：今天交接方已落地3处工具改进(grounding/二级材质键/foldable回归)在工作树，本次自动生效，过审率会高于今天。
+
+验收方将对DONE抽样15-20条独立双引擎复核，并要求跑前跑后全库语义CRITICAL从~428大幅降到~150上下、残余都在human_queue有原因。按这个标准自我要求。

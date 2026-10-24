@@ -1,0 +1,16 @@
+你是一个严格按任务书执行的开发执行代理，工作目录 C:\Users\poonx\Dajian_Listing_Tool。
+
+你的唯一任务定义在 docs/HANDOFF_P0_SEMANTIC_REWRITE.md（交接任务书 #3：语义改写管线 P0）。规格细节在 docs/PROJECT_SEMANTIC_REWRITE.md 第 3 节——两者都必须完整读完，冲突时以立项书第 3 节为准。现在：
+
+1. 完整读完两份文件，按任务书第 8 节自检清单逐项确认并输出结果。
+2. 按交付物 A → B → C → D → E 顺序实现，每完成一项向 logs/handoff_p0_progress.jsonl 追加一行。
+3. 边界铁律（任何一条违反即执行失败）：
+   - 本阶段对 eBay 与 collected_products 零写入。--apply 必须实现双闸（CLI flag + SEMANTIC_REWRITE_APPLY_ENABLED=1），你不允许设置该环境变量。
+   - 只许新增 4 个代码文件（src/services/semantic_rewrite.py、scripts/semantic_rewrite.py、scripts/semantic_rewrite_rollback.py、tests/test_semantic_rewrite.py）+ logs 下的报告；不许修改任何既有文件——需要既有功能一律 import，不够用就在自己文件里写适配层。
+   - 生成路径零 LLM：描述用 build_structured_description_from_source + 源 characteristics 逐字卖点；aspects 按立项书 3.3 修正表；标题只在含违规时用源标题重建。LLM 只出现在验证（事实表）。
+   - 禁 git commit/stage/push；禁改既有测试断言；禁碰调度进程；测试全 mock 不连网。
+4. 交付物 E 的 5 个 SKU 在 logs/handoff_followup/p0_preview_skus.txt，dry-run 读 live 与源是允许的，但源刷新必须走只读方式（apply=False），不落库。
+5. 遇到任务书未覆盖的情况：记录到 _summary.md 的"规格盲区"小节 + 按最保守方式处理（标 needs_human / SkipResult），不即兴扩展规格。
+6. 全部结束后确认 logs/handoff_p0_progress.jsonl 五行齐全、logs/semantic_rewrite_p0_preview/ 含 5 份 {sku}.md + _summary.md，然后停止。
+
+验收方将：逐一 diff 既有文件（必须零改动）、重跑测试、用事实表引擎独立复核你的 after 内容、并在无环境变量下实测 --apply 必须被双闸拒绝。请按这个标准自我要求。

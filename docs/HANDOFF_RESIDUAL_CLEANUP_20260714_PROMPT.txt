@@ -1,0 +1,17 @@
+你是 semantic_rewrite 工具的作者，执行残余清理。工作目录 C:\Users\poonx\Dajian_Listing_Tool。
+
+任务定义在 docs/HANDOFF_RESIDUAL_CLEANUP_20260714.md（交接任务书 #8）。目标：把语义改写残余（26硬停未处理 + 156 human_queue = 182 唯一SKU，在 logs/residual_rerun_queue.txt）尽量清完，并修 2 个既有测试失败。诚实前提：这182里有真幻觉/真冲突，工具正确地不敢自动改——那部分产出人工复核清单，不硬修，不许写脚本绕过验证盲改。
+
+四阶段，按顺序：
+- **阶段A 残余重跑**：182 SKU大部分是今天4处工具修复(grounding/二级材质键/foldable词形/cert grounding)之前进队列的，重跑会自动清一大块。按任务书#7 §3单SKU协议(plan→pushable才apply留backup→连续两次postfix dry 0语义CRITICAL→不收敛即回滚→仍不行留human)，phase=RESIDUAL_A，每25一批批末抽2条独立复核。预期过审率30-45%(比追赶低,这是硬骨头)。产出 residual_A_summary.md。
+- **阶段B 复合材质映射扩充**：剩余 semantic_material_compound 提取候选写 residual_compound_candidates.yaml(带evidence+建议primary,源可溯禁臆造)→追加进 config/semantic_rewrite_maps.yaml(新条目default policy=human)→**硬停**产出 residual_compound_review.md 等用户逐行批准→批准后apply(phase=RESIDUAL_B)。
+- **阶段C 真残余人工清单**：仍human的分类产出 residual_human_review.md(真幻觉canvas/标题类目冲突/claim层LED/尺寸数量边界)，每条给 SKU/live现值/源证据/建议动作，只整理不改live。
+- **阶段D 修2个测试**：①test_rollback_dual_gate 给FakeEbay加 oauth mock(types.SimpleNamespace(get_valid_token=lambda:"tok"))或让回滚测试走create_or_replace_inventory_item;②test_gap4 更新为映射表命中即解析(测试跟上新行为,非削弱)。跑 pytest tests/test_semantic_rewrite.py 0失败。
+- **阶段E 坏listing守卫接入--fix**：audit 已有检测(description_is_raw_source_dump/dangling标题)但 fix键 __rebuild_description_from_source__ 未接apply循环——审计能报不能修。把它接上,**复用(不复制)** scripts/repair_broken_listings.py 的重建逻辑(build_source_snapshot现抓源→build_structured_description_from_source重建模板→normalize_listing_title_for_ebay修标题→_material_case保缩写→三层验证→backup→推送)。改不干净的不推留人工。新增测试(raw-source SKU修后issue消失且推模板;重建后claim=1的不推)。不改每日调度/守护进程,只让 --live --fix 具备能力。
+- **阶段F 5个held-back人工件**：数据在 logs/held_back_5.json。产出一页清单 logs/held_back_5_review.md(每条 SKU/live现值/源证据/为何拦/建议),并对有明确源解的直接修:W5368P497697(源标题完整只是live截断→重建+Material←Rubber Wood,能修)、W3098P470269(材质Wood错应Polyester/Chenille,标题截断End of→补,能修);拿不准的留人工:N704G201258L(Solid Wood是否保留)、W5123P397514(源标题本身半句)、W3166P455683(源名只"chicken coop"两词,源坏)。能修的走单SKU协议+live复查,不硬改。
+
+铁律：禁 git commit;阶段A/B/C/F不写产品新逻辑(阶段E允许改audit接fix键、复用repair_broken_listings.py不复制),测试只新增不削弱;禁改.env(双闸已开SEMANTIC_REWRITE_APPLY_ENABLED=1);禁碰守护进程/每日调度;live只碰队列SKU;republish原offer原listing_id;四条红线触发即全停;避开10:50-12:15与12:30;审计AUDIT_SEMANTIC_FACT_SHEET=1。
+
+执行顺序：A → B提取候选后硬停等用户审表 → 用户批准后B应用 → C整理 → D测试 → E接入自动修+测试 → F 5件整理+能修则修。B硬停是唯一等指令点。
+
+验收方将在B硬停查候选无臆造;终验对RESIDUAL_A/B的DONE抽10-15条独立双引擎复核、要求human_queue净减少=新DONE数、pytest 0失败、阶段E的--fix自动重建能力(mock+抽live验)、阶段F能修的live干净拿不准的有据、无commit。按此自我要求。

@@ -1,0 +1,3877 @@
+"""Quality gate for generated eBay listing drafts.
+
+The AI optimizer is allowed to draft copy, but product identity, category,
+measurements, item specifics, and image sufficiency must be deterministic.
+"""
+
+from __future__ import annotations
+
+import copy
+import html as html_lib
+import re
+from dataclasses import dataclass
+from typing import Any, Mapping
+from urllib.parse import urlparse
+
+from src.utils.dimension_helpers import (
+    extract_all_dimensions,
+    extract_product_dimensions_from_text,
+    extract_product_weight_from_text,
+    replace_description_measurements,
+)
+from src.utils.product_context_signals import (
+    compound_product_family,
+    has_any_phrase,
+    has_compound_product_signal,
+    has_outdoor_marker,
+    is_camping_kitchen_title,
+    outdoor_context as strict_outdoor_context,
+    primary_product_noun,
+    strip_mixed_indoor_outdoor,
+    strip_room_location_lists,
+    title_allows_outdoor_chair_remap,
+    title_has_clear_outdoor_word,
+    title_has_mixed_indoor_outdoor,
+    title_is_chair_accessory,
+    title_is_dining_set_bundle,
+)
+from src.utils.publish_aspect_completion import (
+    NOT_DIMENSION_AFTER,
+    has_real_table,
+    infer_number_of_items_in_set,
+    number_is_dimension_bound,
+    plausible_seat_count,
+    seating_item_counts,
+    seating_plus_table_item_count,
+)
+from src.utils.approved_category import blocks_automated_category_change
+from src.utils.publish_autofix import sanitize_placeholder_aspects, sanitize_single_value_aspects
+from src.utils.publish_validation import (
+    REQUIRED_MEASUREMENT_ASPECT_KEYS,
+    first_aspect_text,
+    measurement_validation_errors,
+)
+from src.utils.title_sanitizer import normalize_listing_title_for_ebay
+
+
+MIN_READY_IMAGE_COUNT = 2
+
+# CJK Unified Ideographs — buyer-facing EN listings must not ship Chinese copy.
+CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff]")
+
+BAD_TEXT_REPLACEMENTS = {
+    "Sofafor": "Sofa for",
+    "Boucl\u8c37": "Boucle",
+    "Boucl\u0439": "Boucle",
+    "Boucl\u0438\u0436": "Boucle",
+    "Boucl\u00e9": "Boucle",
+    "\u2013": "-",
+    "\u2014": "-",
+    "\u2212": "-",
+    "\u6bcf": "-",
+}
+
+FURNITURE_FORBIDDEN_ASPECTS = {
+    "US Shoe Size",
+    "Shoe Width",
+    "Shoe Size",
+    "Sport",
+    "Sport/Activity",
+    "Performance/Activity",
+    "Performance",
+    "Occasion",
+    "Upper Material",
+    "Closure",
+    "Style Code",
+    "Character",
+    "Pet Type",
+    "Dog Size",
+    "Cat Size",
+}
+
+GAME_TABLE_FORBIDDEN_ASPECTS = {
+    "Game Type",
+    "Game Title",
+    "Min. Number of Players",
+    "Recommended Age Range",
+    "Gender",
+    "Theme",
+    "Year",
+    "Tabletop Size",
+    "Table Height",
+    "Upholstery Material",
+    "Upholstery Fabric",
+}
+
+CLAIM_PATTERNS: dict[str, tuple[str, ...]] = {
+    "foldable": (
+        r"\bfoldable\b",
+        r"\bfolding\b",
+        r"\bcollapsible\b",
+        r"\bcollapse\b",
+    ),
+    "charging": (
+        r"\busb(?:[-\s]?c)?\b",
+        r"\bcharging\s+stations?\b",
+        r"\bcharging\s+ports?\b",
+        r"\bpower\s+outlets?\b",
+        r"\bac\s+outlets?\b",
+        r"\bwireless\s+charg(?:er|ing)\b",
+    ),
+}
+
+# Single arbiter patterns for "does SOURCE support foldable?"
+# Design (HANDOFF_FOLLOWUP): fold/folding/collapsible/折叠 = support;
+# extendable / extending / drop leaf alone do NOT constitute foldable evidence.
+FOLDABLE_SOURCE_EVIDENCE_PATTERNS: tuple[str, ...] = (
+    # Inflection-aware: previous \bfold\b missed "folded"/"folds", so a
+    # drop-leaf island whose source says "can be folded" was wrongly judged
+    # unsupported and every rewrite of it stalled (2026-07-14 foldable regression).
+    # Still excludes drop-leaf/extendable *alone* — those carry no fold verb.
+    r"\bfold(?:s|ed|ing|able|away)?\b",
+    r"\bcollaps(?:e|es|ed|ing|ible)\b",
+    r"折叠",
+)
+
+NATURALLY_FOLDABLE_TITLE_KEYWORDS: tuple[str, ...] = (
+    "umbrella",
+    "camping chair",
+    "canopy",
+    "shade sail",
+    "tent",
+    "hammock",
+)
+
+CLAIM_LABELS = {
+    "foldable": "foldable/collapsible",
+    "charging": "USB/charging",
+}
+
+SUPPORTED_FEATURE_CLAIMS = {
+    "foldable": "Foldable",
+}
+
+DIRECT_VIDEO_EXTENSIONS = frozenset({
+    ".mp4",
+    ".mov",
+    ".m4v",
+    ".webm",
+    ".avi",
+    ".wmv",
+    ".mkv",
+})
+
+BLOCKED_VIDEO_EXTENSIONS = {
+    ".txt": "source_video_txt_manifest",
+    ".m3u8": "source_video_stream_manifest",
+}
+
+BLOCKED_VIDEO_HOST_MARKERS = (
+    "youku.com",
+    "youtube.com",
+    "youtu.be",
+    "vimeo.com",
+)
+
+
+@dataclass(frozen=True)
+class ListingQualityIssue:
+    code: str
+    message: str
+    severity: str = "BLOCKER"
+    field: str | None = None
+
+
+@dataclass(frozen=True)
+class ListingProfile:
+    kind: str
+    category_id: str | None = None
+    category_name: str | None = None
+    type_value: str | None = None
+    set_includes: str | None = None
+    room: str | None = None
+    indoor_outdoor: str | None = None
+    remove_aspects: frozenset[str] = frozenset()
+
+
+def _clean_text(value: str) -> str:
+    text = str(value or "")
+    for bad, good in BAD_TEXT_REPLACEMENTS.items():
+        text = text.replace(bad, good)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _normalize_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_normalize_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _normalize_value(item) for key, item in value.items()}
+    if isinstance(value, str):
+        return _clean_text(value)
+    return value
+
+
+def _text_context(*parts: Any) -> str:
+    return _clean_text(" ".join(str(part or "") for part in parts)).lower()
+
+
+def _has_marker(text: str, *markers: str) -> bool:
+    """Word-boundary marker test. ``bench with`` must not match ``workbench with``."""
+    return has_any_phrase(text, markers)
+
+
+_OTTOMAN_BENCH_FAMILY = frozenset({"20490", "262980"})
+_OTTOMAN_BENCH_NAMES = {
+    "20490": "Ottomans, Footstools & Poufs",
+    "262980": "Benches",
+}
+_INDOOR_TABLE_LEAVES = frozenset({"38199", "38200", "38204"})
+
+
+_OUTDOOR_TABLE_PHRASES = (
+    "outdoor dining table",
+    "patio dining table",
+    "outdoor side table",
+    "patio side table",
+    "outdoor end table",
+    "patio end table",
+    "outdoor table",
+    "patio table",
+    "garden table",
+)
+
+
+def _title_has_outdoor_table_signal(text: str) -> bool:
+    """Outdoor table as the product, not a room-list or indoor/outdoor dual-use coffee table."""
+    from src.utils.product_context_signals import head_clause
+
+    if title_has_mixed_indoor_outdoor(text):
+        return False
+    core = strip_mixed_indoor_outdoor(head_clause(text) or str(text or ""))
+    if _has_marker(core, *_OUTDOOR_TABLE_PHRASES):
+        return True
+    if _has_marker(core, "coffee table", "nesting table", "cocktail table"):
+        return False
+    return _has_marker(core, "outdoor", "patio", "garden") and _has_marker(
+        core, "dining table", "side table", "end table"
+    )
+
+
+def _outdoor_dining_set_profile(title_text: str) -> ListingProfile:
+    """Patio dining set leaf. Never 79682 Patio Chairs or 54235 Chairs."""
+    stool = _has_marker(title_text, "stool", "stools")
+    return ListingProfile(
+        kind="dining_set",
+        category_id="139849",
+        category_name="Patio & Garden Furniture Sets",
+        type_value="Dining Set",
+        set_includes="Dining Table & Stools" if stool else "Dining Table & Chairs",
+        room="Patio",
+        indoor_outdoor="Outdoor",
+    )
+
+
+def _dining_set_bundle_profile(title_text: str) -> ListingProfile:
+    """Outdoor table+chairs / N-piece patio dining set → 139849; indoor bundle without set phrasing → unknown."""
+    if title_has_clear_outdoor_word(title_text):
+        return _outdoor_dining_set_profile(title_text)
+    return ListingProfile(kind="unknown")
+
+
+def _ottoman_bench_leaf(stored: str, proposed: str, proposed_name: str) -> tuple[str, str | None]:
+    """20490 Ottomans and 262980 Benches are one family — never remap between them."""
+    current = str(stored or "").strip()
+    if current in _OTTOMAN_BENCH_FAMILY and proposed in _OTTOMAN_BENCH_FAMILY:
+        return current, _OTTOMAN_BENCH_NAMES[current]
+    return proposed, proposed_name
+
+
+def _outdoor_table_profile(category_id: str) -> ListingProfile:
+    stored = str(category_id or "").strip()
+    # Stay on a non-indoor leaf (dining set / patio table / patio set).
+    # Only leave an indoor table leaf for the outdoor patio-table leaf.
+    if stored in _INDOOR_TABLE_LEAVES:
+        return ListingProfile(
+            kind="outdoor_table",
+            category_id="112590",
+            category_name="Patio & Garden Tables",
+            type_value="Outdoor Table",
+            indoor_outdoor="Outdoor",
+        )
+    return ListingProfile(kind="unknown")
+
+
+def _as_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def _set_aspect(aspects: dict[str, Any], key: str, value: str | None) -> None:
+    if value:
+        aspects[key] = [_clean_text(value)]
+
+
+def _append_unique_aspect_value(aspects: dict[str, Any], key: str, value: str) -> bool:
+    cleaned_value = _clean_text(value)
+    if not cleaned_value:
+        return False
+    existing = _as_list(aspects.get(key))
+    if any(item.lower() == cleaned_value.lower() for item in existing):
+        return False
+    existing.append(cleaned_value)
+    aspects[key] = existing
+    return True
+
+
+def _plain_text(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    return _clean_text(text)
+
+
+def _text_matches_any(text: str, patterns: tuple[str, ...]) -> bool:
+    normalized = _plain_text(text).lower()
+    if not normalized:
+        return False
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _iter_source_entries(
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+) -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    if source_title:
+        entries.append(("title", source_title))
+    if source_description:
+        entries.append(("description", source_description))
+
+    for source_name, source in (("attribute", attributes or {}), ("spec", specs or {})):
+        for key, value in source.items():
+            key_text = _clean_text(key)
+            value_text = _clean_text(value)
+            if not key_text and not value_text:
+                continue
+            entries.append((f"{source_name}:{key_text or 'unknown'}", f"{key_text}: {value_text}"))
+
+    return entries
+
+
+def _collect_claim_evidence(
+    entries: list[tuple[str, str]],
+    patterns: tuple[str, ...],
+    *,
+    limit: int = 5,
+) -> list[str]:
+    evidence: list[str] = []
+    seen: set[tuple[str, str]] = set()
+
+    for label, text in entries:
+        normalized = _plain_text(text)
+        if not normalized:
+            continue
+        for pattern in patterns:
+            for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
+                snippet = _clean_text(match.group(0))
+                if not snippet:
+                    continue
+                key = (label, snippet.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                evidence.append(f"{label}={snippet}")
+                if len(evidence) >= limit:
+                    return evidence
+    return evidence
+
+
+def _generated_claim_locations(
+    *,
+    title: str,
+    description: str,
+    aspects: Mapping[str, Any],
+    claim_name: str,
+) -> list[str]:
+    patterns = CLAIM_PATTERNS[claim_name]
+    locations: list[str] = []
+
+    if _text_matches_any(title, patterns):
+        locations.append("title")
+    if _text_matches_any(description, patterns):
+        locations.append("description")
+
+    for key, value in aspects.items():
+        aspect_text = f"{key}: {' '.join(_as_list(value))}"
+        if _text_matches_any(aspect_text, patterns):
+            locations.append(f"aspects.{key}")
+    return locations
+
+
+def evaluate_source_video_urls(videos: list[str] | None = None) -> dict[str, Any]:
+    """Classify supplier video URLs before READY/publish."""
+    normalized_videos = _as_list(videos or [])
+    result: dict[str, Any] = {
+        "present": bool(normalized_videos),
+        "url_count": len(normalized_videos),
+        "primary_url": normalized_videos[0] if normalized_videos else None,
+        "direct_url": None,
+        "preflight_status": "missing",
+        "issue_codes": [],
+    }
+    if not normalized_videos:
+        return result
+
+    blocked_codes: list[str] = []
+    unknown_urls: list[str] = []
+
+    for raw_url in normalized_videos:
+        parsed = urlparse(str(raw_url).strip())
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        filename = path.rsplit("/", 1)[-1]
+        ext = ""
+        if "." in filename:
+            ext = "." + filename.rsplit(".", 1)[-1]
+
+        if ext in DIRECT_VIDEO_EXTENSIONS:
+            result["direct_url"] = raw_url
+            result["preflight_status"] = "ready"
+            result["issue_codes"] = []
+            return result
+
+        if ext in BLOCKED_VIDEO_EXTENSIONS:
+            blocked_codes.append(BLOCKED_VIDEO_EXTENSIONS[ext])
+            continue
+
+        if ext in {".html", ".htm"} or any(marker in host for marker in BLOCKED_VIDEO_HOST_MARKERS):
+            blocked_codes.append("source_video_page_url")
+            continue
+
+        unknown_urls.append(raw_url)
+
+    result["issue_codes"] = sorted(set(blocked_codes))
+    if unknown_urls:
+        result["preflight_status"] = "unknown"
+    else:
+        result["preflight_status"] = "blocked"
+    return result
+
+
+def source_supports_foldable(
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+) -> bool:
+    """Unique arbiter: whether the GIGA/source product supports foldable claims.
+
+    Both listing_quality_gate (missing_foldable / source_facts) and
+    claim_diff_engine (unsupported foldable claim) MUST use this function so
+    the two detectors cannot disagree on the same inputs.
+
+    Semantic boundary:
+    - fold / folding / collapsible / collapse / 折叠 → supported
+    - extendable / extending / drop leaf alone → NOT supported
+    - naturally foldable product titles (umbrella, tent, …) → supported
+    """
+    title_l = _clean_text(source_title).lower()
+    if any(kw in title_l for kw in NATURALLY_FOLDABLE_TITLE_KEYWORDS):
+        return True
+
+    entries = _iter_source_entries(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    combined = " ".join(text for _, text in entries)
+    combined = re.sub(r"<[^>]+>", " ", combined)
+    combined = re.sub(r"\s+", " ", combined)
+    # Cushion durability copy such as "will not collapse after long-term
+    # sitting" describes resistance to deformation, not a foldable product.
+    combined = re.sub(
+        r"\b(?:will|does|do|can)\s+not\s+collaps(?:e|es|ed|ing|ible)\b|"
+        r"\bwon['’]?t\s+collaps(?:e|es|ed|ing|ible)\b",
+        " ",
+        combined,
+        flags=re.IGNORECASE,
+    )
+    return any(
+        re.search(pattern, combined, flags=re.IGNORECASE)
+        for pattern in FOLDABLE_SOURCE_EVIDENCE_PATTERNS
+    )
+
+
+def build_source_facts(
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    videos: list[str] | None = None,
+) -> dict[str, Any]:
+    """Extract deterministic source facts used to block hallucinated claims."""
+    entries = _iter_source_entries(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    claims = {
+        claim_name: {
+            "supported": bool(evidence := _collect_claim_evidence(entries, patterns)),
+            "evidence": evidence,
+        }
+        for claim_name, patterns in CLAIM_PATTERNS.items()
+    }
+    # Foldable uses the single arbiter so title-only evidence ("Folding Mattress")
+    # and description evidence stay consistent with claim_diff_engine.
+    foldable_supported = source_supports_foldable(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    foldable_evidence = _collect_claim_evidence(entries, FOLDABLE_SOURCE_EVIDENCE_PATTERNS)
+    claims["foldable"] = {
+        "supported": foldable_supported,
+        "evidence": foldable_evidence if foldable_supported else [],
+    }
+    return {
+        "assembly_required": infer_source_assembly_required(attributes, specs, source_description),
+        "assembly_status": infer_source_assembly_status(attributes, specs, source_description),
+        "claims": claims,
+        "video": evaluate_source_video_urls(videos),
+    }
+
+
+def source_preflight_issue_codes(source_facts: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(source_facts, Mapping):
+        return []
+    video = source_facts.get("video") if isinstance(source_facts.get("video"), Mapping) else {}
+    if video.get("present") and video.get("preflight_status") == "blocked":
+        return ["source_video_not_publishable"]
+    return []
+
+
+def _normalize_yes_no(value: Any) -> str | None:
+    text = _clean_text(value).lower()
+    if not text:
+        return None
+    if text in {"yes", "y", "true", "1", "required", "requires assembly", "assembly required"}:
+        return "Yes"
+    if text in {"no", "n", "false", "0", "not required", "no assembly required"}:
+        return "No"
+    if any(marker in text for marker in ("\u662f", "\u9700\u8981", "\u9700\u5b89\u88c5", "\u9700\u7ec4\u88c5")):
+        return "Yes"
+    if any(marker in text for marker in ("\u5426", "\u4e0d\u9700", "\u65e0\u9700")):
+        return "No"
+    return None
+
+
+def infer_source_assembly_required(
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    source_description: str = "",
+) -> str | None:
+    """Return Yes/No only when the supplier source explicitly states assembly.
+
+    Supplier copy does not use one canonical field.  In addition to the
+    ``Assembly Required`` row, common catalogue wording includes phrases such
+    as ``assembly is required``, ``easy assembly``, ``partially pre-assembled``
+    and ``no assembly required``.  Packaging dimensions are deliberately not
+    considered here; they are handled by :func:`infer_assembly_decision` so a
+    compressed or foldable product cannot be mistaken for a flat-pack item.
+    """
+    for source in (attributes or {}, specs or {}):
+        for key, value in source.items():
+            normalized_key = _clean_text(key).lower()
+            if normalized_key in {"assembly required", "requires assembly"}:
+                parsed = _normalize_yes_no(value)
+                if parsed:
+                    return parsed
+
+    text = _plain_text(source_description)
+    keyed_patterns = (
+        r"\bassembly\s+required\s*[:：]?\s*(yes|no)\b",
+        r"\brequires\s+assembly\s*[:：]?\s*(yes|no)\b",
+        (
+            r"(?:\u662f\u5426)?(?:\u9700\u8981\u5b89\u88c5|\u9700\u5b89\u88c5|"
+            r"\u9700\u8981\u7ec4\u88c5|\u9700\u7ec4\u88c5|\u5b89\u88c5\u8981\u6c42|"
+            r"\u7ec4\u88c5\u8981\u6c42)\s*[:：]?\s*"
+            r"(\u662f|\u5426|\u9700\u8981|\u4e0d\u9700\u8981|\u65e0\u9700|yes|no)"
+        ),
+    )
+    for pattern in keyed_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        parsed = _normalize_yes_no(match.group(1))
+        if parsed:
+            return parsed
+
+    negative_patterns = (
+        r"\bno\s+assembly(?:\s+is)?\s+(?:required|needed|necessary)\b",
+        r"\bno\s+tools?\s+or\s+assembly\s+required\b",
+        r"\bassembly\s+(?:is\s+)?(?:not|required\s*[:：]?\s*no)\b",
+        r"\bassembly[-\s]?free\b",
+        r"\b(?:ships?\s+)?fully\s+(?:pre[-\s]?assembled|assembled)\b",
+        r"\bready\s+to\s+use\s+right\s+out\s+of\s+the\s+box\b",
+    )
+    positive_patterns = (
+        r"\bassembly\s+(?:is\s+)?required\b",
+        r"\b(?:requires?|must)\s+(?:be\s+)?assembled\b",
+        r"\bassembly\s+(?:is\s+)?needed\b",
+        r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+(?:to\s+)?assemble\b",
+        r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+assembly\b",
+        r"\b(?:tool[-\s]?free)\s+(?:installation|assembly)\b",
+        r"\b(?:full|complete|partial)\s+assembly\b",
+        r"\bassembly\s+(?:time|instructions|guide|manual|hardware)\b",
+        r"\b(?:installation|assembly)\s+instructions\b",
+        r"\bpartially\s+pre[-\s]?assembled\b",
+        r"\bpre[-\s]?assembled\b[^.]{0,100}\b(?:backrest|seat|board|leg|component|part)\b",
+        r"\b(?:backrest|seat|board|leg|component|part)\b[^.]{0,100}\bpre[-\s]?assembled\b",
+        r"\b(?:attach|install)\s+(?:the\s+)?(?:remaining\s+)?(?:legs?|feet|backrest|seat|base|parts?|components?)\b",
+        r"\bmost\s+assembled\b[^.]{0,100}\bassemble\b",
+        r"\bcomponents?\s+must\s+be\s+connected\b",
+        r"\bships?\s+as\s+\d+\s+separate\s+(?:carton|box)es?\b",
+    )
+    has_negative = any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in negative_patterns)
+    positive_scan_text = text
+    for pattern in negative_patterns:
+        positive_scan_text = re.sub(pattern, " ", positive_scan_text, flags=re.IGNORECASE)
+    has_positive = any(
+        re.search(pattern, positive_scan_text, flags=re.IGNORECASE)
+        for pattern in positive_patterns
+    )
+    if has_negative and has_positive:
+        return None
+    if has_positive:
+        return "Yes"
+    if has_negative:
+        return "No"
+    return None
+
+
+_PACKAGE_ASSEMBLY_DIMENSION_KEYS = {
+    "assembled": (
+        ("length", ("Assembled Length (in.)", "Product Length (in.)")),
+        ("width", ("Assembled Width (in.)", "Product Width (in.)")),
+        ("height", ("Assembled Height (in.)", "Product Height (in.)")),
+    ),
+    "package": (
+        ("length", ("Package Length (in.)", "Shipping Length", "Carton Length")),
+        ("width", ("Package Width (in.)", "Shipping Width", "Carton Width")),
+        ("height", ("Package Height (in.)", "Shipping Height", "Carton Height")),
+    ),
+}
+
+_ASSEMBLY_NEGATIVE_CUE_PATTERNS = (
+    ("no_assembly", r"\bno\s+assembly\s+required\b"),
+    ("assembly_required_no", r"\bassembly\s+required\s*[:：]?\s*no\b"),
+    ("assembly_not_required", r"\bassembly\s+(?:is\s+)?not\s+required\b"),
+    ("no_tools_or_assembly", r"\bno\s+tools?\s+or\s+assembly\s+required\b"),
+    ("assembly_free", r"\bassembly[-\s]?free\b"),
+    ("fully_assembled", r"\b(?:ships?\s+)?fully\s+(?:pre[-\s]?assembled|assembled)\b"),
+    ("ready_out_of_box", r"\bready\s+to\s+use\s+right\s+out\s+of\s+the\s+box\b"),
+)
+
+_ASSEMBLY_FLEXIBLE_PRODUCT_PATTERNS = (
+    r"\bcompressed\b",
+    r"\bcompression\b",
+    r"\bfold(?:able|ing)\b",
+    r"\bcollapsible\b",
+    r"\bmattress\b",
+    r"\binflatable\b",
+    r"\bbean\s*bag\b",
+    r"\bstroller\b",
+    r"\btreadmill\b",
+    r"\bcamping\b",
+    r"\bvacuum[-\s]?packed\b",
+)
+
+_ASSEMBLY_POSITIVE_CUE_PATTERNS = (
+    ("assembly_action", r"\b(?:requires?|must)\s+(?:be\s+)?assembled\b"),
+    ("assembly_is_required", r"\bassembly\s+(?:is\s+)?required\b"),
+    ("assemble_action", r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+(?:to\s+)?assemble\b"),
+    ("easy_assembly", r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+assembly\b"),
+    ("install_action", r"\b(?:easy|simple|straightforward)\s+(?:to\s+)?install(?:ation)?\b"),
+    ("tool_free_installation", r"\btool[-\s]?free\s+(?:installation|assembly)\b"),
+    ("assembly_time", r"\bassembly\s+time\b"),
+    ("assembly_instructions", r"\b(?:assembly|installation)\s+(?:instructions|guide|manual)\b"),
+    ("assembly_hardware", r"\bassembly\s+hardware\b"),
+    ("full_assembly", r"\b(?:full|complete|partial)\s+assembly\b"),
+    ("partial_preassembly", r"\bpartially\s+pre[-\s]?assembled\b"),
+    (
+        "preassembled_components",
+        r"(?:\bpre[-\s]?assembled\b[^.]{0,100}\b(?:backrest|seat|board|leg|component|part)\b|"
+        r"\b(?:backrest|seat|board|leg|component|part)\b[^.]{0,100}\bpre[-\s]?assembled\b)",
+    ),
+    (
+        "assembly_action_components",
+        r"\b(?:attach|install)\s+(?:the\s+)?(?:remaining\s+)?(?:legs?|feet|backrest|seat|base|parts?|components?)\b",
+    ),
+    ("treadmill_setup", r"\bmost\s+assembled\b[^.]{0,100}\bassemble\b"),
+    ("setup_action", r"\bsetup\s+(?:required|instructions|guide)\b"),
+)
+
+_ASSEMBLY_RIGID_PRODUCT_PATTERNS = (
+    r"\bcabinet\b",
+    r"\b(?:table|desk)\b",
+    r"\b(?:shelf|shelves|bookshelf|bookcase)\b",
+    r"\bsideboard\b",
+    r"\bpantry\b",
+    r"\bconsole\b",
+    r"\bnightstand\b",
+    r"\bdresser\b",
+    r"\b(?:kitchen|storage)\s+island\b",
+    r"\b(?:storage|coat)\s+rack\b",
+    r"\bmirror\s+cabinet\b",
+    r"\bchicken\s+coop\b",
+    r"\bgreenhouse\b",
+)
+
+
+def _combo_box_count_from_specs(specs: Mapping[str, Any] | None) -> int | None:
+    for key in ("Combo Box Count", "combo box count"):
+        value = (specs or {}).get(key)
+        match = re.search(r"\d+", str(value or ""))
+        if not match:
+            continue
+        try:
+            count = int(match.group(0))
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            return count
+    return None
+
+
+def _first_numeric_source_value(source: Mapping[str, Any] | None, keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = (source or {}).get(key)
+        match = re.search(r"-?\d+(?:\.\d+)?", str(value or ""))
+        if not match:
+            continue
+        try:
+            number = float(match.group(0))
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return None
+
+
+def infer_package_assembly_evidence(
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Estimate whether package geometry is strong evidence of assembly.
+
+    A thin carton is not proof by itself: compressed sofas and foldable goods
+    are common counterexamples.  The returned evidence therefore separates the
+    geometry signal (``strong``) from the product-family and copy cues used to
+    decide whether an automatic ``Yes`` is safe.
+    """
+    dimensions: dict[str, list[float | None]] = {}
+    for group_name, axis_specs in _PACKAGE_ASSEMBLY_DIMENSION_KEYS.items():
+        source = attributes if group_name == "assembled" else specs
+        dimensions[group_name] = [
+            _first_numeric_source_value(source, keys)
+            for _axis, keys in axis_specs
+        ]
+
+    assembled = dimensions["assembled"]
+    package = dimensions["package"]
+    available = all(value is not None for value in assembled + package)
+    title_text = _plain_text(source_title).lower()
+    text = _plain_text(f"{source_title} {source_description}").lower()
+    negative_cues = [
+        name for name, pattern in _ASSEMBLY_NEGATIVE_CUE_PATTERNS
+        if re.search(pattern, text, flags=re.IGNORECASE)
+    ]
+    flexible_cues = [
+        pattern for pattern in _ASSEMBLY_FLEXIBLE_PRODUCT_PATTERNS
+        if re.search(pattern, text, flags=re.IGNORECASE)
+    ]
+    positive_scan_text = text
+    for _name, pattern in _ASSEMBLY_NEGATIVE_CUE_PATTERNS:
+        positive_scan_text = re.sub(pattern, " ", positive_scan_text, flags=re.IGNORECASE)
+    positive_cues = [
+        name for name, pattern in _ASSEMBLY_POSITIVE_CUE_PATTERNS
+        if re.search(pattern, positive_scan_text, flags=re.IGNORECASE)
+    ]
+    rigid_cues = [
+        pattern for pattern in _ASSEMBLY_RIGID_PRODUCT_PATTERNS
+        if re.search(pattern, title_text or text, flags=re.IGNORECASE)
+    ]
+    product_family = (
+        "flexible_or_preassembled"
+        if flexible_cues
+        else "rigid"
+        if rigid_cues
+        else "unknown"
+    )
+
+    no_assembly_family: str | None = None
+    compressed_delivery = (
+        bool(re.search(r"\b(?:compressed|compression|vacuum[-\s]?packed)\b", text, flags=re.IGNORECASE))
+        and bool(
+            re.search(
+                r"\b(?:unpack|unbox|unwrap|regain\s+(?:its\s+)?shape|restore\s+(?:its\s+)?shape|"
+                r"\d+\s+hours?|without\s+(?:complex|complicated)\s+installation)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+    )
+    unboxed_furniture = (
+        bool(negative_cues)
+        and bool(re.search(r"\b(?:sofa|couch|sectional|ottoman|modular)\b", text, flags=re.IGNORECASE))
+        and bool(re.search(r"\b(?:unpack|unbox|unwrap|vacuum[-\s]?packed)\b", text, flags=re.IGNORECASE))
+    )
+    if (compressed_delivery or unboxed_furniture) and not positive_cues:
+        no_assembly_family = "compressed_delivery"
+    elif (
+        bool(re.search(r"\b(?:camping|portable)\s+chairs?\b", title_text or text, flags=re.IGNORECASE))
+        and bool(re.search(r"\b(?:fold(?:able|ing)|carry\s+bag|unfold|portable)\b", text, flags=re.IGNORECASE))
+        and not positive_cues
+    ):
+        no_assembly_family = "folding_portable_chair"
+
+    compressed_title = bool(
+        re.search(
+            r"\b(?:compressed|compression|vacuum[-\s]?packed|cloud\s+couch)\b",
+            title_text or text,
+            flags=re.IGNORECASE,
+        )
+    )
+    combo_box_count = _combo_box_count_from_specs(specs)
+    seating_context = bool(
+        re.search(
+            r"\b(?:sofa|couch|sectional|ottoman|loveseat|chaise)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    modular_sectional = bool(
+        re.search(
+            r"\b(?:modular\s+sectional|sectional\s+sofa|sofa\s+set|matching\s+ottoman|"
+            r"individual\s+matching\s+ottoman)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    separate_piece = bool(
+        re.search(
+            r"\b(?:separate,?\s+matching\s+ottoman|individual\s+matching\s+ottoman|"
+            r"comes\s+with\s+(?:a\s+)?separate|multiple\s+boxes|multi[\s-]?piece|"
+            r"components?\s+must\s+be\s+connected)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+    combo_item = bool(re.search(r"\bcombo\s+item\b", text, flags=re.IGNORECASE))
+
+    required_family: str | None = None
+    if (
+        re.search(r"\btreadmill\b", title_text or text, flags=re.IGNORECASE)
+        and not negative_cues
+    ):
+        required_family = "exercise_equipment_setup"
+    elif (
+        not negative_cues
+        and bool(
+            re.search(
+                r"\b(?:garden\s+trellis|metal\s+trellis|plant\s+trellis|"
+                r"trellis\s+for\s+climbing|garden\s+arch|rose\s+arch|"
+                r"garden\s+arbor|arbor\s+arch|arch\s+with\s+gate)\b",
+                title_text or text,
+                flags=re.IGNORECASE,
+            )
+        )
+    ):
+        # Trellises / arbors ship as rigid flat-pack panels and always need setup.
+        # Ops 2026-09-29: W1586P151254 new order wrongly said Assembly Required=No.
+        required_family = "garden_trellis_arbor"
+    elif (
+        not negative_cues
+        and not compressed_title
+        and combo_box_count is not None
+        and combo_box_count >= 2
+        and seating_context
+    ):
+        required_family = "multi_box_combo"
+    elif (
+        not negative_cues
+        and not compressed_title
+        and modular_sectional
+        and (combo_item or separate_piece or (combo_box_count is not None and combo_box_count >= 2))
+    ):
+        required_family = "modular_combo_sectional"
+    elif (
+        all(value is not None for value in assembled + package)
+        and bool(re.search(r"\b(?:chair|armchair)\b", title_text or text, flags=re.IGNORECASE))
+        and bool(re.search(r"\b(?:metal|steel)\s+frame\b", text, flags=re.IGNORECASE))
+        and bool(re.search(r"\b(?:wooden\s+)?armrests?\b", text, flags=re.IGNORECASE))
+        and not negative_cues
+    ):
+        # A structured metal-frame chair with separate wooden armrests is a
+        # component-built seating item, not a foldable/cushion-only product.
+        # Keep this family narrow: generic chairs, benches, and trunks remain
+        # review-only without an explicit source assembly statement.
+        required_family = "structured_seating_frame"
+
+    evidence: dict[str, Any] = {
+        "available": available,
+        "strong": False,
+        "assembled": assembled,
+        "package": package,
+        "negative_cues": negative_cues,
+        "flexible_cues": flexible_cues,
+        "positive_cues": positive_cues,
+        "rigid_cues": rigid_cues,
+        "product_family": product_family,
+        "no_assembly_family": no_assembly_family,
+        "required_family": required_family,
+    }
+    if not available:
+        return evidence
+
+    assembled_sorted = sorted(float(value) for value in assembled if value is not None)
+    package_sorted = sorted(float(value) for value in package if value is not None)
+    long_ratio = package_sorted[-1] / assembled_sorted[-1]
+    thin_ratio = package_sorted[0] / assembled_sorted[0]
+    middle_ratio = package_sorted[1] / assembled_sorted[1]
+    evidence.update(
+        {
+            "assembled_sorted": assembled_sorted,
+            "package_sorted": package_sorted,
+            "long_ratio": round(long_ratio, 4),
+            "thin_ratio": round(thin_ratio, 4),
+            "middle_ratio": round(middle_ratio, 4),
+            "strong": (
+                long_ratio >= 0.80
+                and thin_ratio <= 0.60
+                and middle_ratio <= 1.60
+            ),
+        }
+    )
+    return evidence
+
+
+def infer_assembly_decision(
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    current_assembly: Any = None,
+) -> dict[str, Any]:
+    """Return a conservative, auditable assembly decision.
+
+    Explicit source ``Yes`` wins.  Explicit source ``No`` remains valid unless
+    strong package geometry conflicts with it.  Known compression-delivery and
+    folding-portable-chair families are exceptions because the thin package is
+    the product's storage or shipping state, not evidence of assembly.  When
+    source evidence is absent, a rigid product or a known setup-required device
+    with strong flat-pack geometry is promoted to ``Yes``.  Unknown geometry
+    falls back to an existing normalized aspect, but never creates a new
+    default ``No``.
+    """
+    source = infer_source_assembly_required(attributes, specs, source_description)
+    package = infer_package_assembly_evidence(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    current = _normalize_yes_no(current_assembly)
+
+    if source == "Yes":
+        return {"required": "Yes", "status": "source", "source": source, "package": package}
+
+    if source == "No":
+        if package.get("no_assembly_family"):
+            return {"required": "No", "status": "source", "source": source, "package": package}
+        if package["strong"]:
+            return {
+                "required": None,
+                "status": "review",
+                "source": source,
+                "package": package,
+                "conflict": True,
+            }
+        return {"required": "No", "status": "source", "source": source, "package": package}
+
+    if package.get("no_assembly_family"):
+        return {"required": "No", "status": "family", "source": None, "package": package}
+
+    unconditional_required_families = {
+        "exercise_equipment_setup",
+        "multi_box_combo",
+        "modular_combo_sectional",
+        "garden_trellis_arbor",
+    }
+    if package.get("required_family") and (
+        package["required_family"] in unconditional_required_families
+        or package.get("strong")
+    ):
+        return {"required": "Yes", "status": "family", "source": None, "package": package}
+
+    if package["positive_cues"] and not package["negative_cues"]:
+        return {"required": "Yes", "status": "package", "source": None, "package": package}
+
+    if package["strong"]:
+        if (
+            package["product_family"] == "rigid" or package["positive_cues"]
+        ) and not package["negative_cues"]:
+            return {"required": "Yes", "status": "package", "source": None, "package": package}
+        return {
+            "required": None,
+            "status": "review",
+            "source": None,
+            "package": package,
+            "conflict": bool(package["negative_cues"]),
+        }
+
+    if current:
+        return {"required": current, "status": "listing", "source": None, "package": package}
+    return {"required": None, "status": "unknown", "source": None, "package": package}
+
+
+ASSEMBLY_NO_REQUIRED_PATTERNS = (
+    r"\bno\s+assembly\s+required\b",
+    r"\bno\s+assembly\s+is\s+required\b",
+    r"\bno\s+tools?\s+or\s+assembly\s+required\b",
+    r"\bno\s+assembly\s+(?:is\s+)?(?:needed|necessary)\b",
+    r"\bassembly\s+(?:is\s+)?not\s+required\b",
+    r"\bdoes\s+not\s+require\s+assembly\b",
+    r"\bassembly\s+required\s*[:：]?\s*no\b",
+    r"\bassembly[-\s]?free\b",
+    r"\bships?\s+fully\s+(?:pre[-\s]?assembled|assembled)\b",
+    r"\bfully\s+(?:pre[-\s]?assembled|assembled)\b",
+    r"\bready\s+to\s+use\s+right\s+out\s+of\s+the\s+box\b",
+)
+
+ASSEMBLY_YES_REQUIRED_PATTERNS = (
+    r"\brequires\s+assembly\b",
+    r"\bassembly\s+(?:is\s+)?required\b",
+    r"\bassembly\s+(?:is\s+)?needed\b",
+    r"\bmust\s+be\s+assembled\b",
+    r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+(?:to\s+)?assemble\b",
+    r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+assembly\b",
+    r"\b(?:tool[-\s]?free)\s+(?:installation|assembly)\b",
+    r"\b(?:full|complete|partial)\s+assembly\b",
+    r"\bpartially\s+pre[-\s]?assembled\b",
+    r"\bassembly\s+(?:time|instructions|guide|manual|hardware)\b",
+)
+
+ASSEMBLY_STATUS_PATTERNS = (
+    (r"\bpart(?:ially)?\s+assembled\b", "Part Assembled"),
+    (r"\bpre[-\s]?assembled\b", "Part Assembled"),
+    (r"\bfully\s+assembled\b", "Fully Assembled"),
+    (r"\bready\s+to\s+assemble\b", "Ready to Assemble"),
+    (r"\bunassembled\b", "Ready to Assemble"),
+)
+
+
+def infer_source_assembly_status(
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    source_description: str = "",
+) -> str | None:
+    """Return an assembly status only when the supplier source states it explicitly."""
+    for source in (attributes or {}, specs or {}):
+        for key, value in source.items():
+            normalized_key = _clean_text(key).lower()
+            if normalized_key != "assembly status":
+                continue
+            value_text = _clean_text(value).lower()
+            for pattern, normalized_status in ASSEMBLY_STATUS_PATTERNS:
+                if re.search(pattern, value_text, flags=re.IGNORECASE):
+                    return normalized_status
+
+    text = _plain_text(source_description)
+    for pattern, normalized_status in ASSEMBLY_STATUS_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return normalized_status
+    return None
+
+
+def has_expected_assembly_copy(description: str, expected: str | None) -> bool:
+    """Return True when the description explicitly matches the expected assembly requirement."""
+    if not description or not expected:
+        return False
+
+    text = _plain_text(description).lower()
+    if expected == "Yes":
+        positive_patterns = (
+            r"\bassembly\s+required\s*[:：]?\s*yes\b",
+            r"\bsome\s+assembly\s+required\b",
+            r"\brequires\s+assembly\b",
+            r"\bassembly\s+(?:is\s+)?required\b",
+            r"\bassembly\s+(?:is\s+)?needed\b",
+            r"\bmust\s+be\s+assembled\b",
+            r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+(?:to\s+)?assemble\b",
+            r"\b(?:easy|simple|straightforward|hassle[-\s]?free)\s+assembly\b",
+            r"\b(?:tool[-\s]?free)\s+(?:installation|assembly)\b",
+            r"\b(?:full|complete|partial)\s+assembly\b",
+            r"\bpartially\s+pre[-\s]?assembled\b",
+            r"\bassembly\s+(?:time|instructions|guide|manual|hardware)\b",
+            r"\bready\s+to\s+use\s+after\s+assembly\b",
+        )
+        return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in positive_patterns)
+
+    negative_patterns = (
+        r"\bassembly\s+required\s*[:：]?\s*no\b",
+        r"\bno\s+assembly\s+required\b",
+        r"\bno\s+tools?\s+or\s+assembly\s+required\b",
+        r"\bno\s+assembly\s+(?:is\s+)?(?:needed|necessary)\b",
+        r"\bassembly\s+(?:is\s+)?not\s+required\b",
+        r"\bdoes\s+not\s+require\s+assembly\b",
+        r"\bassembly[-\s]?free\b",
+        r"\bships?\s+fully\s+(?:pre[-\s]?assembled|assembled)\b",
+        r"\bfully\s+(?:pre[-\s]?assembled|assembled)\b",
+    )
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in negative_patterns)
+
+
+SPECIFICATIONS_TABLE_RE = re.compile(
+    r"(<h3[^>]*>\s*SPECIFICATIONS\s*</h3>\s*<table[^>]*>)(.*?)(</table>)",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+COMPLETE_DETAILS_RE = re.compile(
+    r'<div[^>]*>\s*<p[^>]*>\s*<strong>\s*(?:📋\s*)?Complete Details:\s*</strong>.*?</div>',
+    flags=re.IGNORECASE | re.DOTALL,
+)
+ASSEMBLY_SPEC_ROW_RE = re.compile(
+    r"<tr\b[^>]*>\s*<td\b[^>]*>\s*Assembly(?:\s+Required)?\s*</td>\s*<td\b[^>]*>.*?</td>\s*</tr>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+DESCRIPTION_LITERAL_ESCAPE_RE = re.compile(r"\\[nrt]")
+DESCRIPTION_BETWEEN_TAG_QUOTE_GT_RE = re.compile(
+    r'>\s*(?:&quot;|&#34;|")\s*>\s*(?=<)',
+    flags=re.IGNORECASE,
+)
+DESCRIPTION_BETWEEN_TAG_QUOTES_RE = re.compile(
+    r'>\s*(?:&quot;|&#34;|")\s*(?=<)',
+    flags=re.IGNORECASE,
+)
+
+
+def _assembly_copy(expected: str) -> str:
+    if expected == "Yes":
+        return "Yes - Assembly is required; setup required before use with included hardware and instructions."
+    return "No - Ready for use without assembly."
+
+
+def _build_spec_row(label: str, value: str, *, shaded: bool, mark_assembly: bool = False) -> str:
+    row_style = ' style="background:#fafafa"' if shaded else ""
+    marker = ' data-assembly-note="true"' if mark_assembly else ""
+    return (
+        f"<tr{row_style}{marker}>"
+        f'<td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#636e72;width:40%">{label}</td>'
+        f'<td style="padding:10px;border-bottom:1px solid #e0e0e0;color:#2d3436">{value}</td>'
+        f"</tr>"
+    )
+
+
+def _sanitize_specifications_table_body(table_body: str) -> str:
+    cleaned = re.sub(r"</?div\b[^>]*>", "", table_body or "", flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def sanitize_generated_description_html(description: str) -> str:
+    if not description:
+        return description or ""
+    cleaned = DESCRIPTION_LITERAL_ESCAPE_RE.sub(" ", description)
+    cleaned = DESCRIPTION_BETWEEN_TAG_QUOTE_GT_RE.sub(">", cleaned)
+    cleaned = DESCRIPTION_BETWEEN_TAG_QUOTES_RE.sub(">", cleaned)
+    cleaned = re.sub(r">\s+(?=<)", ">", cleaned)
+    return cleaned.strip()
+
+
+def _sanitize_specifications_table_html(description: str) -> str:
+    match = SPECIFICATIONS_TABLE_RE.search(description or "")
+    if not match:
+        return description or ""
+    table_start, table_body, table_end = match.groups()
+    sanitized_body = _sanitize_specifications_table_body(table_body)
+    return f"{description[:match.start()]}{table_start}{sanitized_body}{table_end}{description[match.end():]}"
+
+
+def _strip_existing_assembly_note(description: str) -> str:
+    updated = re.sub(
+        r'<div[^>]*data-assembly-note="true"[^>]*>.*?</div>',
+        "",
+        description,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    updated = re.sub(
+        r'<p[^>]*>\s*<strong>\s*Assembly(?:\s+Required)?\s*:?\s*</strong>.*?</p>',
+        "",
+        updated,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    updated = COMPLETE_DETAILS_RE.sub("", updated)
+    return updated
+
+
+def _upsert_assembly_specs_row(description: str, expected: str) -> str:
+    updated = _strip_existing_assembly_note(description)
+    match = SPECIFICATIONS_TABLE_RE.search(updated)
+    if not match:
+        fallback = (
+            f'<p data-assembly-note="true"><strong>Assembly Required:</strong> {_assembly_copy(expected)}</p>'
+        )
+        if "</div>" in updated:
+            return updated.replace("</div>", f"{fallback}</div>", 1)
+        return f"{updated}{fallback}"
+
+    table_start, table_body, table_end = match.groups()
+    sanitized_body = _sanitize_specifications_table_body(table_body)
+    body_without_assembly = ASSEMBLY_SPEC_ROW_RE.sub("", sanitized_body)
+    row_count = len(re.findall(r"<tr\b", body_without_assembly, flags=re.IGNORECASE))
+    assembly_row = _build_spec_row(
+        "Assembly Required",
+        _assembly_copy(expected),
+        shaded=bool(row_count % 2),
+        mark_assembly=True,
+    )
+    new_body = f"{body_without_assembly.rstrip()}{assembly_row}"
+    return f"{updated[:match.start()]}{table_start}{new_body}{table_end}{updated[match.end():]}"
+
+
+def find_assembly_description_contradictions(description: str, expected: str | None) -> list[str]:
+    if not expected:
+        return []
+    text = _plain_text(description).lower()
+    if expected == "No":
+        found: list[str] = []
+        for match in re.finditer(r"\bassembly\s+required\b", text, flags=re.IGNORECASE):
+            before = text[max(0, match.start() - 30): match.start()]
+            after = text[match.end(): match.end() + 120]
+            if re.search(r"\b(?:no|not)\b", before):
+                continue
+            if re.search(r"\b(?:no|not\s+required|not\s+needed|false)\b", after, flags=re.IGNORECASE):
+                continue
+            found.append(r"\bassembly\s+required\b")
+            break
+        positive_scan_text = text
+        for pattern in ASSEMBLY_NO_REQUIRED_PATTERNS:
+            positive_scan_text = re.sub(pattern, " ", positive_scan_text, flags=re.IGNORECASE)
+        # Stale package-includes lines from an earlier Yes rewrite are not
+        # assembly-required claims when the aspect already says No.
+        positive_scan_text = re.sub(
+            r"\b1\s*x\s+(?:assembly\s+instructions?|hardware\s+kit)\b",
+            " ",
+            positive_scan_text,
+            flags=re.IGNORECASE,
+        )
+        for pattern in ASSEMBLY_YES_REQUIRED_PATTERNS:
+            matched = False
+            for match in re.finditer(pattern, positive_scan_text, flags=re.IGNORECASE):
+                before = positive_scan_text[max(0, match.start() - 30): match.start()]
+                if re.search(r"\b(?:no|not)\b", before):
+                    continue
+                found.append(pattern)
+                matched = True
+                break
+            if matched:
+                break
+        return list(dict.fromkeys(found))
+
+    patterns = ASSEMBLY_NO_REQUIRED_PATTERNS
+    found: list[str] = []
+    for pattern in patterns:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            found.append(pattern)
+    return found
+
+
+def rewrite_assembly_copy(description: str, expected: str | None) -> str:
+    if not description or not expected:
+        return description or ""
+
+    if expected == "Yes":
+        replacements = (
+            (
+                r"Space-Smart\s*&\s*Assembly-Free\s*:\s*Ships?\s+fully\s+assembled\s*[-\u2013\u2014]\s*"
+                r"ready\s+to\s+use\s+right\s+out\s+of\s+the\s+box\.\s*"
+                r"Saves\s+time,\s*eliminates\s+frustration,\s*and\s*guarantees\s+structural\s+integrity\.?",
+                "Assembly Required: Assembly is required before use. Follow the included instructions and hardware guide.",
+            ),
+            (
+                r"\bno\s+assembly\s+required\b",
+                "assembly required",
+            ),
+            (
+                r"\bassembly[-\s]?free\b",
+                "assembly required",
+            ),
+            (
+                r"\bships?\s+fully\s+assembled\b",
+                "requires assembly before use",
+            ),
+            (
+                r"\bfully\s+assembled\b",
+                "requires assembly",
+            ),
+            (
+                r"\bready\s+to\s+use\s+right\s+out\s+of\s+the\s+box\b",
+                "ready to use after assembly",
+            ),
+        )
+    else:
+        replacements = (
+            (r"\bassembly\s+required\s*[:：]?\s*yes\b", "no assembly required"),
+            (r"\bsome\s+assembly\s+required\b", "no assembly required"),
+            (r"\brequires\s+assembly\b", "does not require assembly"),
+            (r"\bassembly\s+(?:is\s+)?needed\b", "no assembly required"),
+            (r"\bmust\s+be\s+assembled\b", "does not require assembly"),
+        )
+
+    updated = description
+    for pattern, replacement in replacements:
+        updated = re.sub(pattern, replacement, updated, flags=re.IGNORECASE)
+
+    if expected == "No":
+        updated = re.sub(r",?\s*1 x Assembly Instructions", "", updated, flags=re.IGNORECASE)
+        updated = re.sub(r",?\s*1 x Hardware Kit", "", updated, flags=re.IGNORECASE)
+
+        def _drop_false_assembly_bullet(match: re.Match[str]) -> str:
+            block = match.group(0)
+            if re.search(r"\bno\s+assembly\s+required\b", block, flags=re.IGNORECASE):
+                return block
+            if re.search(r"\bassembly\s+required\b", block, flags=re.IGNORECASE):
+                return ""
+            return block
+
+        updated = re.sub(
+            r"<li\b[^>]*>.*?</li>",
+            _drop_false_assembly_bullet,
+            updated,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+    return _upsert_assembly_specs_row(updated, expected)
+
+
+def apply_source_assembly_requirement(
+    opt: dict[str, Any],
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+) -> str | None:
+    aspects = opt.setdefault("aspects", {})
+    if "Assembly Status" in aspects and not infer_source_assembly_status(attributes, specs, source_description):
+        aspects.pop("Assembly Status", None)
+
+    current = first_aspect_text(aspects, "Assembly Required")
+    decision = infer_assembly_decision(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+        current_assembly=current,
+    )
+    expected = decision.get("required")
+    if not expected:
+        return None
+
+    aspects["Assembly Required"] = [expected]
+
+    packaging = _as_list(aspects.get("Packaging"))
+    if expected == "Yes" and any("fully assembled" in value.lower() for value in packaging):
+        aspects.pop("Packaging", None)
+
+    opt["description"] = rewrite_assembly_copy(opt.get("description", ""), expected)
+    return expected
+
+
+def apply_aspect_assembly_description_requirement(opt: dict[str, Any]) -> str | None:
+    """Keep description copy aligned when the generated aspect already declares assembly."""
+    aspects = opt.get("aspects") if isinstance(opt.get("aspects"), dict) else {}
+    current = first_aspect_text(aspects, "Assembly Required")
+    expected = _normalize_yes_no(current)
+    if not expected:
+        return None
+
+    description = opt.get("description", "")
+    if not has_expected_assembly_copy(description, expected):
+        opt["description"] = rewrite_assembly_copy(description, expected)
+    return expected
+
+
+def _remove_aspects(aspects: dict[str, Any], names: set[str] | frozenset[str]) -> None:
+    for name in names:
+        aspects.pop(name, None)
+
+
+def _format_measurement(value: float | int | str, unit: str) -> str:
+    number = float(value)
+    normalized = str(round(number, 2))
+    return f"{normalized} {unit}"
+
+
+def _infer_color_from_text(text: str) -> str | None:
+    color_map = (
+        ("black", "Black"),
+        ("blue", "Blue"),
+        ("green", "Green"),
+        ("brown", "Brown"),
+        ("camel", "Beige"),
+        ("beige", "Beige"),
+        ("cream", "Beige"),
+        ("white", "White"),
+        ("gray", "Gray"),
+        ("grey", "Gray"),
+        ("red", "Red"),
+    )
+    normalized = _text_context(text)
+    for keyword, color in color_map:
+        if re.search(rf"(?<![a-z]){re.escape(keyword)}(?![a-z])", normalized):
+            return color
+    return None
+
+
+def _fill_measurement_aspects(aspects: dict[str, Any], attributes: Mapping[str, Any]) -> dict[str, str]:
+    dims = extract_all_dimensions(dict(attributes or {}))
+    updates: dict[str, str] = {}
+    mapping = {
+        "Item Length": ("length", "in"),
+        "Item Width": ("width", "in"),
+        "Item Height": ("height", "in"),
+        "Item Weight": ("weight", "lbs"),
+    }
+    for aspect_key, (dim_key, unit) in mapping.items():
+        value = dims.get(dim_key)
+        if value in (None, ""):
+            continue
+        formatted = _format_measurement(value, unit)
+        aspects[aspect_key] = [formatted]
+        updates[aspect_key] = formatted
+    return updates
+
+
+def _seed_attributes_from_description(
+    attributes: Mapping[str, Any] | None,
+    description: str,
+) -> dict[str, Any]:
+    seeded = dict(attributes or {})
+    desc_dims = extract_product_dimensions_from_text(description or "")
+    desc_weight = extract_product_weight_from_text(description or "")
+    for key, value in {
+        "Assembled Length (in.)": desc_dims.get("length"),
+        "Assembled Width (in.)": desc_dims.get("width"),
+        "Assembled Height (in.)": desc_dims.get("height"),
+        "Product Weight (lbs.)": desc_weight,
+    }.items():
+        if value not in (None, "") and not seeded.get(key):
+            seeded[key] = str(value)
+    return seeded
+
+
+def _outdoor_seating_profile(title_text: str) -> ListingProfile:
+    """Patio Chairs 79682 vs Loungers 79684. Never invert those leaves."""
+    hay = str(title_text or "")
+    lounger = bool(
+        re.search(
+            r"\b(?:chaise|lounger|sun\s+lounger|outdoor\s+recliner)\b",
+            hay,
+            re.IGNORECASE,
+        )
+        or (
+            re.search(r"\blounge\s+chairs?\b", hay, re.IGNORECASE)
+            and re.search(r"\b(?:adjustable|reclin(?:e|er|ing))\b", hay, re.IGNORECASE)
+        )
+    )
+    if lounger:
+        return ListingProfile(
+            kind="outdoor_chaise",
+            category_id="79684",
+            category_name="Loungers",
+            type_value="Chaise Lounge",
+            set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
+            indoor_outdoor="Outdoor",
+        )
+    return ListingProfile(
+        kind="outdoor_chair",
+        category_id="79682",
+        category_name="Patio Chairs",
+        type_value="Outdoor Chair",
+        set_includes="Chairs" if _has_marker(title_text, "set of 2", "set of two", "chairs") else "Chair",
+        indoor_outdoor="Outdoor",
+    )
+
+
+def classify_listing_profile(
+    title: str,
+    description: str = "",
+    category_id: str = "",
+    *,
+    source_title: str = "",
+) -> ListingProfile:
+    title_text = strip_room_location_lists(_text_context(title))
+    text = strip_room_location_lists(_text_context(title, source_title, description))
+    outdoor_context = has_outdoor_marker(text)
+    # Shared with ebay_category_matcher via product_context_signals: one passing
+    # mention of a balcony must not outweigh four named indoor rooms. Both
+    # engines classify categories, so a guard fixed in only one leaves live wrong.
+    outdoor_context_strict = strict_outdoor_context(title_text or _text_context(title), text)
+    primary = primary_product_noun(title, source_title)
+    if primary == "workbench":
+        return ListingProfile(kind="unknown")
+    if primary == "nightstand":
+        return ListingProfile(
+            kind="nightstand",
+            category_id="38199",
+            category_name="Nightstands",
+            type_value="Nightstand",
+            room="Bedroom",
+            remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
+        )
+    if primary == "dresser":
+        # Do not guess a dresser leaf; a wrong remap is worse than no remap.
+        return ListingProfile(kind="unknown")
+    if primary == "storage_ottoman":
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "20490", "Ottomans, Footstools & Poufs")
+        return ListingProfile(
+            kind="storage_ottoman",
+            category_id=leaf,
+            category_name=leaf_name,
+            type_value="Storage Ottoman",
+            set_includes="Ottoman",
+            room="Living Room",
+            remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
+        )
+    if primary in {"ottoman_bench", "ottoman"}:
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "20490", "Ottomans, Footstools & Poufs")
+        return ListingProfile(
+            kind="ottoman_bench",
+            category_id=leaf,
+            category_name=leaf_name,
+            type_value="Ottoman",
+            set_includes="Ottoman",
+            room="Living Room",
+            remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
+        )
+    if primary == "daybed":
+        if outdoor_context_strict:
+            return ListingProfile(
+                kind="outdoor_daybed",
+                category_id="138996",
+                category_name="Outdoor Daybeds",
+                indoor_outdoor="Outdoor",
+            )
+        return ListingProfile(kind="unknown")
+    if primary == "accent_chair":
+        if _has_marker(title_text, "dining chair"):
+            return ListingProfile(kind="unknown")
+        if title_allows_outdoor_chair_remap(title_text) and _has_marker(
+            title_text, "outdoor", "patio", "garden", "wicker"
+        ):
+            return _outdoor_seating_profile(title_text)
+        return ListingProfile(
+            kind="armchair",
+            category_id="38208",
+            category_name="Sofas, Armchairs & Couches",
+            type_value="Armchair",
+            set_includes="Chair",
+            room="Living Room",
+        )
+    if primary == "dining_chair":
+        if _has_marker(title_text, "accent chair"):
+            return ListingProfile(kind="unknown")
+        if title_is_chair_accessory(title_text):
+            return ListingProfile(kind="unknown")
+        if title_is_dining_set_bundle(title_text):
+            return _dining_set_bundle_profile(title_text)
+        if title_allows_outdoor_chair_remap(title_text):
+            return _outdoor_seating_profile(title_text)
+        if title_has_mixed_indoor_outdoor(title_text):
+            return ListingProfile(kind="unknown")
+        return ListingProfile(
+            kind="dining_chair",
+            category_id="54235",
+            category_name="Chairs",
+            type_value="Dining Chair",
+            set_includes="Chairs" if _has_marker(text, "set of", "chairs") else None,
+            room="Dining Room",
+        )
+    if primary == "outdoor_chair":
+        if title_is_chair_accessory(title_text) or title_is_dining_set_bundle(title_text):
+            return ListingProfile(kind="unknown")
+        if title_allows_outdoor_chair_remap(title_text):
+            return _outdoor_seating_profile(title_text)
+        return ListingProfile(kind="unknown")
+    if primary == "pantry":
+        return ListingProfile(
+            kind="pantry_cabinet",
+            category_id="20487",
+            category_name="Cabinets & Cupboards",
+            type_value="Cabinet",
+        )
+    if primary in {"dining_bench", "storage_bench"}:
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "262980", "Benches")
+        return ListingProfile(
+            kind="indoor_bench",
+            category_id=leaf,
+            category_name=leaf_name,
+            type_value="Bench",
+            set_includes="Bench",
+        )
+
+    # Compound / set titles stop here. Never fall through to the ottoman /
+    # pantry / cabinet keyword ladder (root cause of sofa+ottoman → 20490).
+    compound_kind = compound_product_family(title_text)
+    if compound_kind == "dining_set":
+        if title_has_clear_outdoor_word(title_text):
+            return _outdoor_dining_set_profile(title_text)
+        if _has_marker(title_text, "dining set", "dining table set", "piece dining"):
+            return ListingProfile(
+                kind="dining_set",
+                category_id="107578",
+                category_name="Dining Sets",
+                type_value="Dining Set",
+                set_includes="Dining Table & Chairs",
+            )
+        return ListingProfile(kind="unknown")
+    if compound_kind == "patio_furniture_set":
+        return ListingProfile(
+            kind="patio_furniture_set",
+            category_id="139849",
+            category_name="Patio & Garden Furniture Sets",
+            type_value="Patio Furniture Set",
+            set_includes="Sofa Set",
+            room="Patio",
+            indoor_outdoor="Outdoor",
+        )
+    if compound_kind == "sofa":
+        is_sectional = _has_marker(
+            title_text, "sectional", "modular", "l-shaped", "u-shaped", "u shaped", "l shaped"
+        )
+        is_armchair = (not is_sectional) and _has_marker(
+            title_text, "armchair", "single sofa", "reading chair"
+        )
+        return ListingProfile(
+            kind="armchair" if is_armchair else "sofa",
+            category_id="38208",
+            category_name="Sofas, Armchairs & Couches",
+            type_value="Armchair" if is_armchair else ("Sectional" if is_sectional else "Sofa"),
+            set_includes="Chair" if is_armchair else ("Sofa Set" if is_sectional else "Sofa"),
+            room="Living Room",
+        )
+    if compound_kind == "armchair":
+        return ListingProfile(
+            kind="armchair",
+            category_id="38208",
+            category_name="Sofas, Armchairs & Couches",
+            type_value="Armchair",
+            set_includes="Chair",
+            room="Living Room",
+        )
+    if compound_kind == "coffee_table":
+        return ListingProfile(
+            kind="coffee_table",
+            category_id="38204",
+            category_name="Coffee Tables",
+            type_value="Coffee Table",
+            set_includes="Table",
+            room="Living Room",
+        )
+    if compound_kind == "bed":
+        bed_type = (
+            "Loft Bed"
+            if _has_marker(title_text, "loft bed")
+            else ("Bunk Bed" if _has_marker(title_text, "bunk bed", "twin over", "full over", "queen over") else "Bed Frame")
+        )
+        return ListingProfile(
+            kind="bed",
+            category_id="175758",
+            category_name="Beds & Bed Frames",
+            type_value=bed_type,
+            room="Bedroom",
+        )
+    if compound_kind == "desk":
+        return ListingProfile(
+            kind="desk",
+            category_id="88057",
+            category_name="Desks & Tables",
+        )
+    if compound_kind == "kids_table_set":
+        return ListingProfile(
+            kind="kids_table_set",
+            category_id="66743",
+            category_name="Play Table & Chair Sets",
+            type_value="Play Table & Chair Set",
+            set_includes="Table & Chairs",
+            room="Playroom",
+        )
+    if compound_kind in {"unknown", "kitchen_island"}:
+        return ListingProfile(kind="unknown")
+    if has_compound_product_signal(title_text):
+        return ListingProfile(kind="unknown")
+
+    sofa_context = _has_marker(
+        title_text,
+        "sectional sofa",
+        "l-shaped sofa",
+        "u-shaped sofa",
+        "modular sectional",
+        "single sofa",
+        "sofa",
+        "couch",
+        "loveseat",
+        "armchair",
+        "reading chair",
+        "chaise lounge",
+        "club chair",
+    ) and primary not in {"storage_ottoman", "ottoman_bench", "ottoman", "workbench"}
+    dining_set_markers = (
+        "dining set",
+        "dining table set",
+        "piece dining set",
+        "5-piece dining",
+        "5 piece dining",
+        "6-piece dining",
+        "6 piece dining",
+        "7-piece dining",
+        "7 piece dining",
+        "table set",
+        "kitchen table set",
+    )
+    kids_table_set_markers = (
+        "kids activity table",
+        "kids table and chair",
+        "kids table & chair",
+        "children table and chair",
+        "children's table and chair",
+        "childrens table and chair",
+        "play table and chair",
+        "play table & chair",
+        "activity table and chair",
+        "toddler table and chair",
+        "table and chair set for toddlers",
+    )
+    bed_markers = (
+        "bunk bed",
+        "loft bed",
+        "platform bed",
+        "bed frame",
+        "house bed",
+        "floor bed",
+        "montessori bed",
+    )
+    bed_stack_markers = (
+        "queen over queen",
+        "twin over twin",
+        "twin over full",
+        "full over full",
+        "full over queen",
+        "queen over full",
+    )
+
+    if _has_marker(title_text, "treadmill", "walking pad", "running machine") and not _has_marker(
+        title_text, "dog treadmill", "pet treadmill"
+    ):
+        return ListingProfile(
+            kind="treadmill",
+            category_id="15280",
+            category_name="Treadmills",
+            type_value="Treadmill",
+        )
+
+    if _has_marker(title_text, "potting bench", "garden workstation"):
+        return ListingProfile(
+            kind="potting_bench",
+            category_id="139939",
+            category_name="Greenhouses",
+            type_value="Potting Bench",
+        )
+
+    if _has_marker(title_text, "table tennis", "ping pong"):
+        return ListingProfile(
+            kind="table_tennis",
+            category_id="97075",
+            category_name="Tables",
+            type_value="Table Tennis Table",
+            set_includes="Table",
+        )
+
+    if _has_marker(title_text, *kids_table_set_markers) or (
+        _has_marker(title_text, "kids table") and _has_marker(title_text, "chair")
+    ):
+        return ListingProfile(
+            kind="kids_table_set",
+            category_id="66743",
+            category_name="Play Table & Chair Sets",
+            type_value="Play Table & Chair Set",
+            set_includes="Table & Chairs",
+            room="Playroom",
+        )
+
+    non_dining_table_set_markers = (
+        "coffee table",
+        "cocktail table",
+        "side table",
+        "end table",
+        "console table",
+        "nesting table",
+    )
+    if (
+        _has_marker(title_text, *dining_set_markers) or title_is_dining_set_bundle(title_text)
+    ) and not _has_marker(
+        title_text, *kids_table_set_markers, *non_dining_table_set_markers
+    ):
+        if title_has_clear_outdoor_word(title_text):
+            return _outdoor_dining_set_profile(title_text)
+        if _has_marker(title_text, *dining_set_markers):
+            return ListingProfile(
+                kind="dining_set",
+                category_id="107578",
+                category_name="Dining Sets",
+                type_value="Dining Set",
+                set_includes="Dining Table & Stools" if "stool" in title_text else "Dining Table & Chairs",
+            )
+        return ListingProfile(kind="unknown")
+
+    if _has_marker(title_text, "computer desk", "writing desk", "l-shaped desk", "l shaped desk", "corner desk", "home office desk"):
+        return ListingProfile(
+            kind="desk",
+            category_id="88057",
+            category_name="Desks & Tables",
+        )
+
+    if _has_marker(title_text, *bed_markers, *bed_stack_markers):
+        return ListingProfile(
+            kind="bed",
+            category_id="175758",
+            category_name="Beds & Bed Frames",
+            type_value=(
+                "Loft Bed"
+                if _has_marker(title_text, "loft bed")
+                else ("Bunk Bed" if _has_marker(title_text, "bunk bed", *bed_stack_markers) else "Bed Frame")
+            ),
+            room="Bedroom",
+        )
+
+    pantry_markers = (
+        "kitchen pantry",
+        "pantry cabinet",
+        "freestanding pantry",
+        "pantry storage",
+        "storage cabinet",
+        "cupboard",
+        "kitchen hutch",
+        "hutch cabinet",
+        "microwave shelf",
+    )
+    has_pantry = (
+        _has_marker(title_text, *pantry_markers)
+        or (_has_marker(title_text, "hutch") and _has_marker(title_text, "kitchen", "pantry", "microwave"))
+    ) and not _has_marker(title_text, "nightstand", "bedside table", "dresser", "workbench", "work bench")
+    if has_pantry and not _has_marker(title_text, "wine rack", "wine cabinet", "bar cabinet"):
+        return ListingProfile(
+            kind="pantry_cabinet",
+            category_id="20487",
+            category_name="Cabinets & Cupboards",
+            type_value="Cabinet",
+        )
+
+    if _has_marker(title_text, "display cabinet", "curio cabinet", "glass display cabinet") and not _has_marker(
+        title_text, "wine rack", "stemware rack"
+    ):
+        return ListingProfile(
+            kind="display_cabinet",
+            category_id="20493",
+            category_name="Display Cabinets",
+            type_value="Display Cabinet",
+        )
+
+    if _has_marker(title_text, "golf") and _has_marker(title_text, "golf putting green", "putting green"):
+        return ListingProfile(
+            kind="golf_putting_green",
+            category_id="36234",
+            category_name="Putting Greens & Aids",
+        )
+
+    if _has_marker(title_text, "golf") and _has_marker(title_text, "golf hitting mat", "golf practice mat", "golf training mat", "golf swing mat"):
+        return ListingProfile(
+            kind="golf_mat",
+            category_id="50876",
+            category_name="Nets, Cages & Mats",
+        )
+
+    if (
+        _has_marker(title_text, "porch swing", "porch swing bed", "patio swing bed", "garden swing bed")
+        or (
+            _has_marker(title_text, "swing bed")
+            and outdoor_context
+            and _has_marker(title_text, "rope")
+            and not _has_marker(title_text, "cat ", "dog ", "pet ", "kitten", "puppy")
+        )
+    ):
+        return ListingProfile(
+            kind="porch_swing",
+            category_id="79694",
+            category_name="Porch Swings",
+            indoor_outdoor="Outdoor",
+        )
+
+    if _has_marker(title_text, "outdoor daybed", "patio daybed", "sunbed") or (
+        _has_marker(title_text, "daybed")
+        and outdoor_context_strict
+        and not _has_marker(title_text, "porch swing", "swing bed")
+        and not _has_marker(title_text, "sofa", "couch", "loveseat", "sectional")
+    ):
+        return ListingProfile(
+            kind="outdoor_daybed",
+            category_id="138996",
+            category_name="Outdoor Daybeds",
+            indoor_outdoor="Outdoor",
+        )
+
+    if (
+        title_allows_outdoor_chair_remap(title_text)
+        and not _has_marker(title_text, "sofa", "couch", "loveseat", "sectional")
+        and re.search(r"\btable\b", title_text) is None
+        and _has_marker(
+            title_text,
+            "outdoor chair",
+            "patio chair",
+            "club chair",
+            "club chairs",
+            "armchair",
+            "armchairs",
+            "patio armchair",
+            "patio armchairs",
+            "outdoor dining chair",
+            "outdoor dining chairs",
+            "patio dining chair",
+            "patio dining chairs",
+            "outdoor lounge chair",
+            "outdoor lounge chairs",
+            "patio lounge",
+            "sun lounger",
+            "camping chair",
+            "camping chairs",
+        )
+    ):
+        return _outdoor_seating_profile(title_text)
+
+    if _has_marker(title_text, "bar stool", "bar stools", "counter stool", "counter stools", "barstool", "barstools"):
+        return ListingProfile(
+            kind="bar_stool",
+            category_id="103431",
+            category_name="Bar Stools & Stools",
+            type_value="Bar Stool",
+            set_includes="Stools" if ("set of" in text or "stools" in text) else "Stool",
+        )
+
+    patio_set_markers = (
+        "patio furniture set",
+        "patio set",
+        "patio conversation",
+        "outdoor conversation set",
+        "outdoor furniture set",
+        "outdoor sectional",
+    )
+    if _has_marker(title_text, *patio_set_markers):
+        return ListingProfile(
+            kind="patio_furniture_set",
+            category_id="139849",
+            category_name="Patio & Garden Furniture Sets",
+            type_value="Patio Furniture Set",
+            set_includes="Sofa Set",
+            room="Patio",
+            indoor_outdoor="Outdoor",
+        )
+
+    if (
+        not sofa_context
+        and _has_marker(title_text, "storage ottoman", "lift top ottoman", "storage footstool")
+    ) or (
+        not sofa_context
+        and _has_marker(title_text, "ottoman") and _has_marker(title_text, "storage")
+    ):
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "20490", "Ottomans, Footstools & Poufs")
+        return ListingProfile(
+            kind="storage_ottoman",
+            category_id=leaf,
+            category_name=leaf_name,
+            type_value="Storage Ottoman",
+            set_includes="Ottoman",
+            room="Living Room",
+            remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
+        )
+
+    if not sofa_context and _has_marker(title_text, "ottoman bench"):
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "20490", "Ottomans, Footstools & Poufs")
+        return ListingProfile(
+            kind="ottoman_bench",
+            category_id=leaf,
+            category_name=leaf_name,
+            type_value="Ottoman",
+            set_includes="Ottoman",
+            room="Living Room",
+            remove_aspects=frozenset({"Top Material", "Tabletop Material"}),
+        )
+
+    excluded_bench = _has_marker(
+        title_text,
+        "garden bench",
+        "outdoor bench",
+        "park bench",
+        "shower bench",
+        "bath stool",
+        "potting bench",
+        "hall tree",
+        "coat rack bench",
+        "shoe bench",
+        "storage ottoman",
+        "ottoman bench",
+        "workbench",
+        "work bench",
+    )
+    bench_markers = (
+        "dining bench",
+        "long bench",
+        "upholstered bench",
+        "mid century bench",
+        "bench with",
+        "end of bed",
+        "footrest stool",
+    )
+    if not excluded_bench and _has_marker(title_text, *bench_markers):
+        leaf, leaf_name = _ottoman_bench_leaf(category_id, "262980", "Benches")
+        return ListingProfile(
+            kind="indoor_bench",
+            category_id=leaf,
+            category_name=leaf_name,
+            type_value="Bench",
+            set_includes="Bench",
+        )
+
+    if _has_marker(title_text, "board game table", "gaming table", "game table"):
+        return ListingProfile(
+            kind="game_table",
+            category_id="38204",
+            category_name="Tables",
+            type_value="Game Table",
+            set_includes="Table",
+            room="Game Room",
+            remove_aspects=frozenset(GAME_TABLE_FORBIDDEN_ASPECTS),
+        )
+
+    if _has_marker(title_text, "dining chair") or (
+        _has_marker(title_text, "chair")
+        and _has_marker(title_text, "dining")
+        and _has_marker(title_text, "set of", "chairs")
+        and not _has_marker(title_text, "accent chair", "armchair", "reading chair")
+        and not _has_marker(title_text, "chairs not included", "without chairs", "table only")
+    ):
+        if _has_marker(title_text, "accent chair"):
+            return ListingProfile(kind="unknown")
+        if title_is_dining_set_bundle(title_text):
+            return _dining_set_bundle_profile(title_text)
+        if title_allows_outdoor_chair_remap(title_text):
+            return _outdoor_seating_profile(title_text)
+        if title_has_mixed_indoor_outdoor(title_text):
+            return ListingProfile(kind="unknown")
+        return ListingProfile(
+            kind="dining_chair",
+            category_id="54235",
+            category_name="Chairs",
+            type_value="Dining Chair",
+            set_includes="Chairs" if ("set of" in text or "chairs" in text) else None,
+            room="Dining Room",
+        )
+
+    if _has_marker(title_text, "bean bag"):
+        return ListingProfile(
+            kind="bean_bag",
+            category_id="48319",
+            category_name="Bean Bags & Inflatables",
+            type_value="Beanbag",
+            room="Living Room",
+            remove_aspects=frozenset({"Set Includes"}),
+        )
+
+    seating_negated = _has_marker(title_text, "chairs not included", "without chairs", "table only")
+    if _has_marker(title_text, "dining table") and (
+        seating_negated or not _has_marker(title_text, "chair", "bench")
+    ):
+        if _title_has_outdoor_table_signal(title_text):
+            return _outdoor_table_profile(category_id)
+        return ListingProfile(
+            kind="dining_table",
+            category_id="38204",
+            category_name="Tables",
+            type_value="Dining Table",
+            set_includes="Table",
+            room="Dining Room",
+            remove_aspects=frozenset({"Upholstery Material", "Upholstery Fabric"}),
+        )
+
+    if _has_marker(title_text, "coffee table", "cocktail table"):
+        if _title_has_outdoor_table_signal(title_text):
+            return _outdoor_table_profile(category_id)
+        return ListingProfile(
+            kind="coffee_table",
+            category_id="38204",
+            category_name="Coffee Tables",
+            type_value="Coffee Table",
+            set_includes="Table",
+            room="Living Room",
+        )
+
+    if _has_marker(title_text, "nightstand", "bedside table"):
+        return ListingProfile(
+            kind="nightstand",
+            category_id="38199",
+            category_name="Nightstands",
+            type_value="Nightstand",
+            room="Bedroom",
+            remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
+        )
+
+    if is_camping_kitchen_title(title_text):
+        # Camping cook stations list fold-out "4 Side Tables" wings; they are not
+        # indoor End Tables (W465P439797). Grill/griddle/BBQ/smoker/island/cart
+        # titles are excluded and keep their upstream route.
+        return ListingProfile(
+            kind="camping_kitchen_table",
+            category_id="112590",
+            category_name="Patio & Garden Tables",
+            type_value="Camping Table",
+            indoor_outdoor="Outdoor",
+            remove_aspects=frozenset({"Room", "Upholstery Material", "Upholstery Fabric"}),
+        )
+
+    if _has_marker(title_text, "side table", "end table", "accent table", "lamp table"):
+        # Animal-head / statue accent tables are decorative sculpture (20518), same as
+        # published W5398 flamingo sibling. Plain furniture end tables use 38200.
+        # Never use 54235 (Chairs) or 38204 (Coffee Tables).
+        if _has_marker(title_text, "statue", "figurine", "sculpture", "animal head", "head accent"):
+            return ListingProfile(
+                kind="decor_statue_table",
+                category_id="20518",
+                category_name="Garden Sculptures & Statues",
+                type_value="Statue",
+                room="Living Room",
+                remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
+            )
+        if _title_has_outdoor_table_signal(title_text):
+            return _outdoor_table_profile(category_id)
+        return ListingProfile(
+            kind="side_table",
+            category_id="38200",
+            category_name="End Tables",
+            type_value="End & Side Tables",
+            room="Living Room",
+            remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
+        )
+
+    if _has_marker(title_text, "armchair", "reading chair", "single seat sofa", "accent chair") and not _has_marker(title_text, "dining"):
+        return ListingProfile(
+            kind="armchair",
+            category_id="38208",
+            category_name="Sofas, Armchairs & Couches",
+            type_value="Armchair",
+            set_includes="Chair",
+            room="Living Room",
+        )
+
+    # "Sofa Table" / "Sofa Side Table" / "Console Table ... Behind Couch" are
+    # tables that merely mention a sofa — never classify them as sofas
+    # (live incident 2026-07-13: a nightstand and a console table were both
+    # recategorized into 38208 by this branch). A real sectional/couch/armchair
+    # that happens to include a storage ottoman is still seating, not an
+    # accessory-ottoman title (W3098 "Double Sofa" stuffing stays blocked).
+    true_sofa_seating = _has_marker(
+        title_text,
+        "sectional sofa",
+        "l-shaped sofa",
+        "l-shaped sectional",
+        "u-shaped sofa",
+        "modular sectional",
+        "loveseat",
+        "couch",
+        "armchair",
+        "accent chair",
+        "reading chair",
+        "chaise lounge",
+        "club chair",
+    )
+    sofa_accessory_context = (
+        re.search(r"\b(?:sofa|couch)\s+(?:side\s+)?table\b", title_text)
+        or _has_marker(title_text, "console table")
+        or re.search(r"\bbehind\s+(?:the\s+)?(?:couch|sofa)\b", title_text)
+        or (
+            _has_marker(title_text, "storage ottoman", "ottoman bench", "storage bench")
+            and not true_sofa_seating
+        )
+    )
+    if not sofa_accessory_context and _has_marker(
+        title_text,
+        "loveseat",
+        "sectional sofa",
+        "l-shaped sofa",
+        "u-shaped sofa",
+        "modular sectional",
+        "sofa",
+        "couch",
+    ):
+        is_sectional = _has_marker(
+            title_text, "sectional", "modular", "l-shaped", "u-shaped", "u shaped", "l shaped"
+        )
+        return ListingProfile(
+            kind="sofa",
+            category_id="38208",
+            category_name="Sofas, Armchairs & Couches",
+            type_value="Loveseat" if "loveseat" in text else ("Sectional" if is_sectional else "Sofa"),
+            set_includes="Sofa Set" if is_sectional else "Sofa",
+            room="Living Room",
+        )
+
+    return ListingProfile(kind="unknown")
+
+
+def quality_gate_expected_aspects(
+    *,
+    title: str = "",
+    description: str = "",
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    category_id: str = "",
+    current_aspects: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """Aspect values the quality gate requires or derives.
+
+    The publish source-guard must defer to these instead of stripping or
+    rewriting them. Keys match Item Specific names (Type, Assembly Required, …).
+    """
+    expected: dict[str, str] = {}
+    profile = classify_listing_profile(
+        title or source_title,
+        description,
+        category_id,
+        source_title=source_title,
+    )
+    if profile.type_value:
+        expected["Type"] = profile.type_value
+    if profile.set_includes:
+        expected["Set Includes"] = profile.set_includes
+    if profile.room:
+        expected["Room"] = profile.room
+    if profile.indoor_outdoor:
+        expected["Indoor/Outdoor"] = profile.indoor_outdoor
+
+    title_text = _text_context(title)
+    if profile.kind == "dining_chair":
+        match = re.search(r"set\s+of\s+(\d+)", title_text)
+        if match:
+            expected["Number of Items in Set"] = match.group(1)
+    if profile.kind == "dining_set":
+        item_count = expected_dining_set_item_count(
+            title,
+            category_id=category_id or profile.category_id or "",
+        )
+        if item_count:
+            expected["Number of Items in Set"] = item_count
+            expected["Number of Pieces"] = item_count
+
+    current_assembly = first_aspect_text(current_aspects or {}, "Assembly Required")
+    assembly_decision = infer_assembly_decision(
+        source_title=source_title or title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+        current_assembly=current_assembly,
+    )
+    expected_assembly = assembly_decision.get("required")
+    if not expected_assembly and assembly_decision.get("status") == "unknown":
+        expected_assembly = _normalize_yes_no(
+            infer_source_assembly_required(attributes, specs, source_description)
+        )
+    if expected_assembly:
+        expected["Assembly Required"] = expected_assembly
+    return expected
+
+
+def expected_dining_set_item_count(title: str, *, category_id: str = "") -> str | None:
+    """Dining-set piece count from the listing title only.
+
+    Shared by ``validate_listing_quality`` and ``quality_gate_expected_aspects``
+    so the publish guard cannot invent a different count from a combined
+    source+listing title.
+    """
+    return infer_number_of_items_in_set(title or "", category_id=category_id)
+
+
+def _apply_profile_rules(
+    opt: dict[str, Any],
+    profile: ListingProfile,
+    *,
+    preserve_category: bool = False,
+) -> None:
+    aspects = opt.setdefault("aspects", {})
+    if profile.category_id and not preserve_category:
+        opt["categoryId"] = profile.category_id
+        opt["categoryName"] = profile.category_name
+    if profile.type_value:
+        _set_aspect(aspects, "Type", profile.type_value)
+    if profile.set_includes:
+        _set_aspect(aspects, "Set Includes", profile.set_includes)
+    if profile.room and not aspects.get("Room"):
+        _set_aspect(aspects, "Room", profile.room)
+    if profile.indoor_outdoor:
+        _set_aspect(aspects, "Indoor/Outdoor", profile.indoor_outdoor)
+    _remove_aspects(aspects, FURNITURE_FORBIDDEN_ASPECTS | profile.remove_aspects)
+
+    if profile.kind == "dining_chair":
+        title_text = _text_context(opt.get("title", ""))
+        match = re.search(r"set\s+of\s+(\d+)", title_text)
+        if match:
+            _set_aspect(aspects, "Number of Items in Set", match.group(1))
+        aspects.setdefault("Department", ["Adults"])
+    if profile.kind == "dining_set":
+        item_count = expected_dining_set_item_count(
+            opt.get("title", ""),
+            category_id=profile.category_id or "",
+        )
+        if item_count:
+            _set_aspect(aspects, "Number of Items in Set", item_count)
+            _set_aspect(aspects, "Number of Pieces", item_count)
+    if profile.kind == "storage_ottoman":
+        for material_key in ("Upholstery Material", "Material"):
+            values = _as_list(aspects.get(material_key))
+            if any("boucle" in value.lower() for value in values):
+                _set_aspect(aspects, material_key, "Boucle" if material_key == "Upholstery Material" else "Fabric")
+
+    inferred_color = _infer_color_from_text(opt.get("title", ""))
+    if inferred_color:
+        _set_aspect(aspects, "Color", inferred_color)
+
+
+def _numbers_present(text: str, *values: str) -> bool:
+    normalized = re.sub(r"<[^>]+>", " ", text or "")
+    normalized = re.sub(r"\s+", " ", normalized).lower()
+    for value in values:
+        match = re.search(r"(\d+(?:\.\d+)?)", str(value or ""))
+        if not match:
+            return False
+        number = float(match.group(1))
+        variants = {
+            f"{number:g}",
+            f"{number:.1f}".rstrip("0").rstrip("."),
+            f"{number:.2f}".rstrip("0").rstrip("."),
+        }
+        if not any(variant and variant in normalized for variant in variants):
+            return False
+    return True
+
+
+def _first_present_aspect(aspects: Mapping[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = first_aspect_text(aspects, key)
+        if value:
+            return value
+    return ""
+
+
+def _build_fallback_feature_bullets(
+    *,
+    title: str,
+    description: str,
+    aspects: Mapping[str, Any],
+    source_facts: Mapping[str, Any] | None = None,
+) -> list[str]:
+    bullets: list[str] = []
+
+    feature_type = _first_present_aspect(aspects, "Type", "Set Includes")
+    if feature_type:
+        bullets.append(f"Product Type: {feature_type}.")
+
+    length = first_aspect_text(aspects, "Item Length")
+    width = first_aspect_text(aspects, "Item Width")
+    height = first_aspect_text(aspects, "Item Height")
+    if length and width and height:
+        bullets.append(f"Overall Dimensions (L x W x H): {length} x {width} x {height}.")
+
+    weight = first_aspect_text(aspects, "Item Weight")
+    if weight:
+        bullets.append(f"Item Weight: {weight}.")
+
+    material = _first_present_aspect(
+        aspects,
+        "Material",
+        "Upholstery Material",
+        "Upholstery Fabric",
+        "Frame Material",
+        "Base Material",
+    )
+    if material:
+        bullets.append(f"Material: {material}.")
+
+    color = first_aspect_text(aspects, "Color")
+    if color:
+        bullets.append(f"Color: {color}.")
+
+    assembly_required = ""
+    if isinstance(source_facts, Mapping):
+        assembly_required = str(source_facts.get("assembly_required") or "").strip()
+    if assembly_required and "assembly required" not in description.lower():
+        if assembly_required == "Yes":
+            bullets.append("Assembly Required: Yes - setup is required before use.")
+        else:
+            bullets.append("Assembly Required: No - ready for use without assembly.")
+
+    if not bullets and title:
+        bullets.append(_clean_text(title))
+
+    return bullets[:6]
+
+
+def _ensure_key_features_block(
+    description: str,
+    *,
+    title: str,
+    aspects: Mapping[str, Any],
+    source_facts: Mapping[str, Any] | None = None,
+) -> str:
+    if not description:
+        return description or ""
+
+    lowered = description.lower()
+    has_key_features = "key features" in lowered
+    has_bullets = "<li" in lowered
+    if has_key_features and has_bullets:
+        return description
+
+    if has_bullets and not has_key_features:
+        inserted = re.sub(
+            r"(<ul\b[^>]*>|<li\b)",
+            r'<h3 style="margin:16px 0 8px 0;font-size:18px;">KEY FEATURES</h3>\1',
+            description,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if inserted != description:
+            return inserted
+        return '<h3 style="margin:16px 0 8px 0;font-size:18px;">KEY FEATURES</h3>' + description
+
+    bullets = _build_fallback_feature_bullets(
+        title=title,
+        description=description,
+        aspects=aspects,
+        source_facts=source_facts,
+    )
+    if not bullets:
+        return description
+
+    bullet_html = "".join(f"<li>{_clean_text(bullet)}</li>" for bullet in bullets)
+    if has_key_features and not has_bullets:
+        return description + f"<ul>{bullet_html}</ul>"
+
+    intro = f"<p>{_clean_text(title)}</p>" if title else ""
+    return (
+        f"{intro}<h3 style=\"margin:16px 0 8px 0;font-size:18px;\">KEY FEATURES</h3>"
+        f"<ul>{bullet_html}</ul>{description}"
+    )
+
+
+def normalize_generated_listing(
+    optimization: Mapping[str, Any] | None,
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    images: list[str] | None = None,
+    videos: list[str] | None = None,
+    category_matcher: Any = None,
+) -> dict[str, Any]:
+    """Normalize an AI-generated draft before it can become READY or publish."""
+    opt: dict[str, Any] = copy.deepcopy(dict(optimization or {}))
+    sanitized_title, _ = normalize_listing_title_for_ebay(
+        opt.get("title") or source_title or "",
+        source_title=source_title or "",
+    )
+    opt["title"] = _clean_text(sanitized_title)
+    opt["description"] = _clean_text(opt.get("description") or source_description or "")
+    opt["aspects"] = _normalize_value(opt.get("aspects") or {})
+
+    if not isinstance(opt["aspects"], dict):
+        opt["aspects"] = {}
+
+    # Decision uses the same raw live/giga pair as audit. Sanitized 80-char
+    # listing titles must not become a second live_title.
+    raw_live_title = str((optimization or {}).get("title") or "")
+    giga_title = str(source_title or "")
+    stored_category = str(opt.get("categoryId") or "")
+    live_title = str(opt.get("title") or "")
+    # Aspects still come from the live-title profile. The leaf comes from the
+    # shared decision so publish and audit cannot disagree.
+    profile = classify_listing_profile(
+        raw_live_title or giga_title or live_title,
+        "",
+        stored_category,
+        source_title="",
+    )
+    preserve_category = blocks_automated_category_change(opt)
+    if not preserve_category:
+        from src.utils.category_decision import decision_category_id, resolve_category_decision
+
+        decision = resolve_category_decision(
+            raw_live_title,
+            giga_title,
+            "",
+            stored_category,
+            opt.get("categoryName"),
+        )
+        write_id = decision_category_id(decision, stored_category)
+        if write_id:
+            profile = ListingProfile(
+                kind=decision.kind or profile.kind,
+                category_id=write_id,
+                category_name=decision.category_name or profile.category_name,
+                type_value=profile.type_value,
+                set_includes=profile.set_includes,
+                room=profile.room,
+                indoor_outdoor=profile.indoor_outdoor,
+                remove_aspects=profile.remove_aspects,
+            )
+        else:
+            profile = ListingProfile(
+                kind=profile.kind if decision.kind == "keep" else (decision.kind or "unknown"),
+                category_id=None,
+                category_name=None,
+                type_value=profile.type_value,
+                set_includes=profile.set_includes,
+                room=profile.room,
+                indoor_outdoor=profile.indoor_outdoor,
+                remove_aspects=profile.remove_aspects,
+            )
+            if decision.kind not in {"keep"} and (
+                decision.category_id
+                or decision.reason
+                not in {
+                    "",
+                    "classified",
+                    "empty_title",
+                    "tree_cache_unavailable",
+                    "tree_unavailable",
+                }
+            ):
+                opt["_category_remap_review"] = {
+                    "from": stored_category or "",
+                    "to": decision.category_id or "",
+                    "reason": decision.reason,
+                    "suggested_alternative": decision.suggested_alternative or "",
+                }
+
+    seeded_attributes = _seed_attributes_from_description(attributes, opt.get("description", ""))
+    updates = _fill_measurement_aspects(opt["aspects"], seeded_attributes)
+    _apply_profile_rules(opt, profile, preserve_category=preserve_category)
+    sanitize_placeholder_aspects(opt["aspects"], title=opt["title"], category_id=str(opt.get("categoryId") or ""))
+    _apply_profile_rules(opt, profile, preserve_category=preserve_category)
+    enforce_store_brand_aspect(opt["aspects"])
+    opt["description"] = sanitize_generated_description_html(opt.get("description", ""))
+    opt["description"] = _sanitize_specifications_table_html(opt.get("description", ""))
+    # Hard requirement: English buyer copy + store banner/footer shell.
+    # Rebuilds Chinese / keyword-soup KEY FEATURES into conversion copy + template.
+    opt["description"] = ensure_store_description_template(
+        opt.get("description", ""),
+        title=opt.get("title") or source_title or "",
+        source_description=source_description or "",
+        attributes=attributes or {},
+        specs=specs or {},
+        aspects=opt.get("aspects") or {},
+    )
+    # Assembly note must land AFTER template ensure so rebuild/wrap cannot wipe it.
+    apply_source_assembly_requirement(
+        opt,
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    apply_aspect_assembly_description_requirement(opt)
+    sanitize_single_value_aspects(opt["aspects"])
+
+    # Specialized templates (arttoy_hype, auto_technical, garden_lifestyle) render
+    # their own complete description chrome and surface specs via their own blocks
+    # + eBay's native item-specifics panel. The furniture-era description appenders
+    # below (measurement box, fallback KEY FEATURES bullets) must NOT run for them —
+    # otherwise they inject a furniture-styled dimensions box and a raw <ul> AFTER
+    # the specialized footer, corrupting the layout.
+    _specialized_template = (
+        str(getattr(_store_profile_or_none(), "template_style", "furniture_classic"))
+        != "furniture_classic"
+    )
+
+    length = updates.get("Item Length") or first_aspect_text(opt["aspects"], "Item Length")
+    width = updates.get("Item Width") or first_aspect_text(opt["aspects"], "Item Width")
+    height = updates.get("Item Height") or first_aspect_text(opt["aspects"], "Item Height")
+    weight = updates.get("Item Weight") or first_aspect_text(opt["aspects"], "Item Weight")
+    try:
+        if not _specialized_template:
+            opt["description"] = replace_description_measurements(
+                opt["description"],
+                length=float(re.search(r"(\d+(?:\.\d+)?)", length).group(1)) if length else None,
+                width=float(re.search(r"(\d+(?:\.\d+)?)", width).group(1)) if width else None,
+                height=float(re.search(r"(\d+(?:\.\d+)?)", height).group(1)) if height else None,
+                weight=float(re.search(r"(\d+(?:\.\d+)?)", weight).group(1)) if weight else None,
+            )
+    except Exception:
+        pass
+
+    opt["source_facts"] = build_source_facts(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+        videos=videos,
+    )
+    claim_facts = opt["source_facts"].get("claims") if isinstance(opt["source_facts"], dict) else {}
+    for claim_name, feature_value in SUPPORTED_FEATURE_CLAIMS.items():
+        claim_state = claim_facts.get(claim_name) if isinstance(claim_facts, Mapping) else {}
+        if isinstance(claim_state, Mapping) and claim_state.get("supported"):
+            _append_unique_aspect_value(opt["aspects"], "Features", feature_value)
+    if not _specialized_template:
+        # Specialized templates write their own KEY FEATURES; skip the furniture
+        # fallback that would append a raw <ul> after their footer.
+        opt["description"] = _ensure_key_features_block(
+            opt.get("description", ""),
+            title=opt.get("title", ""),
+            aspects=opt.get("aspects", {}),
+            source_facts=opt["source_facts"],
+        )
+
+    # ── Layer 2: Deterministic claim violation detection ──
+    from src.utils.claim_diff_engine import build_source_constraints, detect_claim_violations
+    source_constraints = build_source_constraints(
+        attrs=attributes,
+        specs=specs,
+        source_description=source_description,
+        source_title=source_title,
+    )
+    claim_violations = detect_claim_violations(
+        source_constraints=source_constraints,
+        generated_title=opt.get("title", ""),
+        generated_description=opt.get("description", ""),
+        generated_aspects=opt.get("aspects", {}),
+    )
+    # 记录违规到 source_facts 供下游使用
+    opt["source_facts"]["claim_violations"] = [
+        {
+            "claim_type": v.claim_type,
+            "claim_text": v.claim_text,
+            "location": v.location,
+            "severity": v.severity,
+        }
+        for v in claim_violations
+    ]
+
+    # ── Layer 3: LLM Fact Checker (runs conditionally) ──
+    # Skip when buyer copy already uses the English store template shell.
+    # Deterministic FactSheet (run_listing_qc) remains the semantic gate for
+    # those listings; LLM was double-blocking compliant template rebuilds.
+    enable_llm_fact_check = True  # Feature flag
+    critical_layer2_violations = [v for v in claim_violations if v.severity == "CRITICAL"]
+    desc_now = opt.get("description") or ""
+    store_template_en = description_uses_store_template(desc_now) and not description_contains_cjk(
+        desc_now
+    )
+    if enable_llm_fact_check and not critical_layer2_violations and not store_template_en:
+        from src.utils.llm_fact_checker import llm_fact_check
+        llm_violations = llm_fact_check(
+            source_title=source_title,
+            source_description=source_description,
+            source_specs=specs or {},
+            generated_title=opt.get("title", ""),
+            generated_description=opt.get("description", "")
+        )
+        if llm_violations:
+            opt["source_facts"]["llm_fact_check_results"] = llm_violations
+    elif store_template_en:
+        opt["source_facts"]["llm_fact_check_results"] = []
+        opt["source_facts"]["llm_fact_check_skipped"] = "store_template_en"
+
+    return opt
+
+
+def description_contains_cjk(text: str | None) -> bool:
+    """True when buyer-facing copy contains CJK ideographs."""
+    return bool(CJK_CHAR_RE.search(text or ""))
+
+
+def _store_profile_or_none():
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        return get_store_profile()
+    except Exception:
+        return None
+
+
+_STORE_BRAND_PLACEHOLDERS = frozenset({"", "unbranded", "generic", "no brand", "none"})
+
+
+def expected_store_brand() -> str | None:
+    """Return the configured house brand when this store owns generic goods."""
+    profile = _store_profile_or_none()
+    if not bool(getattr(profile, "force_house_brand", False)):
+        return None
+    brand = _clean_text(
+        str(
+            getattr(profile, "default_brand", None)
+            or getattr(profile, "brand_name", None)
+            or ""
+        )
+    )
+    if not brand or brand.casefold() in _STORE_BRAND_PLACEHOLDERS:
+        return None
+    return brand
+
+
+def is_store_brand_placeholder(value: Any) -> bool:
+    return _clean_text(str(value or "")).casefold() in _STORE_BRAND_PLACEHOLDERS
+
+
+def enforce_store_brand_aspect(aspects: dict[str, Any]) -> str | None:
+    """Replace generic placeholder brands with the configured house brand."""
+    expected = expected_store_brand()
+    if not expected:
+        return None
+    current = first_aspect_text(aspects, "Brand")
+    if is_store_brand_placeholder(current):
+        aspects["Brand"] = [expected]
+        return expected
+    return None
+
+
+def description_has_store_banner(text: str | None, profile: Any = None) -> bool:
+    profile = profile if profile is not None else _store_profile_or_none()
+    marker = str(getattr(profile, "quality_banner_marker", "") or "").strip().lower()
+    if not marker:
+        return True
+    return marker in html_lib.unescape(text or "").lower()
+
+
+def description_has_store_footer(text: str | None, profile: Any = None) -> bool:
+    profile = profile if profile is not None else _store_profile_or_none()
+    marker = str(getattr(profile, "quality_footer_marker", "") or "").strip().lower()
+    if not marker:
+        return True
+    return marker in html_lib.unescape(text or "").lower()
+
+
+def description_uses_store_template(text: str | None, profile: Any = None) -> bool:
+    """Buyer-facing description carries the configured store banner + footer markers."""
+    profile = profile if profile is not None else _store_profile_or_none()
+    return description_has_store_banner(text, profile) and description_has_store_footer(text, profile)
+
+
+def _store_footer_html(profile: Any = None) -> str:
+    profile = profile if profile is not None else _store_profile_or_none()
+    footer_html = str(getattr(profile, "footer_html", "") or "").strip()
+    if footer_html:
+        return footer_html
+    l1 = html_lib.escape(str(getattr(profile, "description_footer_line1", "") or ""))
+    l2 = html_lib.escape(str(getattr(profile, "description_footer_line2", "") or ""))
+    return (
+        '<div style="text-align:center;padding:20px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
+        f'<p style="margin:0;font-size:12px;color:#d4af37;letter-spacing:1px">{l1}</p>'
+        f'<p style="margin:8px 0 0;font-size:11px;color:#808080">{l2}</p>'
+        "</div>"
+    )
+
+
+def dedupe_store_description_headers(description: str | None, profile: Any = None) -> str:
+    """Remove nested duplicate brand banner+title blocks (keep one shell).
+
+    Happens when a description that already includes the AquaVerve header is
+    passed through ``build_store_description_shell`` again as the body.
+    """
+    profile = profile if profile is not None else _store_profile_or_none()
+    html = description or ""
+    brand = str(getattr(profile, "brand_name", "AquaVerve") or "AquaVerve").upper()
+    if html.upper().count(brand) <= 1:
+        return html
+
+    # Strip one leading banner + title-bar pair at a time while duplicates remain.
+    header_re = re.compile(
+        r"(?is)"
+        r'<div style="text-align:center;padding:30px[^"]*"[^>]*>.*?</div>\s*'
+        r'<div style="background:#f8f9fa;padding:25px[^"]*"[^>]*>\s*'
+        r"<h2[^>]*>.*?</h2>\s*</div>"
+    )
+    guard = 0
+    while html.upper().count(brand) > 1 and guard < 5:
+        guard += 1
+        new_html, n = header_re.subn("", html, count=1)
+        if n == 0 or new_html == html:
+            break
+        html = new_html
+    return html
+
+
+def build_store_description_shell(
+    *,
+    title: str,
+    body_html: str = "",
+    profile: Any = None,
+) -> str:
+    """Minimal brand shell: banner + optional body + footer (idempotent markers)."""
+    profile = profile if profile is not None else _store_profile_or_none()
+    brand = html_lib.escape(str(getattr(profile, "brand_name", "AquaVerve") or "AquaVerve").upper())
+    tagline = html_lib.escape(str(getattr(profile, "brand_tagline", "") or ""))
+    footer_html = _store_footer_html(profile)
+    safe_title = html_lib.escape(_clean_text(title) or brand)
+    # Never nest a second banner/title when the body already carries one.
+    body = dedupe_store_description_headers(body_html or "", profile)
+    if description_has_store_banner(body, profile):
+        if not description_has_store_footer(body, profile):
+            body = f"{body}{footer_html}"
+        return body
+    return (
+        '<div style="max-width:900px;margin:0 auto;font-family:Arial,sans-serif;color:#1a1a1a;line-height:1.7">'
+        '<div style="text-align:center;padding:30px 15px;background:linear-gradient(135deg,#0d1b2a 0%,#1a365d 100%)">'
+        f'<h1 style="margin:0;font-size:28px;font-weight:300;letter-spacing:6px;color:#d4af37">{brand}</h1>'
+        f'<p style="margin:8px 0 0;font-size:12px;color:#a0a0a0;letter-spacing:2px">{tagline}</p>'
+        "</div>"
+        '<div style="background:#f8f9fa;padding:25px;text-align:center;border-bottom:2px solid #d4af37">'
+        f'<h2 style="margin:0;font-size:20px;color:#2d3436;font-weight:500">{safe_title}</h2>'
+        "</div>"
+        f"{body}"
+        f"{footer_html}"
+        "</div>"
+    )
+
+
+def ensure_store_description_template(
+    description: str | None,
+    *,
+    title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    aspects: Mapping[str, Any] | None = None,
+    profile: Any = None,
+) -> str:
+    """Ensure buyer-facing description is English and uses the store template shell.
+
+    - CJK / empty / keyword-soup KEY FEATURES → full conversion rebuild
+    - English body missing only banner/footer → wrap (preserve assembly/spec copy)
+    - Already good store template → unchanged
+    """
+    profile = profile if profile is not None else _store_profile_or_none()
+    desc = dedupe_store_description_headers(description or "", profile)
+
+    # Specialized templates (arttoy_hype, auto_technical) emit their OWN complete
+    # banner + footer. The furniture shell here must not re-wrap them — doing so
+    # stacks a furniture header over the specialized body and duplicates the
+    # footer. Only furniture_classic uses this shell.
+    if (
+        str(getattr(profile, "template_style", "furniture_classic")) != "furniture_classic"
+        and desc.strip()
+        and not description_contains_cjk(desc)
+    ):
+        return desc
+
+    thin = False
+    try:
+        from src.utils.conversion_copy import is_thin_key_features_description
+
+        thin = is_thin_key_features_description(desc)
+    except Exception:
+        thin = False
+
+    has_shell = description_uses_store_template(desc, profile)
+    has_cjk = description_contains_cjk(desc)
+
+    # Healthy English store template with real bullets — keep as-is.
+    if desc.strip() and has_shell and not has_cjk and not thin:
+        return desc
+
+    needs_full_rebuild = (not desc.strip()) or has_cjk or thin
+
+    if needs_full_rebuild:
+        rebuilt = ""
+        try:
+            from src.services.semantic_rewrite import build_description_from_source
+
+            rebuilt = build_description_from_source(
+                title=title or "",
+                source_description=source_description or "",
+                attrs=dict(attributes or {}),
+                specs=dict(specs or {}),
+                aspects=dict(aspects or {}),
+            ) or ""
+        except Exception:
+            try:
+                from scripts.audit_fix_active_listings import build_structured_description_from_source
+
+                rebuilt = build_structured_description_from_source(
+                    title or "",
+                    source_description or "",
+                    dict(attributes or {}),
+                    dict(specs or {}),
+                    dict(aspects or {}),
+                ) or ""
+            except Exception:
+                rebuilt = ""
+
+        if (
+            rebuilt
+            and not description_contains_cjk(rebuilt)
+            and description_uses_store_template(rebuilt, profile)
+        ):
+            return dedupe_store_description_headers(rebuilt, profile)
+
+    # Already has the brand banner: never wrap again (that creates double headers).
+    # Only append a missing footer when needed.
+    if description_has_store_banner(desc, profile) and not has_cjk:
+        if not description_has_store_footer(desc, profile):
+            desc = f"{desc}{_store_footer_html(profile)}"
+        return dedupe_store_description_headers(desc, profile)
+
+    # English body without shell (or rebuild failed): wrap existing copy so
+    # assembly notes / specs rows from normalize are not discarded.
+    if description_contains_cjk(desc):
+        body = ""
+    else:
+        body = desc
+    wrapped = build_store_description_shell(title=title or "", body_html=body, profile=profile)
+    if not description_contains_cjk(wrapped) and description_uses_store_template(wrapped, profile):
+        return wrapped
+    return wrapped or desc
+
+
+
+_SET_WORD_RE = re.compile(r"\bsets?\b", re.IGNORECASE)
+_PKG_QTY_RE = re.compile(r"(\d+)\s*[x\u00d7]\s*([^,;<]+)", re.IGNORECASE)
+_PKG_ACCESSORY_TOKENS = ("hardware", "assembly", "instruction", "pillow", "screw", "bolt")
+
+
+def _parse_piece_count(raw: Any) -> int | None:
+    if raw is None:
+        return None
+    match = re.match(r"\s*(\d+)\b", str(raw).strip())
+    if not match:
+        return None
+    try:
+        count = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return count if count > 1 else None
+
+
+def _claimed_set_or_pieces_qty(
+    title: str,
+    aspects: Mapping[str, Any] | None = None,
+) -> int | None:
+    """Set-of-N from Number of Items in Set, Number of Pieces, or the title."""
+    aspects = aspects or {}
+    for key in ("Number of Items in Set", "Number of Pieces"):
+        count = _parse_piece_count(first_aspect_text(aspects, key))
+        if count:
+            return count
+    return _parse_piece_count(infer_number_of_items_in_set(title or ""))
+
+
+def _text_claims_set(title: str, aspects: Mapping[str, Any] | None = None) -> bool:
+    if _SET_WORD_RE.search(title or ""):
+        return True
+    for value in (aspects or {}).values():
+        if isinstance(value, (list, tuple)):
+            blob = " ".join(str(item) for item in value)
+        else:
+            blob = str(value or "")
+        if _SET_WORD_RE.search(blob):
+            return True
+    return False
+
+
+def expected_package_includes_main_qty(
+    title: str,
+    aspects: Mapping[str, Any] | None = None,
+) -> int | None:
+    """Expected main-product qty in PACKAGE INCLUDES for singular Type listings.
+
+    Returns None when Type already denotes a set product, or when no set count
+    is stated in aspects/title. Number of Pieces is read the same way as
+    Number of Items in Set. Used by the quality gate and tests.
+    """
+    aspects = aspects or {}
+    type_name = first_aspect_text(aspects, "Type") or ""
+    if _SET_WORD_RE.search(type_name):
+        return None
+    return _claimed_set_or_pieces_qty(title, aspects)
+
+
+def _package_includes_blob(description: str) -> str | None:
+    if not description:
+        return None
+    match = re.search(
+        r"PACKAGE\s+INCLUDES</h3>\s*<p[^>]*>\s*([^<]+)",
+        description,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if match:
+        return html_lib.unescape(match.group(1)).strip()
+    match = re.search(
+        r"PACKAGE\s+INCLUDES\s*[:\n]\s*([^\n<]+)",
+        description,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return html_lib.unescape(match.group(1)).strip()
+    loose = re.search(
+        r"PACKAGE\s+INCLUDES\b(.{0,500})",
+        description,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not loose:
+        return None
+    chunk = re.sub(r"<[^>]+>", " ", loose.group(1))
+    chunk = html_lib.unescape(chunk)
+    chunk = re.sub(r"\s+", " ", chunk).strip(" :-")
+    return chunk or None
+
+
+def parse_package_includes_main_item(description: str) -> tuple[int, str] | None:
+    """First non-accessory ``N x name`` pair in the PACKAGE INCLUDES block."""
+    pkg_text = _package_includes_blob(description)
+    if not pkg_text:
+        return None
+    for qm in _PKG_QTY_RE.finditer(pkg_text):
+        name = qm.group(2).strip()
+        if any(token in name.lower() for token in _PKG_ACCESSORY_TOKENS):
+            continue
+        try:
+            return int(qm.group(1)), name
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def parse_package_includes_main_qty(description: str) -> int | None:
+    """Parse the first non-accessory Nx item from the PACKAGE INCLUDES block."""
+    parsed = parse_package_includes_main_item(description)
+    if parsed is None:
+        return None
+    return parsed[0]
+
+
+def find_package_includes_set_qty_mismatch(
+    title: str,
+    description: str,
+    aspects: Mapping[str, Any] | None = None,
+) -> ListingQualityIssue | None:
+    """Flag title/aspect Set or Number of Pieces vs PACKAGE INCLUDES qty.
+
+    A Type that already names a set product still passes when the box line is
+    ``1 x {that set}`` (one set ships). ``1 x`` of the singular piece, or any
+    other qty that disagrees with Set / Number of Pieces / Number of Items in
+    Set, is a blocker. Motors QC calls this directly so universal-fit parts
+    are not exempt.
+    """
+    aspects = aspects or {}
+    parsed = parse_package_includes_main_item(description)
+    if parsed is None:
+        return None
+    actual, item_name = parsed
+    expected = _claimed_set_or_pieces_qty(title, aspects)
+    if expected and actual == expected:
+        return None
+
+    type_name = first_aspect_text(aspects, "Type") or ""
+    # One named set in the box: "1 x Wood Chisel Set" / "1 x Socket Set".
+    # The piece count describes what is inside that set, not extra sets.
+    if (
+        actual == 1
+        and _SET_WORD_RE.search(type_name)
+        and _SET_WORD_RE.search(item_name)
+    ):
+        return None
+
+    if expected and actual != expected:
+        return ListingQualityIssue(
+            "package_includes_set_qty_mismatch",
+            f"PACKAGE INCLUDES main qty is {actual} but title/aspects say set of {expected}",
+            field="description",
+        )
+
+    if actual == 1 and not _SET_WORD_RE.search(item_name) and _text_claims_set(title, aspects):
+        return ListingQualityIssue(
+            "package_includes_set_qty_mismatch",
+            "PACKAGE INCLUDES main qty is 1 but title/aspects say Set",
+            field="description",
+        )
+    return None
+
+
+
+_KIT_SIZE_CLAIM_RE = re.compile(
+    rf"\b(\d{{1,3}}){NOT_DIMENSION_AFTER}\s*[- ]?\s*(?:pieces?|pcs?|packs?|pk)\b|"
+    rf"\bset\s+of\s+(\d{{1,3}}){NOT_DIMENSION_AFTER}\b",
+    re.IGNORECASE,
+)
+_SOURCE_KIT_CN_RE = re.compile(r"(\d{1,3})\s*(?:件套|件|套)")
+_SOURCE_KIT_CN_CHAIRS_RE = re.compile(r"(\d{1,3})\s*把\S{0,3}?椅")
+_PIECE_COUNT_KEY_RE = re.compile(
+    r"\b(?:number of pieces|pieces included|number of items in set|"
+    r"items in set|piece count)\b",
+    re.IGNORECASE,
+)
+_TABLE_OR_DINING_RE = re.compile(
+    r"\b(?:table|dining|bistro|patio)\b|桌|餐桌",
+    re.IGNORECASE,
+)
+def _add_kit_count(dest: set[int], raw: Any) -> None:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return
+    if 2 <= value <= 999:
+        dest.add(value)
+
+
+def _first_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value or "")
+    match = re.search(r"(?<![A-Za-z0-9])(\d{1,3})(?![A-Za-z0-9])", text)
+    if not match or number_is_dimension_bound(text, match):
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _extract_kit_size_claims(text: str) -> set[int]:
+    """N from N-piece / N pc / N pack / set of N (N>=2)."""
+    claims: set[int] = set()
+    plain = html_lib.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    for match in _KIT_SIZE_CLAIM_RE.finditer(plain):
+        for idx, group in enumerate(match.groups(), start=1):
+            if not group or number_is_dimension_bound(plain, match, idx):
+                continue
+            _add_kit_count(claims, group)
+    for match in _SOURCE_KIT_CN_RE.finditer(plain):
+        if number_is_dimension_bound(plain, match):
+            continue
+        _add_kit_count(claims, match.group(1))
+    return claims
+
+
+def _piece_counts_from_mapping(mapping: Mapping[str, Any] | None) -> set[int]:
+    counts: set[int] = set()
+    if not isinstance(mapping, Mapping):
+        return counts
+    for key, value in mapping.items():
+        if not _PIECE_COUNT_KEY_RE.search(str(key or "")):
+            continue
+        parsed = _first_int(value)
+        if parsed is not None:
+            _add_kit_count(counts, parsed)
+    return counts
+
+
+def _has_real_table(text: str) -> bool:
+    """True only for a table / dining|bistro|pub|patio table|set / 桌."""
+    return has_real_table(text)
+
+
+def _source_kit_size_evidence(
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+) -> set[int]:
+    parts = [source_title or "", source_description or ""]
+    for mapping in (attributes, specs):
+        if isinstance(mapping, Mapping):
+            for key, value in mapping.items():
+                parts.append(f"{key}: {value}")
+    blob = " ".join(parts)
+    evidence = _extract_kit_size_claims(blob)
+    evidence.update(_piece_counts_from_mapping(attributes))
+    evidence.update(_piece_counts_from_mapping(specs))
+
+    for text in (source_title, source_description, blob):
+        dining_count = expected_dining_set_item_count(text)
+        if dining_count:
+            _add_kit_count(evidence, dining_count)
+
+    seating = seating_item_counts(blob)
+    evidence.update(seating)
+    if _has_real_table(blob):
+        for n in seating:
+            if plausible_seat_count(n):
+                _add_kit_count(evidence, n + 1)
+        seating_plus = seating_plus_table_item_count(blob)
+        if seating_plus:
+            _add_kit_count(evidence, seating_plus)
+
+    for match in _SOURCE_KIT_CN_CHAIRS_RE.finditer(blob):
+        if number_is_dimension_bound(blob, match):
+            continue
+        chairs = _first_int(match.group(1))
+        if chairs is None:
+            continue
+        _add_kit_count(evidence, chairs)
+        if _has_real_table(blob) and plausible_seat_count(chairs):
+            _add_kit_count(evidence, chairs + 1)
+    return evidence
+
+
+def find_invented_kit_size(
+    title: str,
+    description: str = "",
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+) -> ListingQualityIssue | None:
+    """Block N-piece/pack/set claims that GIGA/source never states.
+
+    Catches LLM SEO invents like ``108-Piece`` on a kit whose BOM only lists
+    ``27pc`` first-aid contents. Severity is BLOCKER so analyze/publish and
+    motors QC cannot ship or revise the invent.
+    """
+    live_claims = _extract_kit_size_claims(f"{title or ''}\n{description or ''}")
+    if not live_claims:
+        return None
+    evidence = _source_kit_size_evidence(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    invented = sorted(n for n in live_claims if n not in evidence)
+    if not invented:
+        return None
+    shown = ", ".join(str(n) for n in invented[:5])
+    return ListingQualityIssue(
+        "invented_kit_size",
+        (
+            f"Title/description claims {shown}-piece/pack/set but GIGA/source "
+            "has no matching qty evidence"
+        ),
+        field="title",
+    )
+
+
+
+# --- soft3 content gates (2026-10-12): Table Set on tools / generic 1 x box / cut Source Spec ---
+_SOFT3_FURNITURE_SET_INCLUDES = frozenset({
+    "table set", "table", "dining table & chairs", "dining table and chairs",
+    "table & chairs", "table and chairs", "sofa set", "chairs",
+    "dining table & stools", "dining table and stools", "table & stools", "table and stools",
+})
+_SOFT3_FURNITURE_HINTS = (
+    "dining", "table", "sofa", "couch", "sectional", "chair", "stool", "bistro",
+    "patio set", "conversation set", "bed ", "mattress", "ottoman", "loveseat",
+)
+_SOFT3_BOX_HEADS = ("WHAT'S IN THE BOX", "WHAT&#39;S IN THE BOX", "PACKAGE INCLUDES")
+_SOFT3_SECTION_ENDS = ("Specifications", "KEY FEATURES", "Ships from", "WHAT'S IN THE BOX", "PACKAGE INCLUDES")
+
+
+def _soft3_plain(text: str) -> str:
+    raw = html_lib.unescape(str(text or ""))
+    raw = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>|</h\d>", "\n", raw)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = re.sub(r"[ \t]+", " ", raw)
+    return re.sub(r"\n\s*\n+", "\n", raw).strip()
+
+
+def _soft3_section(plain: str, heads, ends) -> str | None:
+    low = plain.lower()
+    best = None
+    for h in heads:
+        i = low.find(h.lower())
+        if i >= 0 and (best is None or i < best[0]):
+            best = (i, len(h))
+    if best is None:
+        return None
+    rest = plain[best[0] + best[1]:]
+    end = len(rest)
+    for e in ends:
+        j = rest.lower().find(e.lower())
+        if j > 0:
+            end = min(end, j)
+    return rest[:end].strip(" :\n\t")
+
+
+def is_furniture_context(title: str, aspects: Mapping[str, Any] | None = None) -> bool:
+    blob = f"{title or ''} {first_aspect_text(aspects or {}, 'Type') or ''}".lower()
+    for tool_word in ("router table", "work table", "table saw", "workbench", "setup block"):
+        blob = blob.replace(tool_word, " ")
+    return any(h in blob for h in _SOFT3_FURNITURE_HINTS)
+
+
+def find_wrong_domain_set_includes(title: str, aspects: Mapping[str, Any] | None) -> ListingQualityIssue | None:
+    value = (first_aspect_text(aspects or {}, "Set Includes") or "").strip()
+    if not value or value.casefold() not in _SOFT3_FURNITURE_SET_INCLUDES:
+        return None
+    if is_furniture_context(title, aspects):
+        return None
+    return ListingQualityIssue(
+        "wrong_domain_set_includes",
+        f"Set Includes={value!r} is a furniture value on a non-furniture listing",
+        field="Set Includes",
+    )
+
+
+def _soft3_claimed_pieces(title: str, aspects: Mapping[str, Any] | None) -> int | None:
+    for key in ("Number of Pieces", "Number of Items in Set"):
+        m = re.search(r"\d+", first_aspect_text(aspects or {}, key) or "")
+        if m and int(m.group()) >= 2:
+            return int(m.group())
+    for pat in (r"\b(\d+)\s*-?\s*(?:piece|pcs?)\b", r"\bset\s+of\s+(\d+)\b"):
+        m = re.search(pat, title or "", re.I)
+        if m and int(m.group(1)) >= 2:
+            return int(m.group(1))
+    return None
+
+
+def _soft3_norm(s: str) -> str:
+    s = html_lib.unescape(re.sub(r"<[^>]+>", " ", s or "")).replace("\u00d7", "x").replace("\u2011", "")  # mirror ascii_safe
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+def find_generic_package_box(title: str, description: str, aspects: Mapping[str, Any] | None, source_text: str = "") -> ListingQualityIssue | None:
+    """Auto-template box collapsed to one ``1 x {Type}`` / ``Mixed Set`` line on a multi-piece/Set listing."""
+    plain = _soft3_plain(description)
+    if "source spec" not in plain.lower() and "what's in the box" not in plain.lower():
+        return None  # only the deterministic AquaRides/auto template
+    box = _soft3_section(plain, _SOFT3_BOX_HEADS, ("Specifications", "KEY FEATURES", "Ships from"))
+    if not box:
+        return None
+    lines = [ln.strip() for ln in re.split(r"[\n;]", box) if ln.strip()]
+    if len(lines) != 1:
+        return None
+    line = re.sub(r"\s+", " ", lines[0])
+    m = re.fullmatch(r"1\s*x\s+(.+)", line, re.I)
+    if not m:
+        return None
+    mixed = "mixed set" in line.lower()
+    # GIGA-verbatim box line (e.g. '1 x <GIGA product name> Kit') is allowed: it is the
+    # supplier's own wording, not a collapsed '1 x {Type}' template.
+    literal = _soft3_norm(m.group(1))
+    if not mixed and source_text and len(literal) >= 12 and literal in _soft3_norm(source_text):
+        return None
+    pieces = _soft3_claimed_pieces(title, aspects)
+    has_set = bool(re.search(r"\b(set|kit)\b", title or "", re.I))
+    if mixed or pieces or has_set:
+        return ListingQualityIssue(
+            "package_includes_generic",
+            f"box is generic {line!r} but listing is multi-piece/Set (pieces={pieces})",
+            field="description",
+        )
+    return None
+
+
+def is_truncated_snippet(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    if re.search(r"[.!?)\]\"']$", s):
+        return False
+    if re.search(r"\d\s*(?:in|mm|cm|ft|lbs?|kg|oz|pcs?|v|w|a)$", s, re.I):
+        return False
+    last = re.search(r"([A-Za-z]+)$", s)
+    if last and len(last.group(1)) <= 2 and not last.group(1).isupper():
+        return True
+    return 180 <= len(s) <= 260
+
+
+def find_truncated_source_spec(description: str) -> ListingQualityIssue | None:
+    plain = _soft3_plain(description)
+    m = re.search(r"Source Spec:\s*(.+)", plain)
+    if not m:
+        return None
+    snippet = m.group(1).split("\n")[0]
+    for e in _SOFT3_SECTION_ENDS:
+        j = snippet.find(e)
+        if j > 0:
+            snippet = snippet[:j]
+    if is_truncated_snippet(snippet):
+        return ListingQualityIssue(
+            "source_spec_truncated",
+            f"Source Spec ends mid-sentence: ...{snippet.strip()[-40:]!r}",
+            field="description",
+        )
+    return None
+
+
+def find_soft3_content_issues(title: str, description: str, aspects: Mapping[str, Any] | None, source_text: str = "") -> list[ListingQualityIssue]:
+    out = []
+    for issue in (
+        find_wrong_domain_set_includes(title, aspects),
+        find_generic_package_box(title, description, aspects, source_text),
+        find_truncated_source_spec(description),
+    ):
+        if issue is not None:
+            out.append(issue)
+    return out
+
+
+def validate_listing_quality(
+    optimization: Mapping[str, Any] | None,
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    attributes: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    images: list[str] | None = None,
+    videos: list[str] | None = None,
+    category_matcher: Any = None,
+    listing_status: str = "",
+) -> list[ListingQualityIssue]:
+    """Return quality issues that should block READY/publish."""
+    opt = dict(optimization or {})
+    aspects = opt.get("aspects") if isinstance(opt.get("aspects"), dict) else {}
+    title = _clean_text(opt.get("title") or source_title or "")
+    description = _clean_text(opt.get("description") or source_description or "")
+    image_count = len(images or [])
+    issues: list[ListingQualityIssue] = []
+    expected_brand = expected_store_brand()
+    current_brand = first_aspect_text(aspects, "Brand")
+    if expected_brand and is_store_brand_placeholder(current_brand):
+        issues.append(
+            ListingQualityIssue(
+                "store_brand_missing",
+                f"Brand must be {expected_brand} for this store; listing currently uses {current_brand or 'missing'}",
+                field="Brand",
+            )
+        )
+    source_facts = opt.get("source_facts") if isinstance(opt.get("source_facts"), dict) else build_source_facts(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+        videos=videos,
+    )
+
+    if not title:
+        issues.append(ListingQualityIssue("missing_title", "missing listing title", field="title"))
+    if not description:
+        issues.append(ListingQualityIssue("missing_description", "missing listing description", field="description"))
+    else:
+        has_key_features = "key features" in description.lower()
+        has_bullets = "<li" in description.lower()
+        if has_key_features != has_bullets:
+            issues.append(ListingQualityIssue("description_incomplete", "description is missing KEY FEATURES or bullet points", field="description"))
+        if description_contains_cjk(description) or description_contains_cjk(title):
+            issues.append(
+                ListingQualityIssue(
+                    "description_contains_cjk",
+                    "buyer-facing title/description contains Chinese (CJK) characters; English store template required",
+                    field="description",
+                )
+            )
+        store_profile = _store_profile_or_none()
+        if not description_has_store_banner(description, store_profile):
+            issues.append(
+                ListingQualityIssue(
+                    "missing_store_banner",
+                    "description missing store brand banner/template marker",
+                    field="description",
+                )
+            )
+        if not description_has_store_footer(description, store_profile):
+            issues.append(
+                ListingQualityIssue(
+                    "missing_store_footer",
+                    "description missing store footer template marker",
+                    field="description",
+                )
+            )
+
+    pkg_mismatch = find_package_includes_set_qty_mismatch(title, description, aspects)
+    if pkg_mismatch:
+        issues.append(pkg_mismatch)
+    issues.extend(find_soft3_content_issues(title, description, aspects, f"{source_title or ''}\n{source_description or ''}"))
+
+    invented_kit = find_invented_kit_size(
+        title,
+        description,
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+    )
+    if invented_kit:
+        issues.append(invented_kit)
+
+    if image_count < MIN_READY_IMAGE_COUNT:
+        issues.append(
+            ListingQualityIssue(
+                "insufficient_images",
+                f"only {image_count} image(s); at least {MIN_READY_IMAGE_COUNT} required",
+                field="images",
+            )
+        )
+
+    blob = "\n".join([title, description, str(aspects)])
+    bad_tokens = [bad for bad in BAD_TEXT_REPLACEMENTS if bad in blob]
+    if bad_tokens:
+        issues.append(
+            ListingQualityIssue(
+                "bad_text_artifact",
+                f"contains mojibake text: {', '.join(sorted(set(bad_tokens)))}",
+            )
+        )
+
+    category_id = str(opt.get("categoryId") or "").strip()
+    preserve_category = blocks_automated_category_change(opt)
+    from src.utils.category_decision import decision_category_id, resolve_category_decision
+
+    profile = classify_listing_profile(
+        title or source_title,
+        "",
+        category_id,
+        source_title="",
+    )
+    decision = resolve_category_decision(
+        str((optimization or {}).get("title") or ""),
+        source_title,
+        "",
+        category_id,
+        opt.get("categoryName"),
+    )
+    write_id = decision_category_id(decision, category_id)
+    from src.utils.category_decision import (
+        unpublished_listing_status,
+        validate_target_category,
+        warn_once_tree_unavailable,
+    )
+
+    status = str(listing_status or opt.get("listingStatus") or opt.get("status") or "")
+    stored_ok, stored_reason = (True, "")
+    if category_id:
+        stored_ok, stored_reason = validate_target_category(category_id, "", title or source_title)
+    if stored_reason == "tree_unavailable" or decision.reason in {"tree_unavailable", "tree_cache_unavailable"}:
+        warn_once_tree_unavailable()
+    elif (
+        not preserve_category
+        and category_id
+        and not stored_ok
+        and stored_reason in {"stored_category_implausible", "invalid_target_leaf", "implausible_target_path"}
+    ):
+        if unpublished_listing_status(status):
+            issues.append(
+                ListingQualityIssue(
+                    "stored_category_unpublishable",
+                    f"stored category {category_id} is {stored_reason}; holding READY/PENDING/READY_TO_PUBLISH publish",
+                    severity="BLOCKER",
+                    field="categoryId",
+                )
+            )
+    if decision.conflict or decision.reason == "title_source_conflict":
+        issues.append(
+            ListingQualityIssue(
+                "title_source_conflict",
+                "live title and GIGA title disagree on the product leaf; holding stored category",
+                severity="INFO",
+                field="title",
+            )
+        )
+    pending_remap = (
+        not preserve_category
+        and not write_id
+        and decision.kind not in {"keep"}
+        and decision.reason not in {"tree_unavailable", "tree_cache_unavailable"}
+        and (
+            bool(decision.category_id)
+            or decision.reason
+            in {
+                "unknown_head_noun",
+                "pet_species_mismatch",
+                "invalid_target_leaf",
+                "implausible_target_path",
+                "stored_category_implausible",
+                "accessory",
+                "mattress_not_accessory",
+            }
+        )
+    )
+    review = opt.get("_category_remap_review") if isinstance(opt.get("_category_remap_review"), dict) else None
+    if pending_remap or (review and not preserve_category and not write_id and decision.kind not in {"keep"}):
+        issues.append(
+            ListingQualityIssue(
+                "category_remap_pending_review",
+                (
+                    f"remap {category_id or 'empty'} → {decision.category_id or 'none'} "
+                    f"reason={decision.reason}"
+                    + (
+                        f" suggested_alternative={decision.suggested_alternative}"
+                        if decision.suggested_alternative
+                        else ""
+                    )
+                ),
+                severity="WARNING",
+                field="categoryId",
+            )
+        )
+    if not preserve_category and write_id and category_id != write_id:
+        issues.append(
+            ListingQualityIssue(
+                "category_mismatch",
+                f"{decision.kind} should use category {write_id}, got {category_id or 'missing'}",
+                field="categoryId",
+            )
+        )
+    elif not category_id:
+        issues.append(ListingQualityIssue("missing_category", "missing categoryId", field="categoryId"))
+
+    if category_matcher and write_id and not preserve_category:
+        if not category_matcher.is_category_plausible_for_text(title or source_title, write_id, opt.get("categoryName")):
+            issues.append(
+                ListingQualityIssue(
+                    "category_mismatch",
+                    f"category {write_id} is implausible for title '{(title or source_title)[:120]}'",
+                    field="categoryId",
+                )
+            )
+
+    for error in measurement_validation_errors(aspects):
+        code = "missing_measurement" if "missing measurement" in error else "invalid_measurement"
+        field_match = re.search(r"Item (?:Length|Width|Height|Weight)", error)
+        issues.append(ListingQualityIssue(code, error, field=field_match.group(0) if field_match else None))
+
+    current_assembly = first_aspect_text(aspects, "Assembly Required")
+    assembly_decision = infer_assembly_decision(
+        source_title=source_title,
+        source_description=source_description,
+        attributes=attributes,
+        specs=specs,
+        current_assembly=current_assembly,
+    )
+    expected_assembly = assembly_decision.get("required")
+    if not expected_assembly and assembly_decision.get("status") == "unknown":
+        expected_assembly = _normalize_yes_no(source_facts.get("assembly_required"))
+
+    if (
+        assembly_decision.get("status") == "review"
+        and assembly_decision.get("package", {}).get("strong")
+        # Mirror of the audit guard: when the listing already declares
+        # "Assembly Required: Yes" the flat-pack geometry AGREES with it, so there
+        # is no buyer-facing contradiction to confirm. Fire only when the listing
+        # says "No" or omits the aspect (2026-08-10: 53 of 112 flags already said
+        # Yes). Two engines, same guard — see product_context_signals note.
+        and (current_assembly or "").strip().lower() != "yes"
+    ):
+        issues.append(
+            ListingQualityIssue(
+                "assembly_package_conflict",
+                "package geometry suggests a flat-pack product but source/listing copy also suggests no assembly; manual confirmation required",
+                severity="BLOCKER",
+                field="Assembly Required",
+            )
+        )
+
+    if expected_assembly:
+        if current_assembly.lower() != expected_assembly.lower():
+            issues.append(
+                ListingQualityIssue(
+                    "assembly_required_mismatch",
+                    f"Assembly Required should be {expected_assembly}, got {current_assembly or 'missing'}",
+                    field="Assembly Required",
+                )
+            )
+        contradictions = find_assembly_description_contradictions(description, expected_assembly)
+        if contradictions:
+            issues.append(
+                ListingQualityIssue(
+                    "assembly_description_contradiction",
+                    f"description contradicts source Assembly Required={expected_assembly}",
+                    field="description",
+                )
+            )
+        packaging = _as_list(aspects.get("Packaging"))
+        if expected_assembly == "Yes" and any("fully assembled" in value.lower() for value in packaging):
+            issues.append(
+                ListingQualityIssue(
+                    "assembly_packaging_contradiction",
+                    "Packaging must not say Fully Assembled when source says assembly is required",
+                    field="Packaging",
+                )
+            )
+
+    current_assembly = first_aspect_text(aspects, "Assembly Required")
+    normalized_current_assembly = _normalize_yes_no(current_assembly)
+    if normalized_current_assembly and not has_expected_assembly_copy(description, normalized_current_assembly):
+        issues.append(
+            ListingQualityIssue(
+                "assembly_description_missing",
+                f"description must explicitly state Assembly Required={normalized_current_assembly}",
+                field="description",
+            )
+        )
+
+    claim_facts = source_facts.get("claims") if isinstance(source_facts.get("claims"), Mapping) else {}
+    for claim_name, label in CLAIM_LABELS.items():
+        claim_state = claim_facts.get(claim_name) if isinstance(claim_facts.get(claim_name), Mapping) else {}
+        if claim_state.get("supported"):
+            continue
+        locations = _generated_claim_locations(
+            title=title,
+            description=description,
+            aspects=aspects,
+            claim_name=claim_name,
+        )
+        if locations:
+            issues.append(
+                ListingQualityIssue(
+                    f"unsupported_{claim_name}_claim",
+                    f"listing mentions {label} in {', '.join(locations)} but source does not support it",
+                    field=locations[0],
+                )
+            )
+
+    for claim_name, feature_value in SUPPORTED_FEATURE_CLAIMS.items():
+        claim_state = claim_facts.get(claim_name) if isinstance(claim_facts.get(claim_name), Mapping) else {}
+        if not claim_state.get("supported"):
+            continue
+        feature_values = _as_list(aspects.get("Features"))
+        if not any(value.lower() == feature_value.lower() for value in feature_values):
+            issues.append(
+                ListingQualityIssue(
+                    f"missing_supported_{claim_name}_feature",
+                    f"source supports {CLAIM_LABELS.get(claim_name, claim_name)} but Features is missing {feature_value}",
+                    field="Features",
+                )
+            )
+
+    video_info = source_facts.get("video") if isinstance(source_facts.get("video"), Mapping) else {}
+    if video_info.get("present") and video_info.get("preflight_status") == "blocked":
+        detail = ", ".join(video_info.get("issue_codes") or []) or "unknown reason"
+        # A non-publishable source video must NOT block the whole listing — publish
+        # it without the video (strictly better than not publishing). Warning only.
+        issues.append(
+            ListingQualityIssue(
+                "source_video_not_publishable",
+                f"source video exists but is not directly publishable: {detail}",
+                field="videos",
+                severity="WARNING",
+            )
+        )
+
+    for forbidden in sorted(FURNITURE_FORBIDDEN_ASPECTS):
+        if forbidden in aspects:
+            issues.append(
+                ListingQualityIssue(
+                    "forbidden_aspect",
+                    f"{forbidden} is not applicable to this furniture listing",
+                    field=forbidden,
+                )
+            )
+
+    if profile.kind != "unknown":
+        expected_type = profile.type_value
+        if expected_type and first_aspect_text(aspects, "Type") != expected_type:
+            issues.append(
+                ListingQualityIssue(
+                    "wrong_type_aspect",
+                    f"Type should be {expected_type}",
+                    field="Type",
+                )
+            )
+        if profile.set_includes and first_aspect_text(aspects, "Set Includes") != profile.set_includes:
+            issues.append(
+                ListingQualityIssue(
+                    "wrong_set_includes",
+                    f"Set Includes should be {profile.set_includes}",
+                    field="Set Includes",
+                )
+            )
+        if profile.kind == "dining_set":
+            expected_count = expected_dining_set_item_count(
+                title,
+                category_id=category_id or profile.category_id or "",
+            )
+            current_count = first_aspect_text(aspects, "Number of Items in Set")
+            if expected_count and current_count != expected_count:
+                issues.append(
+                    ListingQualityIssue(
+                        "wrong_set_count",
+                        f"Number of Items in Set should be {expected_count}",
+                        field="Number of Items in Set",
+                    )
+                )
+
+    measurement_values = [
+        first_aspect_text(aspects, key)
+        for key in REQUIRED_MEASUREMENT_ASPECT_KEYS
+        if first_aspect_text(aspects, key)
+    ]
+    if len(measurement_values) == 3 and not _numbers_present(description, *measurement_values):
+        issues.append(
+            ListingQualityIssue(
+                "description_measurement_mismatch",
+                "description does not contain the item length/width/height numbers",
+                field="description",
+            )
+        )
+
+    # ── Layer 2 claim violations as quality issues ──
+    stored_violations = (source_facts.get("claim_violations") or [])
+    for cv in stored_violations:
+        if cv.get("severity") in ("CRITICAL", "HIGH"):
+            issues.append(
+                ListingQualityIssue(
+                    f"claim_violation_{cv['claim_type']}",
+                    f"Unsupported claim: {cv['claim_text']} in {cv['location']}",
+                    field=cv.get("location"),
+                )
+            )
+
+    # ── Layer 3 LLM fact check violations as quality issues ──
+    llm_violations = (source_facts.get("llm_fact_check_results") or [])
+    for llm_v in llm_violations:
+        if llm_v.get("severity") == "HIGH":
+            issues.append(
+                ListingQualityIssue(
+                    "llm_fact_violation",
+                    f"LLM Fact Check Failed: {llm_v.get('quote')} - {llm_v.get('reason')}",
+                    field="description",
+                )
+            )
+
+    return issues
+
+
+def blocking_issue_messages(issues: list[ListingQualityIssue]) -> list[str]:
+    return [issue.message for issue in issues if issue.severity == "BLOCKER"]
+
+
+# Spec name for the publish-path normalizer. Same function, same category gate.
+normalize_listing_optimization = normalize_generated_listing
+
+
