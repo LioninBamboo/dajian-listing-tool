@@ -449,8 +449,156 @@ def _build_candidate_reason(age_days: int, metrics: dict[str, Any]) -> str:
     )
 
 
-def _is_old_dead_link(age_days: int, impressions: int, views: int) -> bool:
-    return age_days >= 60 and impressions == 0 and views == 0
+def _is_old_dead_link(
+    age_days: int,
+    impressions: int,
+    views: int,
+    *,
+    traffic_verified: bool = False,
+) -> bool:
+    """Only End when age is high AND traffic is a verified zero.
+
+    Unverified zeros (listing missing from truncated top-200 Traffic Report)
+    must never be treated as dead-link evidence.
+    """
+    return (
+        age_days >= 60
+        and bool(traffic_verified)
+        and impressions == 0
+        and views == 0
+    )
+
+
+
+def _load_performance_traffic_index() -> tuple[dict[str, dict], dict]:
+    """Return ({listing_id: traffic_row}, traffic_meta) from performance cache.
+
+    Listings absent from a truncated top-200 Traffic Report are unknown, not zero.
+    """
+    try:
+        from src.services.ebay_performance import load_performance_cache
+
+        cache = load_performance_cache(max_age_hours=72) or {}
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("performance cache unavailable for End gate: %s", exc)
+        return {}, {"api_ok": False, "is_truncated": True, "record_count": 0, "limit": 200}
+    # Missing, empty, or traffic-less cache is not a complete report.
+    # Stale caches come back as None from load_performance_cache.
+    if not cache or "traffic" not in cache:
+        return (
+            {},
+            {
+                "api_ok": False,
+                "is_truncated": True,
+                "record_count": 0,
+                "limit": 200,
+                "reason": "cache_missing_or_expired",
+            },
+        )
+    traffic = cache.get("traffic") or {}
+    meta = dict(cache.get("traffic_meta") or {})
+    if traffic and "is_truncated" not in meta:
+        # Historical caches may omit meta; treat full-size maps as truncated.
+        # Only when traffic is non-empty. An empty map must not look complete.
+        limit = int(meta.get("limit") or 200)
+        meta.setdefault("record_count", len(traffic))
+        meta.setdefault("limit", limit)
+        meta.setdefault("api_ok", True)
+        meta["is_truncated"] = len(traffic) >= limit
+    index = {str(k): (v if isinstance(v, dict) else {}) for k, v in traffic.items()}
+    return index, meta
+
+
+def _lookup_listing_traffic_live(listing_id: str) -> dict | None:
+    """Per-listing Traffic Report lookup. Returns verified metrics or None."""
+    lid = str(listing_id or "").strip()
+    if not lid:
+        return None
+    try:
+        from src.services.ebay_performance import EbayPerformanceService
+
+        svc = EbayPerformanceService()
+        row = svc.fetch_traffic_for_listing(lid, days=90)
+        if row is None:
+            return None
+        return {
+            "impressions": int(row.get("impressions") or 0),
+            "views": int(row.get("views") or 0),
+            "transactions": int(row.get("transactions") or 0),
+            "verified": True,
+            "source": "traffic_report_per_listing",
+        }
+    except Exception as exc:
+        logger.warning("per-listing traffic lookup failed for %s: %s", lid, exc)
+        return None
+
+
+def _resolve_traffic_metrics(
+    listing_id: str,
+    snapshot_impressions: int,
+    snapshot_views: int,
+    *,
+    traffic_index: dict[str, dict] | None = None,
+    traffic_meta: dict | None = None,
+    live_lookup: bool = False,
+    traffic_lookup: Callable[[str], dict | None] | None = None,
+) -> dict:
+    """Resolve impressions/views without treating top-200 misses as zero."""
+    lid = str(listing_id or "").strip()
+    traffic_index = traffic_index or {}
+    traffic_meta = traffic_meta or {}
+
+    if lid and lid in traffic_index:
+        row = traffic_index[lid] or {}
+        return {
+            "impressions": int(row.get("impressions") or 0),
+            "views": int(row.get("views") or 0),
+            "transactions": int(row.get("transactions") or 0),
+            "traffic_verified": True,
+            "traffic_source": "performance_cache",
+        }
+
+    # Positive snapshot values are trustworthy even when cache is truncated.
+    if snapshot_impressions > 0 or snapshot_views > 0:
+        return {
+            "impressions": snapshot_impressions,
+            "views": snapshot_views,
+            "transactions": 0,
+            "traffic_verified": True,
+            "traffic_source": "cro_snapshot_positive",
+        }
+
+    # Complete (non-truncated) Traffic Report: absence means verified zero.
+    if traffic_meta.get("api_ok") and not traffic_meta.get("is_truncated"):
+        return {
+            "impressions": 0,
+            "views": 0,
+            "transactions": 0,
+            "traffic_verified": True,
+            "traffic_source": "traffic_report_complete_absent",
+        }
+
+    lookup = traffic_lookup
+    if lookup is None and live_lookup:
+        lookup = _lookup_listing_traffic_live
+    if lookup is not None:
+        got = lookup(lid)
+        if isinstance(got, dict) and got.get("verified"):
+            return {
+                "impressions": int(got.get("impressions") or 0),
+                "views": int(got.get("views") or 0),
+                "transactions": int(got.get("transactions") or 0),
+                "traffic_verified": True,
+                "traffic_source": str(got.get("source") or "traffic_lookup"),
+            }
+
+    return {
+        "impressions": snapshot_impressions,
+        "views": snapshot_views,
+        "transactions": 0,
+        "traffic_verified": False,
+        "traffic_source": "unverified_zero_not_in_top200",
+    }
 
 
 def detect_candidates(
@@ -458,42 +606,70 @@ def detect_candidates(
     min_age_days: int = 30,
     limit: int = 200,
     db_path: Path | None = None,
+    as_of_date: str | date | None = None,
+    live_traffic_lookup: bool = False,
+    traffic_lookup: Callable[[str], dict | None] | None = None,
+    persist: bool = True,
 ) -> dict[str, Any]:
-    """Detect stale no-sale listings and persist manual-approval candidates."""
+    """Detect stale no-sale listings and persist manual-approval candidates.
+
+    Age is measured against the run day (``as_of_date``, default today), not a
+    frozen July snapshot day. End/final_delist requires *verified* zero traffic
+    (per-listing Traffic Report / complete report / positive-cache hit). Missing
+    a truncated top-200 Traffic Report is never treated as impressions=0.
+    """
     ensure_schema(db_path)
     limit = max(0, int(limit))
     skipped: Counter[str] = Counter()
     created_rows: list[dict[str, Any]] = []
 
+    if as_of_date is None:
+        run_day = date.today()
+    elif isinstance(as_of_date, date) and not isinstance(as_of_date, datetime):
+        run_day = as_of_date
+    else:
+        parsed = _parse_date(as_of_date)
+        if parsed is None:
+            raise ValueError(f"Invalid as_of_date: {as_of_date!r}")
+        run_day = parsed
+
+    traffic_index, traffic_meta = _load_performance_traffic_index()
+
     with _conn(db_path) as conn:
         if not _table_exists(conn, "collected_products"):
             return {
                 "snapshot_date": snapshot_date,
+                "as_of_date": run_day.isoformat(),
                 "limit": limit,
                 "scanned": 0,
                 "created": 0,
                 "candidates": [],
                 "skipped": {"missing_collected_products": 1},
+                "traffic_meta": traffic_meta,
             }
         if not _table_exists(conn, "cro_snapshots"):
             return {
                 "snapshot_date": snapshot_date,
+                "as_of_date": run_day.isoformat(),
                 "limit": limit,
                 "scanned": 0,
                 "created": 0,
                 "candidates": [],
                 "skipped": {"missing_cro_snapshots": 1},
+                "traffic_meta": traffic_meta,
             }
 
         effective_snapshot = snapshot_date or _latest_snapshot_date(conn)
         if not effective_snapshot:
             return {
                 "snapshot_date": effective_snapshot,
+                "as_of_date": run_day.isoformat(),
                 "limit": limit,
                 "scanned": 0,
                 "created": 0,
                 "candidates": [],
                 "skipped": {"no_snapshot": 1},
+                "traffic_meta": traffic_meta,
             }
         snapshot_day = _parse_date(effective_snapshot)
         if snapshot_day is None:
@@ -512,6 +688,10 @@ def detect_candidates(
             sku = str(product.get("sku") or "").strip()
             if not sku:
                 skipped["missing_sku"] += 1
+                continue
+            local_status = str(product.get("status") or "").strip().upper()
+            if local_status in {"ENDED", "DELISTED"}:
+                skipped["already_ended_or_delisted"] += 1
                 continue
             if sku in cro_blacklist:
                 skipped["cro_blacklisted"] += 1
@@ -541,7 +721,8 @@ def detect_candidates(
             if age_start is None:
                 skipped["missing_age"] += 1
                 continue
-            age_days = (snapshot_day - age_start).days
+            # Age against the run day so a stale snapshot cannot freeze age_days.
+            age_days = (run_day - age_start).days
             if age_days < int(min_age_days):
                 skipped["too_young"] += 1
                 continue
@@ -549,8 +730,8 @@ def detect_candidates(
             if not product.get("metrics_snapshot_date"):
                 skipped["no_snapshot"] += 1
                 continue
-            impressions = _int_value(product.get("impressions"))
-            views = _int_value(product.get("views"))
+            snap_impressions = _int_value(product.get("impressions"))
+            snap_views = _int_value(product.get("views"))
             transactions = _int_value(product.get("transactions"))
             sold_qty = _int_value(product.get("sold_qty"))
             sales_detected = transactions > 0 or sold_qty > 0
@@ -558,8 +739,26 @@ def detect_candidates(
                 skipped["sales_present"] += 1
                 continue
 
+            traffic = _resolve_traffic_metrics(
+                old_listing_id,
+                snap_impressions,
+                snap_views,
+                traffic_index=traffic_index,
+                traffic_meta=traffic_meta,
+                live_lookup=live_traffic_lookup,
+                traffic_lookup=traffic_lookup,
+            )
+            impressions = int(traffic["impressions"])
+            views = int(traffic["views"])
+            traffic_verified = bool(traffic["traffic_verified"])
+            # Prefer sales signal from verified live traffic when present.
+            if int(traffic.get("transactions") or 0) > 0:
+                skipped["sales_present"] += 1
+                continue
+
             metrics = {
                 "snapshot_date": product.get("metrics_snapshot_date"),
+                "as_of_date": run_day.isoformat(),
                 "age_days": age_days,
                 "age_source": age_source,
                 "impressions": impressions,
@@ -567,17 +766,25 @@ def detect_candidates(
                 "transactions": transactions,
                 "sold_qty": sold_qty,
                 "sales_detected": False,
+                "traffic_verified": traffic_verified,
+                "traffic_source": traffic.get("traffic_source"),
             }
             reason = _build_candidate_reason(age_days, metrics)
             action_type = ACTION_REVIVE_RELIST
             priority = "P2" if impressions > 0 or views > 0 else "P3"
             attempts = _relist_attempt_count(conn, sku)
 
-            if _is_old_dead_link(age_days, impressions, views):
+            if _is_old_dead_link(
+                age_days, impressions, views, traffic_verified=traffic_verified
+            ):
                 action_type = ACTION_FINAL_DELIST
                 priority = "P3"
                 reason = f"old_dead_link; {reason}; direct_final_delist"
             else:
+                if age_days >= 60 and not traffic_verified and impressions == 0 and views == 0:
+                    # Would have been a false End under the old top-200=0 rule.
+                    skipped["traffic_unverified_for_end"] += 1
+                    continue
                 if attempts >= 1:
                     skipped["relist_attempt_limit"] += 1
                     continue
@@ -594,44 +801,46 @@ def detect_candidates(
                     continue
 
             now = _now_iso()
-            try:
-                cur = conn.execute(
-                    """
-                    INSERT INTO cro_listing_lifecycle_actions
-                    (sku, action_type, status, priority, reason, old_listing_id,
-                     old_offer_id, attempt_no, metrics_before_json, db_snapshot_json,
-                     created_at, source, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        sku,
-                        action_type,
-                        STATUS_CANDIDATE,
-                        priority,
-                        reason,
-                        old_listing_id,
-                        product.get("offer_id") or product.get("ebay_offer_id"),
-                        attempts + 1 if action_type == ACTION_REVIVE_RELIST else 1,
-                        _json_dumps(metrics),
-                        _json_dumps(product),
-                        now,
-                        f"detect_candidates:{effective_snapshot}",
-                        now,
-                    ),
-                )
-            except sqlite3.IntegrityError:
-                skipped["duplicate_active_action"] += 1
-                continue
+            action_id = None
+            if persist:
+                try:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO cro_listing_lifecycle_actions
+                        (sku, action_type, status, priority, reason, old_listing_id,
+                         old_offer_id, attempt_no, metrics_before_json, db_snapshot_json,
+                         created_at, source, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            sku,
+                            action_type,
+                            STATUS_CANDIDATE,
+                            priority,
+                            reason,
+                            old_listing_id,
+                            product.get("offer_id") or product.get("ebay_offer_id"),
+                            attempts + 1 if action_type == ACTION_REVIVE_RELIST else 1,
+                            _json_dumps(metrics),
+                            _json_dumps(product),
+                            now,
+                            f"detect_candidates:{effective_snapshot}",
+                            now,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    skipped["duplicate_active_action"] += 1
+                    continue
 
-            action_id = int(cur.lastrowid)
-            _record_event(
-                conn,
-                action_id=action_id,
-                sku=sku,
-                from_status=None,
-                to_status=STATUS_CANDIDATE,
-                note="detected",
-            )
+                action_id = int(cur.lastrowid)
+                _record_event(
+                    conn,
+                    action_id=action_id,
+                    sku=sku,
+                    from_status=None,
+                    to_status=STATUS_CANDIDATE,
+                    note="detected",
+                )
             created_rows.append(
                 {
                     "id": action_id,
@@ -648,12 +857,16 @@ def detect_candidates(
 
         return {
             "snapshot_date": effective_snapshot,
+            "as_of_date": run_day.isoformat(),
             "limit": limit,
             "scanned": len(rows),
             "created": len(created_rows),
             "candidates": created_rows,
             "skipped": dict(skipped),
+            "traffic_meta": traffic_meta,
+            "persist": persist,
         }
+
 
 
 def _get_action(conn: sqlite3.Connection, action_id: int) -> Optional[dict[str, Any]]:

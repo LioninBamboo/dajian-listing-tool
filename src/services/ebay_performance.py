@@ -160,6 +160,71 @@ class EbayPerformanceService:
         logger.info(f"Total traffic records: {len(all_records)}")
         return all_records
     
+
+    def fetch_traffic_for_listing(self, listing_id: str, days: int = 90):
+        """Per-listing Traffic Report. Never infers zero from top-200 absence.
+
+        Returns a metrics dict when the API responds, including verified zeros
+        when the listing filter returns no rows. Returns None on API failure.
+        """
+        lid = str(listing_id or "").strip()
+        if not lid:
+            return None
+
+        now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+        start_utc = (now_utc - timedelta(days=days)).replace(hour=0, minute=0, second=0)
+        end_date = self._format_ebay_utc_timestamp(now_utc)
+        start_date = self._format_ebay_utc_timestamp(start_utc)
+        url = f"{self.base}/sell/analytics/v1/traffic_report"
+        params = {
+            "dimension": "LISTING",
+            "filter": f"date_range:[{start_date}..{end_date}],listing_ids:{{{lid}}}",
+            "metric": ",".join(self.METRICS),
+            "sort": "-LISTING_IMPRESSION_TOTAL",
+            "limit": "1",
+            "offset": "0",
+        }
+        try:
+            r = requests.get(url, headers=self._headers(), params=params, timeout=60, verify=False)
+            if r.status_code != 200:
+                logger.error(
+                    "Analytics per-listing error %s for %s: %s",
+                    r.status_code,
+                    lid,
+                    r.text[:300],
+                )
+                return None
+            data = r.json()
+            records = data.get("records") or []
+            header_metrics = data.get("header", {}).get("metrics", [])
+            metric_keys = [m.get("key", "") for m in header_metrics]
+            if not records:
+                return {
+                    "impressions": 0,
+                    "views": 0,
+                    "ctr": 0.0,
+                    "conversion_rate": 0.0,
+                    "transactions": 0,
+                }
+            rec = records[0]
+            vals = rec.get("metricValues", [])
+            entry = {}
+            for i, mv in enumerate(vals):
+                key = metric_keys[i] if i < len(metric_keys) else f"metric_{i}"
+                val = mv.get("value", 0) if mv.get("applicable", False) else 0
+                entry[key] = val
+            return {
+                "impressions": int(entry.get("LISTING_IMPRESSION_TOTAL", 0)),
+                "views": int(entry.get("LISTING_VIEWS_TOTAL", 0)),
+                "ctr": float(entry.get("CLICK_THROUGH_RATE", 0)),
+                "conversion_rate": float(entry.get("SALES_CONVERSION_RATE", 0)),
+                "transactions": int(entry.get("TRANSACTION", 0)),
+            }
+        except Exception as exc:
+            logger.error("Analytics per-listing exception for %s: %s", lid, exc)
+            return None
+
+
     # ─── Fulfillment API (Orders/Sales) ───
     
     def fetch_sales_data(self, days=90):
