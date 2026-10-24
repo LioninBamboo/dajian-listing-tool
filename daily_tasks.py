@@ -743,6 +743,7 @@ def run_listing_audit(
             QUALITY_GATE_RULESET_VERSION,
             split_transport_issues,
         )
+        from src.utils.audit_severity import is_report_only_issue, normalize_severity
 
         if use_live is None:
             use_live = auto_fix
@@ -928,9 +929,11 @@ def run_listing_audit(
                 if content_issues:
                     issues_found += 1
                     severity_max = min(
-                        severity_order.index(i["severity"])
-                        for i in content_issues
-                        if i.get("severity") in severity_order
+                        (
+                            severity_order.index(normalize_severity(i.get("severity")))
+                            for i in content_issues
+                        ),
+                        default=len(severity_order) - 1,
                     )
                     if severity_max == 0:
                         critical_count += 1
@@ -943,9 +946,11 @@ def run_listing_audit(
                 if transport_issues:
                     transport_failures += 1
                     severity_max = min(
-                        severity_order.index(i["severity"])
-                        for i in transport_issues
-                        if i.get("severity") in severity_order
+                        (
+                            severity_order.index(normalize_severity(i.get("severity")))
+                            for i in transport_issues
+                        ),
+                        default=len(severity_order) - 1,
                     )
                     transport_issue_skus.append({
                         "sku": row["sku"],
@@ -954,7 +959,14 @@ def run_listing_audit(
                         "max_severity": severity_order[severity_max],
                     })
 
-                if auto_fix and fixes and ebay_client:
+                # Report-only findings are included in issue_skus above, but they
+                # must not dirty the listing, apply a fix, or write the row.
+                # WARNING/INFO previously crashed min() before this persist, so
+                # writing here would be a new side effect of normalization.
+                state_changing_issues = [
+                    issue for issue in issues if not is_report_only_issue(issue)
+                ]
+                if auto_fix and fixes and ebay_client and state_changing_issues:
                     import time
                     results_fix = fix_listing_on_ebay(
                         row["sku"],
@@ -991,7 +1003,7 @@ def run_listing_audit(
                                 issue_types=issue_types,
                             )
                     time.sleep(1)  # Rate limit
-                elif use_live:
+                elif use_live and state_changing_issues:
                     persist_listing_audit_state(
                         conn,
                         row["sku"],
