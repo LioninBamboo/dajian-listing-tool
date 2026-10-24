@@ -365,13 +365,13 @@ def main(argv: list[str] | None = None) -> int:
         work = specific_rows
 
     for r in work:
+        if args.apply and candidate_cap is not None and n_candidates >= candidate_cap:
+            break
         if args.apply and reads_used >= max_reads_effective:
             read_cap_hit = True
             print(
                 f"read cap {max_reads_effective} reached after {n_candidates} candidates"
             )
-            break
-        if args.apply and candidate_cap is not None and n_candidates >= candidate_cap:
             break
         title = r["title"] or ""
         if classify_fitment(title) == "vehicle_specific":
@@ -453,6 +453,7 @@ def main(argv: list[str] | None = None) -> int:
                     applied += 1
                     apply_result = "applied"
                     row_out["applied"] = True
+                    row_out["applied_entries"] = len(products)
                     print(f"  [APPLY] {r['sku']} {r['listing_id']}: +{len(products)} fitment OK")
                     time.sleep(0.4)
                     try:
@@ -564,18 +565,32 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  [{i['severity']}] {row['sku']} {safe} :: {i['code']} — {i['detail'][:80]}")
 
     if args.email:
-        def _row_issue_html(row):
-            issues = (
-                row.get("post_apply_issues")
-                if row.get("post_apply_issues") is not None
-                else row.get("issues") or []
+        def _issue_bits(issues):
+            return "<br>".join(
+                f"<b>{_html.escape(i['severity'])}</b> {_html.escape(i['detail'][:90])}"
+                for i in issues
             )
+
+        def _row_issue_html(row):
+            post = row.get("post_apply_issues")
+            if isinstance(post, list):
+                if post:
+                    return _issue_bits(post)
+                written = int(row.get("applied_entries") or 0)
+                return _html.escape(f"已挂 {written} 条适配，回读通过")
+            if row.get("status") == "unknown":
+                detail = str(row.get("error") or "").strip()
+                return _html.escape(detail or "live 读取失败")
+            if row.get("applied") and str(row.get("error") or "").strip():
+                return _html.escape(str(row.get("error")).strip())
+            skip = str(row.get("skip_reason") or "").strip()
+            if skip:
+                return _html.escape(skip)
+            issues = row.get("issues") or []
             if issues:
-                return "<br>".join(
-                    f"<b>{_html.escape(i['severity'])}</b> {_html.escape(i['detail'][:90])}"
-                    for i in issues
-                )
-            return _html.escape(str(row.get("error") or row.get("skip_reason") or "live 读取失败"))
+                return _issue_bits(issues)
+            detail = str(row.get("error") or "").strip()
+            return _html.escape(detail) if detail else ""
 
         def _table(rows_data, empty="无"):
             if not rows_data:

@@ -759,8 +759,12 @@ def test_audit_mode_keeps_raw_limit_and_report_keys(monkeypatch, tmp_path):
     assert reads == first_20_specific
     assert pushed == []
     assert state_path.read_text(encoding="utf-8") == original
-    assert "本次读取" not in emails[0]["html"]
-    assert "缺适配候选" not in emails[0]["html"]
+    html = emails[0]["html"]
+    assert "本次读取" not in html
+    assert "缺适配候选" not in html
+    assert "条适配，回读通过" not in html
+    assert "ItemCompatibilityList 为空" in html
+    assert html.count("live 读取失败") == 1
     assert CASES_BY_ID["3"].item_id not in reads
 
 
@@ -1206,3 +1210,321 @@ def test_synthetic_state_write_failure_keeps_exit_code(monkeypatch, tmp_path, ca
     assert payload["findings"][0]["skip_reason"] == "skipped_no_source_fitment"
     assert "WARNING: fitment apply state write failed" in capsys.readouterr().out
     assert not (tmp_path / "fitment_apply_state.json").exists()
+
+
+def _run_apply_email(monkeypatch, tmp_path, rows, live):
+    from scripts import fitment_audit
+
+    db = _insert(tmp_path, rows)
+    emails = []
+    pushed = []
+    _bind(monkeypatch, tmp_path, live, _recording_push(pushed), emails=emails)
+    rc = fitment_audit.main(["--apply", "--email", "--db", str(db)])
+    assert emails, "expected an email"
+    return rc, emails[0]["html"], pushed, _report(tmp_path)
+
+
+def _section(html, start, end):
+    body = html.split(start, 1)[1]
+    return body.split(end, 1)[0]
+
+
+def test_email_w3611p407484_applied_verified_says_readback_passed(monkeypatch, tmp_path):
+    """Real SKU W3611P407484: 6 stored Honda Pilot entries, verified clean."""
+    from scripts import fitment_audit
+
+    case = CASES_BY_ID["21"]
+    pushed = []
+
+    def live(_tok, item_id, *, site_id, session=None):
+        for record in reversed(pushed):
+            if record["item_id"] == str(item_id):
+                return record["products"]
+        return []
+
+    db = _insert(tmp_path, [case.row(1)])
+    emails = []
+    _bind(monkeypatch, tmp_path, live, _recording_push(pushed), emails=emails)
+    rc = fitment_audit.main(["--apply", "--email", "--db", str(db), "--sku", case.sku])
+    html = emails[0]["html"]
+    applied_table = _section(html, "已挂适配", "仍需处理")
+    payload = _report(tmp_path)
+    assert rc == 0
+    assert len(pushed) == 1 and len(pushed[0]["products"]) == 6
+    assert payload["verified_ok"] == 1
+    assert payload["findings"][0]["applied_entries"] == 6
+    assert payload["findings"][0]["post_apply_issues"] == []
+    assert "已挂 6 条适配，回读通过" in applied_table
+    assert "live 读取失败" not in applied_table
+
+
+def test_email_real_skus_and_failure_rows(monkeypatch, tmp_path):
+    """Applied, verify-failed, read-failed, and skipped rows each render their own text."""
+    from scripts import fitment_audit
+
+    real_get = fitment_audit.get_live_compat
+    applied = CASES_BY_ID["21"]  # W3611P407484, write 6
+    skipped = CASES_BY_ID["10"]  # W3611P339821, skipped_stored_mismatch
+    rows = [applied.row(1), skipped.row(2)]
+    db = _insert(tmp_path, rows)
+    emails = []
+    pushed = []
+
+    def live(_tok, item_id, *, site_id, session=None):
+        for record in reversed(pushed):
+            if record["item_id"] == str(item_id):
+                return record["products"]
+        return []
+
+    _bind(monkeypatch, tmp_path, live, _recording_push(pushed), emails=emails)
+    rc = fitment_audit.main(
+        ["--apply", "--email", "--db", str(db), "--sku", applied.sku, "--sku", skipped.sku]
+    )
+    html = emails[0]["html"]
+    applied_table = _section(html, "已挂适配", "仍需处理")
+    residual = _section(html, "仍需处理", "疑似错挂")
+    assert rc == 0
+    assert payload_applied_entries(pushed, applied.item_id) == 6
+    assert "已挂 6 条适配，回读通过" in applied_table
+    assert "live 读取失败" not in applied_table
+    assert skipped.sku in residual
+    assert "skipped_stored_mismatch" in residual
+    assert "live 读取失败" not in residual
+    assert "已挂 6 条适配，回读通过" not in residual
+
+    # Same applied SKU, verify read stays empty: show the post-apply issue, not the pass line.
+    verify_dir = tmp_path / "verify-failed"
+    verify_dir.mkdir()
+    db = _insert(verify_dir, [applied.row(1)])
+    emails.clear()
+    pushed.clear()
+
+    def still_missing(*_args, **_kwargs):
+        return []
+
+    _bind(monkeypatch, verify_dir, still_missing, _recording_push(pushed), emails=emails)
+    rc = fitment_audit.main(["--apply", "--email", "--db", str(db), "--sku", applied.sku])
+    html = emails[0]["html"]
+    assert rc == 0
+    assert len(pushed) == 1 and len(pushed[0]["products"]) == 6
+    assert "已挂 6 条适配，回读通过" not in html
+    assert "ItemCompatibilityList 为空" in html
+    assert _report(verify_dir)["verify_failed"] == 1
+
+    # Read failure keeps the transport detail, and the generic phrase stays on unknown rows.
+    fail_dir = tmp_path / "read-failed"
+    fail_dir.mkdir()
+    db = _insert(
+        fail_dir,
+        [
+            {
+                "id": 1,
+                "sku": "SYNTHETIC-READ-FAIL",
+                "listing_id": "188000000099",
+                "title": "Running Boards For 2019-2026 Chevy Silverado 1500",
+                "description": "Board.",
+                "optimization": {},
+            }
+        ],
+    )
+    emails.clear()
+
+    def fail_live(tok, item_id, *, site_id, session=None):
+        class Resp:
+            status_code = 200
+            text = (
+                "<GetItemResponse><Ack>Failure</Ack>"
+                "<LongMessage>Auth token is hard expired.</LongMessage>"
+                "<SeverityCode>Error</SeverityCode></GetItemResponse>"
+            )
+
+        class Sess:
+            def post(self, *_a, **_k):
+                return Resp()
+
+        return real_get(tok, item_id, site_id=site_id, session=Sess())
+
+    _bind(monkeypatch, fail_dir, fail_live, _recording_push([]), emails=emails)
+    rc = fitment_audit.main(["--apply", "--email", "--db", str(db)])
+    html = emails[0]["html"]
+    assert rc == 1
+    assert "Auth token is hard expired." in html
+    unknown_table = html.split("live 读取失败（", 1)[1]
+    assert "SYNTHETIC-READ-FAIL" in unknown_table
+    assert "Auth token is hard expired." in unknown_table
+    assert "条适配，回读通过" not in html
+
+
+def payload_applied_entries(pushed, item_id):
+    matches = [record for record in pushed if record["item_id"] == item_id]
+    assert len(matches) == 1
+    return len(matches[0]["products"])
+
+
+def test_candidate_cap_before_read_cap(monkeypatch, tmp_path, capsys):
+    """Candidate cap wins when both would stop; read_cap_hit only if candidates remain under the limit."""
+    from scripts import fitment_audit
+
+    title = "Running Boards For 2019-2026 Chevy Silverado 1500"
+
+    def missing_rows(count):
+        return [
+            {
+                "id": idx + 1,
+                "sku": f"SYNTHETIC-CAP-ORDER-{idx}",
+                "listing_id": str(197000000000 + idx),
+                "title": title,
+                "description": "Board.",
+                "optimization": {},
+            }
+            for idx in range(count)
+        ]
+
+    both = tmp_path / "both"
+    both.mkdir()
+    db = _insert(both, missing_rows(3))
+    reads = []
+    _bind(monkeypatch, both, _scripted_live({}, [], reads), _recording_push([]))
+    rc = fitment_audit.main(["--apply", "--limit", "2", "--max-reads", "2", "--db", str(db)])
+    payload = _report(both)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert payload["candidates"] == 2
+    assert payload["reads_used"] == 2
+    assert payload["read_cap_hit"] is False
+    assert reads == ["197000000000", "197000000001"]
+    assert "read cap" not in out
+
+    under = tmp_path / "under"
+    under.mkdir()
+    db = _insert(under, missing_rows(3))
+    reads = []
+    _bind(monkeypatch, under, _scripted_live({}, [], reads), _recording_push([]))
+    rc = fitment_audit.main(["--apply", "--limit", "3", "--max-reads", "2", "--db", str(db)])
+    payload = _report(under)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert payload["candidates"] == 2
+    assert payload["reads_used"] == 2
+    assert payload["read_cap_hit"] is True
+    assert reads == ["197000000000", "197000000001"]
+    assert "read cap 2 reached after 2 candidates" in out
+
+
+def test_synthetic_verify_exception_email_shows_detail(monkeypatch, tmp_path):
+    """SYNTHETIC: verify GetItem raises; the cell is the error, escaped, not the pass line."""
+    from scripts import fitment_audit
+
+    case = CASES_BY_ID["21"]
+    calls = {"n": 0}
+
+    def live(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []
+        raise fitment_audit.LiveCompatReadError("verify boom <bad>")
+
+    rc, html, pushed, payload = _run_apply_email(monkeypatch, tmp_path, [case.row(1)], live)
+    applied_table = _section(html, "已挂适配", "仍需处理")
+    assert rc == 0
+    assert len(pushed) == 1
+    assert payload["verify_failed"] == 1
+    assert payload["findings"][0]["applied_entries"] == 6
+    assert "已挂 6 条适配，回读通过" not in html
+    assert "verify boom &lt;bad&gt;" in applied_table
+    assert "<bad>" not in applied_table
+    assert "live 读取失败" not in applied_table
+
+
+def test_synthetic_blank_read_error_uses_generic_phrase(monkeypatch, tmp_path):
+    """SYNTHETIC: unknown row with an empty error still says live 读取失败, and only that status does."""
+    from scripts import fitment_audit
+
+    db_rows = [
+        {
+            "id": 1,
+            "sku": "SYNTHETIC-BLANK-READ",
+            "listing_id": "188000000831",
+            "title": "Running Boards For 2019-2026 Chevy Silverado 1500",
+            "description": "Board.",
+            "optimization": {},
+        }
+    ]
+
+    def live(*_args, **_kwargs):
+        raise fitment_audit.LiveCompatReadError("   ")
+
+    rc, html, pushed, payload = _run_apply_email(monkeypatch, tmp_path, db_rows, live)
+    unknown_table = html.split("live 读取失败（", 1)[1]
+    assert rc == 1
+    assert pushed == []
+    assert payload["read_failed"] == 1
+    assert payload["findings"][0]["status"] == "unknown"
+    assert "SYNTHETIC-BLANK-READ" in unknown_table
+    assert unknown_table.count("live 读取失败") >= 1
+    cell = unknown_table.split("SYNTHETIC-BLANK-READ", 1)[1]
+    assert "live 读取失败" in cell.split("</tr>", 1)[0]
+
+
+def test_synthetic_skip_reason_beats_missing_detail(monkeypatch, tmp_path):
+    """SYNTHETIC: a gated skip renders skip_reason, not the pre-apply missing_fitment sentence."""
+    case = CASES_BY_ID["8"]  # W3611P511712 skipped_title_no_year
+    rc, html, pushed, payload = _run_apply_email(
+        monkeypatch,
+        tmp_path,
+        [case.row(1)],
+        lambda *_a, **_k: [],
+    )
+    residual = _section(html, "仍需处理", "疑似错挂")
+    assert rc == 0
+    assert pushed == []
+    assert payload["findings"][0]["skip_reason"] == "skipped_title_no_year"
+    assert "skipped_title_no_year" in residual
+    assert "ItemCompatibilityList 为空" not in residual
+    assert "live 读取失败" not in residual
+
+
+def test_synthetic_has_fitment_read_keeps_candidates_under_limit(monkeypatch, tmp_path, capsys):
+    """SYNTHETIC: a has-fitment read spends --max-reads while candidates stay under --limit."""
+    from scripts import fitment_audit
+
+    has_title = "Off-Road Traction Boards for 2020-2026 Jeep Gladiator JT"
+    miss_title = "Running Boards For 2019-2026 Chevy Silverado 1500"
+    rows = [
+        {
+            "id": 1,
+            "sku": "SYNTHETIC-AHEAD-HAS",
+            "listing_id": "198000000001",
+            "title": has_title,
+            "description": "Boards.",
+            "optimization": {},
+        },
+        {
+            "id": 2,
+            "sku": "SYNTHETIC-MISS-A",
+            "listing_id": "198000000002",
+            "title": miss_title,
+            "description": "Board.",
+            "optimization": {},
+        },
+        {
+            "id": 3,
+            "sku": "SYNTHETIC-MISS-B",
+            "listing_id": "198000000003",
+            "title": miss_title,
+            "description": "Board.",
+            "optimization": {},
+        },
+    ]
+    db = _insert(tmp_path, rows)
+    reads = []
+    by_item = {"198000000001": ymm("Jeep", "Gladiator", 2020, 2026)}
+    _bind(monkeypatch, tmp_path, _scripted_live(by_item, [], reads), _recording_push([]))
+    rc = fitment_audit.main(["--apply", "--limit", "2", "--max-reads", "2", "--db", str(db)])
+    payload = _report(tmp_path)
+    assert rc == 0
+    assert payload["reads_used"] == 2
+    assert payload["candidates"] == 1
+    assert payload["read_cap_hit"] is True
+    assert reads == ["198000000001", "198000000002"]
+    assert "read cap 2 reached after 1 candidates" in capsys.readouterr().out
