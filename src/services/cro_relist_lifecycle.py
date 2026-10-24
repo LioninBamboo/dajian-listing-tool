@@ -470,7 +470,7 @@ def _is_old_dead_link(
 
 
 
-def _load_performance_traffic_index() -> tuple[dict[str, dict], dict]:
+def _load_performance_traffic_index() -> tuple[dict[str, Any], dict]:
     """Return ({listing_id: traffic_row}, traffic_meta) from performance cache.
 
     Listings absent from a truncated top-200 Traffic Report are unknown, not zero.
@@ -505,7 +505,8 @@ def _load_performance_traffic_index() -> tuple[dict[str, dict], dict]:
         meta.setdefault("limit", limit)
         meta.setdefault("api_ok", True)
         meta["is_truncated"] = len(traffic) >= limit
-    index = {str(k): (v if isinstance(v, dict) else {}) for k, v in traffic.items()}
+    # Keep raw rows. A non-dict must not become {} and then a verified zero.
+    index = {str(k): v for k, v in traffic.items()}
     return index, meta
 
 
@@ -533,12 +534,42 @@ def _lookup_listing_traffic_live(listing_id: str) -> dict | None:
         return None
 
 
+def _is_metric_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _verified_cache_hit(row: Any) -> dict | None:
+    """Verified only for a dict that has numeric impressions and views."""
+    if not isinstance(row, dict):
+        return None
+    if "impressions" not in row or "views" not in row:
+        return None
+    impressions = row.get("impressions")
+    views = row.get("views")
+    if not _is_metric_number(impressions) or not _is_metric_number(views):
+        return None
+    try:
+        impressions_i = int(impressions)
+        views_i = int(views)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    raw_tx = row.get("transactions", 0)
+    transactions = int(raw_tx) if _is_metric_number(raw_tx) else 0
+    return {
+        "impressions": impressions_i,
+        "views": views_i,
+        "transactions": transactions,
+        "traffic_verified": True,
+        "traffic_source": "performance_cache",
+    }
+
+
 def _resolve_traffic_metrics(
     listing_id: str,
     snapshot_impressions: int,
     snapshot_views: int,
     *,
-    traffic_index: dict[str, dict] | None = None,
+    traffic_index: dict[str, Any] | None = None,
     traffic_meta: dict | None = None,
     live_lookup: bool = False,
     traffic_lookup: Callable[[str], dict | None] | None = None,
@@ -548,15 +579,14 @@ def _resolve_traffic_metrics(
     traffic_index = traffic_index or {}
     traffic_meta = traffic_meta or {}
 
+    malformed_cache_entry = False
     if lid and lid in traffic_index:
-        row = traffic_index[lid] or {}
-        return {
-            "impressions": int(row.get("impressions") or 0),
-            "views": int(row.get("views") or 0),
-            "transactions": int(row.get("transactions") or 0),
-            "traffic_verified": True,
-            "traffic_source": "performance_cache",
-        }
+        hit = _verified_cache_hit(traffic_index[lid])
+        if hit is not None:
+            return hit
+        # Present, but not a measurement. Do not coerce it to a verified zero,
+        # and do not treat the listing as absent from a complete report.
+        malformed_cache_entry = True
 
     # Positive snapshot values are trustworthy even when cache is truncated.
     if snapshot_impressions > 0 or snapshot_views > 0:
@@ -569,7 +599,11 @@ def _resolve_traffic_metrics(
         }
 
     # Complete (non-truncated) Traffic Report: absence means verified zero.
-    if traffic_meta.get("api_ok") and not traffic_meta.get("is_truncated"):
+    if (
+        not malformed_cache_entry
+        and traffic_meta.get("api_ok")
+        and not traffic_meta.get("is_truncated")
+    ):
         return {
             "impressions": 0,
             "views": 0,

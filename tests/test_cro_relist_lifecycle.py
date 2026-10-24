@@ -1350,27 +1350,68 @@ def test_historical_truncation_inferred_only_for_non_empty_traffic(tmp_path, mon
     assert kept["is_truncated"] is True
 
 
-def test_edge_non_dict_cache_entry_becomes_verified_zero(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "bad_entry",
+    ["not-a-dict", [1, 2], None, 0, {"views": 0}, {"impressions": 0}],
+    ids=[
+        "string",
+        "list",
+        "none",
+        "number",
+        "dict_without_impressions",
+        "dict_without_views",
+    ],
+)
+def test_malformed_cache_entry_is_not_a_verified_zero(tmp_path, monkeypatch, bad_entry):
+    """A broken per-listing row is unverified, even on a complete report."""
     listing_id = "366352780364"
     _use_real_performance_cache(
         monkeypatch,
         {
-            "traffic": {
-                listing_id: "not-a-dict",
-                "other": {"impressions": 4, "views": 1, "transactions": 0},
+            "traffic": {listing_id: bad_entry},
+            "traffic_meta": {
+                "api_ok": True,
+                "is_truncated": False,
+                "record_count": 1,
+                "limit": 200,
             },
-            "traffic_meta": dict(_TRUNCATED_TRAFFIC_META),
         },
     )
-    index, meta = lifecycle._load_performance_traffic_index()
-    assert index[listing_id] == {}
-    assert index["other"]["impressions"] == 4
-    assert meta["is_truncated"] is True
-
     db = tmp_path / "cro.db"
     _create_source_tables(db)
     _seed_product(db, "SKU-BAD", listing_id=listing_id, published_at="2026-03-14T00:00:00")
-    _seed_snapshot(db, "SKU-BAD", listing_id=listing_id, impressions=12, views=2)
+    _seed_snapshot(db, "SKU-BAD", listing_id=listing_id, impressions=0, views=0)
+
+    result = detect_candidates(
+        snapshot_date="2026-05-13",
+        db_path=db,
+        as_of_date="2026-05-13",
+        traffic_lookup=None,
+    )
+
+    assert result["created"] == 0
+    assert result["skipped"].get("traffic_unverified_for_end") == 1
+    assert _actions(db) == []
+    assert all(row.get("action_type") != "final_delist" for row in result["candidates"])
+
+
+def test_well_formed_zero_cache_hit_ends_on_complete_report(tmp_path, monkeypatch):
+    _use_real_performance_cache(
+        monkeypatch,
+        {
+            "traffic": {"L-OK": {"impressions": 0, "views": 0}},
+            "traffic_meta": {
+                "api_ok": True,
+                "is_truncated": False,
+                "record_count": 1,
+                "limit": 200,
+            },
+        },
+    )
+    db = tmp_path / "cro.db"
+    _create_source_tables(db)
+    _seed_product(db, "SKU-OK", listing_id="L-OK", published_at="2026-03-14T00:00:00")
+    _seed_snapshot(db, "SKU-OK", listing_id="L-OK", impressions=0, views=0)
 
     result = detect_candidates(
         snapshot_date="2026-05-13",
@@ -1383,6 +1424,7 @@ def test_edge_non_dict_cache_entry_becomes_verified_zero(tmp_path, monkeypatch):
     row = _actions(db)[0]
     assert row["action_type"] == "final_delist"
     metrics = _metrics(row)
+    assert metrics["age_days"] == 60
     assert metrics["impressions"] == 0
     assert metrics["views"] == 0
     assert metrics["traffic_verified"] is True
