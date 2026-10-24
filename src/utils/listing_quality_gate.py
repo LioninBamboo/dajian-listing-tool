@@ -24,6 +24,7 @@ from src.utils.product_context_signals import (
     has_any_phrase,
     has_compound_product_signal,
     has_outdoor_marker,
+    is_camping_kitchen_title,
     outdoor_context as strict_outdoor_context,
     primary_product_noun,
     strip_mixed_indoor_outdoor,
@@ -2146,6 +2147,19 @@ def classify_listing_profile(
             type_value="Nightstand",
             room="Bedroom",
             remove_aspects=frozenset({"Set Includes", "Upholstery Material", "Upholstery Fabric"}),
+        )
+
+    if is_camping_kitchen_title(title_text):
+        # Camping cook stations list fold-out "4 Side Tables" wings; they are not
+        # indoor End Tables (W465P439797). Grill/griddle/BBQ/smoker/island/cart
+        # titles are excluded and keep their upstream route.
+        return ListingProfile(
+            kind="camping_kitchen_table",
+            category_id="112590",
+            category_name="Patio & Garden Tables",
+            type_value="Camping Table",
+            indoor_outdoor="Outdoor",
+            remove_aspects=frozenset({"Room", "Upholstery Material", "Upholstery Fabric"}),
         )
 
     if _has_marker(title_text, "side table", "end table", "accent table", "lamp table"):

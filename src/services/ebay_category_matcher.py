@@ -16,6 +16,7 @@ from src.utils.product_context_signals import (
     first_product_noun,
     has_any_phrase,
     has_phrase,
+    is_camping_kitchen_title,
     mentions_cooler_product,
     outdoor_context,
     primary_product_noun,
@@ -1393,9 +1394,18 @@ class EbayCategoryMatcher:
             if cid not in kids_table_set_categories:
                 return False
 
+        # Indoor table leaves are canonicalized to 112590 above, so a stored
+        # 38200 would otherwise look plausible. Reject unless both the requested
+        # id and the canonical id are camping-kitchen leaves.
+        requested_cid = str(category_id or "").strip()
+        if is_camping_kitchen_title(title_lower) and (
+            cid not in {"112590", "16038"} or requested_cid not in {"112590", "16038"}
+        ):
+            return False
+
         if any(marker in title_lower for marker in outdoor_table_markers) and not any(
             marker in title_lower for marker in dining_set_markers
-        ):
+        ) and not is_camping_kitchen_title(title_lower):
             if cid not in outdoor_table_categories:
                 return False
 
@@ -2025,6 +2035,7 @@ class EbayCategoryMatcher:
             (["room divider", "partition", "screen"], "175764", "Room Dividers"),
             
             # ==================== TABLES (GENERAL) ====================
+            (["camping kitchen", "camp kitchen", "camping cook station", "camping cooking station", "camping table"], "112590", "Patio & Garden Tables"),
             (["folding table", "card table", "utility table"], "98044", "Folding Tables"),
             (["spinner wheel luggage", "spinner luggage", "hard shell luggage", "luggage set", "carry on suitcase", "travel suitcase", "checked luggage", "travel luggage"], "16080", "Luggage"),
             
@@ -2072,9 +2083,16 @@ class EbayCategoryMatcher:
                 return False
             return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text) is not None
 
+        # The camping-kitchen leaf has no exclude list of its own. "Camping Cook
+        # Station with Griddle Plate" contains the phrase and must keep the
+        # upstream hint. Gate on the title only — a description must not exclude.
+        title_is_camping_kitchen = is_camping_kitchen_title(title_lower)
+
         def match(text: str, rules) -> Tuple[Optional[str], Optional[str]]:
             for keywords, cat_id, cat_name in rules:
                 if any(_keyword_in_text(text, kw) for kw in keywords):
+                    if "camping kitchen" in keywords and not title_is_camping_kitchen:
+                        continue
                     return cat_id, cat_name
             return None, None
 

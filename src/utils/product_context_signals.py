@@ -910,6 +910,37 @@ def has_any_phrase(text: str, phrases: tuple[str, ...] | list[str]) -> bool:
     return any(has_phrase(text, phrase) for phrase in phrases)
 
 
+# Camping cook stations. Bare "outdoor cooking" is not a marker: grill carts and
+# outdoor kitchen islands stay on their upstream route. has_phrase already
+# allows one trailing s, so "camping tables" / "camp kitchens" match without a
+# separate plural entry.
+CAMPING_KITCHEN_PHRASES = (
+    "camping kitchen", "camp kitchen",
+    "camping cook station", "camping cooking station",
+    "camping table",
+)
+CAMPING_CONTEXT_WORDS = ("camping", "camp")
+COOK_STATION_PHRASES = ("cook station", "cooking station")
+CAMPING_KITCHEN_EXCLUDE = (
+    "grill", "grills", "griddle", "griddles", "bbq", "barbecue", "smoker", "smokers",
+    "island", "islands", "kitchen island", "cart", "carts",
+)
+
+
+def is_camping_kitchen_title(title: str) -> bool:
+    """True for a camping kitchen / camp table title, never a grill or cart.
+
+    Word-boundary phrases only. An exclude word anywhere in the title wins.
+    Description text is not consulted; callers must pass the title.
+    """
+    t = (title or "").lower()
+    if has_any_phrase(t, CAMPING_KITCHEN_EXCLUDE):
+        return False
+    if has_any_phrase(t, CAMPING_KITCHEN_PHRASES):
+        return True
+    return has_any_phrase(t, COOK_STATION_PHRASES) and has_any_phrase(t, CAMPING_CONTEXT_WORDS)
+
+
 def strip_room_location_lists(text: str) -> str:
     """Drop 'for Living Room, Bedroom, Balcony' lists so they cannot pick a type."""
     cleaned = _ROOM_LIST_RE.sub(" ", as_safe_text(text))
