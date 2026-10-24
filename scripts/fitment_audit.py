@@ -12,9 +12,15 @@ Writes logs/fitment_audit_YYYYMMDDTHHMMSSZ.json always.
           model + year range is also present in the stored GIGA source or the
           stored authoritative optimization.motorsCompatibility.compatibleProducts.
           Never auto-fixes mismatch (human review). Never sends ItemSpecifics.
+          In apply mode, --limit counts missing-fitment candidates only
+          (universal rows are not read). Vehicle-specific rows rotate by the
+          oldest live check in logs/fitment_apply_state.json. --max-reads caps
+          pre-write GetItem calls (the post-write verify read is not counted).
 --email : send the report (CRITICAL/HIGH focused) with applied / residual /
           mismatch sections.
---limit : cap listings processed (for capped apply jobs).
+--limit : audit: max raw rows (0=all). apply: max missing-fitment candidates
+          (0=no candidate cap; reads still follow --max-reads).
+--max-reads : apply only, default 60. Ignored without --apply.
 
     python scripts/fitment_audit.py                 # report only
     python scripts/fitment_audit.py --email
@@ -25,6 +31,7 @@ from __future__ import annotations
 import argparse
 import html as _html
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -174,6 +181,93 @@ def _stored_compatible_products(optimization: Mapping[str, Any]) -> list[dict[st
     return [dict(entry) for entry in products if isinstance(entry, Mapping)]
 
 
+APPLY_STATE_NAME = "fitment_apply_state.json"
+
+
+def _apply_state_path() -> Path:
+    return LOG_DIR / APPLY_STATE_NAME
+
+
+def _empty_apply_state() -> dict[str, Any]:
+    return {"version": 1, "listings": {}}
+
+
+def _load_apply_state(path: Path) -> dict[str, Any]:
+    """Missing or corrupt state means every listing is never checked."""
+    if not path.exists():
+        print(
+            f"WARNING: fitment apply state missing ({path}); "
+            "treating every listing as never checked"
+        )
+        return _empty_apply_state()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+        print(
+            f"WARNING: fitment apply state unreadable ({path}): {exc}; "
+            "treating every listing as never checked"
+        )
+        return _empty_apply_state()
+    listings = data.get("listings") if isinstance(data, dict) else None
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(listings, dict):
+        print(
+            f"WARNING: fitment apply state corrupt ({path}); "
+            "treating every listing as never checked"
+        )
+        return _empty_apply_state()
+    return {"version": 1, "listings": dict(listings)}
+
+
+def _save_apply_state(path: Path, state: Mapping[str, Any]) -> None:
+    """Atomic replace. A failed write logs a warning and does not raise."""
+    tmp: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"version": 1, "listings": dict(state.get("listings") or {})}
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"WARNING: fitment apply state write failed ({path}): {exc}")
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _row_id(row: Mapping[str, Any]) -> int:
+    try:
+        return int(row["id"])
+    except (KeyError, TypeError, ValueError):
+        return 0
+
+
+def _last_checked(state: Mapping[str, Any], listing_id: str) -> str:
+    listings = state.get("listings") or {}
+    entry = listings.get(str(listing_id))
+    if not isinstance(entry, dict):
+        return ""
+    value = entry.get("last_checked") or ""
+    return str(value).strip() if value else ""
+
+
+def _apply_sort_key(row: Mapping[str, Any], state: Mapping[str, Any]) -> tuple[int, str, int]:
+    """Never-checked first, then oldest last_checked, then collected_products.id."""
+    last = _last_checked(state, str(row["listing_id"]))
+    return (0 if not last else 1, last, _row_id(row))
+
+
+def _touch_apply_state(state: dict[str, Any], path: Path, row: Mapping[str, Any], result: str) -> None:
+    listings = state.setdefault("listings", {})
+    listings[str(row["listing_id"])] = {
+        "sku": row["sku"],
+        "last_checked": datetime.now(timezone.utc).isoformat(),
+        "last_result": result,
+    }
+    _save_apply_state(path, state)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -182,7 +276,18 @@ def main(argv: list[str] | None = None) -> int:
         help="push YMM fitment for MISSING vehicle-specific listings only",
     )
     ap.add_argument("--email", action="store_true")
-    ap.add_argument("--limit", type=int, default=0, help="max listings to process (0=all)")
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="audit: max raw rows (0=all); apply: max missing-fitment candidates (0=no candidate cap)",
+    )
+    ap.add_argument(
+        "--max-reads",
+        type=int,
+        default=60,
+        help="apply: max pre-write GetItem reads (default 60; ignored without --apply)",
+    )
     ap.add_argument(
         "--sku",
         action="append",
@@ -201,7 +306,9 @@ def main(argv: list[str] | None = None) -> int:
     db = sqlite3.connect(str(args.db))
     db.row_factory = sqlite3.Row
     selected_skus = [str(value).strip() for value in (args.sku or []) if str(value).strip()]
-    columns = "sku, listing_id, title, description, optimization"
+    table_cols = {row[1] for row in db.execute("PRAGMA table_info(collected_products)")}
+    id_expr = "id" if "id" in table_cols else "rowid"
+    columns = f"{id_expr} AS id, sku, listing_id, title, description, optimization"
     if selected_skus:
         placeholders = ",".join("?" for _ in selected_skus)
         rows = db.execute(
@@ -216,7 +323,8 @@ def main(argv: list[str] | None = None) -> int:
             "WHERE status='PUBLISHED' AND listing_id!=''"
         ).fetchall()
     db.close()
-    if args.limit and args.limit > 0:
+    # Audit keeps the raw-row cap. Apply counts missing-fitment candidates later.
+    if not args.apply and args.limit and args.limit > 0:
         rows = rows[: int(args.limit)]
 
     from src.services.ebay_auth import EbayOAuthService
@@ -232,14 +340,48 @@ def main(argv: list[str] | None = None) -> int:
     verify_failed = 0
     skipped_no_source = 0
     skipped_title_no_year = 0
+    reads_used = 0
+    n_candidates = 0
+    n_has_fitment = 0
+    read_cap_hit = False
+    max_reads_effective = int(args.max_reads) if int(args.max_reads) >= 1 else 1
+    candidate_cap = int(args.limit) if args.limit and args.limit > 0 else None
+    state_path = _apply_state_path()
+    state = _empty_apply_state()
+    work = rows
 
-    for r in rows:
+    if args.apply:
+        universal_rows = []
+        specific_rows = []
+        for r in rows:
+            if classify_fitment(r["title"] or "") == "vehicle_specific":
+                specific_rows.append(r)
+            else:
+                universal_rows.append(r)
+        n_univ = len(universal_rows)
+        n_spec = len(specific_rows)
+        state = _load_apply_state(state_path)
+        specific_rows.sort(key=lambda row: _apply_sort_key(row, state))
+        work = specific_rows
+
+    for r in work:
+        if args.apply and reads_used >= max_reads_effective:
+            read_cap_hit = True
+            print(
+                f"read cap {max_reads_effective} reached after {n_candidates} candidates"
+            )
+            break
+        if args.apply and candidate_cap is not None and n_candidates >= candidate_cap:
+            break
         title = r["title"] or ""
         if classify_fitment(title) == "vehicle_specific":
-            n_spec += 1
+            if not args.apply:
+                n_spec += 1
         else:
             n_univ += 1
             continue
+        if args.apply:
+            reads_used += 1
         try:
             live = get_live_compat(tok, r["listing_id"], site_id=site_id)
         except Exception as exc:
@@ -259,10 +401,15 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             print(f"  [UNKNOWN] {r['sku']} {r['listing_id']}: {message}")
+            if args.apply:
+                _touch_apply_state(state, state_path, r, "read_failed")
             time.sleep(0.25)
             continue
         issues = check_fitment_qc(title, live)
         time.sleep(0.25)
+        if args.apply and not any(i.code == "missing_fitment" for i in issues):
+            n_has_fitment += 1
+            _touch_apply_state(state, state_path, r, "has_fitment")
         if not issues:
             continue
 
@@ -282,6 +429,8 @@ def main(argv: list[str] | None = None) -> int:
         }
 
         if args.apply and any(i.code == "missing_fitment" for i in issues):
+            n_candidates += 1
+            apply_result = "missing"
             optimization = _parse_mapping(r["optimization"] if "optimization" in r.keys() else {})
             products, skip_reason = resolve_apply_fitment(
                 title,
@@ -291,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if skip_reason or not products:
                 row_out["skip_reason"] = skip_reason or "skipped_no_source_fitment"
+                apply_result = row_out["skip_reason"]
                 if skip_reason == "skipped_title_no_year":
                     skipped_title_no_year += 1
                 else:
@@ -301,6 +451,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if ok:
                     applied += 1
+                    apply_result = "applied"
                     row_out["applied"] = True
                     print(f"  [APPLY] {r['sku']} {r['listing_id']}: +{len(products)} fitment OK")
                     time.sleep(0.4)
@@ -331,6 +482,7 @@ def main(argv: list[str] | None = None) -> int:
                     row_out["apply_error"] = err
                     print(f"  [APPLY] {r['sku']} FAIL: {err}")
                 time.sleep(0.4)
+            _touch_apply_state(state, state_path, r, apply_result)
 
         findings.append(row_out)
 
@@ -386,6 +538,15 @@ def main(argv: list[str] | None = None) -> int:
         "read_failed": n_unknown,
         "findings": findings,
     }
+    if args.apply:
+        limit_value = int(args.limit or 0)
+        report["limit"] = limit_value
+        report["max_reads"] = max_reads_effective
+        report["reads_used"] = reads_used
+        report["candidates"] = n_candidates
+        report["has_fitment"] = n_has_fitment
+        report["read_cap_hit"] = bool(read_cap_hit)
+        report["state_file"] = str(state_path)
     LOG_DIR.mkdir(exist_ok=True)
     report_path = LOG_DIR / f"fitment_audit_{stamp}.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -450,6 +611,18 @@ def main(argv: list[str] | None = None) -> int:
         if has_read_failures:
             head_bits.append(f"live 读取失败 {n_unknown} 条")
         head = " · ".join(head_bits) if head_bits else "车型适配全部通过"
+        if args.apply:
+            if args.limit and args.limit > 0:
+                cand_label = f"{n_candidates}/{int(args.limit)}"
+            else:
+                cand_label = f"{n_candidates}/不限"
+            cap_bit = "；read_cap_hit: true" if read_cap_hit else ""
+            apply_progress = (
+                f"<p>本次读取 {reads_used}/{max_reads_effective}，"
+                f"缺适配候选 {cand_label}{cap_bit}</p>"
+            )
+        else:
+            apply_progress = ""
         html = (
             f"<h2>AquaRides 车型适用性(Fitment)质检</h2>"
             f"<div style='background:{banner};color:#fff;padding:12px 16px;border-radius:6px;font-weight:700'>{head}</div>"
@@ -458,6 +631,7 @@ def main(argv: list[str] | None = None) -> int:
             + (f"；本次已挂适配 {applied} 条（回读通过 {verified_ok}）" if args.apply else "")
             + (f"；live 读取失败 {n_unknown} 条" if n_unknown else "")
             + f"</p><p>报告: <code>{_html.escape(str(report_path))}</code></p>"
+            f"{apply_progress}"
             f"<h3>已挂适配（{len(applied_rows)}）</h3>{_table(applied_rows, '无本次写入')}"
             f"<h3>仍需处理 / 残留（{len(residual)}）</h3>{_table(residual, '无残留')}"
             f"<h3>疑似错挂 mismatch（{len(mismatches)}，不自动改）</h3>"
