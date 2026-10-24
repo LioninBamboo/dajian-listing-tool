@@ -13,6 +13,11 @@ import src.services.cro_relist_lifecycle as lifecycle
 @pytest.fixture(autouse=True)
 def _isolate_mi_blacklist(monkeypatch):
     monkeypatch.setattr(lifecycle, "_load_mi_blacklist", lambda path=None: set())
+    # Missing cache must not be read, and must not count as a complete report.
+    monkeypatch.setattr(
+        "src.services.ebay_performance.load_performance_cache",
+        lambda max_age_hours=72: None,
+    )
 
 
 def _create_source_tables(db_path: Path) -> None:
@@ -144,13 +149,15 @@ def test_detect_dry_run_writes_report_without_mutating_original_db(tmp_path: Pat
     )
 
     assert report["applied"] is False
-    assert report["detect"]["created"] == 2
-    assert report["detect"]["by_action"] == {"final_delist": 1, "revive_relist": 1}
+    # Positive snapshot still revives. The zero row is unverified, so it is not an End.
+    assert report["detect"]["created"] == 1
+    assert report["detect"]["by_action"] == {"revive_relist": 1}
+    assert report["detect"]["skipped"]["traffic_unverified_for_end"] == 1
     assert out.exists()
     assert _lifecycle_count(db) == 0
 
 
-def test_detect_apply_persists_candidates(tmp_path: Path):
+def test_detect_apply_skips_unverified_zero_without_insert(tmp_path: Path):
     from scripts import cro_relist_lifecycle as cli
 
     db = tmp_path / "cro.db"
@@ -175,8 +182,10 @@ def test_detect_apply_persists_candidates(tmp_path: Path):
     )
 
     assert report["applied"] is True
-    assert report["detect"]["by_action"] == {"final_delist": 1}
-    assert _lifecycle_count(db) == 1
+    assert report["detect"]["created"] == 0
+    assert report["detect"]["by_action"] == {}
+    assert report["detect"]["skipped"]["traffic_unverified_for_end"] == 1
+    assert _lifecycle_count(db) == 0
 
 
 def test_delist_links_dry_run_does_not_persist_tokens(tmp_path: Path):
