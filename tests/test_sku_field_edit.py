@@ -1878,6 +1878,7 @@ def test_ambiguous_plywood_three_hits_refused_db_and_live(tmp_path):
             "description",
             "--apply",
             "--push-live",
+            "--allow-multi-unit",
             "--note",
             "ambiguous live",
             "--report",
@@ -2151,6 +2152,7 @@ def test_r4_m1_plywood_li_plus_paragraph_strips_both_db_and_live(tmp_path):
             "description",
             "--apply",
             "--push-live",
+            "--allow-multi-unit",
             "--note",
             "li plus p live",
             "--report",
@@ -2389,3 +2391,595 @@ def test_corpus_sweep_fixture_descriptions_no_false_success_or_protected_rollbac
                     false_applied.append((claim, html[:80], reason))
     assert false_applied == []
     assert false_rollback == []
+
+
+PACKAGE_DUP_DURABLE_HTML = (
+    "<ul><li>Durable powder-coated steel frame</li><li>Steel handle</li></ul>"
+    "<h2>PACKAGE INCLUDES</h2>"
+    "<p>Durable powder-coated steel frame</p>"
+)
+
+
+def test_r5_h1_inventory_put_never_attaches_stored_video(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.clients.real_ebay_client.lookup_stored_video_id",
+        lambda sku: "bca6bd55-stored-video",
+    )
+    row = deepcopy(ROWS[2])
+    row["optimization"]["video_id"] = "bca6bd55-stored-video"
+    item = inventory_item(row)
+    assert not item["inventory"]["product"].get("videoIds")
+    ebay = FakeEbay({row["sku"]: item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 h1 no video",
+            "--report",
+            str(tmp_path / "h1.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["live_readback"]["ok"] is True
+    inv_puts = [put for put in ebay.puts if "/inventory_item/" in put["url"]]
+    assert inv_puts
+    for put in inv_puts:
+        assert not (put["json"].get("product") or {}).get("videoIds")
+    assert not ebay.items[row["sku"]]["inventory"]["product"].get("videoIds")
+
+
+def test_r5_h1_live_video_ids_left_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "src.clients.real_ebay_client.lookup_stored_video_id",
+        lambda sku: "should-not-replace",
+    )
+    row = deepcopy(ROWS[2])
+    item = inventory_item(row)
+    item["inventory"]["product"]["videoIds"] = ["already-live-video"]
+    ebay = FakeEbay({row["sku"]: item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 h1 keep video",
+            "--report",
+            str(tmp_path / "h1keep.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    inv_puts = [put for put in ebay.puts if "/inventory_item/" in put["url"]]
+    assert inv_puts
+    for put in inv_puts:
+        assert (put["json"].get("product") or {}).get("videoIds") == ["already-live-video"]
+    assert ebay.items[row["sku"]]["inventory"]["product"]["videoIds"] == ["already-live-video"]
+
+
+def test_r5_h2_multi_value_room_refused_before_write(tmp_path):
+    row = deepcopy(ROWS[2])
+    item = inventory_item(row)
+    item["inventory"]["product"]["aspects"]["Room"] = ["Living Room", "Bedroom", "Office"]
+    ebay = FakeEbay({row["sku"]: item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 h2 room",
+            "--report",
+            str(tmp_path / "h2.json"),
+        ],
+        ctx,
+    )
+    assert code == 2
+    assert "inventory_put_would_alter_aspects" in (out + json.dumps(report))
+    assert "Room" in (out + json.dumps(report))
+    assert ebay.puts == []
+    conn = sqlite3.connect(ctx.db_path)
+    opt = json.loads(
+        conn.execute("SELECT optimization FROM collected_products WHERE sku=?", (row["sku"],)).fetchone()[0]
+    )
+    conn.close()
+    assert "plywood" in json.dumps(opt).casefold()
+
+
+def test_r5_h2_sanitized_room_description_strip_ok(tmp_path):
+    row = deepcopy(ROWS[2])
+    item = inventory_item(row)
+    item["inventory"]["product"]["aspects"]["Room"] = ["Living Room"]
+    ebay = FakeEbay({row["sku"]: item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 h2 sanitized room",
+            "--report",
+            str(tmp_path / "h2ok.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["live_readback"]["ok"] is True
+    inv_puts = [put for put in ebay.puts if "/inventory_item/" in put["url"]]
+    assert inv_puts
+    for put in inv_puts:
+        assert (put["json"]["product"]["aspects"].get("Room") == ["Living Room"])
+
+
+def test_r5_m1_trailing_plus_title_refused_before_write(tmp_path):
+    row = deepcopy(ROWS[2])
+    item = inventory_item(row)
+    item["inventory"]["product"]["title"] = row["optimization"]["title"] + " +"
+    ebay = FakeEbay({row["sku"]: item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 m1 plus",
+            "--report",
+            str(tmp_path / "m1.json"),
+        ],
+        ctx,
+    )
+    assert code == 2
+    assert "inventory_put_would_alter_title" in (out + json.dumps(report))
+    assert ebay.puts == []
+
+
+def test_r5_m1_short_trailing_token_refused_before_write(tmp_path):
+    row = deepcopy(ROWS[2])
+    item = inventory_item(row)
+    item["inventory"]["product"]["title"] = row["optimization"]["title"] + " x"
+    ebay = FakeEbay({row["sku"]: item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 m1 short token",
+            "--report",
+            str(tmp_path / "m1short.json"),
+        ],
+        ctx,
+    )
+    assert code == 2
+    assert "inventory_put_would_alter_title" in (out + json.dumps(report))
+    assert ebay.puts == []
+
+
+def test_r5_m1_normal_title_description_strip_ok(tmp_path):
+    row = deepcopy(ROWS[2])
+    ebay = FakeEbay({row["sku"]: inventory_item(row)})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 m1 normal title",
+            "--report",
+            str(tmp_path / "m1ok.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["live_readback"]["ok"] is True
+    assert ebay.puts
+
+
+def test_r5_m3_removed_bullet_duplicated_in_package_readback_ok(tmp_path):
+    row = deepcopy(ROWS[2])
+    row["optimization"]["description"] = PACKAGE_DUP_DURABLE_HTML
+    item = inventory_item(row)
+    ebay = FakeEbay({row["sku"]: item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "durable",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 m3 package dup",
+            "--report",
+            str(tmp_path / "m3ok.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["live_readback"]["ok"] is True
+    live_offer = ebay.items[row["sku"]]["offer"]["listingDescription"]
+    assert "PACKAGE INCLUDES" in live_offer
+    assert "Durable powder-coated steel frame" in live_offer
+    assert not sfe.claim_still_in_unprotected("durable", live_offer)
+
+
+def test_r5_m3_removed_bullet_still_unprotected_is_mismatch(tmp_path):
+    class IgnoreDescriptionEbay(FakeEbay):
+        def _on_put(self, url, payload):
+            if "/offer/" in url and "listingDescription" in payload:
+                return
+            if "/inventory_item/" in url:
+                return
+            super()._on_put(url, payload)
+
+    row = deepcopy(ROWS[2])
+    row["optimization"]["description"] = PACKAGE_DUP_DURABLE_HTML
+    item = inventory_item(row)
+    ebay = IgnoreDescriptionEbay({row["sku"]: item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "durable",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 m3 leftover",
+            "--report",
+            str(tmp_path / "m3bad.json"),
+        ],
+        ctx,
+    )
+    assert code == 3
+    assert "description" in (report["skus"][0].get("live_readback") or {}).get("mismatches", [])
+
+
+def test_r5_l1_multi_unit_gate_and_flag_required(tmp_path):
+    row = deepcopy(ROWS[2])
+    row["optimization"]["description"] = PLYWOOD_LI_AND_P
+    ctx = make_ctx(tmp_path, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--report",
+            str(tmp_path / "mu-dry.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    sku = report["skus"][0]
+    assert sku["status"] == "planned"
+    assert sku["removed_unit_count"] == 2
+    assert any(gate["name"] == "multi_unit_strip:2" and gate["ok"] for gate in sku["gates"])
+
+    item = inventory_item(row)
+    ebay = FakeEbay({row["sku"]: item})
+    ctx = make_ctx(tmp_path / "apply", ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 l1 no flag",
+            "--report",
+            str(tmp_path / "mu-apply.json"),
+        ],
+        ctx,
+    )
+    assert code == 2
+    assert "multi_unit_flag_required" in (out + json.dumps(report))
+    assert ebay.puts == []
+
+
+def test_r5_d4_exit4_prints_live_still_edited(tmp_path):
+    class FailAfterOffer(FakeEbay):
+        def _on_put(self, url, payload):
+            if "/offer/" in url and "listingDescription" in payload and not getattr(self, "_offer_ok", False):
+                self._offer_ok = True
+                super()._on_put(url, payload)
+                return
+            raise RuntimeError("forced live write failure")
+
+    row = deepcopy(ROWS[2])
+    item = inventory_item(row)
+    ebay = FailAfterOffer({row["sku"]: item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 d4 still edited",
+            "--report",
+            str(tmp_path / "d4.json"),
+        ],
+        ctx,
+    )
+    assert code == 4
+    assert "RESTORE_FAILED" in out
+    assert "LIVE LISTING STILL EDITED — manual action needed" in out
+    assert f"sku={row['sku']}" in out
+    assert f"listing_id={row['listing_id']}" in out
+    assert f"offer_id=off-{row['sku']}" in out
+    assert "LIVE_STILL_EDITED" in out
+    assert "live_before=" in out
+    assert (report["skus"][0].get("live_readback") or {}).get("live_restored") is False
+
+
+def test_r5_d3_skip_restore_when_no_live_write(tmp_path):
+    class FailFirst(FakeEbay):
+        def _on_put(self, url, payload):
+            raise RuntimeError("first put fails")
+
+    row = deepcopy(ROWS[2])
+    item = inventory_item(row)
+    ebay = FailFirst({row["sku"]: item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 d3 no restore",
+            "--report",
+            str(tmp_path / "d3.json"),
+        ],
+        ctx,
+    )
+    assert code == 3
+    assert (report["skus"][0].get("live_readback") or {}).get("live_restored") is True
+    assert len(ebay.puts) == 1
+
+
+def test_r5_d5_aqua_restore_skips_unchanged_item_specifics(tmp_path, monkeypatch):
+    monkeypatch.setenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    monkeypatch.setattr("src.utils.store_profile.get_store_profile", aqua_profile)
+
+    class IgnoreDescThenRestore(FakeEbay):
+        def revise_fixed_price_item_motors(self, item_id, **kwargs):
+            self.revise_calls.append({"item_id": item_id, **deepcopy(kwargs)})
+            if not getattr(self, "_ignored", False):
+                self._ignored = True
+                return {"itemId": item_id, "ack": "Success"}
+            return super().revise_fixed_price_item_motors(item_id, **kwargs)
+
+    row = deepcopy(ROWS[2])
+    row["listing_id"] = "366333333333"
+    live_html = "<p>Waterproof coating on the deck.</p><p>Ready for marine use.</p>"
+    row["optimization"]["description"] = live_html
+    ebay = IgnoreDescThenRestore(
+        {
+            "366333333333": {
+                "description": live_html,
+                "title": "Motors Support Bracket Steel",
+                "aspects": {"Brand": ["AquaRides"], "Features": ["Steel construction"]},
+                "start_price": "29.99",
+                "quantity": "4",
+                "compatibility": [
+                    {
+                        "compatibilityProperties": [
+                            {"name": "Year", "value": "2018"},
+                            {"name": "Make", "value": "Ford"},
+                            {"name": "Model", "value": "F-150"},
+                        ]
+                    }
+                ],
+            }
+        },
+        aqua=True,
+    )
+    trading = FakeTrading(AQUA_XML, ebay=ebay)
+    ctx = make_ctx(tmp_path, store="aqua", profile=aqua_profile(), ebay=ebay, trading=trading, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "aqua",
+            "--sku",
+            row["sku"],
+            "--strip-claim",
+            "Waterproof",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "r5 d5 aqua restore",
+            "--report",
+            str(tmp_path / "d5.json"),
+        ],
+        ctx,
+    )
+    assert code == 3
+    assert len(ebay.revise_calls) >= 2
+    restore_call = ebay.revise_calls[-1]
+    assert "item_specifics" not in restore_call
+    assert restore_call.get("description") == live_html
+
+
+def test_r5_corpus_no_unintended_field_changes(tmp_path, monkeypatch):
+    from src.services.live_listing_writes import prepare_inventory_put_aspects
+    from src.utils.title_sanitizer import normalize_listing_title_for_ebay
+
+    monkeypatch.setattr(
+        "src.clients.real_ebay_client.lookup_stored_video_id",
+        lambda sku: "stored-should-not-attach",
+    )
+    cases = []
+    for row in ROWS:
+        base = inventory_item(deepcopy(row))
+        cases.append(("fixture", deepcopy(row), deepcopy(base)))
+        video_item = deepcopy(base)
+        video_item["inventory"]["product"]["videoIds"] = ["live-video"]
+        cases.append(("video-present", deepcopy(row), video_item))
+        room_item = deepcopy(base)
+        room_item["inventory"]["product"]["aspects"]["Room"] = ["Living Room", "Bedroom", "Office"]
+        cases.append(("multi-room", deepcopy(row), room_item))
+        plus_item = deepcopy(base)
+        plus_item["inventory"]["product"]["title"] = str(base["inventory"]["product"]["title"]) + " +"
+        cases.append(("title-plus", deepcopy(row), plus_item))
+        short_item = deepcopy(base)
+        short_item["inventory"]["product"]["title"] = str(base["inventory"]["product"]["title"]) + " 22.4"
+        cases.append(("title-short", deepcopy(row), short_item))
+
+    dup_row = deepcopy(ROWS[2])
+    dup_row["optimization"]["description"] = PACKAGE_DUP_DURABLE_HTML
+    dup_item = inventory_item(dup_row)
+    cases.append(("protected-dup", dup_row, dup_item))
+
+    unintended = []
+    for label, row, item in cases:
+        sku = row["sku"]
+        live_title = str(item["inventory"]["product"].get("title") or "")
+        live_aspects = deepcopy(item["inventory"]["product"].get("aspects") or {})
+        sent_title, _ = normalize_listing_title_for_ebay(live_title, source_title=live_title)
+        sent_aspects = prepare_inventory_put_aspects(live_aspects, sku=sku)
+        helper_would_alter_title = sent_title != live_title
+        helper_would_alter_aspects = sent_aspects != live_aspects
+        ebay = FakeEbay({sku: deepcopy(item)})
+        ctx = make_ctx(tmp_path / label / sku, ebay=ebay, db_rows=[row])
+        claim = "durable" if label == "protected-dup" else "plywood"
+        blob = json.dumps(row) + json.dumps(item)
+        if claim == "plywood" and "plywood" not in blob.casefold():
+            claim = "wood"
+        argv = [
+            "--store",
+            "main",
+            "--sku",
+            sku,
+            "--strip-claim",
+            claim,
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--allow-multi-unit",
+            "--note",
+            f"corpus {label}",
+            "--report",
+            str(tmp_path / f"{label}-{sku}.json"),
+        ]
+        code, out, report = run(argv, ctx)
+        sku_report = (report.get("skus") or [{}])[0]
+        reason = str(sku_report.get("refuse_reason") or "")
+        after_product = ebay.items[sku]["inventory"]["product"]
+        wrote = bool(ebay.puts)
+        if helper_would_alter_title or helper_would_alter_aspects:
+            if sku_report.get("status") == "already_absent" and not wrote:
+                continue
+            if code != 2 or not reason.startswith("inventory_put_would_alter_"):
+                unintended.append((label, sku, code, reason, "expected helper refuse"))
+                continue
+            if wrote:
+                unintended.append((label, sku, "wrote after refuse", reason))
+            continue
+        if wrote:
+            if (item["inventory"]["product"].get("videoIds") or []) != (after_product.get("videoIds") or []):
+                unintended.append((label, sku, "videoIds changed"))
+            if after_product.get("title") != live_title:
+                unintended.append((label, sku, "title changed", after_product.get("title")))
+            if deepcopy(after_product.get("aspects") or {}) != live_aspects:
+                unintended.append((label, sku, "aspects changed", after_product.get("aspects")))
+        elif sku_report.get("status") not in {"already_absent", "refused", "planned", "applied"}:
+            unintended.append((label, sku, code, sku_report.get("status"), reason))
+    assert unintended == []

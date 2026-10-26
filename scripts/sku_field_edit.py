@@ -75,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--push-live", action="store_true")
     parser.add_argument("--allow-category", action="store_true")
+    parser.add_argument(
+        "--allow-multi-unit",
+        action="store_true",
+        help="Required with --apply when one --strip-claim removes more than one bullet/paragraph.",
+    )
     parser.add_argument("--override-category-lock", action="store_true")
     parser.add_argument("--mark-category-approved", action="store_true")
     parser.add_argument("--backup-dir")

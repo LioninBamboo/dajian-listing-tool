@@ -29,6 +29,7 @@ from src.services.live_listing_writes import (
     _update_offer_description_only,
     compress_html,
     get_category_matcher,
+    prepare_inventory_put_aspects,
 )
 from src.utils.html_truncator import smart_truncate_html
 from src.utils.approved_category import (
@@ -78,6 +79,7 @@ from src.utils.text_deletion_guard import (
     ordered_subsequence,
     tokenize_text,
 )
+from src.utils.title_sanitizer import normalize_listing_title_for_ebay
 
 EXIT_OK = 0
 EXIT_REFUSED = 2
@@ -260,6 +262,9 @@ class SkuPlan:
     live_changed: bool = False
     db_readback: dict[str, Any] = dc_field(default_factory=dict)
     live_readback: dict[str, Any] = dc_field(default_factory=dict)
+    removed_unit_count: int = 0
+    live_write_happened: bool = False
+    expected_sent_aspects: dict[str, list[str]] | None = None
 
 
 class ToolRefused(Exception):
@@ -536,6 +541,105 @@ def refuse(plan: SkuPlan, name: str, reason: str) -> SkuPlan:
     return plan
 
 
+def _note_multi_unit_strip(plan: SkuPlan, units: list[str], args: Any) -> SkuPlan | None:
+    """Record ``multi_unit_strip:N`` and refuse writes unless ``--allow-multi-unit``."""
+    count = len(units)
+    if count > plan.removed_unit_count:
+        plan.removed_unit_count = count
+    if count <= 1:
+        return None
+    name = f"multi_unit_strip:{count}"
+    if not any(gate.name == name for gate in plan.gates):
+        add_gate(plan, name, True, str(count))
+    if getattr(args, "apply", False) and not getattr(args, "allow_multi_unit", False):
+        return refuse(plan, "multi_unit_flag_required", f"multi_unit_flag_required:{count}")
+    return None
+
+
+def _unprotected_html(html_src: str) -> str:
+    """Return HTML with ``protected_ranges`` spans removed."""
+    raw = html_src or ""
+    ranges = sorted(protected_ranges(raw), key=lambda item: (item[0], item[1]))
+    if not ranges:
+        return raw
+    parts: list[str] = []
+    cursor = 0
+    for start, end in ranges:
+        if start < cursor:
+            if end > cursor:
+                cursor = end
+            continue
+        parts.append(raw[cursor:start])
+        cursor = max(cursor, end)
+    parts.append(raw[cursor:])
+    return "".join(parts)
+
+
+def _targeted_aspect_keys(
+    before: Mapping[str, list[str]],
+    after: Mapping[str, list[str]],
+) -> set[str]:
+    targeted: set[str] = set()
+    seen: set[str] = set()
+    for name in list(before) + list(after):
+        key = str(name)
+        folded = key.casefold()
+        if folded in seen:
+            continue
+        seen.add(folded)
+        before_key = find_aspect_key(before, key) or key
+        after_key = find_aspect_key(after, key) or key
+        if list(before.get(before_key) or []) != list(after.get(after_key) or []):
+            targeted.add(after_key if after_key in after else before_key)
+    return targeted
+
+
+def _untargeted_aspect_alters(
+    planned: Mapping[str, list[str]],
+    sent: Mapping[str, list[str]],
+    targeted: set[str],
+) -> list[str]:
+    planned_n = _normalize_aspects(planned)
+    sent_n = _normalize_aspects(sent)
+    targeted_folded = {str(name).casefold() for name in targeted}
+    altered: list[str] = []
+    seen: set[str] = set()
+    for name in list(planned_n) + list(sent_n):
+        folded = str(name).casefold()
+        if folded in seen or folded in targeted_folded:
+            continue
+        seen.add(folded)
+        planned_key = find_aspect_key(planned_n, name)
+        sent_key = find_aspect_key(sent_n, name)
+        planned_vals = planned_n.get(planned_key, []) if planned_key else []
+        sent_vals = sent_n.get(sent_key, []) if sent_key else []
+        if planned_vals != sent_vals:
+            altered.append(str(sent_key or planned_key or name))
+    return altered
+
+
+def _product_video_ids(product: Mapping[str, Any] | None) -> list[str]:
+    return [str(item).strip() for item in ((product or {}).get("videoIds") or []) if str(item).strip()]
+
+
+def _print_live_still_edited(plan: SkuPlan, backup_info: Mapping[str, Any] | None) -> None:
+    backup_dir = (backup_info or {}).get("dir") or ""
+    live_before = str(Path(backup_dir) / "live_before.json") if backup_dir else ""
+    offer = (plan.live or {}).get("offer") or {}
+    offer_id = str(offer.get("offerId") or "")
+    print(
+        "LIVE LISTING STILL EDITED — manual action needed "
+        f"sku={plan.sku} listing_id={plan.listing_id} offer_id={offer_id} "
+        f"backup={backup_dir}"
+    )
+    print(f"LIVE_STILL_EDITED sku={plan.sku} live_before={live_before}")
+
+
+def _maybe_print_live_still_edited(plan: SkuPlan, backup_info: Mapping[str, Any] | None) -> None:
+    if (plan.live_readback or {}).get("live_restored") is False:
+        _print_live_still_edited(plan, backup_info)
+
+
 def sku_edit_required_aspect_names(category_id: str | None) -> list[str] | None:
     """Return required aspect names. ``[]`` means Taxonomy 200 with none.
 
@@ -684,6 +788,9 @@ def apply_ops(
                         if ul_would_be_empty(before_desc, units):
                             add_gate(plan, "empty_ul", True, "empty_ul_cleaned")
                         removed_desc_units.extend(units)
+                        refused = _note_multi_unit_strip(plan, units, args)
+                        if refused is not None:
+                            return refused
                         op_changed = True
                 elif loc == "features":
                     result, status = _strip_claim_from_aspect_values(
@@ -966,8 +1073,9 @@ def _description_strip_claims(plan: SkuPlan) -> list[str]:
 
 
 def _removed_units_absent(html_src: str, plan: SkuPlan) -> bool:
-    got_text = strip_html_to_text(html_src).casefold()
-    got_norm = normalize_html_for_readback(html_src)
+    unprotected = _unprotected_html(html_src)
+    got_text = strip_html_to_text(unprotected).casefold()
+    got_norm = normalize_html_for_readback(unprotected)
     for claim in _description_strip_claims(plan):
         if claim_still_in_unprotected(claim, html_src):
             return False
@@ -1271,6 +1379,7 @@ def plan_to_report(plan: SkuPlan) -> dict[str, Any]:
         "status": plan.status,
         "qty_zero_preserved": plan.qty_zero_preserved,
         "refuse_reason": plan.refuse_reason,
+        "removed_unit_count": plan.removed_unit_count,
     }
 
 
@@ -1419,11 +1528,11 @@ def apply_live_ops(
     required_names, required_available = required_aspect_names(ctx, category_id)
     changed = False
 
-    def _strip_live_html(html: str, claim: str) -> tuple[str, str | None]:
+    def _strip_live_html(html: str, claim: str) -> tuple[str, list[str]]:
         after, units, reason = _strip_claim_html(html, claim)
         if reason:
             raise ToolRefused(reason)
-        return after, units[0] if units else None
+        return after, units
 
     try:
         for op in ops:
@@ -1434,8 +1543,14 @@ def apply_live_ops(
                 locations = ["description", "features", "aspects_all", "title"] if op.location == "all" else [op.location]
                 for loc in locations:
                     if loc == "description":
-                        offer_desc, _ = _strip_live_html(offer_desc, claim)
-                        inv_desc, _ = _strip_live_html(inv_desc, claim)
+                        offer_desc, offer_units = _strip_live_html(offer_desc, claim)
+                        inv_desc, inv_units = _strip_live_html(inv_desc, claim)
+                        refused = _note_multi_unit_strip(plan, offer_units, args)
+                        if refused is not None:
+                            return refused
+                        refused = _note_multi_unit_strip(plan, inv_units, args)
+                        if refused is not None:
+                            return refused
                     elif loc == "title":
                         new_title, status = _strip_title(title, claim)
                         if status == "title_would_degrade":
@@ -1524,6 +1639,26 @@ def apply_live_ops(
         or aspects != live_aspects_before
     )
     plan.live_changed = changed
+    if ctx.store != "aqua":
+        inventory_put = (
+            inv_desc != live_inv_before
+            or title != live_title_before
+            or aspects != live_aspects_before
+        )
+        if inventory_put:
+            sent_title, _ = normalize_listing_title_for_ebay(title, source_title=title)
+            if sent_title != title:
+                return refuse(plan, "inventory_put_would_alter_title", "inventory_put_would_alter_title")
+            sent_aspects = prepare_inventory_put_aspects(aspects, sku=plan.sku)
+            targeted = _targeted_aspect_keys(live_aspects_before, aspects)
+            altered = _untargeted_aspect_alters(aspects, sent_aspects, targeted)
+            if altered:
+                return refuse(
+                    plan,
+                    "inventory_put_would_alter_aspects",
+                    "inventory_put_would_alter_aspects:" + ",".join(sorted(altered)),
+                )
+            plan.expected_sent_aspects = _normalize_aspects(sent_aspects)
     if changed and plan.status == "already_absent":
         plan.status = "planned"
     return plan
@@ -1863,6 +1998,7 @@ def _push_inventory(plan: SkuPlan, ctx: SkuFieldEditContext) -> None:
     aspects_changed = planned_aspects != _normalize_aspects(product.get("aspects"))
     if offer_desc_changed:
         _update_offer_description_only(ebay, offer_id, new_offer_desc)
+        plan.live_write_happened = True
     if inv_desc_changed or title_changed or aspects_changed:
         _put_inventory_product_only(
             ebay,
@@ -1870,12 +2006,15 @@ def _push_inventory(plan: SkuPlan, ctx: SkuFieldEditContext) -> None:
             new_title if title_changed else live_title,
             new_inv_desc if inv_desc_changed else live_desc,
             planned_aspects if aspects_changed else _normalize_aspects(product.get("aspects")),
+            lookup_video=lambda _sku: "",
         )
+        plan.live_write_happened = True
     if "categoryId" in plan.diff:
         target = str(plan.optimization_after.get("categoryId") or "")
         live_offer = ebay.get_offer(offer_id)
         payload = offer_category_only_put_payload(live_offer, target)
         _offer_put(ebay, offer_id, payload)
+        plan.live_write_happened = True
 
 
 def _first_strip_claim(plan: SkuPlan) -> str:
@@ -1906,6 +2045,7 @@ def _push_aqua(plan: SkuPlan, ctx: SkuFieldEditContext) -> None:
     if not kwargs:
         return
     ebay.revise_fixed_price_item_motors(plan.listing_id, **kwargs)
+    plan.live_write_happened = True
 
 
 def live_readback_ok(plan: SkuPlan, ctx: SkuFieldEditContext) -> tuple[bool, list[str]]:
@@ -1978,7 +2118,17 @@ def live_readback_ok(plan: SkuPlan, ctx: SkuFieldEditContext) -> tuple[bool, lis
     )
     if (plan.live_changed or "title" in plan.diff) and str(product.get("title") or "") != want_title:
         mismatches.append("title")
-    if (
+    if _inventory_put_planned(plan):
+        live_before_product = (plan.live.get("inventory") or {}).get("product") or {}
+        if _product_video_ids(product) != _product_video_ids(live_before_product):
+            mismatches.append("videoIds")
+        expected = plan.expected_sent_aspects
+        if expected is None:
+            expected = prepare_inventory_put_aspects(_planned_live_aspects(plan), sku=plan.sku)
+        if _normalize_aspects(product.get("aspects")) != _normalize_aspects(expected):
+            if "aspects" not in mismatches:
+                mismatches.append("aspects")
+    elif (
         "aspects" in plan.diff or _live_aspects_changed(plan)
     ) and _normalize_aspects(product.get("aspects")) != _planned_live_aspects(plan):
         if "aspects" not in mismatches:
@@ -1989,13 +2139,18 @@ def live_readback_ok(plan: SkuPlan, ctx: SkuFieldEditContext) -> tuple[bool, lis
 
 
 def restore_live(plan: SkuPlan, ctx: SkuFieldEditContext) -> bool:
+    if not plan.live_write_happened:
+        return True
     try:
         if ctx.store == "aqua":
             kwargs: dict[str, Any] = {
                 "description": plan.live.get("description"),
                 "title": plan.live.get("title"),
-                "item_specifics": plan.live.get("aspects"),
             }
+            live_aspects = _normalize_aspects(plan.live.get("aspects"))
+            after_aspects = _normalize_aspects((plan.live_after or {}).get("aspects"))
+            if live_aspects != after_aspects:
+                kwargs["item_specifics"] = plan.live.get("aspects")
             ctx.ebay_client.revise_fixed_price_item_motors(plan.listing_id, **kwargs)
             return True
         ebay = ctx.ebay_client
@@ -2176,6 +2331,7 @@ def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
                                     f"RESTORE_FAILED backup={backup_info.get('dir')} "
                                     f"db={backup_info.get('db', {}).get('path')}"
                                 )
+                                _maybe_print_live_still_edited(plan, backup_info)
                             worst = max(worst, live_code)
                             if getattr(args, "stop_on_error", True):
                                 break

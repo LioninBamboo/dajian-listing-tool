@@ -228,21 +228,8 @@ def _put_inventory_snapshot(ebay_client, sku: str, live_inventory: dict):
     )
 
 
-def _put_inventory_product_only(
-    ebay_client, sku, title, description, aspects, lookup_video=None
-):
-    """Update only inventory_item.product fields without touching quantity or price."""
-    live_inventory = ebay_client.get_inventory_item(sku) or {}
-    if not live_inventory:
-        raise RuntimeError(f"{sku}: live inventory item not found")
-
-    description = description or ""
-    compressed = compress_html(description)
-    if len(compressed) <= 4000:
-        description = compressed
-    else:
-        description = smart_truncate_html(description, max_length=4000, min_length=3600)
-
+def prepare_inventory_put_aspects(aspects, *, sku: str = "") -> dict:
+    """Sanitize/prepare aspects exactly as ``_put_inventory_product_only`` will send them."""
     cleaned_aspects = {}
     for key, value in (aspects or {}).items():
         if isinstance(value, list):
@@ -265,6 +252,25 @@ def _put_inventory_product_only(
         required_aspect_names=(),
         log=lambda message: logging.info(f"[ASPECTS] {sku}: {message}"),
     )
+    return cleaned_aspects
+
+
+def _put_inventory_product_only(
+    ebay_client, sku, title, description, aspects, lookup_video=None
+):
+    """Update only inventory_item.product fields without touching quantity or price."""
+    live_inventory = ebay_client.get_inventory_item(sku) or {}
+    if not live_inventory:
+        raise RuntimeError(f"{sku}: live inventory item not found")
+
+    description = description or ""
+    compressed = compress_html(description)
+    if len(compressed) <= 4000:
+        description = compressed
+    else:
+        description = smart_truncate_html(description, max_length=4000, min_length=3600)
+
+    cleaned_aspects = prepare_inventory_put_aspects(aspects, sku=sku)
 
     product = dict(live_inventory.get("product") or {})
     safe_title, _ = normalize_listing_title_for_ebay(title, source_title=title)
