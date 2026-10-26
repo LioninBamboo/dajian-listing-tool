@@ -159,6 +159,7 @@ def build_revise_fixed_price_item_xml(
     start_price: Optional[float] = None,
     compatibility: Optional[Sequence[Mapping[str, Any]]] = None,
     replace_all_compatibility: bool = False,
+    item_specifics: Optional[Mapping[str, list[str]]] = None,
 ) -> str:
     """Build a minimal ReviseFixedPriceItem request for a live Motors item.
 
@@ -179,6 +180,10 @@ def build_revise_fixed_price_item_xml(
         parts.append(f"<StartPrice>{float(start_price):.2f}</StartPrice>")
     if description is not None:
         parts.append(f"<Description>{_description_cdata(description)}</Description>")
+    if item_specifics is not None:
+        aspects_xml = _aspects_xml(item_specifics)
+        if aspects_xml:
+            parts.append(aspects_xml)
     compatibility_xml = format_compatibility_list(
         compatibility,
         replace_all=replace_all_compatibility,

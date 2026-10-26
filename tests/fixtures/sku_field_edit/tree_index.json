@@ -1,0 +1,430 @@
+{
+  "900001": [
+    "Home & Garden",
+    ""
+  ],
+  "900002": [
+    "Yard, Garden & Outdoor Living",
+    "900001"
+  ],
+  "900003": [
+    "Patio & Garden Furniture",
+    "900002"
+  ],
+  "900004": [
+    "Household Supplies & Cleaning",
+    "900001"
+  ],
+  "900005": [
+    "Home Organization",
+    "900004"
+  ],
+  "900006": [
+    "Kitchen, Dining & Bar",
+    "900001"
+  ],
+  "900007": [
+    "Furniture",
+    "900001"
+  ],
+  "900008": [
+    "Tools & Workshop Equipment",
+    "900001"
+  ],
+  "900009": [
+    "Power Tools",
+    "900008"
+  ],
+  "900010": [
+    "Antiques",
+    ""
+  ],
+  "900011": [
+    "Furniture",
+    "900010"
+  ],
+  "900012": [
+    "Pet Supplies",
+    ""
+  ],
+  "900013": [
+    "Dog Supplies",
+    "900012"
+  ],
+  "900014": [
+    "Cat Supplies",
+    "900012"
+  ],
+  "900015": [
+    "eBay Motors",
+    ""
+  ],
+  "900016": [
+    "Collectibles",
+    ""
+  ],
+  "900017": [
+    "Transportation",
+    "900016"
+  ],
+  "79682": [
+    "Patio Chairs",
+    "900003"
+  ],
+  "79684": [
+    "Loungers",
+    "900003"
+  ],
+  "22656": [
+    "Coat & Hat Racks",
+    "900005"
+  ],
+  "261263": [
+    "Hall Trees & Stands",
+    "900011"
+  ],
+  "20744": [
+    "Beds",
+    "900013"
+  ],
+  "20740": [
+    "Furniture & Scratchers",
+    "900014"
+  ],
+  "100411": [
+    "Litter Boxes",
+    "900014"
+  ],
+  "177000": [
+    "Power Tool Sets",
+    "900009"
+  ],
+  "260157": [
+    "Kitchen Islands",
+    "900006"
+  ],
+  "115753": [
+    "Kitchen Carts",
+    "900006"
+  ],
+  "38204": [
+    "Tables",
+    "900007"
+  ],
+  "20487": [
+    "Cabinets & Cupboards",
+    "900007"
+  ],
+  "183322": [
+    "Sideboards & Buffets",
+    "900007"
+  ],
+  "20488": [
+    "TV Stands & Entertainment Units",
+    "900007"
+  ],
+  "26429": [
+    "Boats",
+    "900015"
+  ],
+  "6024": [
+    "Motorcycles",
+    "900015"
+  ],
+  "66466": [
+    "Powersports",
+    "900015"
+  ],
+  "6038": [
+    "Other Vehicles & Trailers",
+    "900015"
+  ],
+  "6001": [
+    "Cars & Trucks",
+    "900015"
+  ],
+  "54235": [
+    "Chairs",
+    "900007"
+  ],
+  "38208": [
+    "Sofas, Armchairs & Couches",
+    "900007"
+  ],
+  "139849": [
+    "Patio & Garden Furniture Sets",
+    "900003"
+  ],
+  "112590": [
+    "Patio & Garden Tables",
+    "900003"
+  ],
+  "138996": [
+    "Outdoor Daybeds",
+    "900003"
+  ],
+  "107578": [
+    "Dining Sets",
+    "900007"
+  ],
+  "20689": [
+    "Wine Racks & Bottle Holders",
+    "900007"
+  ],
+  "88057": [
+    "Desks & Tables",
+    "900007"
+  ],
+  "175758": [
+    "Beds & Bed Frames",
+    "900007"
+  ],
+  "66743": [
+    "Play Table & Chair Sets",
+    "900007"
+  ],
+  "20490": [
+    "Ottomans, Footstools & Poufs",
+    "900007"
+  ],
+  "262980": [
+    "Benches",
+    "900007"
+  ],
+  "121851": [
+    "Houses",
+    "900013"
+  ],
+  "66690": [
+    "Rockers, Gliders",
+    "900007"
+  ],
+  "75671": [
+    "Wheelbarrows, Carts & Wagons",
+    "900002"
+  ],
+  "38199": [
+    "Nightstands",
+    "900007"
+  ],
+  "20580": [
+    "Mirrors",
+    "900007"
+  ],
+  "103431": [
+    "Bar Stools & Stools",
+    "900007"
+  ],
+  "63557": [
+    "Sideboards & Buffets",
+    "900007"
+  ],
+  "42425": [
+    "Medicine Cabinets",
+    "900007"
+  ],
+  "175754": [
+    "Bunk Beds",
+    "900007"
+  ],
+  "179444": [
+    "Garage/Shop Tool Chests",
+    "900009"
+  ],
+  "179506": [
+    "Dollies",
+    "900015"
+  ],
+  "900021": [
+    "Outdoor Power Equipment",
+    "900002"
+  ],
+  "71277": [
+    "String Trimmers",
+    "900021"
+  ],
+  "900022": [
+    "Weed & Pest Control",
+    "900002"
+  ],
+  "900023": [
+    "Insect & Grub Control",
+    "900022"
+  ],
+  "181037": [
+    "Fogger Machines",
+    "900023"
+  ],
+  "71296": [
+    "Drill Presses",
+    "900009"
+  ],
+  "900024": [
+    "Brewing, Distilling & Wine Making",
+    "900006"
+  ],
+  "260139": [
+    "Equipment",
+    "900024"
+  ],
+  "260931": [
+    "Barbecue Accessories",
+    "900018"
+  ],
+  "900025": [
+    "Home Improvement",
+    "900001"
+  ],
+  "900026": [
+    "Heating, Cooling & Air",
+    "900025"
+  ],
+  "900027": [
+    "Fireplaces & Stoves",
+    "900026"
+  ],
+  "38221": [
+    "Fireplace Screens & Doors",
+    "900027"
+  ],
+  "900028": [
+    "Business & Industrial",
+    ""
+  ],
+  "900029": [
+    "Office",
+    "900028"
+  ],
+  "900030": [
+    "Office Furniture",
+    "900029"
+  ],
+  "3299": [
+    "Filing Cabinets",
+    "900030"
+  ],
+  "114397": [
+    "Dressers",
+    "900007"
+  ],
+  "900031": [
+    "Toys & Hobbies",
+    ""
+  ],
+  "900032": [
+    "Outdoor Toys & Structures",
+    "900031"
+  ],
+  "16515": [
+    "Swings, Slides & Gyms",
+    "900032"
+  ],
+  "38205": [
+    "Console Tables",
+    "900007"
+  ],
+  "999018": [
+    "Boats & Ships",
+    "900017"
+  ],
+  "32878": [
+    "Vanities & Makeup Tables",
+    "900007"
+  ],
+  "176991": [
+    "Bathroom Cabinets",
+    "900007"
+  ],
+  "63108": [
+    "Cages, Hutches & Enclosures",
+    "900012"
+  ],
+  "161059": [
+    "Trash Can Storage",
+    "900005"
+  ],
+  "131588": [
+    "Mattresses",
+    "900007"
+  ],
+  "20751": [
+    "Cat Trees & Condos",
+    "900014"
+  ],
+  "32880": [
+    "Coat Racks",
+    "900005"
+  ],
+  "103430": [
+    "Armoires & Wardrobes",
+    "900007"
+  ],
+  "42428": [
+    "Pantry Cabinets",
+    "900007"
+  ],
+  "38217": [
+    "China Cabinets",
+    "900007"
+  ],
+  "179446": [
+    "Tool Storage Organizers",
+    "900008"
+  ],
+  "79694": [
+    "Porch Swings",
+    "900003"
+  ],
+  "125085": [
+    "Trunks & Chests",
+    "900007"
+  ],
+  "63700": [
+    "Other Shop Equipment",
+    "900015"
+  ],
+  "900018": [
+    "Outdoor Heating, Cooking & Eating",
+    "900002"
+  ],
+  "20725": [
+    "Barbecue Tools",
+    "900018"
+  ],
+  "260150": [
+    "Manual Juicers",
+    "900006"
+  ],
+  "900019": [
+    "Sporting Goods",
+    ""
+  ],
+  "900020": [
+    "Cycling",
+    "900019"
+  ],
+  "177815": [
+    "Forks",
+    "900020"
+  ],
+  "177816": [
+    "Handlebar Grips",
+    "900020"
+  ],
+  "303": [
+    "Other Hand Tools",
+    "900008"
+  ],
+  "184155": [
+    "Hand Trucks",
+    "900008"
+  ],
+  "999881": [
+    "Utility Trailers",
+    "6038"
+  ],
+  "999882": [
+    "Blacklisted Leaf",
+    "900008"
+  ]
+}

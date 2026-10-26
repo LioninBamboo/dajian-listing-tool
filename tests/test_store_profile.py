@@ -43,6 +43,7 @@ class TestDefaults:
         assert profile.server_port == 8000
         assert profile.server_base_url == "http://localhost:8000"
         assert profile.brand_name_lower == "aquaverve"
+        assert profile.sku_edit_backup_dir == ""
 
     def test_malformed_yaml_raises_not_silent_default(self, tmp_path):
         # A present-but-broken profile must fail loud: on a sub-account the
@@ -97,6 +98,20 @@ class TestOverrides:
         assert profile.qc_profile == "furniture"
         assert profile.server_port == 8001
         assert profile.server_base_url == "http://localhost:8001"
+
+    def test_sku_edit_backup_dir_yaml_key(self, tmp_path):
+        yaml_file = tmp_path / "backup.yaml"
+        yaml_file.write_text(
+            textwrap.dedent(
+                """
+                server:
+                  sku_edit_backup_dir: D:/deploy_backup
+                """
+            ),
+            encoding="utf-8",
+        )
+        profile = load_store_profile(yaml_file)
+        assert profile.sku_edit_backup_dir == "D:/deploy_backup"
 
     def test_qc_profile_override(self, tmp_path):
         yaml_file = tmp_path / "motors.yaml"

@@ -127,6 +127,8 @@ class StoreProfile:
 
     # Local server
     server_port: int = 8000
+    # Optional operator backup root for sku_field_edit. Empty => tool default.
+    sku_edit_backup_dir: str = ""
 
     # Scheduler profile. "full" = main-store cadence (MI/CRO/listing audit/…).
     # "ops" = sub-store lean cadence (inventory sync + ghost recovery + order recheck only).
@@ -296,6 +298,7 @@ _SECTION_FIELD_MAP = {
     },
     "server": {
         "server_port",
+        "sku_edit_backup_dir",
         "scheduler_profile",
         "scheduler_mutex_name",
         "scheduler_enable_qc_autofix",

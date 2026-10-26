@@ -888,6 +888,18 @@ def offer_description_only_put_payload(
     return payload
 
 
+def offer_category_only_put_payload(
+    live_offer: Mapping[str, Any] | None,
+    category_id: str,
+) -> dict[str, Any]:
+    """Deep-copy a GET offer and change only categoryId for PUT."""
+    payload = deepcopy(dict(live_offer or {}))
+    for key in OFFER_GET_ONLY_KEYS:
+        payload.pop(key, None)
+    payload["categoryId"] = str(category_id)
+    return payload
+
+
 def live_image_urls(inventory: Mapping[str, Any] | None) -> list[str]:
     product = ((inventory or {}).get("product") or {}) if inventory else {}
     urls = product.get("imageUrls") or []
