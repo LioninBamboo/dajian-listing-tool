@@ -10,8 +10,8 @@ Operator-only CLI that edits **one SKU** (or an explicit `--skus` list, max 50) 
 - **默认 dry-run。** 不加 `--apply` 时不写库、不写 eBay、不做备份；仍会写报告。
 - `--apply` writes the local `collected_products` row only. `--push-live` is required to touch eBay, and only after a successful DB write + readback.
 - `--apply` 只写本地库。要推 eBay 必须同时给 `--push-live`，且发生在库写成功并回读通过之后。
-- Automatic online SQLite backup before the first write.
-- 第一次写入前做在线 SQLite 备份。
+- Automatic online SQLite backup before the first write. On Main this is a full copy of `ebay_collection.db` (about 200 MB). Keep a short retention window under `deploy_backup/sku_edit_*`.
+- 第一次写入前做在线 SQLite 备份。Main 库整库约 200 MB；`deploy_backup/sku_edit_*` 请做短期留存。
 - Text edits are **deletion-only**. There is no `--allow-add` in v1.
 - 文本编辑只允许删除。v1 没有 `--allow-add`。
 - Category edits require `--allow-category` plus the high-fee / leaf / lock / required-aspect gates.

@@ -41,8 +41,28 @@ def create_online_backup(
             target.close()
         validate_runtime_database(temporary)
         temporary.replace(destination)
+        for leftover in (
+            Path(str(temporary) + "-wal"),
+            Path(str(temporary) + "-shm"),
+            destination.with_name(destination.name + ".tmp-wal"),
+            destination.with_name(destination.name + ".tmp-shm"),
+        ):
+            if leftover.exists():
+                leftover.unlink()
+        cleaned = sqlite3.connect(str(destination), timeout=30)
+        try:
+            cleaned.execute("PRAGMA journal_mode=DELETE")
+            cleaned.commit()
+        finally:
+            cleaned.close()
         return validate_runtime_database(destination)
     except Exception:
         if temporary.exists():
             temporary.unlink()
+        for leftover in (
+            Path(str(temporary) + "-wal"),
+            Path(str(temporary) + "-shm"),
+        ):
+            if leftover.exists():
+                leftover.unlink()
         raise

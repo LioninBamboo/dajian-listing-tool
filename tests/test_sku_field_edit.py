@@ -53,11 +53,26 @@ def aqua_profile() -> StoreProfile:
     )
 
 
+REQUIRED_38208 = [
+    "Brand",
+    "Color",
+    "Item Height",
+    "Item Length",
+    "Item Width",
+    "Type",
+    "Upholstery Fabric",
+]
+
+
 def required_loader(category_id: str | None):
     cid = str(category_id or "")
     if cid == "38208":
-        return ["Frame Material", "Brand"]
-    if cid in {"303", "184155", "20487"}:
+        return list(REQUIRED_38208)
+    if cid == "999001":
+        return ["Frame Material"]
+    if cid == "184155":
+        return []
+    if cid in {"303", "20487"}:
         return ["Brand"]
     if cid == "missing":
         return None
@@ -316,20 +331,8 @@ def test_listing_writer_tasks_derived_from_scheduler():
     import scheduler_daemon
 
     assert sfe.LISTING_WRITER_TASKS <= set(scheduler_daemon.TASK_TIMEOUT)
-    assert sfe.LISTING_WRITER_TASKS == {
-        "daily_tasks",
-        "auto_publish",
-        "ops_daily",
-        "listing_audit",
-        "source_aspect_autofix",
-        "semantic_rewrite",
-        "missing_video_autofix",
-        "cro_fill_specifics",
-        "cro_title_rewrite",
-        "cro_image_refresh",
-        "smart_reprice",
-        "source_refresh",
-        "listing_status_sync",
+    assert sfe.WRITER_TASK_TIMEOUT == {
+        name: scheduler_daemon.TASK_TIMEOUT[name] for name in sfe.LISTING_WRITER_TASKS
     }
     assert sfe.listing_writer_timeouts() == {
         name: scheduler_daemon.TASK_TIMEOUT[name] for name in sfe.LISTING_WRITER_TASKS
@@ -732,10 +735,31 @@ def test_text_table_title_and_strips(tmp_path):
         ],
         ctx,
     )
-    assert code == 2
-    assert "required_aspect_would_empty" in (out + json.dumps(report))
+    assert code == 0
+    sku = report["skus"][0]
+    assert sku["status"] == "planned"
+    assert sku["diff"]["aspects"]["removed"]["Frame Material"] == ["Wood"]
     desc = ROWS[0]["optimization"]["description"]
     assert "Solid wood legs" in desc
+
+    synth = deepcopy(ROWS[0])
+    synth["optimization"]["categoryId"] = "999001"
+    ctx = make_ctx(tmp_path / "synth", db_rows=[synth])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W714P323654",
+            "--remove-aspect-value",
+            "Frame Material=Wood",
+            "--report",
+            str(tmp_path / "synth.json"),
+        ],
+        ctx,
+    )
+    assert code == 2
+    assert "required_aspect_would_empty" in (out + json.dumps(report))
 
 
 def test_required_aspect_fail_closed(tmp_path):
@@ -1274,3 +1298,260 @@ def test_deletion_only_helper_reorders_and_units():
     assert ok is False
     ok, _ = deletion_only_text("Water&nbsp;resistant", "Water resistant")
     assert ok is True
+
+
+def test_push_live_constructs_real_clients(tmp_path, monkeypatch):
+    monkeypatch.setenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    created = {}
+
+    class FakeReal:
+        base_url = "https://api.ebay.com"
+
+    def fake_factory(environment="PRODUCTION"):
+        created["env"] = environment
+        created["real"] = True
+        return FakeReal()
+
+    def fake_trading(ebay):
+        created["trading"] = ebay
+        return SimpleNamespace()
+
+    monkeypatch.setattr("src.clients.real_ebay_client.create_real_ebay_client", fake_factory)
+    monkeypatch.setattr("src.clients.ebay_trading_client.EbayTradingClient", fake_trading)
+    seed_db(tmp_path / "ebay_collection.db")
+    monkeypatch.setattr(sfe, "DATABASE_PATH", tmp_path / "ebay_collection.db")
+    monkeypatch.setattr(sfe, "MAINTENANCE_PATH", tmp_path / "no-maintenance.lock")
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        args = parse(
+            [
+                "--store",
+                "main",
+                "--sku",
+                "W465P341531",
+                "--strip-claim",
+                "plywood",
+                "--location",
+                "description",
+                "--push-live",
+                "--report",
+                str(tmp_path / "h1.json"),
+            ]
+        )
+        sfe.run_from_args(args, None)
+    finally:
+        sys.stdout = old
+    out = buf.getvalue()
+    assert created.get("real") is True
+    assert "https://api.ebay.com" in out
+    assert "EBAY_ENVIRONMENT=PRODUCTION" in out
+
+    created.clear()
+    args = parse(
+        [
+            "--store",
+            "aqua",
+            "--sku",
+            "W465P341531",
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--push-live",
+            "--report",
+            str(tmp_path / "h1a.json"),
+        ]
+    )
+    aqua = aqua_profile()
+    monkeypatch.setattr(sfe, "get_store_profile", lambda: aqua)
+    sys.stdout = io.StringIO()
+    try:
+        sfe.run_from_args(args, None)
+    except Exception:
+        pass
+    finally:
+        sys.stdout = old
+    assert created.get("real") is True
+    assert "trading" in created
+
+
+def test_live_strip_keeps_live_only_li_never_pushes_db_only_text(tmp_path):
+    row = deepcopy(ROWS[2])
+    row["optimization"]["description"] = (
+        "<ul><li>Plywood deck resists warping</li><li>DB-only extra sentence</li></ul>"
+    )
+    item = inventory_item(row)
+    live_desc = "<ul><li>Plywood deck resists warping</li><li>Live-only extra pad</li></ul>"
+    item["inventory"]["product"]["description"] = live_desc
+    item["offer"]["listingDescription"] = live_desc
+    ebay = FakeEbay({"W465P341531": item})
+    ctx = make_ctx(tmp_path, ebay=ebay)
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "h2 live vs db",
+            "--report",
+            str(tmp_path / "h2.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    offer_puts = [item for item in ebay.puts if "/offer/" in item["url"]]
+    assert offer_puts
+    pushed = offer_puts[0]["json"]["listingDescription"]
+    assert "Live-only extra pad" in pushed
+    assert "plywood" not in pushed.casefold()
+    assert "DB-only extra sentence" not in pushed
+
+    only_claim = deepcopy(ROWS[2])
+    only_claim["optimization"]["description"] = (
+        "<ul><li>Plywood deck resists warping</li><li>DB-only leftover</li></ul>"
+    )
+    only_item = inventory_item(only_claim)
+    only_live = "<ul><li>Plywood deck resists warping</li></ul>"
+    only_item["inventory"]["product"]["description"] = only_live
+    only_item["offer"]["listingDescription"] = only_live
+    only_ebay = FakeEbay({"W465P341531": only_item})
+    only_ctx = make_ctx(tmp_path / "empty-live", ebay=only_ebay, db_rows=[only_claim])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "h2 empty live after",
+            "--report",
+            str(tmp_path / "h2-empty.json"),
+        ],
+        only_ctx,
+    )
+    assert code == 0
+    empty_puts = [item for item in only_ebay.puts if "/offer/" in item["url"]]
+    assert empty_puts
+    empty_pushed = empty_puts[0]["json"]["listingDescription"]
+    assert "plywood" not in empty_pushed.casefold()
+    assert "DB-only leftover" not in empty_pushed
+    assert empty_pushed != only_live
+
+
+def test_zero_required_aspects_184155(tmp_path):
+    ctx = make_ctx(tmp_path)
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--remove-aspect",
+            "Function",
+            "--report",
+            str(tmp_path / "m3a.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["status"] == "planned"
+    assert "Function" in report["skus"][0]["diff"]["aspects"]["removed"]
+
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465140910",
+            "--set-category",
+            "184155",
+            "--allow-category",
+            "--report",
+            str(tmp_path / "m3b.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["diff"]["categoryId"]["after"] == "184155"
+
+
+def test_same_category_already_absent(tmp_path):
+    ctx = make_ctx(tmp_path)
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465140910",
+            "--set-category",
+            "20487",
+            "--allow-category",
+            "--report",
+            str(tmp_path / "l3.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["status"] == "already_absent"
+
+
+def test_set_from_file_unreadable(tmp_path):
+    ctx = make_ctx(tmp_path)
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--set-from-file",
+            f"description={tmp_path / 'missing.html'}",
+            "--report",
+            str(tmp_path / "l6.json"),
+        ],
+        ctx,
+    )
+    assert code == 2
+    assert "file_unreadable" in (out + json.dumps(report))
+
+
+def test_running_tool_does_not_create_scheduler_log(tmp_path):
+    log = ROOT / "logs" / "scheduler_daemon.log"
+    existed = log.exists()
+    mtime = log.stat().st_mtime if existed else None
+    ctx = make_ctx(tmp_path)
+    run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "features",
+            "--report",
+            str(tmp_path / "m1.json"),
+        ],
+        ctx,
+    )
+    source = Path(sfe.__file__).read_text(encoding="utf-8")
+    assert "scheduler_daemon" not in source
+    if existed:
+        assert log.stat().st_mtime == mtime
+    else:
+        assert not log.exists()

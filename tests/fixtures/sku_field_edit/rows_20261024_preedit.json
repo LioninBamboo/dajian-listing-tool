@@ -44,7 +44,7 @@
     "specs": {},
     "optimization": {
       "title": "Adjustable Support Rod 24 inch Steel",
-      "description": "<p>Concretely engineered steel rod</p><p>Fully assembled</p><p>24\" rod</p>",
+      "description": "<p>Concretely engineered steel rod</p><ul><li>Non-Slip PP End Pads protect hardwood, tile, and concrete floors</li><li>Steel construction</li></ul><p>Fully assembled</p><p>24\" rod</p>",
       "aspects": {
         "Brand": ["AquaVerve"],
         "Features": [
@@ -77,6 +77,7 @@
       "description": "<p>Hardwood-look powder-coated frame</p><ul><li>Plywood deck resists warping</li><li>Steel frame</li></ul><p>330 lbs capacity</p><p>2-Piece Set</p>",
       "aspects": {
         "Brand": ["AquaVerve"],
+        "Function": ["Hand Truck"],
         "Features": [
           "<li>Plywood deck resists warping</li>",
           "Steel frame"

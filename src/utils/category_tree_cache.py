@@ -260,19 +260,25 @@ def try_runtime_refresh_tree(tree_id: str, cache_dir: Optional[Path] = None) -> 
         return False
 
 
-def _load_one_tree(tree_id: str, cache_dir: Path) -> dict[str, tuple[str, str]]:
+def _load_one_tree(
+    tree_id: str,
+    cache_dir: Path,
+    *,
+    allow_runtime_refresh: bool = True,
+) -> dict[str, tuple[str, str]]:
     path = category_tree_cache_path(tree_id, cache_dir)
     owned = str(tree_id) in {str(tid) for tid in store_runtime_tree_ids()}
     needs_refresh = (not path.is_file()) or (not _cache_is_fresh(path))
     used_last_good = False
     if needs_refresh and owned:
-        if try_runtime_refresh_tree(tree_id, cache_dir):
+        if allow_runtime_refresh and try_runtime_refresh_tree(tree_id, cache_dir):
             path = category_tree_cache_path(tree_id, cache_dir)
         elif _cache_is_last_good(path):
             _warn_last_good(tree_id, path)
             used_last_good = True
         else:
-            _warn_refresh_failed_once()
+            if allow_runtime_refresh:
+                _warn_refresh_failed_once()
             return {}
     if not path.is_file():
         if not owned:
@@ -315,12 +321,14 @@ def _merge_flat_index(
 
 def load_category_indexes(
     cache_dir: Optional[Path] = None,
+    *,
+    allow_runtime_refresh: bool = True,
 ) -> dict[str, dict[str, tuple[str, str]]]:
     """Load trees 0 and 100 keyed by tree id so colliding ids stay distinct."""
     global _INDEX, _INDEX_BY_TREE, _INDEX_DIR, _INDEX_EXPIRES_AT
     directory = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
     now = _now()
-    if _INDEX_BY_TREE is not None and _INDEX_DIR == directory:
+    if allow_runtime_refresh and _INDEX_BY_TREE is not None and _INDEX_DIR == directory:
         if _INDEX_EXPIRES_AT is None or now < _INDEX_EXPIRES_AT:
             return {
                 tid: dict(piece) for tid, piece in _INDEX_BY_TREE.items()
@@ -330,10 +338,14 @@ def load_category_indexes(
     owned = {str(tid) for tid in store_runtime_tree_ids()}
     unavailable: set[str] = set()
     for tree_id in DEFAULT_TREE_IDS:
-        piece = _load_one_tree(tree_id, directory)
+        piece = _load_one_tree(
+            tree_id, directory, allow_runtime_refresh=allow_runtime_refresh
+        )
         by_tree[str(tree_id)] = piece
         if str(tree_id) in owned and not piece:
             unavailable.add(str(tree_id))
+    if not allow_runtime_refresh:
+        return {tid: dict(piece) for tid, piece in by_tree.items()}
     _UNAVAILABLE_TREES.clear()
     _UNAVAILABLE_TREES.update(unavailable)
     _INDEX_BY_TREE = {tid: dict(piece) for tid, piece in by_tree.items()}

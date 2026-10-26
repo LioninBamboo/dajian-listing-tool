@@ -24,10 +24,10 @@ from src.db.database_safety import (
     assert_single_link_database,
 )
 from src.services.live_listing_writes import (
-    _claim_strip_required_aspect_names,
     _put_inventory_product_only,
     _put_inventory_snapshot,
     _update_offer_description_only,
+    get_category_matcher,
 )
 from src.utils.approved_category import (
     is_valid_category_id,
@@ -37,7 +37,7 @@ from src.utils.approved_category import (
 from src.utils.category_tree_cache import (
     is_cached_leaf_category,
     is_cached_leaf_in_tree,
-    load_category_index,
+    load_category_indexes,
     lookup_category_in_tree,
 )
 from src.utils.claim_strip import (
@@ -65,7 +65,7 @@ from src.utils.claim_strip import (
 from src.utils.db_backup import create_online_backup
 from src.utils.publish_fee_preview import guard_category_write_high_fee
 from src.utils.store_profile import get_store_profile
-from src.utils.task_worker import _acquire_worker_lock
+from src.utils.task_worker import _acquire_worker_lock, _lock_is_stale
 from src.utils.text_deletion_guard import (
     deletion_only_aspects,
     deletion_only_text,
@@ -110,6 +110,21 @@ LISTING_WRITER_TASKS = frozenset(
         "listing_status_sync",
     }
 )
+WRITER_TASK_TIMEOUT = {
+    "daily_tasks": 14400,
+    "auto_publish": 3600,
+    "ops_daily": 1800,
+    "listing_audit": 10800,
+    "source_aspect_autofix": 7200,
+    "semantic_rewrite": 7200,
+    "missing_video_autofix": 7200,
+    "cro_fill_specifics": 1800,
+    "cro_title_rewrite": 900,
+    "cro_image_refresh": 1800,
+    "smart_reprice": 7200,
+    "source_refresh": 1800,
+    "listing_status_sync": 1800,
+}
 
 EDITABLE_OPT_KEYS = frozenset(
     {
@@ -234,6 +249,8 @@ class SkuPlan:
     live: dict[str, Any] = dc_field(default_factory=dict)
     live_after: dict[str, Any] = dc_field(default_factory=dict)
     qty_zero_preserved: bool = False
+    db_changed: bool = False
+    live_changed: bool = False
     db_readback: dict[str, Any] = dc_field(default_factory=dict)
     live_readback: dict[str, Any] = dc_field(default_factory=dict)
 
@@ -291,8 +308,17 @@ def _as_logs(raw: Any) -> list[Any]:
 
 def _row_dict(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:
     data = dict(row)
-    data["optimization"] = _as_opt(data.get("optimization"))
-    data["logs"] = _as_logs(data.get("logs"))
+    raw_opt = data.get("optimization")
+    raw_logs = data.get("logs")
+    data["_optimization_raw"] = (
+        raw_opt if isinstance(raw_opt, str) else json.dumps(_as_opt(raw_opt), ensure_ascii=False)
+    )
+    if isinstance(raw_logs, str):
+        data["_logs_raw"] = raw_logs
+    else:
+        data["_logs_raw"] = json.dumps(_as_logs(raw_logs), ensure_ascii=False)
+    data["optimization"] = _as_opt(raw_opt)
+    data["logs"] = _as_logs(raw_logs)
     return data
 
 
@@ -329,15 +355,11 @@ def store_tree_id(store: str) -> str:
 
 
 def listing_writer_timeouts() -> dict[str, int]:
-    from scheduler_daemon import TASK_TIMEOUT
-
-    return {name: int(TASK_TIMEOUT[name]) for name in LISTING_WRITER_TASKS}
+    return {name: int(WRITER_TASK_TIMEOUT[name]) for name in LISTING_WRITER_TASKS}
 
 
 def _task_lock_stale(lock_info: Mapping[str, Any], timeout_sec: int) -> bool:
-    from scheduler_daemon import _task_lock_is_stale
-
-    return bool(_task_lock_is_stale(lock_info, timeout_sec))
+    return bool(_lock_is_stale(dict(lock_info), int(timeout_sec), datetime.now()))
 
 
 def parse_location(location: str) -> tuple[str, str]:
@@ -507,8 +529,24 @@ def refuse(plan: SkuPlan, name: str, reason: str) -> SkuPlan:
     return plan
 
 
+def sku_edit_required_aspect_names(category_id: str | None) -> list[str] | None:
+    """Return required aspect names. ``[]`` means the taxonomy succeeded with none.
+
+    ``None`` is fail-closed: the lookup failed and every non-Features aspect
+    must be treated as required.
+    """
+    if not category_id:
+        return None
+    try:
+        matcher = get_category_matcher()
+        required_aspects, _ = matcher._get_category_aspects(str(category_id))
+        return [aspect.get("name") for aspect in required_aspects if aspect.get("name")]
+    except Exception:
+        return None
+
+
 def required_aspect_names(ctx: SkuFieldEditContext, category_id: str | None) -> tuple[list[str], bool]:
-    loader = ctx.required_aspect_loader or _claim_strip_required_aspect_names
+    loader = ctx.required_aspect_loader or sku_edit_required_aspect_names
     try:
         loaded = loader(category_id)
     except Exception:
@@ -604,6 +642,8 @@ def apply_ops(
     title = str(opt.get("title") or "")
     category_id = str(opt.get("categoryId") or "")
     changed = False
+    removed_desc_units: list[str] = []
+    removed_title_units: list[str] = []
     required_names, required_available = required_aspect_names(ctx, category_id)
 
     for op in ops:
@@ -632,6 +672,8 @@ def apply_ops(
                     if hit.status == STATUS_WILL_STRIP:
                         if ul_would_be_empty(description, [hit.removed_unit_html] if hit.removed_unit_html else []):
                             add_gate(plan, "empty_ul", True, "empty_ul_cleaned")
+                        if hit.removed_unit_html:
+                            removed_desc_units.append(hit.removed_unit_html)
                         description = hit.after_html
                         op_changed = True
                     elif hit.status not in {STATUS_ALREADY_ABSENT, STATUS_WILL_STRIP}:
@@ -683,6 +725,7 @@ def apply_ops(
                     if status == "title_would_degrade":
                         return refuse(plan, "title_would_degrade", "title_would_degrade")
                     if status == STATUS_WILL_STRIP:
+                        removed_title_units.append(title)
                         title = new_title
                         op_changed = True
             if op_changed:
@@ -706,7 +749,10 @@ def apply_ops(
             aspects.pop(key, None)
             changed = True
         elif op.kind == "set_from_file":
-            content = Path(op.path).read_text(encoding="utf-8")
+            try:
+                content = Path(op.path).read_text(encoding="utf-8")
+            except Exception:
+                return refuse(plan, "file_unreadable", "file_unreadable")
             current = description if op.field_name == "description" else title
             ok, offenders = deletion_only_text(current, content)
             if not ok:
@@ -719,7 +765,9 @@ def apply_ops(
                 title = content.strip()
             changed = True
         elif op.kind == "set_category":
-            verdict = run_category_gates(op.category_id, opt, aspects, ctx, args)
+            if str(op.category_id) == str(category_id):
+                continue
+            verdict = run_category_gates(op.category_id, opt, aspects, ctx, args, plan=plan)
             if not verdict[0]:
                 return refuse(plan, verdict[1], verdict[1])
             add_gate(plan, "category", True, "")
@@ -728,11 +776,13 @@ def apply_ops(
             if getattr(args, "mark_category_approved", False):
                 mark_category_approved(opt, op.category_id)
             category_id = str(op.category_id)
+            required_names, required_available = required_aspect_names(ctx, category_id)
             changed = True
 
     opt["description"] = description
     opt["title"] = title
     opt["aspects"] = aspects
+    plan.optimization_after = opt
 
     text_ok, offenders = deletion_only_text(
         str(plan.optimization_before.get("description") or ""),
@@ -754,12 +804,27 @@ def apply_ops(
     if not changed:
         plan.status = "already_absent"
         plan.optimization_after = deepcopy(plan.optimization_before)
+        plan.db_changed = False
         return plan
 
     plan.optimization_after = opt
-    plan.diff = build_diff(plan.optimization_before, opt)
+    plan.diff = build_diff(
+        plan.optimization_before,
+        opt,
+        removed_desc_units=removed_desc_units,
+        removed_title_units=removed_title_units,
+    )
+    plan.db_changed = True
     plan.status = "planned"
     return plan
+
+
+def store_category_indexes(ctx: SkuFieldEditContext) -> Mapping[str, Mapping[str, tuple[str, str]]] | None:
+    if ctx.category_indexes is not None:
+        return ctx.category_indexes
+    if ctx.category_index is not None:
+        return None
+    return load_category_indexes(allow_runtime_refresh=False)
 
 
 def run_category_gates(
@@ -768,26 +833,33 @@ def run_category_gates(
     aspects: Mapping[str, list[str]],
     ctx: SkuFieldEditContext,
     args: Any,
+    plan: SkuPlan | None = None,
 ) -> tuple[bool, str, str]:
     if not getattr(args, "allow_category", False):
         return False, "category_flag_required", ""
     if not is_valid_category_id(category_id):
         return False, "not_leaf", ""
     tree_id = store_tree_id(ctx.store)
+    indexes = store_category_indexes(ctx)
+    tree = (indexes or {}).get(tree_id) if indexes is not None else None
+    if indexes is not None and not tree:
+        return False, "unverified", ""
     leaf = is_cached_leaf_in_tree(
         category_id,
         tree_id,
-        indexes=ctx.category_indexes,
+        indexes=indexes,
     )
-    if ctx.category_indexes is None:
-        leaf = leaf or is_cached_leaf_category(category_id, index=ctx.category_index)
+    if indexes is None and ctx.category_index is not None:
+        leaf = is_cached_leaf_category(category_id, index=ctx.category_index)
     if not leaf:
         return False, "not_leaf", ""
     name = resolve_category_name(category_id, ctx)
     blocked = guard_category_write_high_fee(
         category_id,
         name,
-        index=ctx.category_index,
+        index=ctx.category_index if ctx.category_index is not None else (
+            dict(tree) if tree is not None else None
+        ),
         blacklist_path=str(ctx.high_fee_blacklist_path) if ctx.high_fee_blacklist_path else None,
     )
     if blocked:
@@ -806,6 +878,12 @@ def run_category_gates(
         key = find_aspect_key(aspects, req)
         if key is None or not aspects.get(key):
             return False, "target_required_aspect_missing", name
+    if getattr(args, "push_live", False) and plan is not None and plan.live:
+        live_aspects = _live_aspects_from_plan(plan)
+        for req in required_names:
+            key = find_aspect_key(live_aspects, req)
+            if key is None or not live_aspects.get(key):
+                return False, "target_required_aspect_missing", name
     if ctx.store == "aqua" and getattr(args, "push_live", False):
         return False, "aqua_live_category_unsupported", name
     return True, "", name
@@ -813,16 +891,28 @@ def run_category_gates(
 
 def resolve_category_name(category_id: str, ctx: SkuFieldEditContext) -> str:
     tree_id = store_tree_id(ctx.store)
-    hit = lookup_category_in_tree(category_id, tree_id, indexes=ctx.category_indexes)
+    indexes = store_category_indexes(ctx)
+    hit = lookup_category_in_tree(category_id, tree_id, indexes=indexes)
     if hit:
         return hit[0]
-    index = dict(ctx.category_index) if ctx.category_index is not None else load_category_index()
-    if category_id in index:
-        return str(index[category_id][0])
+    if ctx.category_index is not None and category_id in ctx.category_index:
+        return str(ctx.category_index[category_id][0])
     return ""
 
 
-def build_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+def _live_aspects_from_plan(plan: SkuPlan) -> dict[str, list[str]]:
+    if "inventory" in plan.live:
+        return _normalize_aspects(((plan.live.get("inventory") or {}).get("product") or {}).get("aspects"))
+    return _normalize_aspects(plan.live.get("aspects"))
+
+
+def build_diff(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    *,
+    removed_desc_units: list[str] | None = None,
+    removed_title_units: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
     import difflib
 
     diff: dict[str, dict[str, Any]] = {}
@@ -830,7 +920,7 @@ def build_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str,
         left = str(before.get(key) or "")
         right = str(after.get(key) or "")
         if left != right:
-            diff[key] = {
+            entry = {
                 "before": left,
                 "after": right,
                 "unified": "\n".join(
@@ -843,6 +933,10 @@ def build_diff(before: Mapping[str, Any], after: Mapping[str, Any]) -> dict[str,
                     )
                 ),
             }
+            units = removed_desc_units if key == "description" else removed_title_units
+            if units:
+                entry["removed_units"] = list(units)
+            diff[key] = entry
     before_asp = _normalize_aspects(before.get("aspects"))
     after_asp = _normalize_aspects(after.get("aspects"))
     if before_asp != after_asp:
@@ -978,10 +1072,15 @@ def print_plan(plan: SkuPlan) -> None:
         print(f"计划: {sku} {', '.join(plan.diff.keys()) or 'no-op'} — {plan.status}")
     for field_name, payload in plan.diff.items():
         print(f"  {field_name}:")
-        if "unified" in payload:
-            print(payload["unified"])
+        if field_name in {"description", "title"} and payload.get("removed_units"):
+            for unit in payload["removed_units"]:
+                print(f"    removed: {unit}")
         elif field_name == "aspects":
             print(f"    removed={payload.get('removed')} added={payload.get('added')}")
+        elif field_name == "categoryId":
+            print(f"    {payload.get('before')} → {payload.get('after')}")
+        elif "unified" in payload:
+            print(payload["unified"])
         else:
             print(f"    {payload.get('before')} → {payload.get('after')}")
     for gate in plan.gates:
@@ -1128,7 +1227,150 @@ def snapshot_and_plan(
         plan = fetch_live(plan, ctx, args)
         if plan.status == "refused":
             return plan
-    return apply_ops(plan, ops, ctx, args)
+    plan = apply_ops(plan, ops, ctx, args)
+    if plan.status == "refused":
+        return plan
+    if getattr(args, "push_live", False) and plan.live:
+        plan = apply_live_ops(plan, ops, ctx, args)
+    return plan
+
+
+def apply_live_ops(
+    plan: SkuPlan,
+    ops: list[EditOp],
+    ctx: SkuFieldEditContext,
+    args: Any,
+) -> SkuPlan:
+    """Apply the same text/aspect ops to the LIVE snapshot, never DB text."""
+    if ctx.store == "aqua":
+        offer_desc = str(plan.live.get("description") or "")
+        inv_desc = offer_desc
+        title = str(plan.live.get("title") or "")
+        aspects = _normalize_aspects(plan.live.get("aspects"))
+    else:
+        inventory = plan.live.get("inventory") or {}
+        offer = plan.live.get("offer") or {}
+        product = inventory.get("product") or {}
+        offer_desc = str(offer.get("listingDescription") or "")
+        inv_desc = str(product.get("description") or "")
+        title = str(product.get("title") or "")
+        aspects = _normalize_aspects(product.get("aspects"))
+    live_offer_before, live_inv_before, live_title_before = offer_desc, inv_desc, title
+    live_aspects_before = deepcopy(aspects)
+    category_id = str(plan.optimization_after.get("categoryId") or plan.optimization_before.get("categoryId") or "")
+    required_names, required_available = required_aspect_names(ctx, category_id)
+    changed = False
+
+    def _strip_live_html(html: str, claim: str) -> tuple[str, str | None]:
+        hit = strip_claim_from_description(html, claim, _description_snippet(html, claim))
+        if hit.status == STATUS_PROTECTED_ZONE:
+            raise ToolRefused("protected_zone")
+        if hit.status == STATUS_WILL_STRIP:
+            return hit.after_html, hit.removed_unit_html or None
+        return html, None
+
+    try:
+        for op in ops:
+            if op.kind == "set_from_file" and op.field_name in QTY_PRICE_FIELDS:
+                return refuse(plan, "qty_price_not_editable", "qty_price_not_editable")
+            if op.kind == "strip_claim":
+                claim = op.text
+                locations = ["description", "features", "aspects_all", "title"] if op.location == "all" else [op.location]
+                for loc in locations:
+                    if loc == "description":
+                        offer_desc, _ = _strip_live_html(offer_desc, claim)
+                        inv_desc, _ = _strip_live_html(inv_desc, claim)
+                    elif loc == "title":
+                        new_title, status = _strip_title(title, claim)
+                        if status == "title_would_degrade":
+                            return refuse(plan, "title_would_degrade", "title_would_degrade")
+                        if status == STATUS_WILL_STRIP:
+                            title = new_title
+                    elif loc in {"features", "aspect", "aspects_all"}:
+                        target = "Features" if loc == "features" else (op.aspect_name if loc == "aspect" else "")
+                        result, status = _strip_claim_from_aspect_values(
+                            aspects, target, claim, required_names, required_available
+                        )
+                        if status == "required_aspect_would_empty":
+                            return refuse(plan, "required_aspect_would_empty_live", "required_aspect_would_empty_live")
+                        if status == STATUS_WILL_STRIP and result is not None:
+                            aspects = result
+            elif op.kind == "remove_aspect_value":
+                result, status = _drop_aspect_value(
+                    aspects, op.aspect_name, op.aspect_value, required_names, required_available
+                )
+                if status == "required_aspect_would_empty":
+                    return refuse(plan, "required_aspect_would_empty_live", "required_aspect_would_empty_live")
+                if status == STATUS_WILL_STRIP and result is not None:
+                    aspects = result
+            elif op.kind == "remove_aspect":
+                key = find_aspect_key(aspects, op.aspect_name)
+                if key is None:
+                    continue
+                if not is_features_aspect(key) and (
+                    not required_available or is_required_aspect(key, required_names)
+                ):
+                    return refuse(plan, "required_aspect_would_empty_live", "required_aspect_would_empty_live")
+                aspects = dict(aspects)
+                aspects.pop(key, None)
+            elif op.kind == "set_from_file":
+                try:
+                    content = Path(op.path).read_text(encoding="utf-8")
+                except Exception:
+                    return refuse(plan, "file_unreadable", "file_unreadable")
+                if op.field_name == "description":
+                    for before in (offer_desc, inv_desc):
+                        ok, offenders = deletion_only_text(before, content)
+                        if not ok:
+                            return refuse(
+                                plan, "text_add_refused_live", "text_add_refused_live:" + ",".join(offenders)
+                            )
+                    offer_desc = content
+                    inv_desc = content
+                else:
+                    ok, offenders = deletion_only_text(title, content)
+                    if not ok:
+                        return refuse(plan, "text_add_refused_live", "text_add_refused_live:" + ",".join(offenders))
+                    if title_would_degrade(title, content.strip()):
+                        return refuse(plan, "title_would_degrade", "title_would_degrade")
+                    title = content.strip()
+            elif op.kind == "set_category":
+                required_names, required_available = required_aspect_names(ctx, op.category_id)
+    except ToolRefused as exc:
+        return refuse(plan, exc.reason, exc.reason)
+
+    for label, before, after in (
+        ("offer_description", live_offer_before, offer_desc),
+        ("inventory_description", live_inv_before, inv_desc),
+        ("title", live_title_before, title),
+    ):
+        ok, offenders = deletion_only_text(before, after)
+        if not ok:
+            return refuse(plan, "text_add_refused_live", "text_add_refused_live:" + ",".join(offenders))
+    asp_ok, asp_offenders = deletion_only_aspects(live_aspects_before, aspects)
+    if not asp_ok:
+        return refuse(plan, "text_add_refused_live", "text_add_refused_live:" + ",".join(asp_offenders))
+    add_gate(plan, "deletion_only_live", True, "")
+
+    if ctx.store == "aqua":
+        plan.live_after = {"description": offer_desc, "title": title, "aspects": aspects}
+    else:
+        plan.live_after = {
+            "offer_description": offer_desc,
+            "inventory_description": inv_desc,
+            "title": title,
+            "aspects": aspects,
+        }
+    changed = (
+        offer_desc != live_offer_before
+        or inv_desc != live_inv_before
+        or title != live_title_before
+        or aspects != live_aspects_before
+    )
+    plan.live_changed = changed
+    if changed and plan.status == "already_absent":
+        plan.status = "planned"
+    return plan
 
 
 def backup_run(
@@ -1195,7 +1437,7 @@ def apply_db_write(
     run_id: str,
     rows_before: list[dict[str, Any]],
 ) -> int:
-    if plan.status != "planned":
+    if plan.status != "planned" or not plan.db_changed:
         return EXIT_OK
     conn.execute("BEGIN IMMEDIATE")
     fresh = load_row(conn, plan.sku)
@@ -1275,25 +1517,51 @@ def restore_db_row(conn: sqlite3.Connection, sku: str, rows_before: list[dict[st
     if not snapshot:
         return False
     row = snapshot.get("row") or {}
+    opt_raw = row.get("_optimization_raw")
+    if not isinstance(opt_raw, str):
+        raw = row.get("optimization")
+        opt_raw = raw if isinstance(raw, str) else json.dumps(_as_opt(raw), ensure_ascii=False)
+    logs_raw = row.get("_logs_raw")
+    if not isinstance(logs_raw, str):
+        raw_logs = row.get("logs")
+        logs_raw = raw_logs if isinstance(raw_logs, str) else json.dumps(_as_logs(raw_logs), ensure_ascii=False)
+    updated_at = row.get("updated_at")
     try:
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
             "UPDATE collected_products SET optimization=?, updated_at=?, logs=? WHERE sku=?",
-            (
-                json.dumps(_as_opt(row.get("optimization")), ensure_ascii=False),
-                row.get("updated_at"),
-                json.dumps(_as_logs(row.get("logs")), ensure_ascii=False),
-                sku,
-            ),
+            (opt_raw, updated_at, logs_raw, sku),
         )
         conn.execute("COMMIT")
-        return True
     except Exception:
         try:
             conn.execute("ROLLBACK")
         except Exception:
             pass
         return False
+    return verify_restored_row(conn, sku, opt_raw, logs_raw, updated_at)
+
+
+def verify_restored_row(
+    conn: sqlite3.Connection,
+    sku: str,
+    opt_raw: str,
+    logs_raw: str,
+    updated_at: Any,
+) -> bool:
+    cur = conn.execute(
+        "SELECT optimization, logs, updated_at FROM collected_products WHERE sku=?",
+        (sku,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return False
+    data = dict(row)
+    return (
+        str(data.get("optimization") or "") == opt_raw
+        and str(data.get("logs") or "") == logs_raw
+        and data.get("updated_at") == updated_at
+    )
 
 
 def _offer_put(ebay_client: Any, offer_id: str, payload: Mapping[str, Any]) -> Any:
@@ -1314,7 +1582,9 @@ def _offer_put(ebay_client: Any, offer_id: str, payload: Mapping[str, Any]) -> A
 
 
 def apply_live_push(plan: SkuPlan, ctx: SkuFieldEditContext, args: Any) -> int:
-    if plan.status != "applied":
+    if plan.status not in {"applied", "planned"}:
+        return EXIT_OK
+    if plan.status == "planned" and not plan.live_changed:
         return EXIT_OK
     try:
         if ctx.store == "aqua":
@@ -1341,7 +1611,21 @@ def apply_live_push(plan: SkuPlan, ctx: SkuFieldEditContext, args: Any) -> int:
     return _fail_live(plan, ctx, db_restored=False, reason="live_readback_mismatch")
 
 
+def _live_planned_text(plan: SkuPlan, key: str, fallback: str = "") -> str:
+    """Return the live-planned string for ``key``. Empty is a real value.
+
+    Never falls back to DB ``optimization`` text. Using DB text on a live
+    push or readback can add or revert live-only content (H2).
+    """
+    planned = plan.live_after or {}
+    if key in planned and planned[key] is not None:
+        return str(planned[key])
+    return fallback
+
+
 def _planned_live_aspects(plan: SkuPlan) -> dict[str, list[str]]:
+    if plan.live_after.get("aspects") is not None:
+        return _normalize_aspects(plan.live_after.get("aspects"))
     live_aspects = _normalize_aspects(
         ((plan.live.get("inventory") or {}).get("product") or {}).get("aspects")
         if ctx_store_is_inventory(plan)
@@ -1413,45 +1697,30 @@ def _push_inventory(plan: SkuPlan, ctx: SkuFieldEditContext) -> None:
     live_title = str(product.get("title") or "")
     live_desc = str(product.get("description") or "")
     live_offer_desc = str(offer.get("listingDescription") or "")
-    new_title = str(plan.optimization_after.get("title") or live_title)
-    new_desc = str(plan.optimization_after.get("description") or live_desc)
-    title_changed = "title" in plan.diff
-    desc_changed = "description" in plan.diff
-    aspects_changed = "aspects" in plan.diff
+    new_title = _live_planned_text(plan, "title", live_title)
+    new_offer_desc = _live_planned_text(plan, "offer_description", live_offer_desc)
+    new_inv_desc = _live_planned_text(plan, "inventory_description", live_desc)
+    title_changed = new_title != live_title
+    offer_desc_changed = new_offer_desc != live_offer_desc
+    inv_desc_changed = new_inv_desc != live_desc
     planned_aspects = _planned_live_aspects(plan)
-    if desc_changed:
-        _update_offer_description_only(ebay, offer_id, new_desc)
-        if claim_still_in_unprotected(_first_strip_claim(plan), live_desc) or live_desc != new_desc:
-            _put_inventory_product_only(
-                ebay,
-                plan.sku,
-                live_title if not title_changed else new_title,
-                new_desc,
-                planned_aspects if aspects_changed else _normalize_aspects(product.get("aspects")),
-            )
-            title_changed = False
-            aspects_changed = False
-    if title_changed or aspects_changed:
+    aspects_changed = planned_aspects != _normalize_aspects(product.get("aspects"))
+    if offer_desc_changed:
+        _update_offer_description_only(ebay, offer_id, new_offer_desc)
+    if inv_desc_changed or title_changed or aspects_changed:
         _put_inventory_product_only(
             ebay,
             plan.sku,
             new_title if title_changed else live_title,
-            live_desc if not desc_changed else new_desc,
+            new_inv_desc if inv_desc_changed else live_desc,
             planned_aspects if aspects_changed else _normalize_aspects(product.get("aspects")),
         )
     if "categoryId" in plan.diff:
         target = str(plan.optimization_after.get("categoryId") or "")
-        required_names, available = required_aspect_names(ctx, target)
-        live_aspects = _normalize_aspects(product.get("aspects"))
-        if not available or any(
-            not find_aspect_key(live_aspects, name) or not live_aspects.get(find_aspect_key(live_aspects, name) or "")
-            for name in required_names
-        ):
-            raise ToolRefused("target_required_aspect_missing")
         live_offer = ebay.get_offer(offer_id)
         payload = offer_category_only_put_payload(live_offer, target)
         _offer_put(ebay, offer_id, payload)
-    _ = live_offer_desc
+    _ = claim_still_in_unprotected
 
 
 def _first_strip_claim(plan: SkuPlan) -> str:
@@ -1466,11 +1735,18 @@ def _push_aqua(plan: SkuPlan, ctx: SkuFieldEditContext) -> None:
         raise ToolRefused("aqua_live_category_unsupported")
     ebay = ctx.ebay_client
     kwargs: dict[str, Any] = {}
-    if "description" in plan.diff:
-        kwargs["description"] = plan.optimization_after.get("description")
-    if "title" in plan.diff:
-        kwargs["title"] = plan.optimization_after.get("title")
-    if "aspects" in plan.diff:
+    planned = plan.live_after or {}
+    live_desc = str(plan.live.get("description") or "")
+    live_title = str(plan.live.get("title") or "")
+    new_desc = _live_planned_text(plan, "description", live_desc)
+    new_title = _live_planned_text(plan, "title", live_title)
+    if new_desc != live_desc:
+        kwargs["description"] = new_desc
+    if new_title != live_title:
+        kwargs["title"] = new_title
+    if planned.get("aspects") is not None and _normalize_aspects(planned.get("aspects")) != _normalize_aspects(
+        plan.live.get("aspects")
+    ):
         kwargs["item_specifics"] = _planned_live_aspects(plan)
     if not kwargs:
         return
@@ -1486,11 +1762,13 @@ def live_readback_ok(plan: SkuPlan, ctx: SkuFieldEditContext) -> tuple[bool, lis
         parsed = parse_getitem_xml(xml or "")
         description = ebay.get_item_description_motors(plan.listing_id)
         compatibility = ebay.get_item_compatibility_motors(plan.listing_id)
-        if "description" in plan.diff and str(description or parsed.get("description") or "") != str(
-            plan.optimization_after.get("description") or ""
-        ):
+        want_desc = _live_planned_text(plan, "description", str(plan.live.get("description") or ""))
+        want_title = _live_planned_text(plan, "title", str(plan.live.get("title") or ""))
+        if (plan.live_changed or "description" in plan.diff) and str(
+            description or parsed.get("description") or ""
+        ) != want_desc:
             mismatches.append("description")
-        if "title" in plan.diff and str(parsed.get("title") or "") != str(plan.optimization_after.get("title") or ""):
+        if (plan.live_changed or "title" in plan.diff) and str(parsed.get("title") or "") != want_title:
             mismatches.append("title")
         if "aspects" in plan.diff and _normalize_aspects(parsed.get("aspects")) != _planned_live_aspects(plan):
             mismatches.append("aspects")
@@ -1515,22 +1793,23 @@ def live_readback_ok(plan: SkuPlan, ctx: SkuFieldEditContext) -> tuple[bool, lis
     if fetches_price_or_qty_changed(plan.live.get("inventory"), plan.live.get("offer"), inventory, offer):
         mismatches.append("price_qty")
     product = inventory.get("product") or {}
-    if "description" in plan.diff or "aspects" in plan.diff:
+    if plan.live_changed or "description" in plan.diff or "aspects" in plan.diff:
         from src.utils.claim_strip import SkuPlan as ClaimSkuPlan
 
+        live_product = (plan.live.get("inventory") or {}).get("product") or {}
         claim_plan = ClaimSkuPlan(
             sku=plan.sku,
             listing_id=plan.listing_id,
-            title=str(plan.optimization_after.get("title") or ""),
+            title=_live_planned_text(plan, "title", str(live_product.get("title") or "")),
             offer_description_before=str((plan.live.get("offer") or {}).get("listingDescription") or ""),
-            offer_description_after=str(plan.optimization_after.get("description") or ""),
-            inventory_description_before=str(
-                ((plan.live.get("inventory") or {}).get("product") or {}).get("description") or ""
+            offer_description_after=_live_planned_text(
+                plan, "offer_description", str((plan.live.get("offer") or {}).get("listingDescription") or "")
             ),
-            inventory_description_after=str(plan.optimization_after.get("description") or ""),
-            aspects_before=_normalize_aspects(
-                ((plan.live.get("inventory") or {}).get("product") or {}).get("aspects")
+            inventory_description_before=str(live_product.get("description") or ""),
+            inventory_description_after=_live_planned_text(
+                plan, "inventory_description", str(live_product.get("description") or "")
             ),
+            aspects_before=_normalize_aspects(live_product.get("aspects")),
             aspects_after=_planned_live_aspects(plan),
         )
         checks = verify_readback(
@@ -1544,7 +1823,10 @@ def live_readback_ok(plan: SkuPlan, ctx: SkuFieldEditContext) -> tuple[bool, lis
             mismatches.append("description")
         if "aspects" in plan.diff and not checks.get("units_gone", True):
             mismatches.append("aspects")
-    if "title" in plan.diff and str(product.get("title") or "") != str(plan.optimization_after.get("title") or ""):
+    want_title = _live_planned_text(
+        plan, "title", str(((plan.live.get("inventory") or {}).get("product") or {}).get("title") or "")
+    )
+    if (plan.live_changed or "title" in plan.diff) and str(product.get("title") or "") != want_title:
         mismatches.append("title")
     if "aspects" in plan.diff and _normalize_aspects(product.get("aspects")) != _planned_live_aspects(plan):
         if "aspects" not in mismatches:
@@ -1601,13 +1883,30 @@ def default_report_path(store: str, stamp: str, run_id: str) -> Path:
     return _REPO_ROOT / "logs" / "sku_field_edit" / f"{stamp}_{store}_{run_id}.json"
 
 
+def build_live_clients(store: str) -> tuple[Any, Any]:
+    """Construct production Inventory (and Aqua Trading) clients. Env is read-only."""
+    environment = os.environ.get("EBAY_ENVIRONMENT") or "PRODUCTION"
+    from src.clients.real_ebay_client import create_real_ebay_client
+
+    ebay = create_real_ebay_client(environment=environment)
+    trading = None
+    if store == "aqua":
+        from src.clients.ebay_trading_client import EbayTradingClient
+
+        trading = EbayTradingClient(ebay)
+    return ebay, trading
+
+
 def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
     run_id = secrets.token_hex(4)
-    stamp = datetime.now(UTC).replace(tzinfo=None).strftime("%Y%m%d_%H%M%S")
+    now_utc = datetime.now(UTC)
+    stamp = now_utc.strftime("%Y%m%d_%H%M%SZ")
+    stamp_local = datetime.now().strftime("%Y%m%d_%H%M%S")
     report_path = Path(args.report) if getattr(args, "report", None) else default_report_path(args.store, stamp, run_id)
     lock_fd = None
     lock_path = None
     backup_info: dict[str, Any] = {}
+    wrote_anything = False
     mode = "dry_run"
     if getattr(args, "apply", False) and getattr(args, "push_live", False):
         mode = "apply_push_live"
@@ -1633,6 +1932,10 @@ def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
         )
         ctx.store = args.store
         ctx.profile = profile
+        if getattr(args, "push_live", False) and ctx.ebay_client is None:
+            ctx.ebay_client, built_trading = build_live_clients(args.store)
+            if ctx.trading_client is None:
+                ctx.trading_client = built_trading
         preflight(args, ctx)
         lock_fd, lock_path = acquire_tool_lock(ctx)
         if getattr(args, "apply", False):
@@ -1653,7 +1956,11 @@ def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
                 print_plan(plan)
                 if plan.status == "refused":
                     worst = max(worst, EXIT_REFUSED)
-            writable = [plan for plan in plans if plan.status == "planned"]
+            writable = [
+                plan
+                for plan in plans
+                if plan.status == "planned" and (plan.db_changed or plan.live_changed)
+            ]
             if getattr(args, "apply", False) and writable:
                 try:
                     backup_info = backup_run(ctx, args, plans, run_id, stamp)
@@ -1663,8 +1970,12 @@ def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
                 for plan in plans:
                     if plan.status != "planned":
                         continue
-                    code = apply_db_write(conn, plan, ctx, args, run_id, rows_before)
-                    print(f"写库: {plan.sku} {plan.status} db_readback={plan.db_readback}")
+                    if plan.db_changed:
+                        code = apply_db_write(conn, plan, ctx, args, run_id, rows_before)
+                        wrote_anything = True
+                        print(f"写库: {plan.sku} {plan.status} db_readback={plan.db_readback}")
+                    else:
+                        code = EXIT_OK
                     if code >= EXIT_RESTORED:
                         if code == EXIT_RESTORE_FAILED:
                             print(
@@ -1674,14 +1985,21 @@ def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
                         worst = max(worst, code)
                         if getattr(args, "stop_on_error", True):
                             break
-                    if code == EXIT_OK and getattr(args, "push_live", False):
+                    if code == EXIT_OK and getattr(args, "push_live", False) and (
+                        plan.status == "applied" or plan.live_changed
+                    ):
                         live_code = apply_live_push(plan, ctx, args)
+                        wrote_anything = True
                         if live_code != EXIT_OK:
-                            restore_db_row(conn, plan.sku, rows_before)
+                            db_restored = False
+                            if plan.db_changed:
+                                db_restored = restore_db_row(conn, plan.sku, rows_before)
                             plan.db_readback = {
                                 **plan.db_readback,
-                                "restored_after_live_fail": True,
+                                "db_restored": db_restored,
                             }
+                            if not db_restored and plan.db_changed:
+                                live_code = EXIT_RESTORE_FAILED
                             if live_code == EXIT_RESTORE_FAILED:
                                 print(
                                     f"RESTORE_FAILED backup={backup_info.get('dir')} "
@@ -1708,6 +2026,8 @@ def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
                 "note": getattr(args, "note", ""),
                 "backup_dir": str(backup_info.get("dir") or ""),
                 "db_backup": backup_info.get("db") or {},
+                "stamp_utc": stamp,
+                "stamp_local": stamp_local,
                 "skus": [plan_to_report(plan) for plan in plans],
             }
             write_json(report_path, report)
@@ -1721,6 +2041,12 @@ def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
         finally:
             conn.close()
     except ToolRefused as exc:
+        if wrote_anything:
+            print(
+                f"RESTORE_FAILED backup={backup_info.get('dir')} "
+                f"db={backup_info.get('db', {}).get('path')} after write: {exc.reason}"
+            )
+            return EXIT_RESTORE_FAILED
         print(f"已拒绝: {exc.reason}")
         report = {
             "run_id": run_id,
@@ -1730,6 +2056,8 @@ def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
             "note": getattr(args, "note", ""),
             "backup_dir": "",
             "db_backup": {},
+            "stamp_utc": stamp,
+            "stamp_local": stamp_local,
             "skus": [{"sku": "*", "status": "refused", "refuse_reason": exc.reason, "gates": [], "diff": {}, "ops": []}],
         }
         try:
@@ -1738,6 +2066,12 @@ def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
             pass
         return exc.exit_code
     except Exception as exc:
+        if wrote_anything:
+            print(
+                f"RESTORE_FAILED backup={backup_info.get('dir')} "
+                f"db={backup_info.get('db', {}).get('path')} after write: {exc}"
+            )
+            return EXIT_RESTORE_FAILED
         print(f"已拒绝: {exc}")
         return EXIT_REFUSED
     finally:

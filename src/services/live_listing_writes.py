@@ -1,15 +1,16 @@
 """Live Inventory write helpers shared by audit_fix and sku_field_edit.
 
 Moved from ``scripts/audit_fix_active_listings.py`` without behavior changes.
-Same-module helpers that those functions called stay available here; names that
-still live on the audit script are resolved lazily so monkeypatches keep working.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import re
 from copy import deepcopy
 
+from src.services.ebay_category_matcher import create_category_matcher
 from src.utils.html_truncator import smart_truncate_html
 from src.utils.publish_autofix import (
     SINGLE_VALUE_ASPECTS,
@@ -20,62 +21,78 @@ from src.utils.publish_autofix import (
 from src.utils.title_sanitizer import normalize_listing_title_for_ebay
 
 
-_HOST_GLOBALS_LIST: list[dict] = []
-
-
-def bind_host_globals(ns: dict) -> None:
-    """Remember every audit-script module dict that imported these helpers.
-
-    The CLI test loads the script via importlib without putting it in
-    ``sys.modules``. A later ``import scripts.audit_fix_active_listings``
-    must not hide that first host, because tests monkeypatch it.
-    """
-    if ns not in _HOST_GLOBALS_LIST:
-        _HOST_GLOBALS_LIST.append(ns)
-
-
-def _audit_fix_attr(name: str, fallback=None):
-    """Resolve a name from an already-loaded audit script host."""
-    import sys
-
-    values = []
-    for ns in _HOST_GLOBALS_LIST:
-        if name in ns:
-            values.append(ns[name])
-    for mod_name in ("audit_fix_active_listings", "scripts.audit_fix_active_listings"):
-        mod = sys.modules.get(mod_name)
-        if mod is not None and hasattr(mod, name):
-            value = getattr(mod, name)
-            if value not in values:
-                values.append(value)
-    if fallback is not None:
-        for value in values:
-            if value is not fallback:
-                return value
-        return fallback
-    if values:
-        return values[-1]
-    from scripts import audit_fix_active_listings as _mod
-
-    return getattr(_mod, name)
-
-
-def compress_html(html: str) -> str:
-    return _audit_fix_attr("compress_html")(html)
+_CATEGORY_MATCHER = None
 
 
 def get_category_matcher():
-    return _audit_fix_attr("get_category_matcher")()
+    global _CATEGORY_MATCHER
+    if _CATEGORY_MATCHER is None:
+        _CATEGORY_MATCHER = create_category_matcher(os.getenv("EBAY_ENVIRONMENT", "PRODUCTION"))
+    return _CATEGORY_MATCHER
+
+
+def remove_empty_table_rows(html: str) -> str:
+    def repl(match):
+        row_content = match.group(1)
+        tds = re.findall(r'<td\b[^>]*>(.*?)</td>', row_content, flags=re.IGNORECASE | re.DOTALL)
+        if len(tds) >= 2:
+            val_text = re.sub(r'<[^>]+>', '', tds[1])
+            val_text = val_text.replace('&nbsp;', '').replace('&#160;', '').replace('&mdash;', '').replace('&#8212;', '')
+            val_text = re.sub(r'[\s\xa0\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]+', '', val_text)
+            if not val_text or val_text.strip() in ("", "-", "Does Not Apply"):
+                return ""
+        
+        text = re.sub(r'<[^>]+>', '', row_content)
+        text = text.replace('&nbsp;', '').replace('&#160;', '').replace('&mdash;', '').replace('&#8212;', '')
+        text = re.sub(r'[\s\xa0\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]+', '', text)
+        if not text:
+            return ""
+        return match.group(0)
+    return re.sub(r'<tr\b[^>]*>(.*?)</tr>', repl, html, flags=re.IGNORECASE | re.DOTALL)
+
+
+def compress_html(html: str) -> str:
+    if not html:
+        return ""
+    html = remove_empty_table_rows(html)
+    html = re.sub(r'[\r\n\t]+', ' ', html)
+    html = re.sub(r'\s+', ' ', html)
+    html = re.sub(r'>\s+<', '><', html)
+    return html.strip()
+
+
+def _select_best_offer(offers, expected_listing_id=None):
+    """Prefer the live published offer over stale unpublished leftovers."""
+    if not offers:
+        return None
+
+    def _rank(offer):
+        listing = offer.get("listing") or {}
+        listing_id = listing.get("listingId")
+        listing_status = listing.get("listingStatus", "")
+        status = offer.get("status", "")
+        listing_match_rank = 0 if expected_listing_id and listing_id == expected_listing_id else 1
+        active_rank = 0 if listing_status == "ACTIVE" else 1
+        published_rank = 0 if status == "PUBLISHED" else 1
+        return (listing_match_rank, active_rank, published_rank, offer.get("offerId", ""))
+
+    return sorted(offers, key=_rank)[0]
 
 
 def _fetch_live_listing_context(ebay_client, sku, expected_listing_id=None):
-    return _audit_fix_attr("_fetch_live_listing_context")(
-        ebay_client, sku, expected_listing_id=expected_listing_id
-    )
+    inventory_item = ebay_client.get_inventory_item(sku) or {}
+    offers = ebay_client.get_offers_by_sku(sku) or []
+    offer = _select_best_offer(offers, expected_listing_id=expected_listing_id)
+    return inventory_item, offer
 
 
 def _publish_offer_checked(ebay_client, offer_id: str):
-    return _audit_fix_attr("_publish_offer_checked")(ebay_client, offer_id)
+    if not hasattr(ebay_client, "publish_offer"):
+        raise RuntimeError(f"offer {offer_id}: client has no publish_offer")
+    result = ebay_client.publish_offer(offer_id)
+    if not result or not result.get("listingId"):
+        raise RuntimeError(f"publish_offer({offer_id}) returned {result!r}")
+    return result
 
 
 def resolve_inventory_availability_for_product_put(
@@ -264,9 +281,7 @@ def _put_inventory_product_only(
     else:
         from src.clients.real_ebay_client import lookup_stored_video_id as _default_lookup
 
-        lookup = lookup_video or _audit_fix_attr(
-            "lookup_stored_video_id", fallback=_default_lookup
-        )
+        lookup = lookup_video or _default_lookup
         local_video_id = lookup(sku)
         if local_video_id:
             product["videoIds"] = [local_video_id]

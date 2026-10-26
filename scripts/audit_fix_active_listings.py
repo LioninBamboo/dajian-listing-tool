@@ -130,7 +130,6 @@ from src.services.vehicle_compatibility import (
     apply_compatibility_aspects,
     serialize_compatibility_analysis,
 )
-from src.services.ebay_category_matcher import create_category_matcher
 from src.utils.publish_aspect_completion import infer_number_of_items_in_set
 from src.utils.claim_diff_engine import (
     COUNTABLE_CLAIMS,
@@ -147,17 +146,20 @@ from src.utils.title_sanitizer import (
 from src.clients.real_ebay_client import lookup_stored_video_id
 from src.services.live_listing_writes import (  # noqa: E402
     _claim_strip_required_aspect_names as _moved_claim_strip_required_aspect_names,
+    _fetch_live_listing_context,
     _inventory_snapshot_put_payload,
     _offer_quantity_hint,
+    _publish_offer_checked,
     _put_inventory_product_only as _moved_put_inventory_product_only,
     _put_inventory_snapshot,
     _restore_claim_strip_snapshot,
+    _select_best_offer,
     _update_offer_description_only,
-    bind_host_globals,
+    compress_html,
+    get_category_matcher,
+    remove_empty_table_rows,
     resolve_inventory_availability_for_product_put,
 )
-
-bind_host_globals(globals())
 
 
 def _put_inventory_product_only(ebay_client, sku, title, description, aspects):
@@ -179,15 +181,7 @@ def _claim_strip_required_aspect_names(category_id):
     )
 
 
-_CATEGORY_MATCHER = None
 _FACT_SHEET_CONN = None
-
-
-def get_category_matcher():
-    global _CATEGORY_MATCHER
-    if _CATEGORY_MATCHER is None:
-        _CATEGORY_MATCHER = create_category_matcher(os.getenv("EBAY_ENVIRONMENT", "PRODUCTION"))
-    return _CATEGORY_MATCHER
 
 
 def get_fact_sheet_conn():
@@ -301,36 +295,6 @@ def parse_json(val):
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
-
-
-def remove_empty_table_rows(html: str) -> str:
-    def repl(match):
-        row_content = match.group(1)
-        tds = re.findall(r'<td\b[^>]*>(.*?)</td>', row_content, flags=re.IGNORECASE | re.DOTALL)
-        if len(tds) >= 2:
-            val_text = re.sub(r'<[^>]+>', '', tds[1])
-            val_text = val_text.replace('&nbsp;', '').replace('&#160;', '').replace('&mdash;', '').replace('&#8212;', '')
-            val_text = re.sub(r'[\s\xa0\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]+', '', val_text)
-            if not val_text or val_text.strip() in ("", "-", "Does Not Apply"):
-                return ""
-        
-        text = re.sub(r'<[^>]+>', '', row_content)
-        text = text.replace('&nbsp;', '').replace('&#160;', '').replace('&mdash;', '').replace('&#8212;', '')
-        text = re.sub(r'[\s\xa0\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]+', '', text)
-        if not text:
-            return ""
-        return match.group(0)
-    return re.sub(r'<tr\b[^>]*>(.*?)</tr>', repl, html, flags=re.IGNORECASE | re.DOTALL)
-
-
-def compress_html(html: str) -> str:
-    if not html:
-        return ""
-    html = remove_empty_table_rows(html)
-    html = re.sub(r'[\r\n\t]+', ' ', html)
-    html = re.sub(r'\s+', ' ', html)
-    html = re.sub(r'>\s+<', '><', html)
-    return html.strip()
 
 
 def replace_specifications_table_html(original_html: str, rebuilt_table_html: str) -> str:
@@ -2002,24 +1966,6 @@ def _detect_aspect_from_title(aspect_name, title_lower):
     return None
 
 
-def _select_best_offer(offers, expected_listing_id=None):
-    """Prefer the live published offer over stale unpublished leftovers."""
-    if not offers:
-        return None
-
-    def _rank(offer):
-        listing = offer.get("listing") or {}
-        listing_id = listing.get("listingId")
-        listing_status = listing.get("listingStatus", "")
-        status = offer.get("status", "")
-        listing_match_rank = 0 if expected_listing_id and listing_id == expected_listing_id else 1
-        active_rank = 0 if listing_status == "ACTIVE" else 1
-        published_rank = 0 if status == "PUBLISHED" else 1
-        return (listing_match_rank, active_rank, published_rank, offer.get("offerId", ""))
-
-    return sorted(offers, key=_rank)[0]
-
-
 def build_live_listing_opt_snapshot(stored_opt, *, inventory_item=None, offer=None):
     """Build an optimization-shaped payload from live eBay inventory/offer data."""
     opt = dict(stored_opt or {})
@@ -2199,13 +2145,6 @@ def validate_fix_scope(args, parser) -> None:
         parser.error("--ignore-clean-freeze requires --live")
     if args.accept_package_conflict_as and not args.sku and not args.sku_file:
         parser.error("--accept-package-conflict-as requires --sku or --sku-file")
-
-
-def _fetch_live_listing_context(ebay_client, sku, expected_listing_id=None):
-    inventory_item = ebay_client.get_inventory_item(sku) or {}
-    offers = ebay_client.get_offers_by_sku(sku) or []
-    offer = _select_best_offer(offers, expected_listing_id=expected_listing_id)
-    return inventory_item, offer
 
 
 def _load_skus_from_file(path: str) -> list[str]:
@@ -4487,17 +4426,6 @@ def _resolve_claim_strip_required(loader, category_id: str | None) -> tuple[list
     if loaded is None:
         return [], False
     return list(loaded), True
-
-
-
-
-def _publish_offer_checked(ebay_client, offer_id: str):
-    if not hasattr(ebay_client, "publish_offer"):
-        raise RuntimeError(f"offer {offer_id}: client has no publish_offer")
-    result = ebay_client.publish_offer(offer_id)
-    if not result or not result.get("listingId"):
-        raise RuntimeError(f"publish_offer({offer_id}) returned {result!r}")
-    return result
 
 
 
