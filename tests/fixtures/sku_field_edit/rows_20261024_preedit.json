@@ -1,0 +1,91 @@
+[
+  {
+    "_reconstructed": true,
+    "sku": "W714P323654",
+    "title": "Modern Fabric Sofa Wood Frame Living Room Couch",
+    "price": 154.29,
+    "stock": 229,
+    "status": "ERROR",
+    "listing_id": "366111111111",
+    "shipping": 0.0,
+    "url": "https://example.test/W714P323654",
+    "images": [],
+    "videos": [],
+    "description": "Source sofa page",
+    "attributes": {},
+    "specs": {},
+    "optimization": {
+      "title": "Modern Fabric Sofa Wood Frame Living Room Couch",
+      "description": "<p>Solid wood legs for stability</p><p>Water&nbsp;resistant fabric</p>",
+      "aspects": {
+        "Frame Material": ["Wood"],
+        "Brand": ["AquaVerve"],
+        "Features": ["Removable cushions"]
+      },
+      "categoryId": "38208",
+      "categoryName": "Sofas, Armchairs & Couches"
+    },
+    "logs": []
+  },
+  {
+    "_reconstructed": true,
+    "sku": "W465140910",
+    "title": "Adjustable Support Rod 24 inch Steel",
+    "price": 66.68,
+    "stock": 149,
+    "status": "ERROR",
+    "listing_id": "366757784455",
+    "shipping": 0.0,
+    "url": "https://example.test/W465140910",
+    "images": [],
+    "videos": [],
+    "description": "Source rod page",
+    "attributes": {},
+    "specs": {},
+    "optimization": {
+      "title": "Adjustable Support Rod 24 inch Steel",
+      "description": "<p>Concretely engineered steel rod</p><ul><li>Non-Slip PP End Pads protect hardwood, tile, and concrete floors</li><li>Steel construction</li></ul><p>Fully assembled</p><p>24\" rod</p>",
+      "aspects": {
+        "Brand": ["AquaVerve"],
+        "Features": [
+          "<li>Fits concrete or tile floors</li>",
+          "Steel construction"
+        ]
+      },
+      "categoryId": "20487",
+      "categoryName": "Cabinets & Cupboards"
+    },
+    "logs": []
+  },
+  {
+    "_reconstructed": true,
+    "sku": "W465P341531",
+    "title": "Heavy Duty Steel Hand Truck 330 lbs",
+    "price": 74.17,
+    "stock": 123,
+    "status": "ERROR",
+    "listing_id": "366222222222",
+    "shipping": 0.0,
+    "url": "https://example.test/W465P341531",
+    "images": [],
+    "videos": [],
+    "description": "Source hand truck page",
+    "attributes": {},
+    "specs": {},
+    "optimization": {
+      "title": "Heavy Duty Steel Hand Truck 330 lbs",
+      "description": "<p>Hardwood-look powder-coated frame</p><ul><li>Plywood deck resists warping</li><li>Steel frame</li></ul><p>330 lbs capacity</p><p>2-Piece Set</p>",
+      "aspects": {
+        "Brand": ["AquaVerve"],
+        "Function": ["Hand Truck"],
+        "Features": [
+          "<li>Plywood deck resists warping</li>",
+          "Steel frame"
+        ]
+      },
+      "categoryId": "184155",
+      "categoryName": "Hand Trucks"
+    },
+    "logs": []
+  }
+]

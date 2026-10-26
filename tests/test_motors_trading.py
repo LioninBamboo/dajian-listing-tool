@@ -12,7 +12,28 @@ from src.services.motors_trading import (
 )
 
 
+REVISE_DESCRIPTION_ONLY_GOLDEN = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">'
+    "<Item><ItemID>188752675328</ItemID>"
+    "<Description><![CDATA[<b>Clean</b>]]></Description>"
+    "</Item></ReviseFixedPriceItemRequest>"
+)
+
+
 class TestReviseBuilder:
+    def test_item_specifics_none_is_byte_identical_to_omitted(self):
+        omitted = build_revise_fixed_price_item_xml(item_id="188752675328", description="<b>Clean</b>")
+        explicit_none = build_revise_fixed_price_item_xml(
+            item_id="188752675328",
+            description="<b>Clean</b>",
+            item_specifics=None,
+        )
+        assert omitted == REVISE_DESCRIPTION_ONLY_GOLDEN
+        assert explicit_none == REVISE_DESCRIPTION_ONLY_GOLDEN
+        assert omitted == explicit_none
+        assert "<ItemSpecifics>" not in omitted
+
     def test_partial_update_only_sends_given_fields(self):
         xml = build_revise_fixed_price_item_xml(item_id="188752675328", description="<b>Clean</b>")
         assert "<ItemID>188752675328</ItemID>" in xml

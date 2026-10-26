@@ -1217,7 +1217,8 @@ class RealEbayClient:
         return entries
 
     def revise_fixed_price_item_motors(self, item_id: str, *, description: Optional[str] = None,
-                                       title: Optional[str] = None) -> Dict:
+                                       title: Optional[str] = None,
+                                       item_specifics: Optional[Any] = None) -> Dict:
         """Partial-update a live Motors Trading item's description and/or title.
 
         On a Motors store, snapshot the live compatibility rows first and send
@@ -1241,6 +1242,7 @@ class RealEbayClient:
             title=title,
             compatibility=compatibility,
             replace_all_compatibility=replace_all_compatibility,
+            item_specifics=item_specifics,
         )
         headers = {
             "X-EBAY-API-CALL-NAME": "ReviseFixedPriceItem",

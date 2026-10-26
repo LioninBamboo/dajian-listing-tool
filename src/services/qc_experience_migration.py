@@ -13,6 +13,7 @@ from src.db.database_safety import (
     assert_runtime_not_in_maintenance,
     validate_runtime_database,
 )
+from src.utils.db_backup import DbBackupError, create_online_backup
 from src.services.qc_experience_seed import seed_initial_qc_experiences
 
 
@@ -82,30 +83,10 @@ def _backup_path(backup_dir: Path, timestamp: str) -> Path:
 def _create_online_backup(source: sqlite3.Connection, destination: Path) -> DatabaseSafetyReport:
     """Create and validate a new backup without overwriting an existing file."""
 
-    destination = destination.resolve()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        raise QCExperienceMigrationError(f"backup already exists: {destination}")
-
-    temporary = destination.with_name(destination.name + ".tmp")
-    if temporary.exists():
-        raise QCExperienceMigrationError(f"temporary backup already exists: {temporary}")
-
     try:
-        target = sqlite3.connect(str(temporary), timeout=30)
-        try:
-            target.execute("PRAGMA busy_timeout=30000")
-            source.backup(target, pages=256, sleep=0.05)
-            target.commit()
-        finally:
-            target.close()
-        validate_runtime_database(temporary)
-        temporary.replace(destination)
-        return validate_runtime_database(destination)
-    except Exception:
-        if temporary.exists():
-            temporary.unlink()
-        raise
+        return create_online_backup(source, destination)
+    except DbBackupError as exc:
+        raise QCExperienceMigrationError(str(exc)) from exc
 
 
 def run_qc_experience_seed_migration(
