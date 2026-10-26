@@ -1262,8 +1262,8 @@ def test_extra_edge_protected_zone_mixed_case_empty_ul_and_both_fields(tmp_path)
         ],
         ctx,
     )
-    assert code == 2
-    assert "protected_zone" in (out + json.dumps(report))
+    assert code == 0
+    assert report["skus"][0]["status"] == "already_absent"
 
     row2 = deepcopy(ROWS[2])
     row2["optimization"]["description"] = "<ul><li>Plywood deck resists warping</li></ul>"
@@ -1852,10 +1852,12 @@ def test_ambiguous_plywood_three_hits_refused_db_and_live(tmp_path):
         ],
         ctx,
     )
-    assert code == 2
-    assert report["skus"][0]["status"] == "refused"
-    assert "strip_ambiguous" in (out + json.dumps(report))
-    assert "already_absent" not in report["skus"][0]["status"]
+    assert code == 0
+    sku = report["skus"][0]
+    assert sku["status"] == "planned"
+    after = sku["diff"]["description"]["after"]
+    assert not sfe.claim_still_in_unprotected("plywood", after)
+    assert "already_absent" not in sku["status"]
 
     clean = deepcopy(ROWS[2])
     clean["optimization"]["description"] = "<p>Steel frame only</p>"
@@ -1883,9 +1885,11 @@ def test_ambiguous_plywood_three_hits_refused_db_and_live(tmp_path):
         ],
         ctx,
     )
-    assert code == 2
-    assert "strip_ambiguous" in (out + json.dumps(report))
-    assert ebay.puts == []
+    assert code == 0
+    assert report["skus"][0]["live_readback"]["ok"] is True
+    live_offer = ebay.items["W465P341531"]["offer"]["listingDescription"]
+    assert not sfe.claim_still_in_unprotected("plywood", live_offer)
+    assert ebay.puts
 
 
 def test_truly_absent_claim_is_already_absent(tmp_path):
@@ -1967,6 +1971,50 @@ def test_aqua_waterproof_readback_keeps_waterproofing(tmp_path, monkeypatch):
     pushed = ebay.revise_calls[0]["description"]
     assert "Waterproofing" in pushed
     assert "Waterproof coating" not in pushed
+
+
+PLYWOOD_LI_AND_P = (
+    "<ul>"
+    "<li>Plywood deck resists warping</li>"
+    "<li>Steel frame</li>"
+    "</ul>"
+    "<p>Also great for moving plywood sheets across the warehouse.</p>"
+)
+
+PROTECTED_DUP_WOOD_HTML = (
+    "<h2>Solid Wood Cart</h2>"
+    "<table><tr><td>Frame</td><td>Solid wood</td></tr></table>"
+    "<ul><li>Solid wood slats support 220 lbs</li><li>Steel frame</li></ul>"
+)
+
+SPEC_TABLE_PLYWOOD_HTML = (
+    "<ul><li>Plywood deck resists warping</li><li>Steel frame</li></ul>"
+    "<table><tr><td>Deck</td><td>Plywood</td></tr></table>"
+)
+
+AQUA_WATERPROOF_HEADING_HTML = (
+    "<h3>Waterproof coating specs</h3>"
+    "<p>Waterproof coating on the deck.</p>"
+    "<p>Ready for marine use.</p>"
+)
+
+CORPUS_CLAIMS = (
+    "plywood",
+    "concrete",
+    "ceramic",
+    "wood",
+    "waterproof",
+    "hardwood",
+    "marble",
+    "convertible",
+    "chenille",
+    "foam",
+    "teak",
+    "oak",
+    "pine",
+    "rubberwood",
+    "weather",
+)
 
 
 def test_removed_units_absent_word_boundary_wood_vs_hardwood():
@@ -2053,3 +2101,291 @@ def test_inventory_readback_fails_when_description_claim_left_in_place(tmp_path)
     )
     assert code != 0
     assert "description" in (report["skus"][0].get("live_readback") or {}).get("mismatches", [])
+
+
+def test_r4_m1_plywood_li_plus_paragraph_strips_both_db_and_live(tmp_path):
+    row = deepcopy(ROWS[2])
+    row["optimization"]["description"] = PLYWOOD_LI_AND_P
+    ctx = make_ctx(tmp_path, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--report",
+            str(tmp_path / "li-p-db.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    sku = report["skus"][0]
+    assert sku["status"] == "planned"
+    after = sku["diff"]["description"]["after"]
+    assert "plywood" not in after.casefold()
+    assert "Steel frame" in after
+    assert not sfe.claim_still_in_unprotected("plywood", after)
+    units = sku["diff"]["description"].get("removed_units") or []
+    assert len(units) == 2
+
+    clean = deepcopy(ROWS[2])
+    clean["optimization"]["description"] = "<p>Steel frame only</p>"
+    item = inventory_item(clean)
+    item["inventory"]["product"]["description"] = PLYWOOD_LI_AND_P
+    item["offer"]["listingDescription"] = PLYWOOD_LI_AND_P
+    ebay = FakeEbay({"W465P341531": item})
+    ctx = make_ctx(tmp_path / "live", ebay=ebay, db_rows=[clean])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "li plus p live",
+            "--report",
+            str(tmp_path / "li-p-live.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["live_readback"]["ok"] is True
+    assert ebay.puts
+    live_offer = ebay.items["W465P341531"]["offer"]["listingDescription"]
+    live_inv = ebay.items["W465P341531"]["inventory"]["product"]["description"]
+    assert not sfe.claim_still_in_unprotected("plywood", live_offer)
+    assert not sfe.claim_still_in_unprotected("plywood", live_inv)
+    assert "Steel frame" in live_offer
+
+
+def test_r4_l1_single_unprotected_with_protected_duplicates_plans(tmp_path):
+    row = deepcopy(ROWS[2])
+    row["optimization"]["description"] = PROTECTED_DUP_WOOD_HTML
+    ctx = make_ctx(tmp_path, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--strip-claim",
+            "solid wood",
+            "--location",
+            "description",
+            "--report",
+            str(tmp_path / "prot-dup.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    sku = report["skus"][0]
+    assert sku["status"] == "planned"
+    after = sku["diff"]["description"]["after"]
+    assert "Solid wood slats" not in after
+    assert "<h2>Solid Wood Cart</h2>" in after
+    assert "<td>Solid wood</td>" in after
+    assert not sfe.claim_still_in_unprotected("solid wood", after)
+
+
+def test_r4_m2_main_spec_table_plywood_readback_ok(tmp_path):
+    row = deepcopy(ROWS[2])
+    row["optimization"]["description"] = SPEC_TABLE_PLYWOOD_HTML
+    item = inventory_item(row)
+    ebay = FakeEbay({"W465P341531": item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "spec table plywood",
+            "--report",
+            str(tmp_path / "spec.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["live_readback"]["ok"] is True
+    assert len(ebay.puts) == 2
+    live_offer = ebay.items["W465P341531"]["offer"]["listingDescription"]
+    assert "<td>Plywood</td>" in live_offer
+    assert "Plywood deck" not in live_offer
+
+
+def test_r4_m2_aqua_waterproof_heading_readback_ok(tmp_path, monkeypatch):
+    monkeypatch.setenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    monkeypatch.setattr("src.utils.store_profile.get_store_profile", aqua_profile)
+    row = deepcopy(ROWS[2])
+    row["listing_id"] = "366333333333"
+    row["optimization"]["description"] = AQUA_WATERPROOF_HEADING_HTML
+    ebay = FakeEbay(
+        {
+            "366333333333": {
+                "description": AQUA_WATERPROOF_HEADING_HTML,
+                "title": "Motors Support Bracket Steel",
+                "aspects": {"Brand": ["AquaRides"], "Features": ["Steel construction"]},
+                "start_price": "29.99",
+                "quantity": "4",
+                "compatibility": [
+                    {
+                        "compatibilityProperties": [
+                            {"name": "Year", "value": "2018"},
+                            {"name": "Make", "value": "Ford"},
+                            {"name": "Model", "value": "F-150"},
+                        ]
+                    }
+                ],
+            }
+        },
+        aqua=True,
+    )
+    trading = FakeTrading(AQUA_XML, ebay=ebay)
+    ctx = make_ctx(tmp_path, store="aqua", profile=aqua_profile(), ebay=ebay, trading=trading, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "aqua",
+            "--sku",
+            "W465P341531",
+            "--strip-claim",
+            "Waterproof",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "waterproof heading",
+            "--report",
+            str(tmp_path / "wp-h.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["live_readback"]["ok"] is True
+    assert len(ebay.revise_calls) == 1
+    pushed = ebay.revise_calls[0]["description"]
+    assert "<h3>Waterproof coating specs</h3>" in pushed
+    assert "Waterproof coating on the deck" not in pushed
+
+
+def test_r4_m3_offer_only_keeps_uncompressed_inventory_body(tmp_path):
+    offer_html = "<ul><li>Plywood deck resists warping</li><li>Steel frame</li></ul>"
+    inv_html = (
+        "<table><tbody><tr></tr><tr><td>Material</td><td>Steel</td></tr></tbody></table>\n"
+        "<p>Ready to use</p>"
+    )
+    row = deepcopy(ROWS[2])
+    row["optimization"]["description"] = offer_html
+    item = inventory_item(row)
+    item["inventory"]["product"]["description"] = inv_html
+    item["offer"]["listingDescription"] = offer_html
+    ebay = FakeEbay({"W465P341531": item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "offer only uncompressed",
+            "--report",
+            str(tmp_path / "offer-only.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["live_readback"]["ok"] is True
+    inv_puts = [item for item in ebay.puts if "/inventory_item/" in item["url"]]
+    offer_puts = [item for item in ebay.puts if "/offer/" in item["url"]]
+    assert inv_puts == []
+    assert offer_puts
+    got_inv = ebay.items["W465P341531"]["inventory"]["product"]["description"]
+    assert got_inv == inv_html
+    assert "<tr></tr>" in got_inv
+    assert "\n" in got_inv
+
+
+def test_corpus_sweep_fixture_descriptions_no_false_success_or_protected_rollback():
+    from src.utils.claim_strip import claim_matches_text as _anywhere
+
+    htmls: list[str] = []
+    for row in ROWS:
+        htmls.append(str((row.get("optimization") or {}).get("description") or ""))
+    htmls.extend(
+        [
+            PLYWOOD_LI_AND_P,
+            PROTECTED_DUP_WOOD_HTML,
+            SPEC_TABLE_PLYWOOD_HTML,
+            AQUA_WATERPROOF_HEADING_HTML,
+            AMBIGUOUS_PLYWOOD_HTML,
+        ]
+    )
+    for path in (ROOT / "tests" / "fixtures").rglob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        stack = [payload]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, dict):
+                desc = item.get("description")
+                if isinstance(desc, str) and "<" in desc:
+                    htmls.append(desc)
+                stack.extend(item.values())
+            elif isinstance(item, list):
+                stack.extend(item)
+
+    false_applied = []
+    false_rollback = []
+    for html in htmls:
+        if not html:
+            continue
+        for claim in CORPUS_CLAIMS:
+            after, units, reason = sfe._strip_claim_html(html, claim)
+            if reason == "":
+                if units and sfe.claim_still_in_unprotected(claim, after):
+                    false_applied.append((claim, html[:80]))
+                if units and _anywhere(claim, after) and not sfe.claim_still_in_unprotected(claim, after):
+                    plan = sfe.SkuPlan(
+                        sku="corpus",
+                        ops=[{"kind": "strip_claim", "text": claim, "location": "description"}],
+                        diff={"description": {"removed_units": units}},
+                    )
+                    if not sfe._removed_units_absent(after, plan):
+                        false_rollback.append((claim, html[:80]))
+            else:
+                if units and reason not in {
+                    "strip_claim_remains",
+                    "strip_ambiguous",
+                    "protected_zone",
+                    "text_add_refused",
+                } and sfe.claim_still_in_unprotected(claim, after) and reason.startswith("planned"):
+                    false_applied.append((claim, html[:80], reason))
+    assert false_applied == []
+    assert false_rollback == []

@@ -555,6 +555,8 @@ def strip_claim_from_description(
     html_src: str,
     claim: str,
     live_snippet: str,
+    *,
+    unprotected_anchor: bool = False,
 ) -> DescriptionHit:
     source = html_src or ""
     if not claim_matches_text(claim, strip_html_to_text(source)):
@@ -566,7 +568,23 @@ def strip_claim_from_description(
     occurrences = _iter_claim_occurrences(index, claim)
     if not occurrences:
         return DescriptionHit(status=STATUS_ALREADY_ABSENT, after_html=source)
-    anchored = _anchor_occurrences(index, occurrences, live_snippet)
+    if unprotected_anchor:
+        zones = protected_ranges(source)
+        unprotected = []
+        for start, end in occurrences:
+            html_start, html_end = _match_html_span(index, start, end)
+            if not is_protected(source, html_start, html_end, zones):
+                unprotected.append((start, end))
+        if unprotected:
+            occurrences = unprotected
+        if len(occurrences) == 1:
+            anchored = occurrences
+        else:
+            anchored = _anchor_occurrences(index, occurrences, live_snippet)
+            if len(anchored) != 1 and occurrences:
+                anchored = [occurrences[0]]
+    else:
+        anchored = _anchor_occurrences(index, occurrences, live_snippet)
     if not anchored:
         return DescriptionHit(status=STATUS_NOT_FOUND, after_html=source)
     if len(anchored) > 1:

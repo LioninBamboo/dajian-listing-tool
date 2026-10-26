@@ -55,12 +55,14 @@ from src.utils.claim_strip import (
     fetches_price_or_qty_changed,
     find_aspect_key,
     is_features_aspect,
+    is_protected,
     is_required_aspect,
     live_category_id,
     live_price,
     live_quantity,
     normalize_entities,
     offer_category_only_put_payload,
+    protected_ranges,
     strip_claim_from_aspects,
     strip_claim_from_description,
     strip_html_to_text,
@@ -84,6 +86,7 @@ EXIT_RESTORE_FAILED = 4
 EXIT_DRIFT = 5
 
 MAX_SKUS = 50
+STRIP_CLAIM_MAX_UNITS = 5
 PRODUCTION_API = "https://api.ebay.com"
 
 STORE_EXPECTATIONS: dict[str, dict[str, str]] = {
@@ -673,23 +676,15 @@ def apply_ops(
             op_changed = False
             for loc in locations:
                 if loc == "description":
-                    hit = strip_claim_from_description(
-                        description, claim, _description_snippet(description, claim)
-                    )
-                    if hit.status == STATUS_PROTECTED_ZONE:
-                        return refuse(plan, "protected_zone", "protected_zone")
-                    if hit.status == STATUS_WILL_STRIP:
-                        if ul_would_be_empty(description, [hit.removed_unit_html] if hit.removed_unit_html else []):
+                    before_desc = description
+                    description, units, reason = _strip_claim_html(description, claim)
+                    if reason:
+                        return refuse(plan, reason.split(":")[0], reason)
+                    if units:
+                        if ul_would_be_empty(before_desc, units):
                             add_gate(plan, "empty_ul", True, "empty_ul_cleaned")
-                        if hit.removed_unit_html:
-                            removed_desc_units.append(hit.removed_unit_html)
-                        description = hit.after_html
+                        removed_desc_units.extend(units)
                         op_changed = True
-                    elif hit.status == STATUS_ALREADY_ABSENT:
-                        if claim_still_in_unprotected(claim, description):
-                            return refuse(plan, "strip_already_absent", "strip_already_absent")
-                    elif claim_still_in_unprotected(claim, description):
-                        return refuse(plan, f"strip_{hit.status}", f"strip_{hit.status}")
                 elif loc == "features":
                     result, status = _strip_claim_from_aspect_values(
                         aspects, "Features", claim, required_names, required_available
@@ -974,7 +969,7 @@ def _removed_units_absent(html_src: str, plan: SkuPlan) -> bool:
     got_text = strip_html_to_text(html_src).casefold()
     got_norm = normalize_html_for_readback(html_src)
     for claim in _description_strip_claims(plan):
-        if claim_still_in_unprotected(claim, html_src) or claim_matches_text(claim, html_src):
+        if claim_still_in_unprotected(claim, html_src):
             return False
     for unit in (plan.diff.get("description") or {}).get("removed_units") or []:
         unit_html = str(unit or "")
@@ -996,6 +991,20 @@ def inventory_sent_description(html: str) -> str:
     if len(compressed) <= 4000:
         return compressed
     return smart_truncate_html(description, max_length=4000, min_length=3600)
+
+
+def _inventory_put_planned(plan: SkuPlan) -> bool:
+    """True when ``_push_inventory`` will PUT inventory_item (desc/title/aspects)."""
+    product = ((plan.live.get("inventory") or {}).get("product") or {})
+    live_desc = str(product.get("description") or "")
+    live_title = str(product.get("title") or "")
+    planned_desc = _live_planned_text(plan, "inventory_description", live_desc)
+    planned_title = _live_planned_text(plan, "title", live_title)
+    return (
+        planned_desc != live_desc
+        or planned_title != live_title
+        or _live_aspects_changed(plan)
+    )
 
 
 def _aqua_description_matches(got: str, want: str, plan: SkuPlan) -> bool:
@@ -1107,15 +1116,27 @@ def fetch_live(plan: SkuPlan, ctx: SkuFieldEditContext, args: Any) -> SkuPlan:
 
 
 def _description_snippet(html_src: str, claim: str) -> str:
-    """Pick the smallest claim_strip unit so --strip-claim can anchor without a live report."""
-    for li in re.findall(r"<li\b[^>]*>.*?</li>", html_src or "", flags=re.I | re.S):
-        if claim_matches_text(claim, li):
-            from src.utils.claim_strip import strip_html_to_text as _to_text
-
-            return _to_text(li) or claim
+    """Pick the smallest unprotected claim_strip unit so --strip-claim can anchor."""
+    source = html_src or ""
+    zones = protected_ranges(source)
     from src.utils.claim_strip import strip_html_to_text as _to_text
 
-    text = _to_text(html_src)
+    for match in re.finditer(r"<li\b[^>]*>.*?</li>", source, flags=re.I | re.S):
+        li = match.group(0)
+        if not claim_matches_text(claim, li):
+            continue
+        if is_protected(source, match.start(), match.end(), zones):
+            continue
+        return _to_text(li) or claim
+    for match in re.finditer(r"<p\b[^>]*>.*?</p>", source, flags=re.I | re.S):
+        paragraph = match.group(0)
+        if not claim_matches_text(claim, paragraph):
+            continue
+        if is_protected(source, match.start(), match.end(), zones):
+            continue
+        return _to_text(paragraph) or claim
+
+    text = _to_text(source)
     pattern = claim_pattern(claim)
     if pattern:
         match = pattern.search(text)
@@ -1129,6 +1150,45 @@ def _description_snippet(html_src: str, claim: str) -> str:
             if window:
                 return window
     return claim
+
+
+def _strip_claim_html(html: str, claim: str) -> tuple[str, list[str], str]:
+    """Strip every unprotected occurrence, or refuse if the claim would remain.
+
+    Returns ``(after_html, removed_units, refuse_reason)``. An empty reason
+    means the claim is gone from unprotected text (or was never there).
+    """
+    working = html or ""
+    removed: list[str] = []
+    if not claim_still_in_unprotected(claim, working):
+        return working, removed, ""
+    for _ in range(STRIP_CLAIM_MAX_UNITS):
+        if not claim_still_in_unprotected(claim, working):
+            return working, removed, ""
+        snippet = _description_snippet(working, claim)
+        hit = strip_claim_from_description(
+            working, claim, snippet, unprotected_anchor=True
+        )
+        if hit.status == STATUS_PROTECTED_ZONE:
+            return working, removed, "protected_zone" if not removed else "strip_claim_remains"
+        if hit.status == STATUS_WILL_STRIP:
+            ok, offenders = deletion_only_text(working, hit.after_html)
+            if not ok:
+                return working, removed, "text_add_refused:" + ",".join(offenders)
+            if hit.removed_unit_html:
+                removed.append(hit.removed_unit_html)
+            working = hit.after_html
+            continue
+        if claim_still_in_unprotected(claim, working):
+            if removed:
+                return working, removed, "strip_claim_remains"
+            if hit.status == STATUS_ALREADY_ABSENT:
+                return working, removed, "strip_already_absent"
+            return working, removed, f"strip_{hit.status}"
+        return working, removed, ""
+    if claim_still_in_unprotected(claim, working):
+        return working, removed, "strip_claim_remains"
+    return working, removed, ""
 
 
 def parse_getitem_xml(xml: str) -> dict[str, Any]:
@@ -1360,18 +1420,10 @@ def apply_live_ops(
     changed = False
 
     def _strip_live_html(html: str, claim: str) -> tuple[str, str | None]:
-        hit = strip_claim_from_description(html, claim, _description_snippet(html, claim))
-        if hit.status == STATUS_PROTECTED_ZONE:
-            raise ToolRefused("protected_zone")
-        if hit.status == STATUS_WILL_STRIP:
-            return hit.after_html, hit.removed_unit_html or None
-        if hit.status == STATUS_ALREADY_ABSENT:
-            if claim_still_in_unprotected(claim, html):
-                raise ToolRefused("strip_already_absent")
-            return html, None
-        if claim_still_in_unprotected(claim, html):
-            raise ToolRefused(f"strip_{hit.status}")
-        return html, None
+        after, units, reason = _strip_claim_html(html, claim)
+        if reason:
+            raise ToolRefused(reason)
+        return after, units[0] if units else None
 
     try:
         for op in ops:
@@ -1900,16 +1952,17 @@ def live_readback_ok(plan: SkuPlan, ctx: SkuFieldEditContext) -> tuple[bool, lis
         mismatches.append("price_qty")
     product = inventory.get("product") or {}
     if plan.live_changed or "description" in plan.diff:
+        live_inv_before = str(
+            ((plan.live.get("inventory") or {}).get("product") or {}).get("description") or ""
+        )
+        planned_inv = _live_planned_text(plan, "inventory_description", live_inv_before)
         want_offer = _live_planned_text(
             plan, "offer_description", str((plan.live.get("offer") or {}).get("listingDescription") or "")
         )
-        want_inv = inventory_sent_description(
-            _live_planned_text(
-                plan,
-                "inventory_description",
-                str(((plan.live.get("inventory") or {}).get("product") or {}).get("description") or ""),
-            )
-        )
+        if _inventory_put_planned(plan):
+            want_inv = inventory_sent_description(planned_inv)
+        else:
+            want_inv = live_inv_before
         got_offer = str((offer or {}).get("listingDescription") or "")
         got_inv = str(product.get("description") or "")
         if normalize_html_for_readback(got_offer) != normalize_html_for_readback(want_offer):
