@@ -1366,6 +1366,9 @@ def test_push_live_constructs_real_clients(tmp_path, monkeypatch):
     )
     aqua = aqua_profile()
     monkeypatch.setattr(sfe, "get_store_profile", lambda: aqua)
+    monkeypatch.setenv("EBAY_APP_ID", "app")
+    monkeypatch.setenv("EBAY_CERT_ID", "cert")
+    monkeypatch.setenv("EBAY_DEV_ID", "dev")
     sys.stdout = io.StringIO()
     try:
         sfe.run_from_args(args, None)
@@ -1375,6 +1378,8 @@ def test_push_live_constructs_real_clients(tmp_path, monkeypatch):
         sys.stdout = old
     assert created.get("real") is True
     assert "trading" in created
+    assert type(created["trading"]).__name__ == "EbayClient"
+    assert getattr(created["trading"], "env", None) == "production"
 
 
 def test_live_strip_keeps_live_only_li_never_pushes_db_only_text(tmp_path):
@@ -1555,3 +1560,265 @@ def test_running_tool_does_not_create_scheduler_log(tmp_path):
         assert log.stat().st_mtime == mtime
     else:
         assert not log.exists()
+
+
+def test_taxonomy_token_failure_refuses_brand_removal(tmp_path, monkeypatch):
+    class TokenFailMatcher:
+        _aspects_cache: dict = {}
+
+        def _get_category_aspects(self, cid):
+            return [], []
+
+    monkeypatch.setattr(sfe, "get_category_matcher", lambda: TokenFailMatcher())
+    assert sfe.sku_edit_required_aspect_names("38208") is None
+    ctx = make_ctx(tmp_path)
+    ctx.required_aspect_loader = None
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W714P323654",
+            "--remove-aspect",
+            "Brand",
+            "--report",
+            str(tmp_path / "tok.json"),
+        ],
+        ctx,
+    )
+    assert code == 2
+    assert "required_aspect_would_empty" in (out + json.dumps(report))
+
+
+def test_taxonomy_non_200_refuses_brand_removal(tmp_path, monkeypatch):
+    class Non200Matcher:
+        _aspects_cache: dict = {}
+
+        def _get_category_aspects(self, cid):
+            return [{"name": "Brand"}, {"name": "Upholstery Fabric"}], []
+
+    monkeypatch.setattr(sfe, "get_category_matcher", lambda: Non200Matcher())
+    assert sfe.sku_edit_required_aspect_names("38208") is None
+    ctx = make_ctx(tmp_path)
+    ctx.required_aspect_loader = None
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W714P323654",
+            "--remove-aspect",
+            "Brand",
+            "--report",
+            str(tmp_path / "n200.json"),
+        ],
+        ctx,
+    )
+    assert code == 2
+    assert "required_aspect_would_empty" in (out + json.dumps(report))
+
+
+def test_taxonomy_200_zero_required_returns_empty_list(tmp_path, monkeypatch):
+    class ZeroRequiredMatcher:
+        def __init__(self):
+            self._aspects_cache = {}
+
+        def _get_category_aspects(self, cid):
+            self._aspects_cache[str(cid)] = [{"name": "Function", "required": False}]
+            return [], [{"name": "Function"}]
+
+    monkeypatch.setattr(sfe, "get_category_matcher", lambda: ZeroRequiredMatcher())
+    assert sfe.sku_edit_required_aspect_names("184155") == []
+    ctx = make_ctx(tmp_path)
+    ctx.required_aspect_loader = None
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--remove-aspect",
+            "Function",
+            "--report",
+            str(tmp_path / "z200.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["status"] == "planned"
+    assert "Function" in report["skus"][0]["diff"]["aspects"]["removed"]
+
+
+def test_live_aspect_readback_fails_when_ebay_ignores_change(tmp_path):
+    class IgnoreAspectEbay(FakeEbay):
+        def _on_put(self, url, payload):
+            saved = None
+            sku = None
+            if "/inventory_item/" in url:
+                sku = self._sku_from_url(url)
+                saved = deepcopy(self.items[sku]["inventory"]["product"].get("aspects"))
+            super()._on_put(url, payload)
+            if saved is not None and sku is not None:
+                self.items[sku]["inventory"]["product"]["aspects"] = saved
+
+    row = deepcopy(ROWS[2])
+    row["optimization"]["aspects"] = {
+        "Brand": ["AquaVerve"],
+        "Features": ["Steel frame"],
+    }
+    item = inventory_item(row)
+    item["inventory"]["product"]["aspects"] = {
+        "Brand": ["AquaVerve"],
+        "Function": ["Hand Truck"],
+        "Features": ["Steel frame"],
+    }
+    ebay = IgnoreAspectEbay({"W465P341531": item})
+    ctx = make_ctx(tmp_path, ebay=ebay, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "main",
+            "--sku",
+            "W465P341531",
+            "--remove-aspect",
+            "Function",
+            "--apply",
+            "--push-live",
+            "--note",
+            "ignore live aspects",
+            "--report",
+            str(tmp_path / "ign.json"),
+        ],
+        ctx,
+    )
+    assert code != 0
+    sku = report["skus"][0]
+    assert "aspects" in (sku.get("live_readback") or {}).get("mismatches", [])
+
+
+def test_aqua_description_readback_accepts_normalized_html(tmp_path, monkeypatch):
+    monkeypatch.setenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    monkeypatch.setattr("src.utils.store_profile.get_store_profile", aqua_profile)
+    row = deepcopy(ROWS[2])
+    row["listing_id"] = "366333333333"
+    live_html = '<p class="b" id="a">Steel&nbsp;bracket</p><ul><li>Plywood backing plate</li></ul>'
+    row["optimization"]["description"] = live_html
+    ebay = FakeEbay(
+        {
+            "366333333333": {
+                "description": live_html,
+                "title": "Motors Support Bracket Steel",
+                "aspects": {"Brand": ["AquaRides"], "Features": ["Steel construction"]},
+                "start_price": "29.99",
+                "quantity": "4",
+                "compatibility": [
+                    {
+                        "compatibilityProperties": [
+                            {"name": "Year", "value": "2018"},
+                            {"name": "Make", "value": "Ford"},
+                            {"name": "Model", "value": "F-150"},
+                        ]
+                    }
+                ],
+            }
+        },
+        aqua=True,
+    )
+    orig_revise = ebay.revise_fixed_price_item_motors
+
+    def revise_and_normalize(item_id, **kwargs):
+        result = orig_revise(item_id, **kwargs)
+        if "description" in kwargs:
+            mutated = str(kwargs["description"])
+            mutated = mutated.replace('class="b" id="a"', 'id="a" class="b"')
+            mutated = mutated.replace("Steel&nbsp;", "Steel ")
+            mutated = mutated.replace("><", "> <")
+            ebay.items[item_id]["description"] = mutated
+        return result
+
+    ebay.revise_fixed_price_item_motors = revise_and_normalize
+    trading = FakeTrading(AQUA_XML, ebay=ebay)
+    ctx = make_ctx(tmp_path, store="aqua", profile=aqua_profile(), ebay=ebay, trading=trading, db_rows=[row])
+    code, out, report = run(
+        [
+            "--store",
+            "aqua",
+            "--sku",
+            "W465P341531",
+            "--strip-claim",
+            "plywood",
+            "--location",
+            "description",
+            "--apply",
+            "--push-live",
+            "--note",
+            "aqua html norm",
+            "--report",
+            str(tmp_path / "anorm.json"),
+        ],
+        ctx,
+    )
+    assert code == 0
+    assert report["skus"][0]["live_readback"]["ok"] is True
+    assert "plywood" not in ebay.items["366333333333"]["description"].casefold()
+
+
+def test_aqua_push_live_unpatched_trading_from_ebay_client(tmp_path, monkeypatch):
+    import requests
+    from src.clients.ebay_client import EbayClient
+    from src.clients.ebay_trading_client import EbayTradingClient
+    from src.clients.real_ebay_client import RealEbayClient
+
+    monkeypatch.setenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    monkeypatch.setenv("EBAY_APP_ID", "test-app-id")
+    monkeypatch.setenv("EBAY_CERT_ID", "test-cert-id")
+    monkeypatch.setenv("EBAY_DEV_ID", "test-dev-id")
+
+    def no_network(*_args, **_kwargs):
+        raise AssertionError("network forbidden in unpatched aqua construction")
+
+    monkeypatch.setattr(requests.Session, "request", no_network)
+    monkeypatch.setattr(requests.Session, "get", no_network)
+    monkeypatch.setattr(requests.Session, "post", no_network)
+    monkeypatch.setattr(requests.Session, "put", no_network)
+    monkeypatch.setattr(requests, "get", no_network)
+    monkeypatch.setattr(requests, "post", no_network)
+    monkeypatch.setattr(requests, "put", no_network)
+
+    ebay, trading = sfe.build_live_clients("aqua")
+    assert isinstance(trading, EbayTradingClient)
+    assert isinstance(trading.ebay_client, EbayClient)
+    assert not isinstance(trading.ebay_client, RealEbayClient)
+    assert trading.env == "production"
+    assert trading.ebay_client.app_id == "test-app-id"
+    assert getattr(ebay, "base_url", "").rstrip("/") == "https://api.ebay.com"
+
+    seed_db(tmp_path / "ebay_collection.db")
+    monkeypatch.setattr(sfe, "DATABASE_PATH", tmp_path / "ebay_collection.db")
+    monkeypatch.setattr(sfe, "MAINTENANCE_PATH", tmp_path / "no-maintenance.lock")
+    monkeypatch.setattr(sfe, "get_store_profile", aqua_profile)
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = buf
+    try:
+        args = parse(
+            [
+                "--store",
+                "aqua",
+                "--sku",
+                "W465P341531",
+                "--strip-claim",
+                "plywood",
+                "--location",
+                "description",
+                "--push-live",
+                "--report",
+                str(tmp_path / "h1a-unpatched.json"),
+            ]
+        )
+        code = sfe.run_from_args(args, None)
+    finally:
+        sys.stdout = old
+    out = buf.getvalue()
+    assert "no attribute 'env'" not in out
+    assert code in {0, 2, 3, 4, 5}

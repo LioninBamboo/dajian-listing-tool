@@ -49,6 +49,7 @@ from src.utils.claim_strip import (
     claim_matches_text,
     claim_pattern,
     claim_still_in_unprotected,
+    collapse_ws,
     fetches_price_or_qty_changed,
     find_aspect_key,
     is_features_aspect,
@@ -56,9 +57,11 @@ from src.utils.claim_strip import (
     live_category_id,
     live_price,
     live_quantity,
+    normalize_entities,
     offer_category_only_put_payload,
     strip_claim_from_aspects,
     strip_claim_from_description,
+    strip_html_to_text,
     ul_would_be_empty,
     verify_readback,
 )
@@ -530,16 +533,21 @@ def refuse(plan: SkuPlan, name: str, reason: str) -> SkuPlan:
 
 
 def sku_edit_required_aspect_names(category_id: str | None) -> list[str] | None:
-    """Return required aspect names. ``[]`` means the taxonomy succeeded with none.
+    """Return required aspect names. ``[]`` means Taxonomy 200 with none.
 
-    ``None`` is fail-closed: the lookup failed and every non-Features aspect
-    must be treated as required.
+    ``None`` is fail-closed. ``_get_category_aspects`` returns ``([], [])`` on
+    token failure and ``_fallback_aspects`` on non-200; those must not look
+    like a successful empty required list. The matcher's ``_aspects_cache`` is
+    written only after a 200 parse.
     """
     if not category_id:
         return None
     try:
         matcher = get_category_matcher()
-        required_aspects, _ = matcher._get_category_aspects(str(category_id))
+        cid = str(category_id)
+        required_aspects, _ = matcher._get_category_aspects(cid)
+        if cid not in getattr(matcher, "_aspects_cache", {}):
+            return None
         return [aspect.get("name") for aspect in required_aspects if aspect.get("name")]
     except Exception:
         return None
@@ -904,6 +912,80 @@ def _live_aspects_from_plan(plan: SkuPlan) -> dict[str, list[str]]:
     if "inventory" in plan.live:
         return _normalize_aspects(((plan.live.get("inventory") or {}).get("product") or {}).get("aspects"))
     return _normalize_aspects(plan.live.get("aspects"))
+
+
+def _live_aspects_changed(plan: SkuPlan) -> bool:
+    if not plan.live:
+        return False
+    return _planned_live_aspects(plan) != _live_aspects_from_plan(plan)
+
+
+_HTML_TAG_RE = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9]*)([^>]*)>", re.S)
+_HTML_ATTR_RE = re.compile(
+    r"""([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?""",
+    re.S,
+)
+
+
+def normalize_html_for_readback(html_src: str) -> str:
+    """Whitespace / entity / attribute-order tolerant HTML compare form."""
+
+    def _tag(match: re.Match[str]) -> str:
+        closing, name, raw_attrs = match.group(1), match.group(2).lower(), match.group(3) or ""
+        if closing:
+            return f"</{name}>"
+        attrs: list[tuple[str, str]] = []
+        for item in _HTML_ATTR_RE.finditer(raw_attrs):
+            key = item.group(1).lower()
+            if key in {"/", ""}:
+                continue
+            value = item.group(2)
+            if value is None:
+                value = item.group(3)
+            if value is None:
+                value = item.group(4) or ""
+            attrs.append((key, value))
+        attrs.sort()
+        rendered = "".join(f' {key}="{value}"' for key, value in attrs)
+        self_close = raw_attrs.rstrip().endswith("/")
+        return f"<{name}{rendered}{' /' if self_close else ''}>"
+
+    text = _HTML_TAG_RE.sub(_tag, normalize_entities(html_src or ""))
+    text = collapse_ws(text)
+    return re.sub(r">\s+<", "><", text)
+
+
+def _description_removed_units(plan: SkuPlan) -> list[str]:
+    units = [str(item) for item in ((plan.diff.get("description") or {}).get("removed_units") or []) if item]
+    for op in plan.ops:
+        kind = str(op.get("kind") or "")
+        location = str(op.get("location") or "")
+        if kind == "strip_claim" and location in {"description", "all", ""}:
+            claim = str(op.get("text") or op.get("claim") or "")
+            if claim:
+                units.append(claim)
+    return units
+
+
+def _removed_units_absent(html_src: str, plan: SkuPlan) -> bool:
+    got_text = strip_html_to_text(html_src).casefold()
+    got_norm = normalize_html_for_readback(html_src)
+    for unit in _description_removed_units(plan):
+        if claim_matches_text(unit, html_src):
+            return False
+        unit_text = strip_html_to_text(unit)
+        if unit_text and unit_text.casefold() in got_text:
+            return False
+        unit_norm = normalize_html_for_readback(unit)
+        if unit_norm and unit_norm in got_norm:
+            return False
+    return True
+
+
+def _aqua_description_matches(got: str, want: str, plan: SkuPlan) -> bool:
+    if normalize_html_for_readback(got) != normalize_html_for_readback(want):
+        return False
+    return _removed_units_absent(got, plan)
 
 
 def build_diff(
@@ -1764,13 +1846,16 @@ def live_readback_ok(plan: SkuPlan, ctx: SkuFieldEditContext) -> tuple[bool, lis
         compatibility = ebay.get_item_compatibility_motors(plan.listing_id)
         want_desc = _live_planned_text(plan, "description", str(plan.live.get("description") or ""))
         want_title = _live_planned_text(plan, "title", str(plan.live.get("title") or ""))
-        if (plan.live_changed or "description" in plan.diff) and str(
-            description or parsed.get("description") or ""
-        ) != want_desc:
+        got_desc = str(description or parsed.get("description") or "")
+        if (plan.live_changed or "description" in plan.diff) and not _aqua_description_matches(
+            got_desc, want_desc, plan
+        ):
             mismatches.append("description")
         if (plan.live_changed or "title" in plan.diff) and str(parsed.get("title") or "") != want_title:
             mismatches.append("title")
-        if "aspects" in plan.diff and _normalize_aspects(parsed.get("aspects")) != _planned_live_aspects(plan):
+        if (
+            "aspects" in plan.diff or _live_aspects_changed(plan)
+        ) and _normalize_aspects(parsed.get("aspects")) != _planned_live_aspects(plan):
             mismatches.append("aspects")
         if str(parsed.get("start_price") or "") != str(plan.live.get("start_price") or ""):
             mismatches.append("price_qty")
@@ -1821,14 +1906,16 @@ def live_readback_ok(plan: SkuPlan, ctx: SkuFieldEditContext) -> tuple[bool, lis
         )
         if not checks.get("description_matches", True) or not checks.get("claims_gone", True):
             mismatches.append("description")
-        if "aspects" in plan.diff and not checks.get("units_gone", True):
+        if ("aspects" in plan.diff or _live_aspects_changed(plan)) and not checks.get("units_gone", True):
             mismatches.append("aspects")
     want_title = _live_planned_text(
         plan, "title", str(((plan.live.get("inventory") or {}).get("product") or {}).get("title") or "")
     )
     if (plan.live_changed or "title" in plan.diff) and str(product.get("title") or "") != want_title:
         mismatches.append("title")
-    if "aspects" in plan.diff and _normalize_aspects(product.get("aspects")) != _planned_live_aspects(plan):
+    if (
+        "aspects" in plan.diff or _live_aspects_changed(plan)
+    ) and _normalize_aspects(product.get("aspects")) != _planned_live_aspects(plan):
         if "aspects" not in mismatches:
             mismatches.append("aspects")
     if "categoryId" in plan.diff and live_category_id(offer) != str(plan.optimization_after.get("categoryId") or ""):
@@ -1863,9 +1950,13 @@ def restore_live(plan: SkuPlan, ctx: SkuFieldEditContext) -> bool:
 
 def _fail_live(plan: SkuPlan, ctx: SkuFieldEditContext, *, db_restored: bool, reason: str) -> int:
     live_ok = restore_live(plan, ctx)
+    prior = [str(item) for item in ((plan.live_readback or {}).get("mismatches") or []) if item]
+    mismatches = list(prior)
+    if reason not in mismatches:
+        mismatches.append(reason)
     plan.live_readback = {
         "ok": False,
-        "mismatches": [reason],
+        "mismatches": mismatches,
         "price_qty_unchanged": False,
         "live_restored": live_ok,
     }
@@ -1884,16 +1975,30 @@ def default_report_path(store: str, stamp: str, run_id: str) -> Path:
 
 
 def build_live_clients(store: str) -> tuple[Any, Any]:
-    """Construct production Inventory (and Aqua Trading) clients. Env is read-only."""
+    """Construct production Inventory (and Aqua Trading) clients. Env is read-only.
+
+    Main/GP use ``create_real_ebay_client`` (Inventory). Aqua keeps that client
+    for Motors helpers (description/compatibility/revise) and builds
+    ``EbayTradingClient`` from legacy ``EbayClient(APP/CERT/DEV, env=production)``
+    the same way ``listing_status_sync`` / ``ebay_ad_service`` do. RealEbayClient
+    has no ``.env`` and cannot back Trading.
+    """
     environment = os.environ.get("EBAY_ENVIRONMENT") or "PRODUCTION"
     from src.clients.real_ebay_client import create_real_ebay_client
 
     ebay = create_real_ebay_client(environment=environment)
     trading = None
     if store == "aqua":
+        from src.clients.ebay_client import EbayClient
         from src.clients.ebay_trading_client import EbayTradingClient
 
-        trading = EbayTradingClient(ebay)
+        trading_ebay = EbayClient(
+            os.getenv("EBAY_APP_ID"),
+            os.getenv("EBAY_CERT_ID"),
+            os.getenv("EBAY_DEV_ID"),
+            env="production",
+        )
+        trading = EbayTradingClient(trading_ebay)
     return ebay, trading
 
 
@@ -1972,7 +2077,8 @@ def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
                         continue
                     if plan.db_changed:
                         code = apply_db_write(conn, plan, ctx, args, run_id, rows_before)
-                        wrote_anything = True
+                        if plan.status in {"applied", "restored", "restore_failed"}:
+                            wrote_anything = True
                         print(f"写库: {plan.sku} {plan.status} db_readback={plan.db_readback}")
                     else:
                         code = EXIT_OK
