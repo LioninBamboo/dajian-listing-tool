@@ -196,7 +196,9 @@ def apply_fix(
 
     explicit = str(explicit_operator_id or "").strip()
     locked = blocks_automated_category_change(opt)
-    override_ok = bool(override_category_lock and explicit and locked)
+    # Operator ``--sku --category-id --override-category-lock`` may write on
+    # locked OR unlocked rows; APPROVED_AUTO_REMAPS alone never opens unlocks.
+    override_ok = bool(override_category_lock and explicit)
 
     lock_error = locked_category_write_error(opt, override=override_ok)
     if lock_error:

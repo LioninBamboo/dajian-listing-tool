@@ -1191,9 +1191,15 @@ def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDe
             return CategoryDecision(None, "keep", "tv_stand_lock")
         return CategoryDecision(None, "unknown", "unknown_head_noun")
     if head in _BAR_CABINET_HEADS:
-        if as_safe_category_id(stored) == "20487":
+        stored_id = as_safe_category_id(stored)
+        if stored_id == "20487":
             return CategoryDecision(None, "keep", "bar_cabinet_lock")
-        return CategoryDecision(None, "unknown", "bar_cabinet_not_wine_rack")
+        if stored_id == SIDEBOARD:
+            return CategoryDecision(None, "keep", "bar_cabinet_sideboard_lock")
+        # Furniture bar / wine / liquor cabinets are sideboards, not Wine Racks.
+        return CategoryDecision(
+            SIDEBOARD, "sideboard", "bar_cabinet_sideboard", "Sideboards & Buffets"
+        )
     if head in _WINE_RACK_HEADS:
         return CategoryDecision(WINE_RACK, "wine_rack", "wine_rack_head", "Wine Racks & Bottle Holders")
     if _title_is_hall_tree_head(hay):
