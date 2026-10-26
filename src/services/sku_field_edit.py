@@ -27,8 +27,10 @@ from src.services.live_listing_writes import (
     _put_inventory_product_only,
     _put_inventory_snapshot,
     _update_offer_description_only,
+    compress_html,
     get_category_matcher,
 )
+from src.utils.html_truncator import smart_truncate_html
 from src.utils.approved_category import (
     is_valid_category_id,
     locked_category_write_error,
@@ -63,7 +65,6 @@ from src.utils.claim_strip import (
     strip_claim_from_description,
     strip_html_to_text,
     ul_would_be_empty,
-    verify_readback,
 )
 from src.utils.db_backup import create_online_backup
 from src.utils.publish_fee_preview import guard_category_write_high_fee
@@ -684,9 +685,11 @@ def apply_ops(
                             removed_desc_units.append(hit.removed_unit_html)
                         description = hit.after_html
                         op_changed = True
-                    elif hit.status not in {STATUS_ALREADY_ABSENT, STATUS_WILL_STRIP}:
-                        if hit.status == STATUS_ALREADY_ABSENT:
-                            pass
+                    elif hit.status == STATUS_ALREADY_ABSENT:
+                        if claim_still_in_unprotected(claim, description):
+                            return refuse(plan, "strip_already_absent", "strip_already_absent")
+                    elif claim_still_in_unprotected(claim, description):
+                        return refuse(plan, f"strip_{hit.status}", f"strip_{hit.status}")
                 elif loc == "features":
                     result, status = _strip_claim_from_aspect_values(
                         aspects, "Features", claim, required_names, required_available
@@ -955,31 +958,44 @@ def normalize_html_for_readback(html_src: str) -> str:
     return re.sub(r">\s+<", "><", text)
 
 
-def _description_removed_units(plan: SkuPlan) -> list[str]:
-    units = [str(item) for item in ((plan.diff.get("description") or {}).get("removed_units") or []) if item]
+def _description_strip_claims(plan: SkuPlan) -> list[str]:
+    claims: list[str] = []
     for op in plan.ops:
         kind = str(op.get("kind") or "")
         location = str(op.get("location") or "")
         if kind == "strip_claim" and location in {"description", "all", ""}:
             claim = str(op.get("text") or op.get("claim") or "")
             if claim:
-                units.append(claim)
-    return units
+                claims.append(claim)
+    return claims
 
 
 def _removed_units_absent(html_src: str, plan: SkuPlan) -> bool:
     got_text = strip_html_to_text(html_src).casefold()
     got_norm = normalize_html_for_readback(html_src)
-    for unit in _description_removed_units(plan):
-        if claim_matches_text(unit, html_src):
+    for claim in _description_strip_claims(plan):
+        if claim_still_in_unprotected(claim, html_src) or claim_matches_text(claim, html_src):
             return False
-        unit_text = strip_html_to_text(unit)
+    for unit in (plan.diff.get("description") or {}).get("removed_units") or []:
+        unit_html = str(unit or "")
+        if not unit_html:
+            continue
+        unit_text = strip_html_to_text(unit_html)
         if unit_text and unit_text.casefold() in got_text:
             return False
-        unit_norm = normalize_html_for_readback(unit)
+        unit_norm = normalize_html_for_readback(unit_html)
         if unit_norm and unit_norm in got_norm:
             return False
     return True
+
+
+def inventory_sent_description(html: str) -> str:
+    """Same compress / 4000-char truncate as ``_put_inventory_product_only``."""
+    description = html or ""
+    compressed = compress_html(description)
+    if len(compressed) <= 4000:
+        return compressed
+    return smart_truncate_html(description, max_length=4000, min_length=3600)
 
 
 def _aqua_description_matches(got: str, want: str, plan: SkuPlan) -> bool:
@@ -1349,6 +1365,12 @@ def apply_live_ops(
             raise ToolRefused("protected_zone")
         if hit.status == STATUS_WILL_STRIP:
             return hit.after_html, hit.removed_unit_html or None
+        if hit.status == STATUS_ALREADY_ABSENT:
+            if claim_still_in_unprotected(claim, html):
+                raise ToolRefused("strip_already_absent")
+            return html, None
+        if claim_still_in_unprotected(claim, html):
+            raise ToolRefused(f"strip_{hit.status}")
         return html, None
 
     try:
@@ -1802,7 +1824,6 @@ def _push_inventory(plan: SkuPlan, ctx: SkuFieldEditContext) -> None:
         live_offer = ebay.get_offer(offer_id)
         payload = offer_category_only_put_payload(live_offer, target)
         _offer_put(ebay, offer_id, payload)
-    _ = claim_still_in_unprotected
 
 
 def _first_strip_claim(plan: SkuPlan) -> str:
@@ -1878,36 +1899,27 @@ def live_readback_ok(plan: SkuPlan, ctx: SkuFieldEditContext) -> tuple[bool, lis
     if fetches_price_or_qty_changed(plan.live.get("inventory"), plan.live.get("offer"), inventory, offer):
         mismatches.append("price_qty")
     product = inventory.get("product") or {}
-    if plan.live_changed or "description" in plan.diff or "aspects" in plan.diff:
-        from src.utils.claim_strip import SkuPlan as ClaimSkuPlan
-
-        live_product = (plan.live.get("inventory") or {}).get("product") or {}
-        claim_plan = ClaimSkuPlan(
-            sku=plan.sku,
-            listing_id=plan.listing_id,
-            title=_live_planned_text(plan, "title", str(live_product.get("title") or "")),
-            offer_description_before=str((plan.live.get("offer") or {}).get("listingDescription") or ""),
-            offer_description_after=_live_planned_text(
-                plan, "offer_description", str((plan.live.get("offer") or {}).get("listingDescription") or "")
-            ),
-            inventory_description_before=str(live_product.get("description") or ""),
-            inventory_description_after=_live_planned_text(
-                plan, "inventory_description", str(live_product.get("description") or "")
-            ),
-            aspects_before=_normalize_aspects(live_product.get("aspects")),
-            aspects_after=_planned_live_aspects(plan),
+    if plan.live_changed or "description" in plan.diff:
+        want_offer = _live_planned_text(
+            plan, "offer_description", str((plan.live.get("offer") or {}).get("listingDescription") or "")
         )
-        checks = verify_readback(
-            claim_plan,
-            inventory,
-            offer,
-            plan.live.get("inventory"),
-            plan.live.get("offer"),
+        want_inv = inventory_sent_description(
+            _live_planned_text(
+                plan,
+                "inventory_description",
+                str(((plan.live.get("inventory") or {}).get("product") or {}).get("description") or ""),
+            )
         )
-        if not checks.get("description_matches", True) or not checks.get("claims_gone", True):
+        got_offer = str((offer or {}).get("listingDescription") or "")
+        got_inv = str(product.get("description") or "")
+        if normalize_html_for_readback(got_offer) != normalize_html_for_readback(want_offer):
             mismatches.append("description")
-        if ("aspects" in plan.diff or _live_aspects_changed(plan)) and not checks.get("units_gone", True):
-            mismatches.append("aspects")
+        if normalize_html_for_readback(got_inv) != normalize_html_for_readback(want_inv):
+            if "description" not in mismatches:
+                mismatches.append("description")
+        if not _removed_units_absent(got_offer, plan) or not _removed_units_absent(got_inv, plan):
+            if "description" not in mismatches:
+                mismatches.append("description")
     want_title = _live_planned_text(
         plan, "title", str(((plan.live.get("inventory") or {}).get("product") or {}).get("title") or "")
     )
