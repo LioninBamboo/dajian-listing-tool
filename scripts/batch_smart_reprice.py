@@ -821,7 +821,19 @@ def read_current_listing_price(oauth, sku: str, listing_id: str = None, client=N
         return None
 
 
-def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: str = None) -> bool:
+class _PriceGuardErrorResult(str):
+    """False-y sentinel: guard raised; callers must not treat as write success."""
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return False
+
+
+PRICE_GUARD_ERROR = _PriceGuardErrorResult("guard_error")
+
+
+def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: str = None):
     """Update live eBay price through the listing's write channel.
 
     Trading-channel Motors listings use ReviseFixedPriceItem. Furniture and
@@ -830,10 +842,16 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
     🛡️ 安全护栏 (2026-05): 写出前调用 repricing_guard.precheck_price 校验.
     - 价格 < 带广告死线 但 >= 关广告死线 → 自动关广告后放行
     - 价格 < 关广告死线 (即真亏本) → 拒绝, 不调任何 eBay API
+    - 守门员自身异常 → fail-closed (返回 PRICE_GUARD_ERROR, 不写 eBay)
+
+    Returns:
+        True on successful write.
+        False on guard refusal or write failure.
+        PRICE_GUARD_ERROR (false-y str "guard_error") when precheck_price raises.
     """
     # ── 守门员: 死线 + 广告自适应 (与 InventorySyncService 共用) ──
+    from src.services.repricing_guard import precheck_price, reprice_write_channel
     try:
-        from src.services.repricing_guard import precheck_price, reprice_write_channel
         ok, reason = precheck_price(
             sku=sku, new_price=new_price,
             db_path='ebay_collection.db',
@@ -844,8 +862,8 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
             log.error(f"  {sku}: 🚫 PRICE GUARD 拒绝改价 ({reason})")
             return False
     except Exception as guard_exc:
-        log.warning(f"  {sku}: ⚠️ PRICE GUARD 异常, 放行: {guard_exc}")
-        from src.services.repricing_guard import reprice_write_channel
+        log.error(f"  {sku}: 🚫 PRICE GUARD 异常, 拒绝改价 (fail-closed): {guard_exc}")
+        return PRICE_GUARD_ERROR
 
     if reprice_write_channel(expected_listing_id) == "trading":
         return update_trading_price(oauth, sku, new_price, expected_listing_id)
@@ -1077,6 +1095,7 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
                 'held_recent_sale': 0,
                 'no_market_data': 0,
                 'errors': 0,
+                'guard_error': 0,
                 'strategies': {},
                 'market_sources': {},
             },
@@ -1147,6 +1166,7 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
     price_up = 0
     price_down = 0
     errors = 0
+    guard_errors = 0
     no_market = 0
     held_recent_sale = 0
 
@@ -1308,6 +1328,12 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
                     )
                     errors += 1
                     log.error(f"  {sku}: price update not verified on eBay ({result['error']})")
+            elif ok == PRICE_GUARD_ERROR or ok == "guard_error":
+                # Guard exception: SKU skipped, no eBay write, distinct report status.
+                result['status'] = 'guard_error'
+                result['error'] = 'price guard exception (fail-closed)'
+                guard_errors += 1
+                errors += 1
             else:
                 result['status'] = 'error'
                 errors += 1
@@ -1339,6 +1365,8 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
         updated = sum(1 for r in results if r['status'] == 'updated')
         log.info(f"Successfully updated: {updated}")
         log.info(f"Errors:             {errors}")
+        if guard_errors:
+            log.info(f"Guard errors:       {guard_errors} (fail-closed, no eBay write)")
 
     # Strategy distribution
     strategy_counts = defaultdict(int)
@@ -1382,6 +1410,7 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
             'held_recent_sale': held_recent_sale,
             'no_market_data': no_market,
             'errors': errors,
+            'guard_error': guard_errors,
             'strategies': dict(strategy_counts),
             'market_sources': dict(source_counts),
         },
