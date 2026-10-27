@@ -2374,13 +2374,18 @@ def recover_missed_tasks(log_when_clean=True):
             if _task_succeeded_today(task_name, now=now):
                 continue
 
-            # daily_tasks: 当日已启动过（含 timeout/failed）禁止再开一轮，
-            # 但 recovering/interrupted + stale lock 走 inventory resume。
-            if task_name == 'daily_tasks':
-                if _should_resume_daily_inventory(task_name, now=now):
-                    pass  # fall through to resume via task_daily_full
-                elif _task_already_started_today(task_name, now=now):
-                    continue
+            resume_inventory = (
+                task_name == 'daily_tasks'
+                and _should_resume_daily_inventory(task_name, now=now)
+            )
+            # daily_tasks: started today blocks a second full apply, except the
+            # recovering/interrupted + stale-lock inventory resume path.
+            if (
+                task_name == 'daily_tasks'
+                and not resume_inventory
+                and _task_already_started_today(task_name, now=now)
+            ):
+                continue
             
             # 未到补跑窗口（给定时任务留出执行时间）
             if now < recovery_window_start:
@@ -2390,16 +2395,12 @@ def recover_missed_tasks(log_when_clean=True):
             if depends_on and not _task_succeeded_today(str(depends_on), now=now):
                 continue
 
-            # recovering with stale lock is handled by the resume path above;
-            # only skip when a live recovery worker is still holding the lock.
-            if task_name == 'daily_tasks' and _should_resume_daily_inventory(task_name, now=now):
-                pass
-            elif _task_in_progress_or_recovered_today(task_name, scheduled_dt, now=now):
+            if (
+                not resume_inventory
+                and _task_in_progress_or_recovered_today(task_name, scheduled_dt, now=now)
+            ):
                 continue
 
-            resume_inventory = (
-                task_name == 'daily_tasks' and _should_resume_daily_inventory(task_name, now=now)
-            )
             last_run = _get_task_health(task_name).get('at', '')
             if last_run and not resume_inventory:
                 try:

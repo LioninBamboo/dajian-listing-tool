@@ -40,7 +40,8 @@ if exist "%ROOT%logs\_scheduler.pid" (
 )
 
 :: ──────────────────────────────────────────
-:: 2. 停止本店服务窗口 (按店铺专属标题)
+:: 2. 停止本店服务窗口 (仅店铺专属标题；勿用
+::    "Streamlit UI*" 通配，会误杀其他店)
 :: ──────────────────────────────────────────
 if defined STREAMLIT_TITLE (
     taskkill /F /FI "WINDOWTITLE eq !STREAMLIT_TITLE!*" >nul 2>&1
@@ -48,12 +49,11 @@ if defined STREAMLIT_TITLE (
 if defined FASTAPI_TITLE (
     taskkill /F /FI "WINDOWTITLE eq !FASTAPI_TITLE!*" >nul 2>&1
 )
-:: 兼容旧标题 (仅当本店端口匹配时也会被下一步端口清理)
-taskkill /F /FI "WINDOWTITLE eq Streamlit UI*" >nul 2>&1
-taskkill /F /FI "WINDOWTITLE eq FastAPI Server*" >nul 2>&1
+if defined BRAND_NAME (
+    taskkill /F /FI "WINDOWTITLE eq Scheduler Daemon - !BRAND_NAME!*" >nul 2>&1
+)
 taskkill /F /FI "WINDOWTITLE eq Daily Tasks*" >nul 2>&1
 taskkill /F /FI "WINDOWTITLE eq Title Optimizer*" >nul 2>&1
-taskkill /F /FI "WINDOWTITLE eq Scheduler Daemon*" >nul 2>&1
 
 :: ──────────────────────────────────────────
 :: 3. 仅按本店端口清理残留 (不碰其他店)
