@@ -672,6 +672,119 @@ def test_task_daily_full_yesterday_stale_lock_runs_full_daily(tmp_path, monkeypa
     assert '--sync-only' not in calls[0][1]
 
 
+def test_timeout_leftover_lock_does_not_resume(tmp_path, monkeypatch):
+    """Daemon timeout leftover (or timeout health) must never re-trigger --sync-only."""
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'timeout',
+                    'at': '2026-05-11T12:30:00',
+                    'message': 'Killed after 14400s',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir, started_at='2026-05-11T09:30:00')
+    # Also cover daemon-kill marking (timeout path writes this).
+    lock_path = lock_dir / 'daily_tasks.lock'
+    payload = json.loads(lock_path.read_text(encoding='utf-8'))
+    payload['killed_by_daemon'] = True
+    payload['daemon_kill_reason'] = 'timeout'
+    lock_path.write_text(json.dumps(payload), encoding='utf-8')
+
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
+    assert scheduler_daemon._has_partial_daily_run_evidence_today('daily_tasks') is False
+
+
+def test_timeout_health_blocks_resume_even_without_kill_marker(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'timeout',
+                    'at': '2026-05-11T12:30:00',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
+
+
+def test_invalidate_lock_as_daemon_kill_excludes_crash_evidence(tmp_path, monkeypatch):
+    lock_dir = tmp_path / '_task_locks'
+    _write_today_dead_lock(lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+
+    assert scheduler_daemon._has_partial_daily_run_evidence_today('daily_tasks') is True
+    scheduler_daemon._invalidate_lock_as_daemon_kill('daily_tasks', reason='timeout')
+    # Unlink may succeed on Linux; either way evidence must be gone.
+    assert scheduler_daemon._has_partial_daily_run_evidence_today('daily_tasks') is False
+
+
+def test_crash_lock_resumes_exactly_once_second_heartbeat_skips(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'interrupted',
+                    'at': '2026-05-11T09:40:00',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+    calls = []
+
+    def _fake_run_task(name, cmd, timeout_sec=0):
+        calls.append([str(x) for x in cmd])
+        return True, 'Success in 12s'
+
+    monkeypatch.setattr(scheduler_daemon, 'run_task', _fake_run_task)
+
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is True
+    ok1, _ = scheduler_daemon.task_daily_full()
+    assert ok1 is True
+    assert len(calls) == 1
+    assert '--sync-only' in calls[0]
+
+    # Leave a dead lock behind (as if sync finished but lock file lingered).
+    _write_today_dead_lock(lock_dir, pid=999)
+    # Health is resumed_inventory; even with a dead lock, no second resume.
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
+    ok2, msg2 = scheduler_daemon.task_daily_full()
+    assert ok2 is True
+    assert 'already started' in msg2.lower()
+    assert len(calls) == 1
+
+
 def test_task_daily_full_resume_exit_75_leaves_status_unchanged(tmp_path, monkeypatch):
     health_path = tmp_path / '_scheduler_health.json'
     lock_dir = tmp_path / '_task_locks'
@@ -706,6 +819,61 @@ def test_task_daily_full_resume_exit_75_leaves_status_unchanged(tmp_path, monkey
     health = json.loads(health_path.read_text(encoding='utf-8'))
     assert health['tasks']['daily_tasks']['status'] == 'interrupted'
     assert health['tasks']['daily_tasks']['at'] == '2026-05-11T09:40:00'
+    marker = scheduler_daemon._read_inventory_resume_marker('daily_tasks')
+    assert marker['outcome'] == 'exit75'
+    assert marker['exit75_retries'] == 1
+
+
+def test_exit75_resume_allows_bounded_retry_after_backoff(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'interrupted',
+                    'at': '2026-05-11T09:40:00',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+    calls = []
+
+    def _fake_run_task(*args, **kwargs):
+        calls.append('run')
+        return True, scheduler_daemon._RESUME_LOCK_SKIP_MESSAGE
+
+    monkeypatch.setattr(scheduler_daemon, 'run_task', _fake_run_task)
+
+    scheduler_daemon.task_daily_full()
+    assert len(calls) == 1
+    # Immediate second attempt blocked by backoff.
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
+
+    # Pretend backoff elapsed.
+    marker = scheduler_daemon._read_inventory_resume_marker('daily_tasks')
+    marker['last_exit75_at'] = '2026-05-11T11:00:00'
+    scheduler_daemon._write_inventory_resume_marker('daily_tasks', marker)
+
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is True
+    scheduler_daemon.task_daily_full()
+    assert len(calls) == 2
+    marker2 = scheduler_daemon._read_inventory_resume_marker('daily_tasks')
+    assert marker2['exit75_retries'] == 2
+
+    # Exhaust retries.
+    marker2['exit75_retries'] = scheduler_daemon._RESUME_EXIT75_MAX
+    marker2['last_exit75_at'] = '2026-05-11T11:00:00'
+    marker2['outcome'] = 'exit75'
+    scheduler_daemon._write_inventory_resume_marker('daily_tasks', marker2)
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
 
 
 def test_task_daily_full_resume_exit_0_marks_resumed_inventory(tmp_path, monkeypatch):
@@ -740,6 +908,8 @@ def test_task_daily_full_resume_exit_0_marks_resumed_inventory(tmp_path, monkeyp
     assert 'resumed inventory' in message.lower()
     health = json.loads(health_path.read_text(encoding='utf-8'))
     assert health['tasks']['daily_tasks']['status'] == 'resumed_inventory'
+    marker = scheduler_daemon._read_inventory_resume_marker('daily_tasks')
+    assert marker['outcome'] == 'success'
 
 
 def test_task_daily_full_skips_completed_success_not_resume(tmp_path, monkeypatch):
