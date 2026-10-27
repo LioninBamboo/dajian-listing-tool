@@ -352,10 +352,6 @@ def urls_keep_giga_sigs(source_urls: List[str], dest_urls: List[str]) -> bool:
     return True
 
 
-_INVENTORY_GET_ONLY_KEYS = frozenset({"sku", "href", "inventoryItemGroupKeys"})
-_PAYLOAD_ALIAS_KEYS = frozenset({"image_urls", "quantity"})
-
-
 def payload_image_urls(payload: Optional[Dict[str, Any]]) -> List[str]:
     if not payload:
         return []
@@ -365,64 +361,38 @@ def payload_image_urls(payload: Optional[Dict[str, Any]]) -> List[str]:
     return list(((payload.get("product") or {}).get("imageUrls")) or [])
 
 
-def inventory_put_body(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Inventory API body: live GET copy minus GET-only / alias keys."""
-    body = copy.deepcopy(payload)
-    for key in list(body.keys()):
-        if key in _INVENTORY_GET_ONLY_KEYS or key in _PAYLOAD_ALIAS_KEYS:
-            body.pop(key, None)
-    return body
-
-
-def put_strict_inventory_item(client: Any, sku: str, payload: Dict[str, Any]) -> Any:
-    """PUT the inventory item as a whole. No live session → refuse (no rebuild)."""
-    body = inventory_put_body(payload)
-    session = getattr(client, "session", None)
-    oauth = getattr(client, "oauth", None)
-    base = getattr(client, "base_url", None)
-    if session is None or oauth is None or not base:
-        raise RuntimeError("inventory PUT refused: no live session")
-    token = oauth.get_valid_token()
-    url = f"{str(base).rstrip('/')}/sell/inventory/v1/inventory_item/{sku}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Content-Language": "en-US",
-    }
-    resp = session.put(url, headers=headers, json=body, timeout=60)
-    code = int(getattr(resp, "status_code", 0) or 0)
-    if code not in (200, 204):
-        text = getattr(resp, "text", "") or ""
-        raise RuntimeError(f"inventory PUT {code}: {text[:200]}")
-    return resp
+def _qty_skip_reason_for_inspect(item: Dict[str, Any]) -> Optional[str]:
+    reason = _quantity_skip_reason(item)
+    if not reason:
+        return None
+    if reason in {"live quantity missing", "live quantity unknown"}:
+        return "qty_unknown"
+    return "qty_zero"
 
 
 def build_strict_refresh_payload(
     item: Dict[str, Any],
     local: Dict[str, Any],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Copy the live GET item; replace only product.imageUrls.
+    """Dry-run inspect wrapper over #48 PUT-body helpers.
 
-    Never default qty to 1. Keep GigaB2B x-c* params, packageWeightAndSize,
-    locale, full availability, and product identifiers (upc/ean/mpn/brand/epid).
+    Never default qty to 1. Keep GigaB2B x-c* params. Weight<=0 is omitted.
     """
-    qty = live_quantity(item)
-    if qty is None:
-        return None, "qty_unknown"
-    if qty <= 0:
-        return None, "qty_zero"
+    qty_reason = _qty_skip_reason_for_inspect(item)
+    if qty_reason:
+        return None, qty_reason
     local_images = list(local.get("images") or [])
-    prepared = [strip_oss_keep_giga_sig(u) for u in local_images]
+    prepared = [strip_oss_keep_giga_sig(u) for u in local_images if isinstance(u, str) and u]
     if not urls_keep_giga_sigs(local_images, prepared):
         return None, "image_sig_stripped"
-    payload = copy.deepcopy(item) if isinstance(item, dict) else {}
-    product = dict(payload.get("product") or {})
-    product["imageUrls"] = prepared
-    payload["product"] = product
-    # Aliases for callers/tests that still read the builder-style keys.
-    payload["image_urls"] = prepared
-    payload["quantity"] = qty
-    return payload, None
+    try:
+        body = _inventory_refresh_put_body(item, prepared)
+    except RuntimeError as exc:
+        return None, str(exc)
+    qty = live_quantity(item)
+    body["image_urls"] = prepared
+    body["quantity"] = qty
+    return body, None
 
 
 def _refresh_one(client, sku: str, local: Dict[str, Any]) -> Dict[str, Any]:

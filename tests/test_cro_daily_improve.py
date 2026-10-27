@@ -11,6 +11,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -178,7 +179,7 @@ class _FakeHttpResp:
 
 
 def _attach_live_session(client):
-    """put_strict_inventory_item requires session/oauth/base_url (no rebuild fallback)."""
+    """#48 _put_inventory_refresh requires session/oauth/base_url (no rebuild fallback)."""
 
     class _OAuth:
         def get_valid_token(self):
@@ -752,8 +753,8 @@ def test_image_qty_and_giga_sig(tmp_path, no_promote_module):
     assert payload["product"]["brand"] == "AquaVerve"
     assert payload["product"]["epid"] == "1234567890"
     assert payload["product"]["imageUrls"] == payload["image_urls"]
-    from scripts.cro_image_refresh import inventory_put_body
-    put_body = inventory_put_body(payload)
+    from scripts.cro_image_refresh import _inventory_refresh_put_body
+    put_body = _inventory_refresh_put_body(item_ok, list(payload["image_urls"]))
     assert "image_urls" not in put_body
     assert "quantity" not in put_body
     assert "sku" not in put_body
@@ -761,6 +762,13 @@ def test_image_qty_and_giga_sig(tmp_path, no_promote_module):
     assert "inventoryItemGroupKeys" not in put_body
     assert put_body["packageWeightAndSize"] == item_ok["packageWeightAndSize"]
     assert put_body["product"]["imageUrls"] == payload["image_urls"]
+    zero_w = dict(item_ok)
+    zero_w["packageWeightAndSize"] = {
+        "weight": {"value": 0, "unit": "POUND"},
+        "dimensions": {"length": 20, "width": 10, "height": 8, "unit": "INCH"},
+    }
+    dropped = _inventory_refresh_put_body(zero_w, list(payload["image_urls"]))
+    assert "weight" not in dropped.get("packageWeightAndSize", {})
 
     class SigStripClient:
         def __init__(self):
@@ -935,17 +943,39 @@ def test_preflight_sha_lock_and_mismatch(tmp_path, monkeypatch, no_promote_modul
     ))
     assert rc == m.EXIT_USAGE
 
-    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    lock_ctx = _ctx(
+        tmp_path / "held", "main", _main_profile(),
+        load_products_fn=lambda _c: [],
+        load_perf_fn=lambda _c: {"traffic_meta": {"api_ok": True}},
+    )
+    root = Path(m.__file__).resolve().parents[1]
+    holding = tmp_path / "child-holding"
+    holder = subprocess.Popen(
+        [
+            sys.executable, "-c",
+            "import sys, time\n"
+            "from datetime import datetime, timedelta, timezone\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from scripts.cro_daily_improve import acquire_lock\n"
+            "rc = acquire_lock(Path(sys.argv[2]), datetime.now(timezone(timedelta(hours=8))))\n"
+            "if rc is None:\n"
+            "    Path(sys.argv[3]).write_text('held')\n"
+            "    time.sleep(60)\n"
+            "sys.exit(int(rc or 0))\n",
+            str(root),
+            str(lock_ctx.lock_path),
+            str(holding),
+        ]
+    )
     try:
-        lock_ctx = _ctx(
-            tmp_path, "main", _main_profile(),
-            load_products_fn=lambda _c: [],
-            load_perf_fn=lambda _c: {"traffic_meta": {"api_ok": True}},
-        )
-        lock_ctx.lock_path.write_text(
-            json.dumps({"pid": holder.pid, "at": _now().isoformat()}),
-            encoding="utf-8",
-        )
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if holding.is_file() and holder.poll() is None:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("holder process did not acquire the OS lock")
         rc = m.main(["--store", "main", "--out-dir", str(lock_ctx.out_dir)], ctx=lock_ctx)
         assert rc == m.EXIT_LOCK
     finally:
@@ -1672,7 +1702,8 @@ def test_live_image_put_error_continues_batch(tmp_path, no_promote_module):
     done_skus = [sku for skus_, _action in marked for sku in skus_]
     assert "SKU1" in done_skus and "SKU3" in done_skus
     assert "SKU2" not in done_skus
-    assert not ctx.lock_path.exists()
+    assert m.acquire_lock(ctx.lock_path, _now()) is None
+    m.release_lock(ctx.lock_path)
 
 
 def test_live_revalidates_raise_force_skip_and_oos(tmp_path, no_promote_module):
@@ -1855,7 +1886,7 @@ def test_pid_alive_win32_never_calls_os_kill(monkeypatch, no_promote_module):
     assert m.pid_alive(1, "win-filetime:1") is False
 
 
-def test_lock_stores_creation_marker_and_rejects_reused_pid(tmp_path, no_promote_module):
+def test_lock_stores_creation_marker_and_os_lock_is_exclusive(tmp_path, no_promote_module):
     from scripts import cro_daily_improve as m
     from src.utils.process_identity import get_process_creation_marker
 
@@ -1867,36 +1898,28 @@ def test_lock_stores_creation_marker_and_rejects_reused_pid(tmp_path, no_promote
     assert data["creation_marker"] == get_process_creation_marker(os.getpid())
     assert data["creation_marker"]
     assert m.acquire_lock(lock, now) == m.EXIT_LOCK
-
-    lock.write_text(
-        json.dumps({
-            "pid": os.getpid(),
-            "creation_marker": "win-filetime:reused-pid",
-            "at": now.isoformat(),
-            "name": "cro_daily_improve",
-        }),
-        encoding="utf-8",
-    )
+    m.release_lock(lock)
+    leftover = json.dumps({
+        "pid": 999999999,
+        "creation_marker": "win-filetime:reused-pid",
+        "at": now.isoformat(),
+        "name": "cro_daily_improve",
+    })
+    lock.write_text(leftover, encoding="utf-8")
     assert m.acquire_lock(lock, now) is None
     data = json.loads(lock.read_text(encoding="utf-8"))
     assert data["creation_marker"] == get_process_creation_marker(os.getpid())
     m.release_lock(lock)
-    assert not lock.exists()
 
 
-def test_empty_fresh_lock_is_held_and_concurrent_stale_has_one_winner(tmp_path, no_promote_module):
+def test_os_lock_single_winner_threads_and_processes(tmp_path, no_promote_module):
     from scripts import cro_daily_improve as m
 
     empty = tmp_path / "empty.lock"
     empty.write_bytes(b"")
-    assert m.acquire_lock(empty, _now()) == m.EXIT_LOCK
+    assert m.acquire_lock(empty, _now()) is None
     assert empty.exists()
-    assert empty.read_bytes() == b""
-
-    garbage = tmp_path / "garbage.lock"
-    garbage.write_text("{not-json", encoding="utf-8")
-    assert m.acquire_lock(garbage, _now()) == m.EXIT_LOCK
-    assert garbage.read_text(encoding="utf-8") == "{not-json"
+    m.release_lock(empty)
 
     stale = tmp_path / "stale.lock"
     stale.write_text(
@@ -1925,26 +1948,116 @@ def test_empty_fresh_lock_is_held_and_concurrent_stale_has_one_winner(tmp_path, 
     holder = json.loads(stale.read_text(encoding="utf-8"))
     assert holder["pid"] == os.getpid()
     m.release_lock(stale)
-    assert not stale.exists()
+
+    import fcntl
+    lock = tmp_path / "os.lock"
+    assert m.acquire_lock(lock, _now()) is None
+    fd = os.open(str(lock), os.O_RDWR)
+    try:
+        with pytest.raises((BlockingIOError, OSError)):
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+    m.release_lock(lock)
+    fd = os.open(str(lock), os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+    root = Path(m.__file__).resolve().parents[1]
+    proc_lock = tmp_path / "proc.lock"
+    script = (
+        "import sys\n"
+        "from datetime import datetime, timedelta, timezone\n"
+        "from pathlib import Path\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from scripts.cro_daily_improve import acquire_lock, release_lock, EXIT_LOCK\n"
+        "rc = acquire_lock(Path(sys.argv[2]), datetime.now(timezone(timedelta(hours=8))))\n"
+        "if rc is None:\n"
+        "    Path(sys.argv[3]).write_text('held')\n"
+        "    import time; time.sleep(1.5)\n"
+        "    release_lock(Path(sys.argv[2]))\n"
+        "    sys.exit(0)\n"
+        "sys.exit(int(rc or EXIT_LOCK))\n"
+    )
+    markers = [tmp_path / f"held{i}" for i in range(2)]
+    procs = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(root), str(proc_lock), str(markers[i])]
+        )
+        for i in range(2)
+    ]
+    codes = [proc.wait(timeout=10) for proc in procs]
+    assert sorted(codes) == [0, m.EXIT_LOCK]
+    assert sum(1 for marker in markers if marker.exists()) == 1
 
 
-def test_acquire_lock_uses_atomic_excl(tmp_path, monkeypatch, no_promote_module):
+def test_concurrent_never_both_reach_live(tmp_path, no_promote_module):
     from scripts import cro_daily_improve as m
 
-    seen = []
-    real_open = os.open
+    writes: list[int] = []
+    in_live = threading.Event()
+    allow_finish = threading.Event()
+    lock_path = tmp_path / "shared.lock"
+    cand = {
+        "schema": "cro_daily_improve/v1",
+        "store": "main",
+        "mode": "dry",
+        "created_at": _now().isoformat(),
+        "expires_at": (_now() + timedelta(hours=2)).isoformat(),
+        "candidates": [{
+            "action": "price_drop",
+            "sku": "W5230P450590",
+            "listing_id": "188111",
+            "live_price": 120,
+            "new_price": 110,
+        }],
+    }
+    path = tmp_path / "shared.json"
+    path.write_text(json.dumps(cand), encoding="utf-8")
+    digest = _sha(path)
+    rcs: list[int] = []
+    barrier = threading.Barrier(2)
 
-    def wrapped(path, flags, *args, **kwargs):
-        seen.append(flags)
-        return real_open(path, flags, *args, **kwargs)
+    def worker(idx: int) -> None:
+        ctx = _ctx(
+            tmp_path / f"live{idx}", "main", _main_profile(),
+            ebay_environment="PRODUCTION",
+            read_live_price_fn=lambda sku, lid: 120,
+            write_price_fn=lambda *a, **k: writes.append(idx) or in_live.set() or allow_finish.wait(timeout=5) or True,
+            write_price_db_fn=lambda *a, **k: True,
+            precheck_price_fn=lambda **k: (True, "ok"),
+            verify_price_fn=lambda *a, **k: (True, 110),
+            recent_terminal_fn=lambda **k: set(),
+            mark_done_fn=lambda *a, **k: 0,
+        )
+        ctx.lock_path = lock_path
+        barrier.wait(timeout=5)
+        rcs.append(m.main(
+            [
+                "--store", "main", "--live",
+                "--candidates", str(path),
+                "--approve-sha256", digest,
+                "--out-dir", str(ctx.out_dir),
+            ],
+            ctx=ctx,
+        ))
 
-    monkeypatch.setattr(m.os, "open", wrapped)
-    lock = tmp_path / "atomic.lock"
-    assert m.acquire_lock(lock, _now()) is None
-    assert seen
-    assert seen[0] & os.O_CREAT
-    assert seen[0] & os.O_EXCL
-    m.release_lock(lock)
+    threads = [threading.Thread(target=worker, args=(i,)) for i in (1, 2)]
+    for thread in threads:
+        thread.start()
+    deadline = time.time() + 5
+    while time.time() < deadline and not (in_live.is_set() and m.EXIT_LOCK in rcs):
+        time.sleep(0.02)
+    assert in_live.is_set()
+    assert m.EXIT_LOCK in rcs
+    allow_finish.set()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert sorted(rcs) == [0, m.EXIT_LOCK]
+    assert writes == [1] or writes == [2]
 
 
 def test_strip_oss_keeps_raw_giga_sig_bytes():
@@ -2136,38 +2249,119 @@ def test_dry_run_exception_writes_degraded_report_and_releases_lock(tmp_path, no
     assert "load exploded" in str(dry.get("error"))
     assert dry["mode"] == "dry"
     assert dry["writes"] == {"db": 0, "queue": 0, "ebay": 0}
-    assert not ctx.lock_path.exists()
+    assert m.acquire_lock(ctx.lock_path, _now()) is None
+    m.release_lock(ctx.lock_path)
 
 
-def test_put_strict_refuses_without_session_and_drops_get_only_keys():
-    from scripts.cro_image_refresh import inventory_put_body, put_strict_inventory_item
+def test_image_live_reuses_48_helpers_exact_readback_and_no_session():
+    from scripts.cro_image_refresh import (
+        _inventory_refresh_put_body,
+        _omit_nonpositive_package_weight,
+        _put_inventory_refresh,
+        _readback_image_urls,
+    )
 
     class NoSession:
         def create_or_replace_inventory_item(self, sku, payload):
             raise AssertionError("must not fall back to create_or_replace_inventory_item")
 
-    with pytest.raises(RuntimeError, match="no live session"):
-        put_strict_inventory_item(NoSession(), "SKU", {
-            "sku": "SKU",
-            "href": "https://api.ebay.com/sell/inventory/v1/inventory_item/SKU",
-            "inventoryItemGroupKeys": ["g1"],
+    with pytest.raises(RuntimeError, match="live session is required"):
+        _put_inventory_refresh(NoSession(), "SKU", {
             "locale": "en_US",
             "product": {"imageUrls": ["https://img/a.jpg"]},
         })
 
-    body = inventory_put_body({
+    item = {
         "sku": "SKU",
         "href": "https://api.ebay.com/x",
         "inventoryItemGroupKeys": ["g1"],
         "image_urls": ["https://alias.jpg"],
         "quantity": 1,
         "locale": "en_US",
-        "product": {"imageUrls": ["https://img/a.jpg"]},
-    })
+        "packageWeightAndSize": {"weight": {"value": 0, "unit": "POUND"}},
+        "product": {"imageUrls": ["https://img/old.jpg"]},
+    }
+    body = _inventory_refresh_put_body(item, ["https://img/a.jpg", "https://img/b.jpg"])
     assert "sku" not in body
     assert "href" not in body
     assert "inventoryItemGroupKeys" not in body
     assert "image_urls" not in body
     assert "quantity" not in body
+    assert "packageWeightAndSize" not in body
     assert body["locale"] == "en_US"
-    assert body["product"]["imageUrls"] == ["https://img/a.jpg"]
+    assert body["product"]["imageUrls"] == ["https://img/a.jpg", "https://img/b.jpg"]
+    positive = {
+        "product": {"imageUrls": ["u"]},
+        "packageWeightAndSize": {
+            "weight": {"value": 2, "unit": "POUND"},
+            "dimensions": {"length": 1, "width": 1, "height": 1, "unit": "INCH"},
+        },
+    }
+    _omit_nonpositive_package_weight(positive)
+    assert positive["packageWeightAndSize"]["weight"]["value"] == 2
+    assert _readback_image_urls({"product": {"imageUrls": ["a", "b"]}}) == ["a", "b"]
+
+
+def test_live_image_readback_must_equal_written_count(tmp_path, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    class CollapseClient:
+        def __init__(self):
+            self.items = {"W5230P450590": _item(["https://live/old.jpg"], qty=3)}
+            self.session = self
+            self.oauth = type("O", (), {"get_valid_token": staticmethod(lambda: "tok")})()
+            self.base_url = "https://api.ebay.com"
+
+        def get_inventory_item(self, sku):
+            return self.items[sku]
+
+        def put(self, url, headers=None, json=None, timeout=None):
+            sku = str(url).rstrip("/").split("/")[-1]
+            self.items[sku] = _item(["https://live/only-one.jpg"], qty=3)
+            return _FakeHttpResp()
+
+        def create_or_replace_inventory_item(self, sku, payload):
+            raise AssertionError("must not fall back")
+
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        ebay_environment="PRODUCTION",
+        ebay_client_factory=lambda: CollapseClient(),
+        load_local_product_fn=lambda sku: {
+            "images": [GIGA_URL, GIGA_URL_2], "title": "t", "description": "d",
+        },
+        recent_terminal_fn=lambda **k: set(),
+        mark_done_fn=lambda *a, **k: 0,
+    )
+    cand = {
+        "schema": "cro_daily_improve/v1",
+        "store": "main",
+        "mode": "dry",
+        "created_at": _now().isoformat(),
+        "expires_at": (_now() + timedelta(hours=2)).isoformat(),
+        "candidates": [{
+            "action": "image_refresh",
+            "sku": "W5230P450590",
+            "listing_id": "188111",
+            "live_n": 1,
+            "live_lead": "https://live/old.jpg",
+            "reason": "local lead image differs from live",
+        }],
+    }
+    path = tmp_path / "collapse.json"
+    path.write_text(json.dumps(cand), encoding="utf-8")
+    rc = m.main(
+        [
+            "--store", "main", "--live",
+            "--candidates", str(path),
+            "--approve-sha256", _sha(path),
+            "--out-dir", str(ctx.out_dir),
+        ],
+        ctx=ctx,
+    )
+    assert rc == 0
+    live = json.loads(next(ctx.out_dir.glob("*_live.json")).read_text(encoding="utf-8"))
+    assert live["results"][0]["status"] == "failed"
+    assert live["results"][0]["reason"] == "verification mismatch"
+    assert live["results"][0]["expected_count"] == 2
+    assert live["results"][0]["after"] == 1

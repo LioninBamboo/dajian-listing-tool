@@ -16,7 +16,7 @@ import os
 import sqlite3
 import subprocess
 import sys
-import time
+import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -57,7 +57,10 @@ EXIT_NOT_PRODUCTION = 5
 EXIT_LOCK = 6
 EXIT_EXPIRED = 7
 EXIT_DEGRADED = 8
-LOCK_UNREADABLE_HOLD_SEC = 60.0
+
+# Held OS-lock fds for this process. Staleness = "can acquire the OS lock".
+_held_lock_fds: Dict[str, int] = {}
+_held_lock_guard = threading.Lock()
 
 STORE_EXPECTATIONS: Dict[str, Dict[str, Any]] = {
     "main": {
@@ -622,56 +625,54 @@ def queue_is_fresh(ctx: ImproveContext, rows: Iterable[Dict[str, Any]]) -> bool:
     return False
 
 
-def _lock_snapshot(lock_path: Path) -> Optional[tuple[bytes, int, float]]:
-    """Read lock bytes together with inode/mtime. None if the file raced."""
+def _lock_key(lock_path: Path) -> str:
+    return str(Path(lock_path).resolve())
+
+
+def _try_exclusive_os_lock(fd: int) -> bool:
+    """Non-blocking exclusive lock. Windows: msvcrt.locking; POSIX: fcntl.flock."""
     try:
-        st = lock_path.stat()
-        raw = lock_path.read_bytes()
-        st2 = lock_path.stat()
-    except OSError:
-        return None
-    inode = int(getattr(st, "st_ino", 0) or 0)
-    inode2 = int(getattr(st2, "st_ino", 0) or 0)
-    if inode != inode2 or float(st.st_mtime) != float(st2.st_mtime):
-        return None
-    return raw, inode, float(st.st_mtime)
+        if sys.platform == "win32":
+            import msvcrt
 
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        import fcntl
 
-def _lock_unchanged(lock_path: Path, observed: bytes, inode: int, mtime: float) -> bool:
-    try:
-        st = lock_path.stat()
-        if int(getattr(st, "st_ino", 0) or 0) != int(inode):
-            return False
-        if float(st.st_mtime) != float(mtime):
-            return False
-        return lock_path.read_bytes() == observed
-    except OSError:
-        return False
-
-
-def _try_reap_observed_lock(lock_path: Path, observed: bytes, inode: int, mtime: float) -> bool:
-    """Unlink only the exact stale file we observed; a replacement stays held."""
-    if not _lock_unchanged(lock_path, observed, inode, mtime):
-        return False
-    try:
-        lock_path.unlink()
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
     except OSError:
         return False
 
 
-def _parse_lock_payload(raw: bytes) -> Optional[Dict[str, Any]]:
-    if not raw or not raw.strip():
-        return None
+def _unlock_os_lock(fd: int) -> None:
     try:
-        data = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
+        if sys.platform == "win32":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
 
 
 def acquire_lock(lock_path: Path, now: datetime) -> Optional[int]:
+    """Hold an exclusive OS lock on the file for the whole run.
+
+    Stale = we can acquire the OS lock (previous holder died and the kernel
+    released it). Never unlink-by-path: a live holder keeps the fd/lock.
+    """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    key = _lock_key(lock_path)
+    with _held_lock_guard:
+        if key in _held_lock_fds:
+            return EXIT_LOCK
+
     payload = {
         "pid": os.getpid(),
         "at": now.isoformat(),
@@ -679,57 +680,51 @@ def acquire_lock(lock_path: Path, now: datetime) -> Optional[int]:
         "creation_marker": get_process_creation_marker(os.getpid()),
     }
     encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    for _ in range(2):
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            snap = _lock_snapshot(lock_path)
-            if snap is None:
-                return EXIT_LOCK
-            observed, inode, mtime = snap
-            data = _parse_lock_payload(observed)
-            if data is None:
-                age_sec = max(0.0, time.time() - mtime)
-                if age_sec < LOCK_UNREADABLE_HOLD_SEC:
-                    return EXIT_LOCK
-            else:
-                try:
-                    holder = int(data.get("pid"))
-                except (TypeError, ValueError):
-                    holder = None
-                marker = data.get("creation_marker")
-                if holder is not None and pid_alive(holder, marker):
-                    return EXIT_LOCK
-            if _try_reap_observed_lock(lock_path, observed, inode, mtime):
-                continue
-            return EXIT_LOCK
-        try:
-            os.write(fd, encoded)
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT)
+    try:
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b" ")
             os.fsync(fd)
-        except Exception:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            try:
-                lock_path.unlink()
-            except OSError:
-                pass
-            raise
-        os.close(fd)
-        return None
-    return EXIT_LOCK
+        if not _try_exclusive_os_lock(fd):
+            os.close(fd)
+            return EXIT_LOCK
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, encoded)
+        os.ftruncate(fd, len(encoded))
+        os.fsync(fd)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+    with _held_lock_guard:
+        if key in _held_lock_fds:
+            # Another thread in this process already holds it. Do not LOCK_UN:
+            # flock is process-wide and would drop the winner's lock.
+            os.close(fd)
+            return EXIT_LOCK
+        _held_lock_fds[key] = fd
+    return None
 
 
 def release_lock(lock_path: Path) -> None:
     try:
-        if not lock_path.exists():
-            return
-        data = json.loads(lock_path.read_text(encoding="utf-8"))
-        if int(data.get("pid") or -1) == os.getpid():
-            lock_path.unlink()
+        key = _lock_key(lock_path)
     except Exception:
-        pass
+        return
+    with _held_lock_guard:
+        fd = _held_lock_fds.pop(key, None)
+    if fd is None:
+        return
+    try:
+        _unlock_os_lock(fd)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def guard_price_fail_closed(
@@ -1535,12 +1530,23 @@ def _write_price_db(ctx: ImproveContext, sku: str, new_price: float) -> bool:
         conn.close()
 
 
+def _image_qty_skip_reason(qty_reason: Optional[str]) -> Optional[str]:
+    if not qty_reason:
+        return None
+    if qty_reason in {"live quantity missing", "live quantity unknown"}:
+        return "qty_unknown"
+    return "qty_zero"
+
+
 def apply_image_live(ctx: ImproveContext, cand: Dict[str, Any]) -> Dict[str, Any]:
     from scripts.cro_image_refresh import (
+        _INVENTORY_IMAGE_LIMIT,
+        _inventory_refresh_put_body,
+        _put_inventory_refresh,
+        _quantity_skip_reason,
+        _readback_image_urls,
         _should_refresh,
-        build_strict_refresh_payload,
-        payload_image_urls,
-        put_strict_inventory_item,
+        strip_oss_keep_giga_sig,
         urls_keep_giga_sigs,
     )
 
@@ -1567,26 +1573,38 @@ def apply_image_live(ctx: ImproveContext, cand: Dict[str, Any]) -> Dict[str, Any
                     "sku": sku, "action": "image_refresh", "status": "skipped",
                     "reason": "live_changed", "before": live_n, "after": None,
                 }
+            qty_skip = _image_qty_skip_reason(_quantity_skip_reason(item))
+            if qty_skip:
+                return {
+                    "sku": sku, "action": "image_refresh", "status": "skipped",
+                    "reason": qty_skip,
+                }
             local = load_local_product(ctx, sku)
             local_images = list(local.get("images") or [])
+            prepared = [strip_oss_keep_giga_sig(u) for u in local_images if isinstance(u, str) and u]
+            prepared = prepared[:_INVENTORY_IMAGE_LIMIT]
+            if not urls_keep_giga_sigs(local_images, prepared):
+                return {
+                    "sku": sku, "action": "image_refresh", "status": "skipped",
+                    "reason": "image_sig_stripped",
+                }
             need = _should_refresh(local_images, live_urls)
-            payload, reason = build_strict_refresh_payload(item, local)
-            if reason:
-                return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": reason}
-            if payload is None or not urls_keep_giga_sigs(local_images, payload_image_urls(payload)):
-                return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": "image_sig_stripped"}
             if not need:
-                return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": "live already healthy"}
-            put_strict_inventory_item(client, sku, payload)
+                return {
+                    "sku": sku, "action": "image_refresh", "status": "skipped",
+                    "reason": "live already healthy",
+                }
+            body = _inventory_refresh_put_body(item, prepared)
+            _put_inventory_refresh(client, sku, body)
             ctx.writes["ebay"] += 1
             item2 = client.get_inventory_item(sku) or {}
-            live2 = list(((item2.get("product") or {}).get("imageUrls")) or [])
-            expected = min(len(local_images), 24)
-            if not live2 or len(live2) < max(1, expected - 1):
+            live2 = _readback_image_urls(item2)
+            if len(live2) != len(prepared):
                 return {
                     "sku": sku, "action": "image_refresh", "status": "failed",
                     "reason": "verification mismatch",
                     "before": live_n, "after": len(live2),
+                    "expected_count": len(prepared),
                 }
             return {
                 "sku": sku, "action": "image_refresh", "status": "done",
