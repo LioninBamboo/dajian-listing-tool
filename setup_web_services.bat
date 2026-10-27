@@ -18,5 +18,6 @@ if not "%ERRORLEVEL%"=="0" (
 )
 
 echo Registering logon auto-start for WEB services only (no scheduler daemon)...
-powershell -NoProfile -ExecutionPolicy Bypass -NoExit -File "%REGISTER_PS1%" -ProjectRoot "%ROOT%"
+set "WEB_USERId=%USERDOMAIN%\%USERNAME%"
+powershell -NoProfile -ExecutionPolicy Bypass -NoExit -File "%REGISTER_PS1%" -ProjectRoot "%ROOT%" -UserId "%WEB_USERId%"
 exit /b %ERRORLEVEL%

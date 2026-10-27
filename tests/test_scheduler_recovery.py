@@ -459,7 +459,13 @@ def test_task_lock_dead_pid_is_stale(monkeypatch):
     ) is True
 
 
-def _write_today_dead_lock(lock_dir, *, started_at='2026-05-11T09:30:00', pid=555):
+def _write_today_dead_lock(
+    lock_dir,
+    *,
+    started_at='2026-05-11T09:30:00',
+    pid=555,
+    owner_token='crash-owner-token',
+):
     lock_dir.mkdir(parents=True, exist_ok=True)
     (lock_dir / 'daily_tasks.lock').write_text(
         json.dumps({
@@ -468,6 +474,7 @@ def _write_today_dead_lock(lock_dir, *, started_at='2026-05-11T09:30:00', pid=55
             'worker_pid': pid,
             'started_at': started_at,
             'timeout_sec': 14400,
+            'owner_token': owner_token,
         }),
         encoding='utf-8',
     )
@@ -595,7 +602,7 @@ def test_task_daily_full_late_first_launch_runs_full_daily(tmp_path, monkeypatch
     monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
     calls = []
 
-    def _fake_run_task(name, cmd, timeout_sec=0):
+    def _fake_run_task(name, cmd, timeout_sec=0, **kwargs):
         calls.append((name, [str(x) for x in cmd], timeout_sec))
         return True, 'Success in 12s'
 
@@ -632,7 +639,7 @@ def test_task_daily_full_resumes_inventory_on_today_dead_lock(tmp_path, monkeypa
     monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
     calls = []
 
-    def _fake_run_task(name, cmd, timeout_sec=0):
+    def _fake_run_task(name, cmd, timeout_sec=0, **kwargs):
         calls.append((name, [str(x) for x in cmd], timeout_sec))
         return True, 'Success in 12s'
 
@@ -660,7 +667,7 @@ def test_task_daily_full_yesterday_stale_lock_runs_full_daily(tmp_path, monkeypa
     monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
     calls = []
 
-    def _fake_run_task(name, cmd, timeout_sec=0):
+    def _fake_run_task(name, cmd, timeout_sec=0, **kwargs):
         calls.append((name, [str(x) for x in cmd], timeout_sec))
         return True, 'Success in 12s'
 
@@ -728,17 +735,307 @@ def test_timeout_health_blocks_resume_even_without_kill_marker(tmp_path, monkeyp
     assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
 
 
-def test_invalidate_lock_as_daemon_kill_excludes_crash_evidence(tmp_path, monkeypatch):
+def test_invalidate_lock_requires_matching_owner_token(tmp_path, monkeypatch):
     lock_dir = tmp_path / '_task_locks'
-    _write_today_dead_lock(lock_dir)
+    own = 'own-token-aaa'
+    _write_today_dead_lock(lock_dir, owner_token=own)
     monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
     monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
     monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
 
     assert scheduler_daemon._has_partial_daily_run_evidence_today('daily_tasks') is True
-    scheduler_daemon._invalidate_lock_as_daemon_kill('daily_tasks', reason='timeout')
-    # Unlink may succeed on Linux; either way evidence must be gone.
+    # Missing / foreign token must leave the crash lock for resume.
+    assert scheduler_daemon._invalidate_lock_as_daemon_kill('daily_tasks', reason='timeout') is False
+    assert (lock_dir / 'daily_tasks.lock').exists()
+    assert scheduler_daemon._has_partial_daily_run_evidence_today('daily_tasks') is True
+    assert scheduler_daemon._invalidate_lock_as_daemon_kill(
+        'daily_tasks', reason='timeout', owner_token='foreign-token'
+    ) is False
+    assert (lock_dir / 'daily_tasks.lock').exists()
+    assert scheduler_daemon._has_partial_daily_run_evidence_today('daily_tasks') is True
+
+    # Own-token timeout => invalidated (no longer crash evidence).
+    assert scheduler_daemon._invalidate_lock_as_daemon_kill(
+        'daily_tasks', reason='timeout', owner_token=own
+    ) is True
     assert scheduler_daemon._has_partial_daily_run_evidence_today('daily_tasks') is False
+
+
+def test_run_task_unclaimed_handshake_leaves_foreign_lock(tmp_path, monkeypatch):
+    """Exit-75 / unclaimed path must never invalidate another worker's lock."""
+    import subprocess
+
+    log_dir = tmp_path / 'logs'
+    lock_dir = log_dir / '_task_locks'
+    health_path = log_dir / '_scheduler_health.json'
+    log_dir.mkdir()
+    lock_dir.mkdir()
+    foreign = {
+        'task_name': 'integration_worker',
+        'pid': 4242,
+        'worker_pid': 4242,
+        'owner_token': 'foreign-live-token',
+        'started_at': '2026-05-11T12:00:00',
+        'timeout_sec': 600,
+    }
+    lock_path = lock_dir / 'integration_worker.lock'
+    lock_path.write_text(json.dumps(foreign), encoding='utf-8')
+
+    class _FakeProc:
+        pid = 9999
+        returncode = 75
+
+        def poll(self):
+            return 75
+
+        def wait(self, timeout=None):
+            return 75
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+    class _Token:
+        hex = 'this-run-owner-token'
+
+    def _popen_writes_unclaimed(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get('args')
+        hs = None
+        for i, part in enumerate(cmd):
+            if part == '--handshake-path':
+                hs = Path(cmd[i + 1])
+                break
+        assert hs is not None
+        hs.write_text(json.dumps({'claimed': False, 'worker_pid': 0}), encoding='utf-8')
+        return _FakeProc()
+
+    monkeypatch.setattr(scheduler_daemon, 'LOG_DIR', log_dir)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, '_notify_failure', lambda *args: None)
+    monkeypatch.setattr(scheduler_daemon, '_terminate_task_worker', lambda *args, **kwargs: None)
+    monkeypatch.setattr(scheduler_daemon.uuid, 'uuid4', lambda: _Token())
+    monkeypatch.setattr(subprocess, 'Popen', _popen_writes_unclaimed)
+
+    ok, message = scheduler_daemon.run_task(
+        'integration_worker',
+        [sys.executable, '-c', 'pass'],
+        timeout_sec=5,
+    )
+
+    assert ok is True
+    assert 'skip' in message.lower() or 'already' in message.lower()
+    left = json.loads(lock_path.read_text(encoding='utf-8'))
+    assert left['owner_token'] == 'foreign-live-token'
+    assert left.get('killed_by_daemon') is not True
+    assert lock_path.exists()
+
+
+def test_never_claimed_pending_marker_allows_one_extra_resume(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'interrupted',
+                    'at': '2026-05-11T09:40:00',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir)
+    # Simulate reboot right after launch: pending marker, no handshake, dead launcher.
+    scheduler_daemon_mod = scheduler_daemon
+    monkeypatch.setattr(scheduler_daemon_mod, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon_mod, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon_mod, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon_mod, '_is_ops_scheduler', lambda: False)
+    monkeypatch.setattr(scheduler_daemon_mod, '_is_pid_alive', lambda pid: False)
+    monkeypatch.setattr(
+        scheduler_daemon_mod,
+        'is_process_identity_alive',
+        lambda pid, marker: False,
+    )
+    day = '20260511'
+    marker_path = lock_dir / f'daily_tasks.inventory_resume.{day}.json'
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps({
+            'date': day,
+            'launch_token': 'old-launch',
+            'launched_at': '2026-05-11T09:41:00',
+            'prior_status': 'interrupted',
+            'outcome': 'pending',
+            'handshake_claimed': False,
+            'never_claimed_retry_used': False,
+            'exit75_retries': 0,
+            'launcher_pid': 1,
+            'launcher_creation_marker': 'dead-launcher',
+        }),
+        encoding='utf-8',
+    )
+    calls = []
+
+    def _fake_run_task(name, cmd, timeout_sec=0, on_worker_claimed=None, **kwargs):
+        calls.append([str(x) for x in cmd])
+        if on_worker_claimed is not None:
+            on_worker_claimed('tok', {'claimed': True, 'worker_pid': 1})
+        return True, 'Success in 3s'
+
+    monkeypatch.setattr(scheduler_daemon_mod, 'run_task', _fake_run_task)
+
+    assert scheduler_daemon_mod._should_resume_daily_inventory('daily_tasks') is True
+    ok1, _ = scheduler_daemon_mod.task_daily_full()
+    assert ok1 is True
+    assert len(calls) == 1
+    marker = scheduler_daemon_mod._read_inventory_resume_marker('daily_tasks')
+    assert marker['never_claimed_retry_used'] is True or marker['outcome'] == 'success'
+    # After success, further resume is blocked even with dead lock left behind.
+    _write_today_dead_lock(lock_dir, pid=777)
+    health = json.loads(health_path.read_text(encoding='utf-8'))
+    health['tasks']['daily_tasks']['status'] = 'interrupted'
+    health_path.write_text(json.dumps(health), encoding='utf-8')
+    # Force marker back to never-claimed-retry-used pending without handshake for block check.
+    marker['outcome'] = 'pending'
+    marker['handshake_claimed'] = False
+    marker['never_claimed_retry_used'] = True
+    marker['launcher_pid'] = 1
+    scheduler_daemon_mod._write_inventory_resume_marker('daily_tasks', marker)
+    assert scheduler_daemon_mod._should_resume_daily_inventory('daily_tasks') is False
+    ok2, msg2 = scheduler_daemon_mod.task_daily_full()
+    assert ok2 is True
+    assert len(calls) == 1
+    assert 'claim lost' in msg2.lower() or 'already' in msg2.lower() or 'consumed' in msg2.lower()
+
+
+def test_claimed_marker_blocks_extra_resume(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'interrupted',
+                    'at': '2026-05-11T09:40:00',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    (lock_dir / 'daily_tasks.inventory_resume.20260511.json').write_text(
+        json.dumps({
+            'date': '20260511',
+            'launch_token': 'claimed-launch',
+            'launched_at': '2026-05-11T09:41:00',
+            'outcome': 'claimed',
+            'handshake_claimed': True,
+            'never_claimed_retry_used': False,
+            'launcher_pid': 1,
+        }),
+        encoding='utf-8',
+    )
+    assert scheduler_daemon._inventory_resume_already_consumed('daily_tasks') is True
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
+
+
+def test_concurrent_resume_marker_claim_one_winner(tmp_path, monkeypatch):
+    import os
+    import threading
+
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    # Launcher for the O_EXCL winner is this test process — keep it "alive" so the
+    # loser cannot fall through into the never-claimed retry path.
+    self_pid = os.getpid()
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: pid == self_pid)
+    monkeypatch.setattr(
+        scheduler_daemon,
+        'is_process_identity_alive',
+        lambda pid, marker: pid == self_pid,
+    )
+
+    results = []
+
+    def _claim(token):
+        results.append(
+            scheduler_daemon._try_claim_inventory_resume_marker(
+                'daily_tasks', token, prior_status='interrupted'
+            )
+        )
+
+    t1 = threading.Thread(target=_claim, args=('token-a',))
+    t2 = threading.Thread(target=_claim, args=('token-b',))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    winners = [claimed for claimed, _ in results if claimed]
+    assert len(winners) == 1
+    losers = [claimed for claimed, _ in results if not claimed]
+    assert len(losers) == 1
+    marker = scheduler_daemon._read_inventory_resume_marker('daily_tasks')
+    assert marker['launch_token'] in {'token-a', 'token-b'}
+    assert marker.get('never_claimed_retry_used') is not True
+
+
+def test_concurrent_never_claimed_retry_one_winner(tmp_path, monkeypatch):
+    import threading
+
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+    monkeypatch.setattr(
+        scheduler_daemon,
+        'is_process_identity_alive',
+        lambda pid, marker: False,
+    )
+    (lock_dir / 'daily_tasks.inventory_resume.20260511.json').write_text(
+        json.dumps({
+            'date': '20260511',
+            'launch_token': 'old',
+            'launched_at': '2026-05-11T09:41:00',
+            'outcome': 'pending',
+            'handshake_claimed': False,
+            'never_claimed_retry_used': False,
+            'launcher_pid': 1,
+            'launcher_creation_marker': 'dead',
+        }),
+        encoding='utf-8',
+    )
+    results = []
+
+    def _claim(token):
+        results.append(
+            scheduler_daemon._try_claim_inventory_resume_marker(
+                'daily_tasks', token, prior_status='interrupted'
+            )
+        )
+
+    t1 = threading.Thread(target=_claim, args=('retry-a',))
+    t2 = threading.Thread(target=_claim, args=('retry-b',))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    winners = [claimed for claimed, _ in results if claimed]
+    assert len(winners) == 1
+    marker = scheduler_daemon._read_inventory_resume_marker('daily_tasks')
+    assert marker['never_claimed_retry_used'] is True
+    assert marker['launch_token'] in {'retry-a', 'retry-b'}
 
 
 def test_crash_lock_resumes_exactly_once_second_heartbeat_skips(tmp_path, monkeypatch):
@@ -763,7 +1060,7 @@ def test_crash_lock_resumes_exactly_once_second_heartbeat_skips(tmp_path, monkey
     monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
     calls = []
 
-    def _fake_run_task(name, cmd, timeout_sec=0):
+    def _fake_run_task(name, cmd, timeout_sec=0, **kwargs):
         calls.append([str(x) for x in cmd])
         return True, 'Success in 12s'
 
