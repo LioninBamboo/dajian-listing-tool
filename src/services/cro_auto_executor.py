@@ -13,7 +13,11 @@ from src.services.cro_action_queue import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-SAFE_AUTO_ACTIONS = ('price_drop', 'image_refresh', 'fill_specifics', 'promote')
+# Owner rule (2026-10-26/27): never auto-raise Promoted Listings ad rates.
+# `promote` stays executable via explicit CLI (`scripts/cro_promote.py`) or a
+# custom action_types pass that an operator opts into after re-adding it here;
+# it is intentionally absent from the default auto-execute set.
+SAFE_AUTO_ACTIONS = ('price_drop', 'image_refresh', 'fill_specifics')
 DEFAULT_LIMITS = {
     'price_drop': 200,
     'image_refresh': 80,
@@ -22,6 +26,31 @@ DEFAULT_LIMITS = {
 }
 
 Executor = Callable[..., Dict[str, Any]]
+
+# Actions that create ads or raise ad rates. Never auto-run unless the store
+# profile flag is on, even if a caller adds them back to SAFE_AUTO_ACTIONS.
+AD_CREATE_OR_RAISE_ACTIONS = frozenset({"promote"})
+
+
+def _main_scheduled_ad_create_blocked() -> bool:
+    """Queued promote is blocked only on Main AquaVerve.
+
+    Other brands keep the pre-PR path (the runner is invoked when the
+    caller opted promote back into the action set). Unreadable profile
+    fails closed because the default identity is Main.
+    """
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        return bool(get_store_profile().scheduled_ad_create_blocked)
+    except Exception:
+        return True
+
+
+def _load_promote_runner():
+    from scripts.cro_promote import run
+
+    return run
 
 
 def _summary_from_report(action_type: str, report: Dict[str, Any]) -> Dict[str, Any]:
@@ -68,12 +97,21 @@ def _default_executor(action_type: str) -> Executor:
 
         return lambda *, apply_changes, limit, send_email: run(apply_changes, limit)
     if action_type == 'promote':
-        from scripts.cro_promote import run
-
-        return lambda *, apply_changes, limit, send_email: run(
-            apply_changes, limit,
-            auto_create_missing_ads=True,
-        )
+        def run_promote(*, apply_changes, limit, send_email):
+            if _main_scheduled_ad_create_blocked():
+                return {
+                    'pending_total': 0,
+                    'done': [],
+                    'failed': [],
+                    'skipped': ['Main AquaVerve: scheduler_enable_cro_promote off'],
+                    'ad_api_called': False,
+                }
+            run = _load_promote_runner()
+            return run(
+                apply_changes, limit,
+                auto_create_missing_ads=True,
+            )
+        return run_promote
     raise ValueError(f'unsupported action_type: {action_type}')
 
 
@@ -90,9 +128,16 @@ def execute_pending_actions(
     executor_map = executor_map or {}
     summaries: List[Dict[str, Any]] = []
     unsupported: List[str] = []
+    blocked_by_flag: List[str] = []
     for action_type in action_types:
         if action_type not in SAFE_AUTO_ACTIONS:
             unsupported.append(action_type)
+            continue
+        if (
+            action_type in AD_CREATE_OR_RAISE_ACTIONS
+            and _main_scheduled_ad_create_blocked()
+        ):
+            blocked_by_flag.append(action_type)
             continue
         executor = executor_map.get(action_type) or _default_executor(action_type)
         report = executor(
@@ -105,6 +150,7 @@ def execute_pending_actions(
         'apply': apply_changes,
         'actions': summaries,
         'unsupported': unsupported,
+        'blocked_by_flag': blocked_by_flag,
         'queue_stats': queue_stats(),
     }
     if send_email and summaries:

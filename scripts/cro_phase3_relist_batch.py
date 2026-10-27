@@ -107,6 +107,23 @@ def main() -> int:
         report["steps"].append({"action": action, "result": result})
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
+        if result.get("refused") or result.get("aborted"):
+            report["stop_reason"] = str(result.get("reason") or "relist_blocked")
+            report["message"] = result.get("message") or ""
+            print(
+                "[phase3] stopped: "
+                f"{report['stop_reason']} {report['message']}",
+                flush=True,
+            )
+            report["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            report["after_counts"] = _counts(db_path)
+            report_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"[phase3] report={report_path}", flush=True)
+            return 2
+
         rows = result.get("results") or []
         first = rows[0] if rows else {}
         print(

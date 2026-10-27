@@ -24,6 +24,14 @@ PYTHONW = str(PROJECT_ROOT / '.venv' / 'Scripts' / 'pythonw.exe')
 DAEMON_SCRIPT = str(PROJECT_ROOT / 'scheduler_daemon.py')
 STALE_HEARTBEAT_MINUTES = 15
 
+# Same set as scheduler_daemon._GATE_SKIP_DONE_TODAY. Status stays 'skipped'
+# (visible on the status line); a same-day skip is not an overdue miss.
+_GATE_SKIP_DONE_TODAY = frozenset({
+    'cro_promote',
+    'ad_restore',
+    'ads_enroll',
+})
+
 # 关键任务巡检表。过了 daemon 的恢复窗口仍未 success → 主动补跑一次。
 # 统一改走 scheduler_daemon.py --task，复用同一套防重和健康状态写入。
 CRITICAL_DAILY_TASKS = [
@@ -347,6 +355,11 @@ def _task_succeeded_today(health, task_name, today):
         'missing_video_autofix',
     }
     if status == 'skipped':
+        if str(task_name) in _GATE_SKIP_DONE_TODAY and at:
+            try:
+                return datetime.fromisoformat(at).date() == today
+            except (TypeError, ValueError):
+                return False
         if str(task_name) not in audit_driven or not at:
             return False
         try:

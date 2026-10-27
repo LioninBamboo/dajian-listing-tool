@@ -219,3 +219,65 @@ def test_delist_links_dry_run_does_not_persist_tokens(tmp_path: Path):
     assert report["delist_links"]["pending_total"] == 1
     assert report["delist_links"]["rows"][0]["sku"] == "OLD-DEAD"
     assert _pending_delist_count(db) == 0
+
+
+def test_execute_cli_flag_off_exits_nonzero_without_ebay(tmp_path: Path, monkeypatch, capsys):
+    from scripts import cro_relist_lifecycle as cli
+
+    db = tmp_path / "cro.db"
+    lifecycle.ensure_schema(db)
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("eBay must not be called")
+
+    monkeypatch.setattr(lifecycle, "_cro_relist_enabled", lambda: False)
+    monkeypatch.setattr(lifecycle, "_fetch_store_active_listings", boom)
+    monkeypatch.setattr(lifecycle, "_default_trading_client", boom)
+    monkeypatch.setattr(lifecycle, "_lookup_listing_traffic_live", boom)
+
+    code = cli.main(["--execute", "--apply", "--db", str(db), "--limit", "5"])
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert "scheduler_enable_cro_relist" in captured.err
+    assert "scheduler_enable_cro_relist" in captured.out
+
+
+def test_detect_and_evaluate_do_not_touch_ebay(tmp_path: Path, monkeypatch):
+    from scripts import cro_relist_lifecycle as cli
+
+    db = tmp_path / "cro.db"
+    _create_source_tables(db)
+    _seed_product(
+        db,
+        "REVIVE",
+        published_at="2026-04-01T00:00:00",
+        impressions=10,
+        views=2,
+    )
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("eBay must not be called")
+
+    monkeypatch.setattr(lifecycle, "_fetch_store_active_listings", boom)
+    monkeypatch.setattr(lifecycle, "_default_trading_client", boom)
+    monkeypatch.setattr(lifecycle, "_lookup_listing_traffic_live", boom)
+    monkeypatch.setattr(
+        "src.services.listing_status_sync.fetch_all_active_listings",
+        boom,
+    )
+    monkeypatch.setattr(
+        "src.services.ebay_performance.EbayPerformanceService",
+        boom,
+    )
+
+    detect_report = cli.run_cli(
+        ["--detect", "--dry-run", "--db", str(db), "--snapshot-date", "2026-05-13"]
+    )
+    evaluate_report = cli.run_cli(
+        ["--evaluate", "--dry-run", "--db", str(db), "--snapshot-date", "2026-05-13"]
+    )
+
+    assert detect_report["mode"] == "detect"
+    assert evaluate_report["mode"] == "evaluate"
+    assert detect_report.get("refused") is not True

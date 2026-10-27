@@ -309,6 +309,15 @@ def render_auto_execution_email(report: Dict[str, Any],
             f"<h3 style='margin:22px 0 10px 0;'>{_escape(action.get('action'))}</h3>"
             + _render_product_table(detail_rows, product_briefs or load_product_briefs(detail_skus), max_products=max_products)
         )
+    blocked = [str(name) for name in (report.get('blocked_by_flag') or []) if str(name).strip()]
+    blocked_note = ""
+    if blocked:
+        blocked_note = (
+            "<p style='margin:0 0 14px 0;color:#8a6d3b;'>"
+            "跳过（Main AquaVerve，scheduler_enable_cro_promote 关闭）: "
+            f"<b>{_escape(', '.join(blocked))}</b>"
+            "</p>"
+        )
     briefs = product_briefs or load_product_briefs(detail_skus)
     if detail_sections and not product_briefs:
         detail_sections = []
@@ -328,6 +337,7 @@ def render_auto_execution_email(report: Dict[str, Any],
     <div style="font-family:Arial,'Microsoft YaHei',sans-serif;color:#1f1f1f;max-width:1080px;">
       <h2 style="margin-bottom:8px;">CRO 自动执行结果</h2>
       <p style="margin:0 0 14px 0;">本邮件汇总本次自动执行的动作结果；如果有商品明细，会按 SKU 合并并显示缩略图。</p>
+      {blocked_note}
       <table style='border-collapse:collapse;width:100%;margin-bottom:16px;'>
         <tr>
           <th style='text-align:left;padding:6px 8px;border:1px solid #eee;background:#fafafa;'>动作</th>

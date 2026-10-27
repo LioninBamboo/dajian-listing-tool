@@ -140,6 +140,20 @@ class StoreProfile:
     # store (scheduler_profile=full) ignores these flags.
     scheduler_enable_qc_autofix: bool = False
     scheduler_enable_ads: bool = False
+    # Opt-in automatic Promoted Listings bid *raises* and the 10:25 promote job.
+    # Default / absent = False on every store (PR #45):
+    # - task_cro_promote skips entirely
+    # - task_smart_bid runs with --no-raises (lowers / no-ops still apply)
+    # Main AquaVerve additionally blocks ad_restore, ads_enroll, and a queued
+    # promote while this flag is false (see scheduled_ad_create_blocked).
+    # Other brands keep the previous ad path when the key is absent.
+    # Flip in store_profile.local.yaml only. Manual CLI remains available.
+    # bid_rollback and ad removal stay on.
+    scheduler_enable_cro_promote: bool = False
+    # Opt-in eBay End / Relist / revive. Default / absent = False:
+    # scripts/cro_relist_lifecycle.py --execute refuses (non-zero, no eBay).
+    # --detect / --evaluate stay local-only. Flip in store_profile.local.yaml only.
+    scheduler_enable_cro_relist: bool = False
     # Explicit ops allowlist. Empty on an ops profile => {ops_daily, order_recheck}.
     # The main full/daily profile ignores this field (unrestricted).
     scheduler_allowed_jobs: tuple = ()
@@ -210,6 +224,43 @@ class StoreProfile:
     def ops_ads_enabled(self) -> bool:
         """True only on an ops instance that opted into the ads/marketing slice."""
         return self.is_ops_scheduler and bool(self.scheduler_enable_ads)
+
+    @property
+    def cro_promote_scheduler_enabled(self) -> bool:
+        """True when any store may run scheduled cro_promote or bid raises.
+
+        Absent or false skips ``task_cro_promote`` and passes ``--no-raises``
+        to ``task_smart_bid`` on every store. Ad creation jobs
+        (``task_ad_restore``, ``task_ads_enroll``, queued ``promote``) are
+        not gated here; Main uses ``scheduled_ad_create_blocked``.
+        """
+        return bool(self.scheduler_enable_cro_promote)
+
+    @property
+    def scheduled_ad_create_blocked(self) -> bool:
+        """Block scheduled ad creation only on Main AquaVerve.
+
+        Identity is ``brand_name == "AquaVerve"``, the same check
+        ``resolved_scheduler_mutex_name`` uses for the historical Main mutex.
+        The flag defaults false and tracked ``config/store_profile.yaml``
+        does not set ``scheduler_enable_cro_promote``, so Main is blocked
+        with no yaml edit. AquaRides, GrovePop, and any other brand keep
+        the previous ``ad_restore`` / ``ads_enroll`` / queued-promote path
+        even when the key is absent. Explicit ``true`` on Main unblocks
+        those jobs.
+        """
+        if self.brand_name != "AquaVerve":
+            return False
+        return not bool(self.scheduler_enable_cro_promote)
+
+    @property
+    def cro_relist_scheduler_enabled(self) -> bool:
+        """True when ``--execute`` may End, Relist, or revive on eBay.
+
+        ``--detect`` / ``--evaluate`` stay local-only either way.
+        Absent or false = fail-closed. Applies on any scheduler_profile.
+        """
+        return bool(self.scheduler_enable_cro_relist)
 
     @property
     def resolved_scheduler_allowed_jobs(self) -> frozenset[str] | None:
@@ -310,6 +361,8 @@ _SECTION_FIELD_MAP = {
         "scheduler_mutex_name",
         "scheduler_enable_qc_autofix",
         "scheduler_enable_ads",
+        "scheduler_enable_cro_promote",
+        "scheduler_enable_cro_relist",
         "scheduler_allowed_jobs",
     },
 }
@@ -337,6 +390,8 @@ _BOOL_FIELDS = {
     "force_house_brand",
     "scheduler_enable_qc_autofix",
     "scheduler_enable_ads",
+    "scheduler_enable_cro_promote",
+    "scheduler_enable_cro_relist",
 }
 _TUPLE_FIELDS = {"banned_terms", "scheduler_allowed_jobs"}
 

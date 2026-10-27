@@ -147,6 +147,7 @@ def run_cli(argv: list[str] | None = None) -> dict[str, Any]:
                 min_age_days=args.min_age_days,
                 limit=args.limit,
                 db_path=effective_db,
+                live_traffic_lookup=False,
             )
             report["mode"] = "detect"
             report["detect"] = _summarize_candidates(detect_report)
@@ -176,6 +177,9 @@ def run_cli(argv: list[str] | None = None) -> dict[str, Any]:
             report["mode"] = "precheck"
             report["precheck"] = precheck_report
         elif args.execute:
+            # End/Relist/revive. Flag off and ActiveList fail-closed both
+            # return refused/aborted with zero eBay writes. detect/evaluate
+            # below stay local (live_traffic_lookup is forced off).
             execute_report = execute_prechecked_relist(
                 limit=args.limit,
                 apply_changes=args.apply,
@@ -184,6 +188,10 @@ def run_cli(argv: list[str] | None = None) -> dict[str, Any]:
             )
             report["mode"] = "execute"
             report["execute"] = execute_report
+            if execute_report.get("refused") or execute_report.get("aborted"):
+                report["refused"] = True
+                report["applied"] = False
+                report["message"] = execute_report.get("message") or ""
         elif args.evaluate:
             evaluate_report = evaluate_observations(
                 snapshot_date=args.snapshot_date,
@@ -212,10 +220,16 @@ def run_cli(argv: list[str] | None = None) -> dict[str, Any]:
             _cleanup_dry_run_db(temp_db)
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int:
     report = run_cli(argv)
     print(json.dumps(report, ensure_ascii=False, indent=2, default=_json_default))
+    if report.get("refused") or (report.get("execute") or {}).get("aborted"):
+        message = report.get("message") or (report.get("execute") or {}).get("message") or ""
+        if message:
+            print(message, file=sys.stderr)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
