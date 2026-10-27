@@ -68,6 +68,42 @@ class SchedulerCroPromoteGateTests(unittest.TestCase):
             self.assertFalse(scheduler_daemon._cro_promote_scheduler_enabled())
 
 
+class SchedulerSmartBidRaiseGateTests(unittest.TestCase):
+    """smart_bid may lower without the flag; raises need the same opt-in."""
+
+    def test_smart_bid_passes_no_raises_when_flag_off(self):
+        with (
+            patch.object(scheduler_daemon, '_task_succeeded_today', return_value=False),
+            patch.object(
+                scheduler_daemon, '_cro_promote_scheduler_enabled', return_value=False
+            ),
+            patch.object(scheduler_daemon, 'run_task') as run_task,
+        ):
+            scheduler_daemon.task_smart_bid()
+
+        task_name, cmd_args = run_task.call_args.args[:2]
+        self.assertEqual(task_name, 'smart_bid')
+        self.assertTrue(any(str(a).endswith('batch_smart_bid.py') for a in cmd_args))
+        self.assertIn('--apply', cmd_args)
+        self.assertIn('--email', cmd_args)
+        self.assertIn('--no-raises', cmd_args)
+
+    def test_smart_bid_allows_raises_when_flag_on(self):
+        with (
+            patch.object(scheduler_daemon, '_task_succeeded_today', return_value=False),
+            patch.object(
+                scheduler_daemon, '_cro_promote_scheduler_enabled', return_value=True
+            ),
+            patch.object(scheduler_daemon, 'run_task') as run_task,
+        ):
+            scheduler_daemon.task_smart_bid()
+
+        task_name, cmd_args = run_task.call_args.args[:2]
+        self.assertEqual(task_name, 'smart_bid')
+        self.assertIn('--apply', cmd_args)
+        self.assertNotIn('--no-raises', cmd_args)
+
+
 class StoreProfileCroPromoteFlagTests(unittest.TestCase):
     def test_default_flag_absent_is_false(self):
         from src.utils.store_profile import StoreProfile

@@ -36,7 +36,7 @@
 | `scripts/ad_blacklist_cleanup.py` | P7 — 清扫不可救 SKU 加入广告黑名单 | `scheduler_daemon.py` 09:45 | 主路径 | 与 `cap_bid_by_floor` 联动, 自动剔除水下连续 N 天 SKU |
 | `scripts/guard_anomaly_alert.py` | P8 — 守门员异常率监控 + 邮件 | `scheduler_daemon.py` 09:50 | 主路径 | reject_pct ≥ 阈值告警, 拒改原因 Top-N |
 | `scripts/campaign_capacity_audit.py` | P10 — PLA Campaign 容量审计 | 手动 / 仪表盘 | 主路径 | 输出 saturated/available 列表, 仪表盘消费 |
-| `scripts/batch_smart_bid.py` | 智能 Bid 调价 (P14: A/B 实验感知) | `scheduler_daemon.py` Tue 10:00 | 主路径 | 命中实验 SKU 用 arm_bid 覆盖 tier 默认 |
+| `scripts/batch_smart_bid.py` | 智能 Bid 调价 (P14: A/B 实验感知) | `scheduler_daemon.py` Tue 10:00（默认 `--no-raises`） | 主路径 | 上调需 `scheduler_enable_cro_promote`；降档仍执行。命中实验 SKU 用 arm_bid 覆盖 tier 默认 |
 | `scripts/bid_rollback.py` | Bid 异动回滚 | `scheduler_daemon.py` Tue 11:00 | 主路径 | 守门员告警的快速复原通道 |
 | `scripts/cro_sentinel.py` | CRO 告警与恶化 SKU 输出 | `scheduler_daemon.py` 10:30 / 手动 | 主路径 | 7d 下滑或恶化比例触发 |
 | `scripts/cro_effect_audit.py` | 已完成动作效果验证与月报输入 | `scheduler_daemon.py` 09:55 / 手动 | 主路径 | 为 threshold feedback 提供依据 |

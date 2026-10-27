@@ -71,8 +71,8 @@ The current CRO-relevant schedule in scheduler_daemon.py is:
 | `10:40` | `task_cro_lifecycle_detect()` | Relist-lifecycle candidate detection (local candidate rows only; no eBay mutation) |
 | `10:45` | `task_cro_title_rewrite()` | Title hot-keyword enrichment; scheduled apply by default with a 50-SKU cap, env can force dry-run |
 | `10:50` | `task_cro_lifecycle_evaluate()` | Relist-lifecycle observation evaluation (local state transitions + soft-lever enqueue; never withdraw/republish) |
-| Tue `10:00` | `task_smart_bid()` | Bid optimization before promote step |
-| Tue `11:00` | `task_bid_rollback()` | Post-promote rollback audit |
+| Tue `10:00` | `task_smart_bid()` | Tiered bid adjust. Raises require `scheduler_enable_cro_promote`; default run passes `--no-raises` (lowers only) |
+| Tue `11:00` | `task_bid_rollback()` | Post-raise rollback audit (lowers only; always allowed) |
 | Mon `11:00` | `task_cro_delist_email()` | Delist candidate email with confirmation link |
 | Sun `02:00` | `task_cro_learn_thresholds()` | Pending-threshold learning |
 | Sun `02:30` | `task_cro_promote_thresholds()` | Threshold shadow gate to production |

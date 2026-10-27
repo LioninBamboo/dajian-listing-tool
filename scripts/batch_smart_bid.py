@@ -173,7 +173,8 @@ def build_plan(products_with_perf: List[Dict[str, Any]],
                ads_by_listing: Dict[str, Dict[str, Any]],
                cost_map: Dict[str, Dict[str, Any]],
                real_client=None,
-               active_experiments: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+               active_experiments: Optional[List[Dict[str, Any]]] = None,
+               allow_raises: bool = True) -> List[Dict[str, Any]]:
     """生成调整计划 (不调用 eBay 写接口).
 
     products_with_perf 每条至少含: sku, listing_id, impressions, ctr, sold_qty
@@ -181,6 +182,9 @@ def build_plan(products_with_perf: List[Dict[str, Any]],
     active_experiments (P14): [{experiment_id, control_bid, variant_bid, assignments: {sku: arm}}]
         若 SKU 命中任意活跃实验 → desired_bid 改为 arm bid; decision 标 'experiment'
         (仍受 cap_bid_by_floor 守门, 不安全则降级 skip_unsafe)
+    allow_raises: when False, any plan that would increase bid_percentage is
+        reclassified to ``skip_raise_disabled`` (owner rule 2026-10-26/27).
+        Lowering / no_change / skip_unsafe still proceed.
     """
     plan: List[Dict[str, Any]] = []
     # 把所有实验的 sku → (eid, arm, bid) 索引化, SKU 同时在多个实验只取第一个
@@ -243,6 +247,17 @@ def build_plan(products_with_perf: List[Dict[str, Any]],
                           f'arm_bid={exp_info["arm_bid"]:.1f}% capped={capped:.2f}%')
             else:
                 reason = f'tier={tier} desired={desired:.1f}% capped={capped:.2f}%'
+            # Owner rule: scheduled/auto path must not raise ad rates unless
+            # store profile scheduler_enable_cro_promote is on. Lowers stay.
+            if (not allow_raises
+                    and new_bid > current_bid + BID_DELTA_THRESHOLD):
+                decision = 'skip_raise_disabled'
+                reason = (
+                    f'raise blocked (allow_raises=false); '
+                    f'would move {current_bid:.2f}% → {new_bid:.2f}% '
+                    f'(desired={desired:.1f}%)'
+                )
+                new_bid = current_bid
 
         plan_item = {
             'sku': sku,
@@ -267,12 +282,25 @@ def build_plan(products_with_perf: List[Dict[str, Any]],
     return plan
 
 
-def apply_plan(plan: List[Dict[str, Any]], ad_service) -> Dict[str, Any]:
-    """对 decision==adjust|experiment 的项调用 update_ad_bid."""
+def apply_plan(plan: List[Dict[str, Any]], ad_service,
+               allow_raises: bool = True) -> Dict[str, Any]:
+    """对 decision==adjust|experiment 的项调用 update_ad_bid.
+
+    Defense in depth: even if a raise slipped into the plan, refuse to write
+    it when allow_raises is False.
+    """
     ok, fail = 0, 0
     errors = []
     for item in plan:
         if item['decision'] not in ('adjust', 'experiment'):
+            continue
+        new_bid = float(item.get('new_bid') or 0)
+        current_bid = float(item.get('current_bid') or 0)
+        if (not allow_raises
+                and new_bid > current_bid + BID_DELTA_THRESHOLD):
+            item['applied'] = False
+            item['apply_error'] = 'raise blocked (allow_raises=false)'
+            item['decision'] = 'skip_raise_disabled'
             continue
         try:
             res = ad_service.update_ad_bid(item['campaign_id'], item['listing_id'], item['new_bid'])
@@ -340,7 +368,8 @@ def render_email_html(report: Dict[str, Any]) -> str:
     </body></html>"""
 
 
-def run(apply: bool = False, send_email: bool = False) -> Dict[str, Any]:
+def run(apply: bool = False, send_email: bool = False,
+        allow_raises: bool = True) -> Dict[str, Any]:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
     from src.services.ebay_ad_service import EbayAdService
     from src.services.ebay_performance import (
@@ -349,6 +378,12 @@ def run(apply: bool = False, send_email: bool = False) -> Dict[str, Any]:
 
     ad_svc = EbayAdService()
     real_client = _make_real_client()
+
+    if not allow_raises:
+        logger.info(
+            "↪ allow_raises=false: 只允许降低 bid / 不变 / 跳过; "
+            "不会自动提高 Promoted Listings ad rate"
+        )
 
     logger.info("加载广告数据...")
     ad_data = ad_svc.fetch_all_ad_data()
@@ -385,19 +420,23 @@ def run(apply: bool = False, send_email: bool = False) -> Dict[str, Any]:
             'sold_qty': s.get('qty', 0),
         })
 
-    plan = build_plan(products, ads_by_listing, cost_map, real_client=real_client,
-                       active_experiments=_load_active_experiments())
+    plan = build_plan(
+        products, ads_by_listing, cost_map, real_client=real_client,
+        active_experiments=_load_active_experiments(),
+        allow_raises=allow_raises,
+    )
     summary = summarize(plan)
     apply_result: Dict[str, Any] = {'applied_ok': 0, 'applied_failed': 0, 'errors': []}
     if apply:
         n_apply = (summary['by_decision'].get('adjust', 0)
                     + summary['by_decision'].get('experiment', 0))
         logger.info(f"应用 {n_apply} 条 bid 调整 (含实验)...")
-        apply_result = apply_plan(plan, ad_svc)
+        apply_result = apply_plan(plan, ad_svc, allow_raises=allow_raises)
 
     report = {
         'timestamp': datetime.now().isoformat(),
         'apply': apply,
+        'allow_raises': allow_raises,
         'summary': summary,
         'apply_result': apply_result,
         'plan': plan,
@@ -443,17 +482,28 @@ def _parse_args():
     ap.add_argument('--apply', action='store_true', help='实际写入 eBay (默认 dry-run)')
     ap.add_argument('--dry-run', action='store_true', help='只预览, 不调用写接口')
     ap.add_argument('--email', action='store_true', help='发送结果邮件')
+    # Scheduler passes --no-raises when scheduler_enable_cro_promote is off.
+    # Manual CLI omits the flag → raises still allowed (explicit operator run).
+    ap.add_argument(
+        '--no-raises', action='store_true',
+        help='只允许降低 bid / 不变; 禁止提高 ad rate (调度器默认关闭提价时传入)',
+    )
     return ap.parse_args()
 
 
 if __name__ == '__main__':
     args = _parse_args()
     apply_flag = args.apply and not args.dry_run
-    rpt = run(apply=apply_flag, send_email=args.email)
+    rpt = run(
+        apply=apply_flag,
+        send_email=args.email,
+        allow_raises=not args.no_raises,
+    )
     s = rpt['summary']
     print(f"\nDONE — total={s['total']} adjust={s['by_decision'].get('adjust', 0)} "
           f"no_change={s['by_decision'].get('no_change', 0)} "
-          f"skip_unsafe={s['by_decision'].get('skip_unsafe', 0)}")
+          f"skip_unsafe={s['by_decision'].get('skip_unsafe', 0)} "
+          f"skip_raise_disabled={s['by_decision'].get('skip_raise_disabled', 0)}")
     if apply_flag:
         ar = rpt['apply_result']
         print(f"applied_ok={ar['applied_ok']} applied_failed={ar['applied_failed']}")

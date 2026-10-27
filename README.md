@@ -58,7 +58,7 @@ Additional CRO cadence:
 - Tue `10:00` smart bid, Tue `11:00` bid rollback
 - Mon `11:00` CRO delist email
 
-Automatic Promoted Listings ad-rate increases are disabled by default (owner rule 2026-10-26/27): diagnose no longer enqueues `promote`, `SAFE_AUTO_ACTIONS` excludes it, and the 10:25 scheduler job skips unless `scheduler_enable_cro_promote` is explicitly set. Manual `python scripts/cro_promote.py` remains available.
+Automatic Promoted Listings ad-rate **increases** are disabled by default (owner rule 2026-10-26/27): diagnose no longer enqueues `promote`, `SAFE_AUTO_ACTIONS` excludes it, the 10:25 `cro_promote` job skips unless `scheduler_enable_cro_promote` is set, and Tuesday `smart_bid` runs with `--no-raises` under the same flag (lowers still apply). `ad_restore` re-opens ads at a target bid (does not raise existing bids); `bid_rollback` only lowers. Manual `python scripts/cro_promote.py` / `batch_smart_bid.py --apply` remain available.
 
 ## Safe Publish Workflow
 

@@ -140,10 +140,11 @@ class StoreProfile:
     # store (scheduler_profile=full) ignores these flags.
     scheduler_enable_qc_autofix: bool = False
     scheduler_enable_ads: bool = False
-    # Opt-in CRO Promoted Listings bid raises. Default / absent = False so
-    # scheduler_daemon task_cro_promote never auto-raises ad rates unless an
-    # operator explicitly flips this in store_profile.local.yaml.
-    # Does not affect manual `python scripts/cro_promote.py` CLI use.
+    # Opt-in automatic Promoted Listings bid *raises*. Default / absent = False:
+    # - task_cro_promote skips entirely
+    # - task_smart_bid runs with --no-raises (lowers / no-ops still apply)
+    # Flip in store_profile.local.yaml only. Manual CLI of cro_promote.py /
+    # batch_smart_bid.py (without --no-raises) remains available.
     scheduler_enable_cro_promote: bool = False
     # Explicit ops allowlist. Empty on an ops profile => {ops_daily, order_recheck}.
     # The main full/daily profile ignores this field (unrestricted).
@@ -211,10 +212,12 @@ class StoreProfile:
 
     @property
     def cro_promote_scheduler_enabled(self) -> bool:
-        """True when this instance opted into scheduled CRO promote (bid raises).
+        """True when this instance opted into scheduled automatic bid raises.
 
-        Unlike ops ads/QC slices, this flag applies on any scheduler_profile
-        (including main ``full``). Absent or false keeps task_cro_promote inert.
+        Gates ``task_cro_promote`` (full skip when false) and the *raise*
+        direction of ``task_smart_bid`` (``--no-raises`` when false).
+        Unlike ops ads/QC slices, applies on any scheduler_profile
+        (including main ``full``). Absent or false = fail-closed.
         """
         return bool(self.scheduler_enable_cro_promote)
 

@@ -121,8 +121,8 @@ PUBLISHED
 | 每 `6h` | `promotion_rotate` | `scripts/auto_rotate_promotions.py` |
 | 周日 `02:00` | `cro_learn_thresholds` | 生成待审核的 CRO 阈值候选 |
 | 周日 `02:30` | `cro_promote_thresholds` | 通过 shadow gate 后推广阈值 |
-| 周二 `10:00` | `smart_bid` | 分级 Bid 优化 |
-| 周二 `11:00` | `bid_rollback` | 7 天回溯回滚无效 Bid |
+| 周二 `10:00` | `smart_bid` | 分级 Bid 优化。默认只降不升；`--no-raises` 除非 `scheduler_enable_cro_promote: true` |
+| 周二 `11:00` | `bid_rollback` | 7 天回溯回滚无效 Bid（只降不升，不受上述开关影响） |
 | 周一 `11:00` | `cro_delist_email` | 发出人工确认型下架候选 |
 
 补充说明：
@@ -247,7 +247,7 @@ python daily_tasks.py --audit-only
 |------|------|----------|
 | `scheduler_enable_qc_autofix` | GrovePop（户外家具，`qc_profile: furniture`） | 与主店相同的 11:30 只读审计 → 12:10 白名单修复 → 12:30 语义改写（仍需 env）→ 13:00 缺视频 |
 | `scheduler_enable_ads` | GrovePop + AquaRides | 周一/周四智能调价 / 广告恢复 / 黑名单 / 守门员告警 / `ads_enroll`（`create_ad_safe`，Trading 现价回退）/ 周二 bid / 促销轮转 |
-| `scheduler_enable_cro_promote` | 主店可选（默认 false） | 打开后才跑 10:25 `task_cro_promote`（提 bid / 安全开广告）。**不会**让 `run_cro_diagnose` 重新入队 `promote`；缺省关闭以遵守「禁止自动提高 ad rate」 |
+| `scheduler_enable_cro_promote` | 主店可选（默认 false） | 打开后：(1) 跑 10:25 `task_cro_promote`；(2) 周二 `smart_bid` 允许**上调** bid。缺省关闭时 promote 跳过、smart_bid 只降不升。**不会**让 `run_cro_diagnose` 重新入队 `promote`。`ad_restore` / `bid_rollback` 不受此开关影响 |
 
 AquaRides 的 Motors 内容 QC / Fitment 仍走专用 Windows 任务，不要给汽配打开 `scheduler_enable_qc_autofix`（那是家具白名单）。
 
