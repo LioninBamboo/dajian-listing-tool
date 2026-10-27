@@ -331,11 +331,15 @@ def abort_if_promote_loaded() -> Optional[int]:
     return None
 
 
+def readonly_sqlite_uri(db_path: Path) -> str:
+    """file URI + mode=ro. as_uri() encodes spaces and Windows drive paths."""
+    return Path(db_path).resolve().as_uri() + "?mode=ro"
+
+
 def open_db(db_path: Path, readonly: bool, authorizer: Optional[Callable] = None) -> sqlite3.Connection:
     target = Path(db_path)
     if readonly:
-        uri = target.resolve().as_posix()
-        conn = sqlite3.connect(f"file:{uri}?mode=ro", uri=True)
+        conn = sqlite3.connect(readonly_sqlite_uri(target), uri=True)
     else:
         conn = sqlite3.connect(str(target))
     conn.row_factory = sqlite3.Row
@@ -965,30 +969,26 @@ def get_ebay_client(ctx: ImproveContext) -> Any:
 def load_local_product(ctx: ImproveContext, sku: str) -> Dict[str, Any]:
     if ctx.load_local_product_fn is not None:
         return ctx.load_local_product_fn(sku)
-    if ctx.isolate_store_root:
-        if not ctx.db_path.exists():
-            return {"images": [], "title": "", "description": ""}
-        conn = open_db(ctx.db_path, readonly=True, authorizer=ctx.authorizer)
-        try:
-            row = conn.execute(
-                "SELECT images, title, description FROM collected_products WHERE sku = ?",
-                (sku,),
-            ).fetchone()
-        finally:
-            conn.close()
-        if row is None:
-            return {"images": [], "title": "", "description": ""}
-        images = _parse_json_field(row["images"], [])
-        if not isinstance(images, list):
-            images = []
-        return {
-            "images": images,
-            "title": row["title"] or "",
-            "description": row["description"] or "",
-        }
-    from scripts.cro_image_refresh import _load_local_product
-
-    return _load_local_product(sku)
+    if not ctx.db_path.exists():
+        return {"images": [], "title": "", "description": ""}
+    conn = open_db(ctx.db_path, readonly=True, authorizer=ctx.authorizer)
+    try:
+        row = conn.execute(
+            "SELECT images, title, description FROM collected_products WHERE sku = ?",
+            (sku,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return {"images": [], "title": "", "description": ""}
+    images = _parse_json_field(row["images"], [])
+    if not isinstance(images, list):
+        images = []
+    return {
+        "images": images,
+        "title": row["title"] or "",
+        "description": row["description"] or "",
+    }
 
 
 def inspect_image(
@@ -997,6 +997,7 @@ def inspect_image(
     local: Dict[str, Any],
 ) -> Dict[str, Any]:
     from scripts.cro_image_refresh import (
+        _normalize_urls_for_compare,
         _should_refresh,
         build_strict_refresh_payload,
         payload_image_urls,
@@ -1015,11 +1016,13 @@ def inspect_image(
     local_images = list(local.get("images") or [])
     need = _should_refresh(local_images, live_urls)
     payload, payload_reason = build_strict_refresh_payload(item, local)
+    local_cmp = _normalize_urls_for_compare(local_images)
+    live_cmp = _normalize_urls_for_compare(live_urls)
     result = {
         "sku": sku,
         "live_n": len(live_urls),
         "local_n": len(local_images),
-        "lead_changed": bool(local_images and live_urls and local_images[0] != live_urls[0]),
+        "lead_changed": bool(local_cmp and live_cmp and local_cmp[0] != live_cmp[0]),
         "live_lead": live_urls[0] if live_urls else "",
         "live_qty": None if payload is None and payload_reason in {"qty_unknown", "qty_zero"} else (
             None if payload is None else payload.get("quantity")
@@ -1029,7 +1032,8 @@ def inspect_image(
         result["status"] = "excluded"
         result["reason"] = payload_reason
         return result
-    if payload is not None and not urls_keep_giga_sigs(local_images, payload_image_urls(payload)):
+    kept = payload_image_urls(payload) if payload is not None else []
+    if payload is not None and not urls_keep_giga_sigs(local_images[:len(kept)], kept):
         result["status"] = "excluded"
         result["reason"] = "image_sig_stripped"
         return result
@@ -1040,6 +1044,7 @@ def inspect_image(
     result["status"] = "ok"
     result["reason"] = need
     result["payload_qty"] = payload.get("quantity") if payload else None
+    result["payload_n"] = len(kept)
     return result
 
 
@@ -1297,6 +1302,7 @@ def build_candidates(
                 "reason": reason,
                 "live_n": inspected.get("live_n"),
                 "local_n": inspected.get("local_n"),
+                "payload_n": inspected.get("payload_n"),
                 "lead_changed": inspected.get("lead_changed"),
                 "live_lead": inspected.get("live_lead"),
                 "payload_qty": inspected.get("payload_qty"),
@@ -1540,14 +1546,12 @@ def _image_qty_skip_reason(qty_reason: Optional[str]) -> Optional[str]:
 
 def apply_image_live(ctx: ImproveContext, cand: Dict[str, Any]) -> Dict[str, Any]:
     from scripts.cro_image_refresh import (
-        _INVENTORY_IMAGE_LIMIT,
         _inventory_refresh_put_body,
         _put_inventory_refresh,
         _quantity_skip_reason,
         _readback_image_urls,
         _should_refresh,
-        strip_oss_keep_giga_sig,
-        urls_keep_giga_sigs,
+        prepare_refresh_image_urls,
     )
 
     sku = str((cand or {}).get("sku") or "")
@@ -1581,12 +1585,11 @@ def apply_image_live(ctx: ImproveContext, cand: Dict[str, Any]) -> Dict[str, Any
                 }
             local = load_local_product(ctx, sku)
             local_images = list(local.get("images") or [])
-            prepared = [strip_oss_keep_giga_sig(u) for u in local_images if isinstance(u, str) and u]
-            prepared = prepared[:_INVENTORY_IMAGE_LIMIT]
-            if not urls_keep_giga_sigs(local_images, prepared):
+            prepared, sig_reason = prepare_refresh_image_urls(local_images)
+            if sig_reason:
                 return {
                     "sku": sku, "action": "image_refresh", "status": "skipped",
-                    "reason": "image_sig_stripped",
+                    "reason": sig_reason,
                 }
             need = _should_refresh(local_images, live_urls)
             if not need:

@@ -65,7 +65,7 @@ def load_blacklisted_skus(db_path: Optional[Path] = None) -> Set[str]:
     if not db.exists():
         return set()
     try:
-        with sqlite3.connect(str(db)) as c:
+        with sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True) as c:
             return {r[0] for r in c.execute(
                 "SELECT sku FROM cro_diagnose_blacklist")}
     except sqlite3.OperationalError:

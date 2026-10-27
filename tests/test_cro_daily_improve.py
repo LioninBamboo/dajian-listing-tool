@@ -2365,3 +2365,308 @@ def test_live_image_readback_must_equal_written_count(tmp_path, no_promote_modul
     assert live["results"][0]["reason"] == "verification mismatch"
     assert live["results"][0]["expected_count"] == 2
     assert live["results"][0]["after"] == 1
+
+
+def _signed_url(i: int) -> str:
+    return (
+        f"https://b2bfiles1.gigab2b.cn/img/{i:02d}.jpg"
+        f"?x-oss-process=image/resize,w_800&x-cc=c{i}&x-cu=u{i}&x-ct=t{i}&x-cs=s{i}/p=%20{i}"
+    )
+
+
+def test_refreshed_sku_stays_healthy_on_next_run(tmp_path, no_promote_module):
+    """Local still has x-oss-process; live has the stripped PUT. Next run is healthy."""
+    from scripts.cro_image_refresh import (
+        _should_refresh,
+        prepare_refresh_image_urls,
+        strip_oss_keep_giga_sig,
+    )
+    from scripts import cro_daily_improve as m
+
+    local = [GIGA_URL, GIGA_URL_2]
+    prepared, reason = prepare_refresh_image_urls(local)
+    assert reason is None
+    assert prepared == [strip_oss_keep_giga_sig(GIGA_URL), strip_oss_keep_giga_sig(GIGA_URL_2)]
+    assert _should_refresh(local, prepared) is None
+
+    client = GetOnlyClient({
+        "W5230P450590": _item(prepared, qty=3),
+    })
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        ebay_client_factory=lambda: client,
+    )
+    inspected = m.inspect_image(
+        ctx, "W5230P450590",
+        {"images": local, "title": "t", "description": "d"},
+    )
+    assert inspected["status"] == "excluded"
+    assert inspected["reason"] == "live already healthy"
+    assert inspected["lead_changed"] is False
+
+    live_ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        ebay_client_factory=lambda: _attach_live_session(GetOnlyClient({
+            "W5230P450590": _item(prepared, qty=3),
+        })),
+        load_local_product_fn=lambda sku: {
+            "images": local, "title": "t", "description": "d",
+        },
+        recent_terminal_fn=lambda **k: set(),
+        mark_done_fn=lambda *a, **k: 0,
+    )
+    cand = {
+        "action": "image_refresh",
+        "sku": "W5230P450590",
+        "listing_id": "188111",
+        "live_n": 2,
+        "live_lead": prepared[0],
+        "reason": "local lead image differs from live",
+    }
+    row = m.apply_image_live(live_ctx, cand)
+    assert row["status"] == "skipped"
+    assert row["reason"] == "live already healthy"
+
+
+def test_readonly_sqlite_uri_spaces_and_windows_path(tmp_path):
+    from pathlib import PureWindowsPath
+
+    from scripts.cro_daily_improve import open_db, readonly_sqlite_uri
+
+    spaced = tmp_path / "Foo Bar" / "ebay collection.db"
+    spaced.parent.mkdir()
+    seed = sqlite3.connect(str(spaced))
+    seed.execute("CREATE TABLE t (x INTEGER)")
+    seed.execute("INSERT INTO t VALUES (7)")
+    seed.commit()
+    seed.close()
+
+    uri = readonly_sqlite_uri(spaced)
+    assert uri.startswith("file:")
+    assert "Foo%20Bar" in uri
+    assert "ebay%20collection.db" in uri
+    assert uri.endswith("?mode=ro")
+    ro = open_db(spaced, readonly=True)
+    try:
+        assert ro.execute("SELECT x FROM t").fetchone()[0] == 7
+    finally:
+        ro.close()
+
+    win = PureWindowsPath(r"C:\Users\Foo Bar\ebay_collection.db")
+    assert win.as_uri() + "?mode=ro" == (
+        "file:///C:/Users/Foo%20Bar/ebay_collection.db?mode=ro"
+    )
+    src = Path(readonly_sqlite_uri.__code__.co_filename).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    helper = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "readonly_sqlite_uri"
+    )
+    helper_src = ast.get_source_segment(src, helper) or ""
+    assert "as_uri()" in helper_src
+    assert "as_posix" not in helper_src
+    assert "?mode=ro" in helper_src
+
+
+def test_dry_run_and_store_root_never_open_db_readwrite(tmp_path, monkeypatch, no_promote_module):
+    from scripts import cro_daily_improve as m
+    from src.services.cro_daily_runner import diagnose_readonly
+    from src.services.cro_diagnose_blacklist import load_blacklisted_skus
+    from src.services.cro_thresholds import load_thresholds
+    from src.services.repricing_guard import _fetch_cost_and_listing
+
+    db = tmp_path / "main" / "ebay_collection.db"
+    db.parent.mkdir(parents=True)
+    _init_db(db, [{
+        "sku": "W5230P450590",
+        "suggested_price": 120,
+        "stock": 4,
+        "images": [GIGA_URL, GIGA_URL_2],
+        "listing_id": "188111",
+    }])
+    db_hash = _sha(db)
+    store_opens: list[str] = []
+    real_connect = sqlite3.connect
+
+    def spy_connect(database, *args, **kwargs):
+        text = str(database)
+        resolved = str(db.resolve())
+        uri = db.resolve().as_uri()
+        if resolved in text or uri in text:
+            store_opens.append(text)
+            if "mode=ro" not in text or kwargs.get("uri") is not True:
+                raise AssertionError(f"store DB opened read-write: {database!r} {kwargs}")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spy_connect)
+
+    writes_seen = []
+
+    def authorizer(action, *_a):
+        if action in (sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE):
+            writes_seen.append(action)
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    client = GetOnlyClient({
+        "W5230P450590": _item(["https://live/old.jpg"], qty=2),
+    })
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        isolate_store_root=True,
+        authorizer=authorizer,
+        load_perf_fn=lambda _c: {"traffic_meta": {"api_ok": True}, "traffic": {}, "sales": {}},
+        load_pending_fn=lambda **k: [{
+            "sku": "W5230P450590",
+            "action": "image_refresh",
+            "listing_id": "188111",
+            "enqueued_at": _now().isoformat(),
+        }] if k.get("action_type") == "image_refresh" else [],
+        recent_terminal_fn=lambda **k: set(),
+        scheduler_succeeded_fn=lambda name: name == "daily_tasks",
+        ebay_client_factory=lambda: client,
+    )
+    rc = m.main(["--store", "main", "--out-dir", str(ctx.out_dir)], ctx=ctx)
+    assert rc == 0
+
+    diagnose_readonly(
+        [{
+            "sku": "W5230P450590",
+            "listing_id": "188111",
+            "impressions": 2000,
+            "views": 5,
+            "transactions": 0,
+            "sold_qty": 0,
+            "selling_price": 130,
+            "age_days": 30,
+            "title": "x" * 70,
+            "images": [GIGA_URL, GIGA_URL_2],
+            "categoryId": "38208",
+        }],
+        market_data={"38208": {"median": 100}},
+        db_path=db,
+    )
+    assert load_thresholds(db_path=db) == {}
+    assert load_blacklisted_skus(db_path=db) == set()
+    _fetch_cost_and_listing(str(db), "W5230P450590")
+    m.load_local_product(ctx, "W5230P450590")
+    m.load_published_products(ctx)
+
+    assert writes_seen == []
+    assert _sha(db) == db_hash
+    for suffix in ("-wal", "-shm", "-journal"):
+        assert not Path(str(db) + suffix).exists()
+    assert store_opens
+    assert all("mode=ro" in item for item in store_opens)
+
+
+def test_more_than_24_signed_images_truncates_like_live(tmp_path, no_promote_module):
+    from scripts.cro_image_refresh import (
+        _INVENTORY_IMAGE_LIMIT,
+        build_strict_refresh_payload,
+        prepare_refresh_image_urls,
+        strip_oss_keep_giga_sig,
+        urls_keep_giga_sigs,
+    )
+    from scripts import cro_daily_improve as m
+
+    local = [_signed_url(i) for i in range(25)]
+    assert len(local) == 25
+    kept = [strip_oss_keep_giga_sig(u) for u in local[:_INVENTORY_IMAGE_LIMIT]]
+    assert urls_keep_giga_sigs(local, kept) is True
+    prepared, reason = prepare_refresh_image_urls(local)
+    assert reason is None
+    assert len(prepared) == 24
+    assert prepared == kept
+
+    item = _item(["https://live/old.jpg"], qty=4)
+    payload, payload_reason = build_strict_refresh_payload(item, {"images": local})
+    assert payload_reason is None
+    assert len(payload["image_urls"]) == 24
+
+    class CaptureClient:
+        def __init__(self):
+            self.item = _item(["https://live/old.jpg"], qty=4)
+            self.puts = []
+            _attach_live_session(self)
+
+        def get_inventory_item(self, sku):
+            return self.item
+
+        def create_or_replace_inventory_item(self, sku, payload):
+            self.puts.append(payload)
+            self.item = payload
+
+    dry_client = GetOnlyClient({"W5230P450590": _item(["https://live/old.jpg"], qty=4)})
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        load_products_fn=lambda _c: [{
+            "sku": "W5230P450590",
+            "listing_id": "188111",
+            "selling_price": 99,
+            "total_cost": 40,
+            "images": local,
+            "stock": 2,
+            "stock_known": True,
+            "title": "Sofa",
+            "categoryId": "38208",
+        }],
+        load_perf_fn=lambda _c: {"traffic_meta": {"api_ok": True}},
+        load_pending_fn=lambda **k: [{
+            "sku": "W5230P450590",
+            "action": "image_refresh",
+            "listing_id": "188111",
+            "enqueued_at": _now().isoformat(),
+        }] if k.get("action_type") == "image_refresh" else [],
+        recent_terminal_fn=lambda **k: set(),
+        scheduler_succeeded_fn=lambda name: True,
+        ebay_client_factory=lambda: dry_client,
+        load_local_product_fn=lambda sku: {
+            "images": local, "title": "t", "description": "d",
+        },
+    )
+    rc = m.main(["--store", "main", "--out-dir", str(ctx.out_dir)], ctx=ctx)
+    assert rc == 0
+    dry = json.loads(next(ctx.out_dir.glob("*_dry.json")).read_text(encoding="utf-8"))
+    imgs = [c for c in dry["candidates"] if c["action"] == "image_refresh"]
+    assert len(imgs) == 1
+    assert imgs[0]["local_n"] == 25
+    assert imgs[0]["payload_n"] == 24
+
+    live_client = CaptureClient()
+    live_ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        ebay_client_factory=lambda: live_client,
+        load_local_product_fn=lambda sku: {
+            "images": local, "title": "t", "description": "d",
+        },
+        recent_terminal_fn=lambda **k: set(),
+        mark_done_fn=lambda *a, **k: 0,
+    )
+    cand_path = tmp_path / "trunc.json"
+    cand_path.write_text(json.dumps({
+        "schema": "cro_daily_improve/v1",
+        "store": "main",
+        "mode": "dry",
+        "created_at": _now().isoformat(),
+        "expires_at": (_now() + timedelta(hours=2)).isoformat(),
+        "candidates": imgs,
+    }), encoding="utf-8")
+    rc = m.main(
+        [
+            "--store", "main", "--live",
+            "--candidates", str(cand_path),
+            "--approve-sha256", _sha(cand_path),
+            "--out-dir", str(live_ctx.out_dir),
+        ],
+        ctx=live_ctx,
+    )
+    assert rc == 0
+    live = json.loads(next(live_ctx.out_dir.glob("*_live.json")).read_text(encoding="utf-8"))
+    assert live["results"][0]["status"] == "done"
+    assert live["results"][0]["after"] == 24
+    assert len(live_client.puts) == 1
+    written = live_client.puts[0]["product"]["imageUrls"]
+    assert len(written) == 24
+    assert written == prepared
+    assert dry["candidates"][0]["payload_n"] == len(written)

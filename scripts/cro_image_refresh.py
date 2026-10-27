@@ -26,7 +26,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -258,15 +257,26 @@ def _skip_is_terminal(row: Dict[str, Any]) -> bool:
     return reason not in _RETRYABLE_SKIP_REASONS
 
 
+def _normalize_urls_for_compare(urls: List[str]) -> List[str]:
+    """Strip only x-oss-process on both sides so a refreshed lead stays healthy."""
+    return [
+        _image_url_drop_oss_process(url)
+        for url in urls
+        if isinstance(url, str) and url
+    ]
+
+
 def _should_refresh(local: List[str], live_urls: List[str]) -> Optional[str]:
     """返回 None 表示无需刷新; 否则返回原因."""
-    if len(local) < 2:
+    local_n = _normalize_urls_for_compare(local)
+    live_n = _normalize_urls_for_compare(live_urls)
+    if len(local_n) < 2:
         return None  # 本地都没多图, 没的换
-    if not live_urls:
+    if not live_n:
         return 'live has no images'
-    if len(live_urls) <= 1 and len(local) >= 2:
-        return f'live only {len(live_urls)} img vs local {len(local)}'
-    if local[0] != live_urls[0]:
+    if len(live_n) <= 1 and len(local_n) >= 2:
+        return f'live only {len(live_n)} img vs local {len(local_n)}'
+    if local_n[0] != live_n[0]:
         return 'local lead image differs from live'
     return None
 
@@ -305,42 +315,15 @@ def strip_oss_keep_giga_sig(url: str) -> str:
     """Drop only the raw x-oss-process &-segment; never re-encode the query."""
     if not url or not isinstance(url, str):
         return url or ""
-    if "?" not in url:
-        return url
-    head, _, rest = url.partition("?")
-    query, hash_sep, fragment = rest.partition("#")
-    parts = query.split("&")
-    kept = [part for part in parts if part.split("=", 1)[0] != "x-oss-process"]
-    if kept == parts:
-        return url
-    rebuilt = head
-    joined = "&".join(kept)
-    if joined:
-        rebuilt += "?" + joined
-    if hash_sep:
-        rebuilt += "#" + fragment
-    return rebuilt
+    return _image_url_drop_oss_process(url)
 
 
 def urls_keep_giga_sigs(source_urls: List[str], dest_urls: List[str]) -> bool:
-    """False when any source URL's present x-c* params are missing or changed."""
+    """False when a kept URL's x-c* bytes are missing or changed.
+
+    Truncation is allowed: only the dest/kept prefix is compared pairwise.
+    """
     n = min(len(source_urls), len(dest_urls))
-    if len(source_urls) != len(dest_urls):
-        for src in source_urls:
-            src_sig = giga_sig_params(src)
-            if not src_sig:
-                continue
-            matched = False
-            src_path = urlparse(src).path
-            for dest in dest_urls:
-                if urlparse(dest).path == src_path:
-                    dest_sig = giga_sig_params(dest)
-                    if all(dest_sig.get(k) == v for k, v in src_sig.items()):
-                        matched = True
-                        break
-            if not matched:
-                return False
-        return True
     for i in range(n):
         src_sig = giga_sig_params(source_urls[i])
         if not src_sig:
@@ -350,6 +333,15 @@ def urls_keep_giga_sigs(source_urls: List[str], dest_urls: List[str]) -> bool:
             if dest_sig.get(key) != value:
                 return False
     return True
+
+
+def prepare_refresh_image_urls(local_images: List[Any]) -> Tuple[List[str], Optional[str]]:
+    """Strip OSS, cap at LIMIT, then check sigs on the kept URLs only."""
+    kept = [u for u in local_images if isinstance(u, str) and u][:_INVENTORY_IMAGE_LIMIT]
+    prepared = [strip_oss_keep_giga_sig(u) for u in kept]
+    if not urls_keep_giga_sigs(kept, prepared):
+        return [], "image_sig_stripped"
+    return prepared, None
 
 
 def payload_image_urls(payload: Optional[Dict[str, Any]]) -> List[str]:
@@ -382,9 +374,9 @@ def build_strict_refresh_payload(
     if qty_reason:
         return None, qty_reason
     local_images = list(local.get("images") or [])
-    prepared = [strip_oss_keep_giga_sig(u) for u in local_images if isinstance(u, str) and u]
-    if not urls_keep_giga_sigs(local_images, prepared):
-        return None, "image_sig_stripped"
+    prepared, sig_reason = prepare_refresh_image_urls(local_images)
+    if sig_reason:
+        return None, sig_reason
     try:
         body = _inventory_refresh_put_body(item, prepared)
     except RuntimeError as exc:
@@ -422,12 +414,9 @@ def _refresh_one(client, sku: str, local: Dict[str, Any]) -> Dict[str, Any]:
     if product is None:
         return _skip_row(sku, 'live product missing')
 
-    prepared: List[str] = []
-    for raw_url in local_images:
-        if not isinstance(raw_url, str) or not raw_url:
-            return _skip_row(sku, 'local image url invalid')
-        prepared.append(_image_url_drop_oss_process(raw_url))
-    prepared = prepared[:_INVENTORY_IMAGE_LIMIT]
+    prepared, sig_reason = prepare_refresh_image_urls(local_images)
+    if sig_reason:
+        return _skip_row(sku, sig_reason)
     if len(prepared) < 2:
         return _skip_row(sku, 'live already healthy', live_n=len(live_urls))
 

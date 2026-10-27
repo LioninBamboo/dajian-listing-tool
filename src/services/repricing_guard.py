@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import sqlite3
+from pathlib import Path
 from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ def _fetch_cost_and_listing(db_path: str, sku: str) -> Tuple[Optional[float], Op
     except Exception:
         PricingEngine = None  # type: ignore
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
         cur = conn.cursor()
         try:
             cur.execute(

@@ -201,6 +201,8 @@ def diagnose_readonly(
     Action types outside {price_drop, image_refresh} are ignored.
     """
     allowed = frozenset({"price_drop", "image_refresh"})
+    # Read-only: load_thresholds / filter_blacklisted open the store DB with
+    # as_uri()?mode=ro so dry-run / --store-root never create WAL/SHM.
     learned_thresholds = load_thresholds(db_path=db_path)
     kept, blacklisted = filter_blacklisted(products, db_path=db_path)
     diagnoses = diagnose_batch(

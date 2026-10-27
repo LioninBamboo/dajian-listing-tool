@@ -282,7 +282,7 @@ def load_thresholds(db_path: Optional[Path] = None,
         return {}
     out: Dict[str, Dict[str, float]] = {}
     try:
-        with sqlite3.connect(str(db)) as c:
+        with sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True) as c:
             for r in c.execute(
                 "SELECT category_id, healthy_ctr, healthy_cvr, healthy_str "
                 "FROM cro_thresholds"
