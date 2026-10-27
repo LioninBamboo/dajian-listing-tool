@@ -31,7 +31,7 @@
 - Mutex：`Global\GrovePopSchedulerDaemonMutex`（`store_profile.local.yaml` → `scheduler_mutex_name`）
 - **ops 档默认任务**：`09:30 daily_tasks.py --ops-only`（增量库存同步 + 幽灵缺货恢复）、`每 6h order_source_recheck`
 - **QC 自动修复切片**（`scheduler_enable_qc_autofix: true` **且** job 在 `scheduler_allowed_jobs` 内，户外家具 `qc_profile: furniture`）：`10:55 source_refresh` → `11:30 listing_audit`（只读）→ `12:10 source_aspect_autofix`（白名单 `--fix-key`，**永不含 categoryId**）→ `12:30 semantic_rewrite`（仍需 `SEMANTIC_REWRITE_APPLY_ENABLED=1`）→ `13:00 missing_video`（limit 80）。默认白名单只有 `ops_daily` + `order_recheck`，所以 GP 当前 **不会** 注册这些 daemon QC 任务。
-- **广告切片**（`scheduler_enable_ads: true` **且** job 在白名单内）：周一/周四 `09:35` 智能调价 → `09:40 ad_restore` / `09:45 blacklist` / `09:50 guard_anomaly` / `10:25 ads_enroll`（`create_ad_safe`，Inventory 空则 Trading GetItem 现价）/ 周二 bid / 每 6h 促销轮转。默认白名单不含这些名字。
+- **广告切片**（`scheduler_enable_ads: true` **且** job 在白名单内）：周一/周四 `09:35` 智能调价 → `09:40 ad_restore` / `09:45 blacklist` / `09:50 guard_anomaly` / `10:25 ads_enroll` / 周二 bid / 每 6h 促销轮转。`ad_restore` 与 `ads_enroll` 还会再被 `scheduler_enable_cro_promote` 拦住（默认 false，不调用 `create_ad_safe`）；bid 上调同样要这个开关。默认白名单不含这些名字。
 - **ops 档仍然禁止**：MI 自动刊登、CRO `price_drop` 消费、GIGA 履约推单、裸 `--fix` 全量写回
 - 注册：`scripts/register_substore_ops_scheduler.ps1 -StorePrefix GrovePop`
 - **`GrovePop Content QC` Windows 任务在 daemon 外**（`--live --email`，无 `--fix`，不写 eBay）。PR-A 不改这条计划任务，也不把 daemon QC 切片加入默认白名单。

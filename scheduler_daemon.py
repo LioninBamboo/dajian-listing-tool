@@ -1197,10 +1197,11 @@ def _daily_tasks_ready_for_cro(task_label):
 
 
 def task_cro_consume():
-    """CRO P1 改价消费 — 把 daily_tasks 09:30 入队的 P1 price_drop 真的执行掉.
+    """CRO P1 改价消费 — 只落地 price_drop, 不执行 promote / 不开广告.
 
     依赖 09:30 daily_tasks 完成 (run_cro_diagnose 写队列), 故安排 10:00 触发.
-    成功改价的 SKU 会被自动 mark_done.
+    队列里的 promote 留在 pending, 不会进广告 API; 10:25 cro_promote 也默认跳过
+    (scheduler_enable_cro_promote). 成功改价的 SKU 会被自动 mark_done.
     """
     if _task_succeeded_today('cro_consume'):
         logger.info("↪ 跳过 CRO 队列消费: 今日已成功执行")
@@ -1428,6 +1429,8 @@ def task_cro_lifecycle_detect():
     10:40 (spec Scheduler Contract), 在 CRO 诊断与安全动作之后.
     withdraw/republish 执行不进调度器: revive_relist 保持人工批准,
     运营走 scripts/cro_relist_lifecycle.py --precheck/--execute.
+    --execute 还需 store profile scheduler_enable_cro_relist（默认 false）,
+    且当前仍在 eBay ActiveList 上的 SKU 记 still_live, 不 End.
     """
     if _task_succeeded_today('cro_lifecycle_detect'):
         logger.info("↪ 跳过 CRO 生命周期检测: 今日已成功执行")
@@ -1604,10 +1607,25 @@ def task_ads_enroll():
 
     不跑 CRO diagnose / cro_promote: 那条链路依赖 daily_tasks 入队, ops 档没有
     daily_tasks, 硬接会天天 skip. 入驻仍复用主店同一套利润/黑名单守卫.
+
+    create_ad_safe 会新开广告, 因此还要 scheduler_enable_cro_promote
+    （默认 false）。scheduler_enable_ads 只决定这个任务是否进 ops 日程。
+    手动 ``scripts/store_marketing.py`` 不受此开关影响。
     """
     if _task_succeeded_today('ads_enroll'):
         logger.info("↪ 跳过子店广告入驻: 今日已成功执行")
         return True, 'Skipped (already succeeded today)'
+    if not _cro_promote_scheduler_enabled():
+        logger.info(
+            "↪ 跳过子店广告入驻: scheduler_enable_cro_promote 未开启 "
+            "(create_ad_safe 不开广告)"
+        )
+        update_health(
+            'ads_enroll',
+            'success',
+            'Skipped (scheduler_enable_cro_promote off)',
+        )
+        return True, 'Skipped (scheduler_enable_cro_promote off)'
 
     run_task(
         'ads_enroll',
@@ -1624,10 +1642,24 @@ def task_ad_restore():
     """广告自动恢复审计 — 把因触底被关掉的广告在条件改善后重新打开 (Phase 3 闭环).
 
     依赖 09:30 daily_tasks 的跟价完成, 故安排在 09:40.
+    重新打开走 create_ad_safe, 属于开广告, 受 scheduler_enable_cro_promote
+    约束（默认 false）。手动 ``scripts/ad_restore_audit.py`` 不受此开关影响。
+    关广告 / bid 回滚不走这里。
     """
     if _task_succeeded_today('ad_restore'):
         logger.info("↪ 跳过广告恢复审计: 今日已成功执行")
         return True, 'Skipped (already succeeded today)'
+    if not _cro_promote_scheduler_enabled():
+        logger.info(
+            "↪ 跳过广告恢复审计: scheduler_enable_cro_promote 未开启 "
+            "(create_ad_safe 不开广告)"
+        )
+        update_health(
+            'ad_restore',
+            'success',
+            'Skipped (scheduler_enable_cro_promote off)',
+        )
+        return True, 'Skipped (scheduler_enable_cro_promote off)'
 
     run_task(
         'ad_restore',
@@ -2147,7 +2179,7 @@ def _setup_schedule_full():
     # 10:10 — MI 机会自动刊登 (READY 草稿 → eBay); 默认 dry-run, 需 env 开关才真发布
     schedule.every().day.at("10:10").do(task_auto_publish).tag('daily', 'auto_publish')
 
-    # 09:40 — 广告恢复审计 (Phase 3 闭环：跟价后重新评估被关广告的 SKU)
+    # 09:40 — 广告恢复 (create_ad_safe). 默认跳过, 需 scheduler_enable_cro_promote
     schedule.every().day.at("09:40").do(task_ad_restore).tag('daily', 'ad_restore')
     # S25: 周一 11:00 给运营发死链下架候选 (magic-link 人工确认)
     schedule.every().monday.at("11:00").do(task_cro_delist_email).tag('weekly', 'cro_delist_email')
@@ -2179,7 +2211,7 @@ def _setup_schedule_full():
     # 10:20 — CRO P1 补 specifics (品类必填 aspects)
     schedule.every().day.at("10:20").do(task_cro_fill_specifics).tag('daily', 'cro_fill_specifics')
 
-    # 10:25 — CRO P1 推广执行 (安全开广告/提 bid)
+    # 10:25 — CRO promote (开广告/提 bid). 默认跳过, 需 scheduler_enable_cro_promote
     schedule.every().day.at("10:25").do(task_cro_promote).tag('daily', 'cro_promote')
 
     # 10:30 — CRO 北极星告警 (7d avg 跌 ≥ 5 分 / 恶化占比 ≥ 20%)
@@ -2238,7 +2270,10 @@ def _setup_schedule_full():
     logger.info("  09:22  GIGA→eBay 运单回写 (默认 dry-run; ENABLE_GIGA_EBAY_FULFILL=1 才 apply)")
     logger.info("  09:30  每日全量任务 (daily_tasks.py — 含库存同步+报告；智能调价仅周一/周四)")
     logger.info("  10:05  MI 流水线自检 (F32 — 异常发邮件)")
-    logger.info("  09:40  广告恢复审计 (ad_restore_audit --apply --email)")
+    logger.info(
+        "  09:40  广告恢复审计 (默认跳过; scheduler_enable_cro_promote 才 "
+        "ad_restore_audit --apply)"
+    )
     logger.info(
         "  周二 10:00  分级 Bid 优化 (batch_smart_bid --apply --email"
         "[; --no-raises unless scheduler_enable_cro_promote])"
@@ -2247,7 +2282,12 @@ def _setup_schedule_full():
     logger.info("  周日 03:00  CRO ops 快照 + DB DR 演练 (cro_ops_snapshot)")
     logger.info("  09:45  广告黑名单自动清理 (P7 — ad_blacklist_cleanup)")
     logger.info("  09:50  守门员异常告警 (P8 — guard_anomaly_alert)")
-    logger.info("  10:00-10:25  CRO 队列自动执行 (改价/图/specifics/推广)")
+    logger.info(
+        "  10:00-10:20  CRO 队列自动执行 (改价/图/specifics; 不含 promote/开广告)"
+    )
+    logger.info(
+        "  10:25  CRO promote (默认跳过, 需 scheduler_enable_cro_promote)"
+    )
     logger.info("  10:45  CRO 标题热词优化 dry-run (显式 env 才 live apply)")
     logger.info("  10:55  源内容刷新 (source_content_refresh --email — 卖家漂移检测)")
     logger.info("  11:30  eBay/GIGA live listing 内容审计 (audit_fix_active_listings --live --email)")
@@ -2617,7 +2657,7 @@ def _get_critical_recovery_tasks():
                 'scheduled_time': '10:25',
                 'recovery_grace_minutes': 30,
                 'func': task_cro_promote,
-                'label': 'CRO 推广执行',
+                'label': 'CRO promote（默认关）',
                 'priority': 110,
                 'depends_on_success': 'daily_tasks',
             },

@@ -27,6 +27,26 @@ DEFAULT_LIMITS = {
 
 Executor = Callable[..., Dict[str, Any]]
 
+# Actions that create ads or raise ad rates. Never auto-run unless the store
+# profile flag is on, even if a caller adds them back to SAFE_AUTO_ACTIONS.
+AD_CREATE_OR_RAISE_ACTIONS = frozenset({"promote"})
+
+
+def _cro_promote_scheduler_enabled() -> bool:
+    """Fail-closed read of scheduler_enable_cro_promote."""
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        return bool(get_store_profile().cro_promote_scheduler_enabled)
+    except Exception:
+        return False
+
+
+def _load_promote_runner():
+    from scripts.cro_promote import run
+
+    return run
+
 
 def _summary_from_report(action_type: str, report: Dict[str, Any]) -> Dict[str, Any]:
     if action_type == 'price_drop':
@@ -72,12 +92,21 @@ def _default_executor(action_type: str) -> Executor:
 
         return lambda *, apply_changes, limit, send_email: run(apply_changes, limit)
     if action_type == 'promote':
-        from scripts.cro_promote import run
-
-        return lambda *, apply_changes, limit, send_email: run(
-            apply_changes, limit,
-            auto_create_missing_ads=True,
-        )
+        def run_promote(*, apply_changes, limit, send_email):
+            if not _cro_promote_scheduler_enabled():
+                return {
+                    'pending_total': 0,
+                    'done': [],
+                    'failed': [],
+                    'skipped': ['scheduler_enable_cro_promote off'],
+                    'ad_api_called': False,
+                }
+            run = _load_promote_runner()
+            return run(
+                apply_changes, limit,
+                auto_create_missing_ads=True,
+            )
+        return run_promote
     raise ValueError(f'unsupported action_type: {action_type}')
 
 
@@ -94,9 +123,16 @@ def execute_pending_actions(
     executor_map = executor_map or {}
     summaries: List[Dict[str, Any]] = []
     unsupported: List[str] = []
+    blocked_by_flag: List[str] = []
     for action_type in action_types:
         if action_type not in SAFE_AUTO_ACTIONS:
             unsupported.append(action_type)
+            continue
+        if (
+            action_type in AD_CREATE_OR_RAISE_ACTIONS
+            and not _cro_promote_scheduler_enabled()
+        ):
+            blocked_by_flag.append(action_type)
             continue
         executor = executor_map.get(action_type) or _default_executor(action_type)
         report = executor(
@@ -109,6 +145,7 @@ def execute_pending_actions(
         'apply': apply_changes,
         'actions': summaries,
         'unsupported': unsupported,
+        'blocked_by_flag': blocked_by_flag,
         'queue_stats': queue_stats(),
     }
     if send_email and summaries:

@@ -1282,6 +1282,133 @@ def precheck_approved(
     }
 
 
+RELIST_FLAG_OFF_MESSAGE = (
+    "Refused: scheduler_enable_cro_relist is off (default). "
+    "--execute will not End, Relist, or revive any eBay listing."
+)
+
+
+def _cro_relist_enabled() -> bool:
+    """Same fail-closed read as scheduler_enable_cro_promote.
+
+    Missing, absent, or unreadable store profile => do not touch eBay.
+    """
+    try:
+        from src.utils.store_profile import get_store_profile
+
+        return bool(get_store_profile().cro_relist_scheduler_enabled)
+    except Exception:
+        return False
+
+
+def _relist_refused_report(apply_changes: bool) -> dict[str, Any]:
+    return {
+        "apply_changes": bool(apply_changes),
+        "refused": True,
+        "aborted": False,
+        "reason": "scheduler_enable_cro_relist_off",
+        "message": RELIST_FLAG_OFF_MESSAGE,
+        "selected": 0,
+        "old_withdrawn": 0,
+        "published_new": 0,
+        "skipped": 0,
+        "failed": 0,
+        "results": [],
+        "ebay_calls": 0,
+    }
+
+
+def _execute_aborted_report(
+    *,
+    apply_changes: bool,
+    selected: int,
+    reason: str,
+    message: str,
+) -> dict[str, Any]:
+    """Whole-execute fail-closed. Caller must not have written yet."""
+    return {
+        "apply_changes": bool(apply_changes),
+        "refused": True,
+        "aborted": True,
+        "reason": reason,
+        "message": message,
+        "selected": selected,
+        "old_withdrawn": 0,
+        "published_new": 0,
+        "skipped": 0,
+        "failed": 0,
+        "results": [],
+        "ebay_calls": 0,
+    }
+
+
+def _fetch_store_active_listings(trading=None):
+    """Read-only ActiveList via the existing Trading client.
+
+    Returns ``(listings, api_total, fetch_complete)`` from
+    ``listing_status_sync.fetch_all_active_listings``.
+    """
+    from src.services.listing_status_sync import (
+        _get_trading_client,
+        fetch_all_active_listings,
+    )
+
+    client = trading if trading is not None and callable(getattr(trading, "call", None)) else None
+    if client is None:
+        client = _get_trading_client()
+    return fetch_all_active_listings(client)
+
+
+def _db_live_listing_count(db_path: Path | None) -> int:
+    """PUBLISHED rows with a listing id. Empty ActiveList is untrustworthy when this is > 0."""
+    conn = _conn(db_path)
+    try:
+        if not _table_exists(conn, "collected_products"):
+            return 0
+        columns = _table_columns(conn, "collected_products")
+        if "status" not in columns or "listing_id" not in columns:
+            return 0
+        row = conn.execute(
+            """
+            SELECT COUNT(*) FROM collected_products
+            WHERE UPPER(COALESCE(status, '')) = 'PUBLISHED'
+              AND TRIM(COALESCE(listing_id, '')) != ''
+            """
+        ).fetchone()
+        return int(row[0] or 0)
+    finally:
+        conn.close()
+
+
+def _active_listing_index(listings) -> tuple[set[str], set[str]]:
+    ids: set[str] = set()
+    skus: set[str] = set()
+    for item in listings or []:
+        if isinstance(item, dict):
+            item_id = str(item.get("item_id") or item.get("listing_id") or "").strip()
+            sku = str(item.get("sku") or "").strip()
+        else:
+            item_id = str(getattr(item, "item_id", "") or "").strip()
+            sku = str(getattr(item, "sku", "") or "").strip()
+        if item_id:
+            ids.add(item_id)
+        if sku:
+            skus.add(sku)
+    return ids, skus
+
+
+def _listing_still_live(
+    *,
+    sku: str,
+    listing_ids: set[str],
+    live_ids: set[str],
+    live_skus: set[str],
+) -> bool:
+    if sku and sku in live_skus:
+        return True
+    return any(lid and lid in live_ids for lid in listing_ids)
+
+
 def execute_prechecked_relist(
     limit: int = 10,
     apply_changes: bool = False,
@@ -1291,11 +1418,21 @@ def execute_prechecked_relist(
     dry_run_publish_func: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     publish_func: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Withdraw old live listings and republish prechecked revive actions.
+    """Withdraw old listings and republish prechecked revive actions.
+
+    ``scheduler_enable_cro_relist`` (default false) must be on or this returns
+    immediately with zero eBay calls. When it is on, a read-only ActiveList is
+    fetched before any End/Relist/publish. Listings still active on eBay are
+    skipped with reason ``still_live``. A failed or empty ActiveList while the
+    DB still has live listings aborts the whole execute with no writes.
 
     The publish dry-run is executed before withdrawing the old listing so local
-    blockers do not strand a live SKU.
+    blockers do not strand a live SKU. That dry-run runs only after the
+    ActiveList gate says the SKU is not currently active.
     """
+    if not _cro_relist_enabled():
+        return _relist_refused_report(apply_changes)
+
     ensure_schema(db_path)
     with _conn(db_path) as conn:
         rows = [
@@ -1315,10 +1452,68 @@ def execute_prechecked_relist(
     if not apply_changes:
         return {
             "apply_changes": False,
+            "refused": False,
+            "aborted": False,
             "selected": len(rows),
             "actions": rows,
+            "ebay_calls": 0,
         }
 
+    if not rows:
+        return {
+            "apply_changes": True,
+            "refused": False,
+            "aborted": False,
+            "selected": 0,
+            "old_withdrawn": 0,
+            "published_new": 0,
+            "skipped": 0,
+            "failed": 0,
+            "results": [],
+            "ebay_calls": 0,
+        }
+
+    try:
+        listings, _api_total, fetch_complete = _fetch_store_active_listings(trading_client)
+    except Exception as exc:
+        logger.warning("ActiveList fetch failed; aborting relist execute: %s", exc)
+        return _execute_aborted_report(
+            apply_changes=True,
+            selected=len(rows),
+            reason="activelist_fetch_failed",
+            message=(
+                "Aborted: eBay ActiveList fetch failed. "
+                "Refusing to End/Relist/revive (fail closed, no writes)."
+            ),
+        )
+
+    if not fetch_complete:
+        return _execute_aborted_report(
+            apply_changes=True,
+            selected=len(rows),
+            reason="activelist_fetch_failed",
+            message=(
+                "Aborted: eBay ActiveList fetch was incomplete. "
+                "Refusing to End/Relist/revive (fail closed, no writes)."
+            ),
+        )
+
+    listing_rows = list(listings or [])
+    db_live = _db_live_listing_count(db_path)
+    if len(listing_rows) == 0 and db_live > 0:
+        return _execute_aborted_report(
+            apply_changes=True,
+            selected=len(rows),
+            reason="activelist_empty_with_db_live",
+            message=(
+                "Aborted: eBay ActiveList returned 0 listings while the DB "
+                f"has {db_live} live PUBLISHED listing(s). "
+                "Refusing to treat an empty ActiveList as complete "
+                "(fail closed, no writes)."
+            ),
+        )
+
+    live_ids, live_skus = _active_listing_index(listing_rows)
     trading = trading_client or _default_trading_client()
     dry_run = dry_run_publish_func or _default_dry_run_publish
     publish = publish_func or _default_publish
@@ -1328,6 +1523,41 @@ def execute_prechecked_relist(
         action_id = int(action["id"])
         sku = str(action["sku"])
         old_listing_id = str(action.get("old_listing_id") or "").strip()
+        with _conn(db_path) as conn:
+            product = _product_for_sku(conn, sku)
+        listing_ids = {old_listing_id}
+        if product:
+            listing_ids.add(str(product.get("listing_id") or "").strip())
+        if _listing_still_live(
+            sku=sku,
+            listing_ids=listing_ids,
+            live_ids=live_ids,
+            live_skus=live_skus,
+        ):
+            transition_action(
+                action_id,
+                STATUS_SKIPPED,
+                operator=operator,
+                note="still_live",
+                error="still_live",
+                live_snapshot_json=_json_dumps({
+                    "reason": "still_live",
+                    "sku": sku,
+                    "old_listing_id": old_listing_id,
+                    "checked_at": _now_iso(),
+                }),
+                db_path=db_path,
+            )
+            results.append({
+                "id": action_id,
+                "sku": sku,
+                "status": STATUS_SKIPPED,
+                "reason": "still_live",
+                "error": "still_live",
+                "old_withdrawn": False,
+            })
+            continue
+
         old_withdrawn = False
         try:
             with _conn(db_path) as conn:

@@ -175,6 +175,23 @@ def _seed_snapshot(
         conn.commit()
 
 
+class _LiveListing:
+    def __init__(self, item_id: str, sku: str):
+        self.item_id = item_id
+        self.sku = sku
+
+
+def _enable_relist_with_activelist(monkeypatch, listings):
+    """Flag on, and a complete ActiveList that does not hit eBay."""
+    rows = list(listings)
+    monkeypatch.setattr(lifecycle, "_cro_relist_enabled", lambda: True)
+    monkeypatch.setattr(
+        lifecycle,
+        "_fetch_store_active_listings",
+        lambda trading=None: (rows, len(rows), True),
+    )
+
+
 def _actions(db_path: Path) -> list[dict]:
     with sqlite3.connect(str(db_path)) as conn:
         conn.row_factory = sqlite3.Row
@@ -398,7 +415,10 @@ def test_precheck_approved_skips_rows_with_new_sales(tmp_path: Path):
     assert "sales_present" in row["error"]
 
 
-def test_execute_prechecked_relist_withdraws_and_publishes(tmp_path: Path):
+def test_execute_prechecked_relist_withdraws_and_publishes(tmp_path: Path, monkeypatch):
+    _enable_relist_with_activelist(
+        monkeypatch, [_LiveListing("OTHER-LIVE", "OTHER-SKU")]
+    )
     db = tmp_path / "cro.db"
     _create_source_tables(db)
     _seed_product(db, "SKU-RELIVE", listing_id="OLD-1")
@@ -462,7 +482,10 @@ def test_execute_prechecked_relist_withdraws_and_publishes(tmp_path: Path):
     assert listing_id == "NEW-1"
 
 
-def test_execute_prechecked_relist_dry_run_failure_keeps_old_listing(tmp_path: Path):
+def test_execute_prechecked_relist_dry_run_failure_keeps_old_listing(tmp_path: Path, monkeypatch):
+    _enable_relist_with_activelist(
+        monkeypatch, [_LiveListing("OTHER-LIVE", "OTHER-SKU")]
+    )
     db = tmp_path / "cro.db"
     _create_source_tables(db)
     _seed_product(db, "SKU-BLOCK", listing_id="OLD-2")
@@ -497,7 +520,10 @@ def test_execute_prechecked_relist_dry_run_failure_keeps_old_listing(tmp_path: P
     assert listing_id == "OLD-2"
 
 
-def test_execute_prechecked_relist_skips_when_sales_arrive_after_precheck(tmp_path: Path):
+def test_execute_prechecked_relist_skips_when_sales_arrive_after_precheck(tmp_path: Path, monkeypatch):
+    _enable_relist_with_activelist(
+        monkeypatch, [_LiveListing("OTHER-LIVE", "OTHER-SKU")]
+    )
     db = tmp_path / "cro.db"
     _create_source_tables(db)
     _seed_product(db, "SKU-SALE-LATE", listing_id="OLD-3")
@@ -537,6 +563,160 @@ def test_execute_prechecked_relist_skips_when_sales_arrive_after_precheck(tmp_pa
         ).fetchone()
     assert product_status == "PUBLISHED"
     assert listing_id == "OLD-3"
+
+
+def _precheck_one(db: Path, sku: str = "SKU-RELIVE", listing_id: str = "OLD-1") -> int:
+    _create_source_tables(db)
+    _seed_product(db, sku, listing_id=listing_id)
+    _seed_snapshot(db, sku, listing_id=listing_id, impressions=55, views=5)
+    detect_candidates(snapshot_date="2026-05-13", db_path=db, as_of_date="2026-05-13")
+    action_id = _actions(db)[0]["id"]
+    approve_actions([action_id], operator="ops", db_path=db)
+    precheck_approved(limit=1, apply_changes=True, db_path=db)
+    return action_id
+
+
+def test_execute_flag_off_refuses_with_zero_ebay_calls(tmp_path: Path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _precheck_one(db)
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("eBay must not be called when relist flag is off")
+
+    monkeypatch.setattr(lifecycle, "_cro_relist_enabled", lambda: False)
+    monkeypatch.setattr(lifecycle, "_fetch_store_active_listings", boom)
+    monkeypatch.setattr(lifecycle, "_default_trading_client", boom)
+    monkeypatch.setattr(lifecycle, "_default_publish", boom)
+    monkeypatch.setattr(lifecycle, "_default_dry_run_publish", boom)
+
+    class FakeTrading:
+        def end_item(self, item_id, reason="NotAvailable"):
+            raise AssertionError("end_item")
+
+        def call(self, *args, **kwargs):
+            raise AssertionError("trading.call")
+
+    result = execute_prechecked_relist(
+        limit=1,
+        apply_changes=True,
+        db_path=db,
+        trading_client=FakeTrading(),
+        dry_run_publish_func=boom,
+        publish_func=boom,
+    )
+
+    assert result["refused"] is True
+    assert result["ebay_calls"] == 0
+    assert "scheduler_enable_cro_relist" in result["message"]
+    assert _actions(db)[0]["status"] == "prechecked"
+
+
+def test_execute_refuses_still_live_sku(tmp_path: Path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _precheck_one(db, sku="SKU-LIVE", listing_id="LIVE-1")
+    _enable_relist_with_activelist(
+        monkeypatch, [_LiveListing("LIVE-1", "SKU-LIVE")]
+    )
+
+    class FakeTrading:
+        def end_item(self, item_id, reason="NotAvailable"):
+            raise AssertionError("live listing must not be ended")
+
+        def call(self, *args, **kwargs):
+            raise AssertionError("trading.call")
+
+    result = execute_prechecked_relist(
+        limit=1,
+        apply_changes=True,
+        db_path=db,
+        trading_client=FakeTrading(),
+        dry_run_publish_func=lambda product: (_ for _ in ()).throw(AssertionError("dry_run")),
+        publish_func=lambda product: (_ for _ in ()).throw(AssertionError("publish")),
+    )
+
+    assert result.get("aborted") is not True
+    assert result["skipped"] == 1
+    assert result["results"][0]["reason"] == "still_live"
+    row = _actions(db)[0]
+    assert row["status"] == "skipped"
+    assert row["error"] == "still_live"
+
+
+def test_execute_aborts_when_activelist_fails(tmp_path: Path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _precheck_one(db)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("GetMyeBaySelling down")
+
+    monkeypatch.setattr(lifecycle, "_cro_relist_enabled", lambda: True)
+    monkeypatch.setattr(lifecycle, "_fetch_store_active_listings", boom)
+
+    class FakeTrading:
+        def end_item(self, item_id, reason="NotAvailable"):
+            raise AssertionError("end_item")
+
+    result = execute_prechecked_relist(
+        limit=1,
+        apply_changes=True,
+        db_path=db,
+        trading_client=FakeTrading(),
+        publish_func=lambda product: (_ for _ in ()).throw(AssertionError("publish")),
+    )
+
+    assert result["aborted"] is True
+    assert result["reason"] == "activelist_fetch_failed"
+    assert result["results"] == []
+    assert _actions(db)[0]["status"] == "prechecked"
+
+
+def test_execute_aborts_when_activelist_empty_but_db_has_live(tmp_path: Path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _precheck_one(db)
+    _enable_relist_with_activelist(monkeypatch, [])
+
+    class FakeTrading:
+        def end_item(self, item_id, reason="NotAvailable"):
+            raise AssertionError("end_item")
+
+    result = execute_prechecked_relist(
+        limit=1,
+        apply_changes=True,
+        db_path=db,
+        trading_client=FakeTrading(),
+        publish_func=lambda product: (_ for _ in ()).throw(AssertionError("publish")),
+    )
+
+    assert result["aborted"] is True
+    assert result["reason"] == "activelist_empty_with_db_live"
+    assert result["results"] == []
+    assert _actions(db)[0]["status"] == "prechecked"
+
+
+def test_execute_aborts_when_activelist_incomplete(tmp_path: Path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _precheck_one(db)
+    monkeypatch.setattr(lifecycle, "_cro_relist_enabled", lambda: True)
+    monkeypatch.setattr(
+        lifecycle,
+        "_fetch_store_active_listings",
+        lambda trading=None: ([_LiveListing("OTHER", "OTHER")], 99, False),
+    )
+
+    class FakeTrading:
+        def end_item(self, item_id, reason="NotAvailable"):
+            raise AssertionError("end_item")
+
+    result = execute_prechecked_relist(
+        limit=1,
+        apply_changes=True,
+        db_path=db,
+        trading_client=FakeTrading(),
+    )
+
+    assert result["aborted"] is True
+    assert result["reason"] == "activelist_fetch_failed"
+    assert _actions(db)[0]["status"] == "prechecked"
 
 
 def test_transition_action_rejects_invalid_status_jump(tmp_path: Path):

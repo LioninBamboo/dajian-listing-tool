@@ -58,7 +58,9 @@ Additional CRO cadence:
 - Tue `10:00` smart bid, Tue `11:00` bid rollback
 - Mon `11:00` CRO delist email
 
-Automatic Promoted Listings ad-rate **increases** are disabled by default (owner rule 2026-10-26/27): diagnose no longer enqueues `promote`, `SAFE_AUTO_ACTIONS` excludes it, the 10:25 `cro_promote` job skips unless `scheduler_enable_cro_promote` is set, and Tuesday `smart_bid` runs with `--no-raises` under the same flag (lowers still apply). `ad_restore` re-opens ads at a target bid (does not raise existing bids); `bid_rollback` only lowers. Manual `python scripts/cro_promote.py` / `batch_smart_bid.py --apply` remain available.
+Automatic Promoted Listings ad **creation** and ad-rate **increases** are disabled by default (owner rule 2026-10-26/27): diagnose no longer enqueues `promote`, `SAFE_AUTO_ACTIONS` excludes it, and a queued `promote` is not sent to the ad API while `scheduler_enable_cro_promote` is off. The same flag skips `10:25` `cro_promote`, `09:40` `ad_restore` (`create_ad_safe`), and ops `ads_enroll`. Tuesday `smart_bid` runs with `--no-raises` (lowers still apply). `bid_rollback` only lowers and stays on. Manual `python scripts/cro_promote.py`, `ad_restore_audit.py --apply`, `store_marketing.py`, and `batch_smart_bid.py --apply` remain available.
+
+`scheduler_enable_cro_relist` (default false) blocks `scripts/cro_relist_lifecycle.py --execute` (End / Relist / revive). `--detect` and `--evaluate` stay local-only. When the flag is on, a live ActiveList SKU is refused with `still_live`, and a failed or empty ActiveList while the DB still has live listings aborts the whole execute.
 
 ## Safe Publish Workflow
 

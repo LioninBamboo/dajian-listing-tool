@@ -104,6 +104,95 @@ class SchedulerSmartBidRaiseGateTests(unittest.TestCase):
         self.assertNotIn('--no-raises', cmd_args)
 
 
+class SchedulerAdCreateGateTests(unittest.TestCase):
+    """create_ad_safe jobs stay off unless scheduler_enable_cro_promote is on."""
+
+    def test_ad_restore_skips_when_flag_off(self):
+        with (
+            patch.object(scheduler_daemon, '_task_succeeded_today', return_value=False),
+            patch.object(
+                scheduler_daemon, '_cro_promote_scheduler_enabled', return_value=False
+            ),
+            patch.object(scheduler_daemon, 'update_health') as health,
+            patch.object(scheduler_daemon, 'run_task') as run_task,
+        ):
+            result = scheduler_daemon.task_ad_restore()
+
+        self.assertEqual(
+            result, (True, 'Skipped (scheduler_enable_cro_promote off)')
+        )
+        run_task.assert_not_called()
+        self.assertEqual(health.call_args.args[0], 'ad_restore')
+
+    def test_ad_restore_runs_when_flag_on(self):
+        with (
+            patch.object(scheduler_daemon, '_task_succeeded_today', return_value=False),
+            patch.object(
+                scheduler_daemon, '_cro_promote_scheduler_enabled', return_value=True
+            ),
+            patch.object(scheduler_daemon, 'run_task') as run_task,
+        ):
+            scheduler_daemon.task_ad_restore()
+
+        task_name, cmd_args = run_task.call_args.args[:2]
+        self.assertEqual(task_name, 'ad_restore')
+        self.assertTrue(any(str(a).endswith('ad_restore_audit.py') for a in cmd_args))
+        self.assertIn('--apply', cmd_args)
+
+    def test_ads_enroll_runs_when_flag_on(self):
+        with (
+            patch.object(scheduler_daemon, '_task_succeeded_today', return_value=False),
+            patch.object(
+                scheduler_daemon, '_cro_promote_scheduler_enabled', return_value=True
+            ),
+            patch.object(scheduler_daemon, 'run_task') as run_task,
+        ):
+            scheduler_daemon.task_ads_enroll()
+
+        task_name, cmd_args = run_task.call_args.args[:2]
+        self.assertEqual(task_name, 'ads_enroll')
+        self.assertTrue(any(str(a).endswith('store_marketing.py') for a in cmd_args))
+        self.assertIn('--apply', cmd_args)
+
+    def test_ads_enroll_skips_when_flag_off(self):
+        with (
+            patch.object(scheduler_daemon, '_task_succeeded_today', return_value=False),
+            patch.object(
+                scheduler_daemon, '_cro_promote_scheduler_enabled', return_value=False
+            ),
+            patch.object(scheduler_daemon, 'run_task') as run_task,
+        ):
+            result = scheduler_daemon.task_ads_enroll()
+
+        self.assertEqual(
+            result, (True, 'Skipped (scheduler_enable_cro_promote off)')
+        )
+        run_task.assert_not_called()
+
+    def test_cro_consume_does_not_launch_ad_writers(self):
+        """10:00 queue consume is price_drop only, even if promote is the topic."""
+        with (
+            patch.object(scheduler_daemon, '_task_succeeded_today', return_value=False),
+            patch.object(
+                scheduler_daemon, '_daily_tasks_ready_for_cro', return_value=True
+            ),
+            patch.object(
+                scheduler_daemon, '_cro_promote_scheduler_enabled', return_value=False
+            ),
+            patch.object(scheduler_daemon, 'run_task') as run_task,
+        ):
+            scheduler_daemon.task_cro_consume()
+
+        task_name, cmd_args = run_task.call_args.args[:2]
+        self.assertEqual(task_name, 'cro_consume')
+        joined = ' '.join(str(a) for a in cmd_args)
+        self.assertIn('batch_smart_reprice.py', joined)
+        self.assertIn('--from-cro-queue', joined)
+        self.assertNotIn('cro_promote.py', joined)
+        self.assertNotIn('ad_restore_audit.py', joined)
+        self.assertNotIn('store_marketing.py', joined)
+
+
 class StoreProfileCroPromoteFlagTests(unittest.TestCase):
     def test_default_flag_absent_is_false(self):
         from src.utils.store_profile import StoreProfile
@@ -130,6 +219,28 @@ class StoreProfileCroPromoteFlagTests(unittest.TestCase):
             profile = load_store_profile(yaml_file)
             self.assertTrue(profile.scheduler_enable_cro_promote)
             self.assertTrue(profile.cro_promote_scheduler_enabled)
+
+    def test_relist_flag_defaults_false_and_yaml_can_enable(self):
+        from src.utils.store_profile import StoreProfile, load_store_profile
+
+        profile = StoreProfile()
+        self.assertFalse(profile.scheduler_enable_cro_relist)
+        self.assertFalse(profile.cro_relist_scheduler_enabled)
+
+        with tempfile.TemporaryDirectory() as td:
+            yaml_file = Path(td) / 'store.yaml'
+            yaml_file.write_text(
+                textwrap.dedent(
+                    """
+                    server:
+                      scheduler_enable_cro_relist: true
+                    """
+                ),
+                encoding='utf-8',
+            )
+            loaded = load_store_profile(yaml_file)
+            self.assertTrue(loaded.scheduler_enable_cro_relist)
+            self.assertTrue(loaded.cro_relist_scheduler_enabled)
 
 
 if __name__ == '__main__':
