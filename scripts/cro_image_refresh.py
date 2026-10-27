@@ -25,7 +25,8 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -268,6 +269,110 @@ def _should_refresh(local: List[str], live_urls: List[str]) -> Optional[str]:
     if local[0] != live_urls[0]:
         return 'local lead image differs from live'
     return None
+
+
+GIGA_SIG_KEYS: tuple[str, ...] = ("x-cc", "x-cu", "x-ct", "x-cs")
+
+
+def live_quantity(item: Dict[str, Any]) -> Optional[int]:
+    """Read ship-to qty. Missing/unparseable → None (never default to 1)."""
+    raw = ((item.get("availability") or {}).get(
+        "shipToLocationAvailability") or {}).get("quantity")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def giga_sig_params(url: str) -> Dict[str, str]:
+    if not url or not isinstance(url, str) or "?" not in url:
+        return {}
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    out: Dict[str, str] = {}
+    for key in GIGA_SIG_KEYS:
+        vals = qs.get(key)
+        if vals:
+            out[key] = vals[0]
+    return out
+
+
+def strip_oss_keep_giga_sig(url: str) -> str:
+    """Drop x-oss-process only; keep GigaB2B x-cc/x-cu/x-ct/x-cs intact."""
+    if not url or not isinstance(url, str) or "?" not in url:
+        return url or ""
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    qs.pop("x-oss-process", None)
+    pairs: List[tuple[str, str]] = []
+    for key, vals in qs.items():
+        for val in vals:
+            pairs.append((key, val))
+    new_query = urlencode(pairs)
+    return urlunparse((
+        parsed.scheme, parsed.netloc, parsed.path,
+        parsed.params, new_query, parsed.fragment,
+    ))
+
+
+def urls_keep_giga_sigs(source_urls: List[str], dest_urls: List[str]) -> bool:
+    """False when any source URL's present x-c* params are missing or changed."""
+    n = min(len(source_urls), len(dest_urls))
+    if len(source_urls) != len(dest_urls):
+        for src in source_urls:
+            src_sig = giga_sig_params(src)
+            if not src_sig:
+                continue
+            matched = False
+            src_path = urlparse(src).path
+            for dest in dest_urls:
+                if urlparse(dest).path == src_path:
+                    dest_sig = giga_sig_params(dest)
+                    if all(dest_sig.get(k) == v for k, v in src_sig.items()):
+                        matched = True
+                        break
+            if not matched:
+                return False
+        return True
+    for i in range(n):
+        src_sig = giga_sig_params(source_urls[i])
+        if not src_sig:
+            continue
+        dest_sig = giga_sig_params(dest_urls[i])
+        for key, value in src_sig.items():
+            if dest_sig.get(key) != value:
+                return False
+    return True
+
+
+def build_strict_refresh_payload(
+    item: Dict[str, Any],
+    local: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Build PUT payload without defaulting qty and without stripping x-c*."""
+    qty = live_quantity(item)
+    if qty is None:
+        return None, "qty_unknown"
+    if qty <= 0:
+        return None, "qty_zero"
+    local_images = list(local.get("images") or [])
+    prepared = [strip_oss_keep_giga_sig(u) for u in local_images]
+    if not urls_keep_giga_sigs(local_images, prepared):
+        return None, "image_sig_stripped"
+    product = item.get("product") or {}
+    title = (product.get("title") or local.get("title") or "").strip()
+    description = (product.get("description") or local.get("description") or title).strip()
+    description = description[:4000] or (title[:4000] if title else "")
+    return {
+        "title": title,
+        "description": description,
+        "image_urls": prepared,
+        "condition": item.get("condition", "NEW"),
+        "quantity": qty,
+        "aspects": product.get("aspects") or {},
+    }, None
 
 
 def _refresh_one(client, sku: str, local: Dict[str, Any]) -> Dict[str, Any]:

@@ -185,3 +185,48 @@ def run_cro_daily(products: List[Dict[str, Any]],
     out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     report['report_path'] = str(out)
     return report
+
+
+def diagnose_readonly(
+    products: List[Dict[str, Any]],
+    market_data: Optional[Dict[str, Any]] = None,
+    action_types: tuple = ("price_drop", "image_refresh"),
+    action_quotas: Optional[Dict[str, int]] = None,
+    db_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Pure diagnose: no cro_snapshots, no queue writes, no cro_daily_*.json.
+
+    Used by scripts/cro_daily_improve.py so ops stores and dry-runs can rank
+    price_drop / image_refresh without touching run_cro_daily side effects.
+    Action types outside {price_drop, image_refresh} are ignored.
+    """
+    allowed = frozenset({"price_drop", "image_refresh"})
+    learned_thresholds = load_thresholds(db_path=db_path)
+    kept, blacklisted = filter_blacklisted(products, db_path=db_path)
+    diagnoses = diagnose_batch(
+        kept,
+        market_data=market_data or {},
+        thresholds_by_category=learned_thresholds or None,
+    )
+    summary = summarize(diagnoses)
+    summary["learned_categories"] = len(learned_thresholds)
+    summary["blacklisted_skipped"] = len(blacklisted)
+    actions: List[Dict[str, Any]] = []
+    for action_type in action_types:
+        if action_type not in allowed:
+            continue
+        limit = (
+            int(action_quotas.get(action_type, 50))
+            if action_quotas is not None else 50
+        )
+        if limit <= 0:
+            continue
+        actions.extend(top_actions(diagnoses, limit=limit, action_type=action_type))
+    return {
+        "summary": summary,
+        "diagnoses": [d.to_dict() for d in diagnoses],
+        "actions": actions,
+        "blacklisted_skipped": len(blacklisted),
+        "snapshots_saved": 0,
+        "p1_queued": 0,
+    }

@@ -1050,7 +1050,8 @@ def generate_search_keyword(product: dict) -> str:
 
 
 def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
-                      market_mode: str = None, from_cro_queue: bool = False):
+                      market_mode: str = None, from_cro_queue: bool = False,
+                      only_skus: set | None = None):
     """主函数"""
     log.info("=" * 70)
     log.info("BATCH SMART REPRICE — Terapeak 市场调研 + 智能定价")
@@ -1059,6 +1060,10 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
 
     products = get_published_products()
     log.info(f"Loaded {len(products)} PUBLISHED products with cost data")
+    if only_skus is not None:
+        wanted = {str(sku) for sku in only_skus}
+        products = [p for p in products if str(p.get("sku") or "") in wanted]
+        log.info(f"Filtered to {len(products)} products by only_skus ({len(wanted)} requested)")
 
     cro_queue_skus: set = set()
     if from_cro_queue:
