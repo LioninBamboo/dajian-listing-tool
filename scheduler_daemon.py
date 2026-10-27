@@ -266,6 +266,29 @@ def _cro_promote_scheduler_enabled() -> bool:
         return False
 
 
+# Health status ``skipped`` on these jobs still counts as done for the day.
+_GATE_SKIP_DONE_TODAY = frozenset({
+    'cro_promote',
+    'ad_restore',
+    'ads_enroll',
+})
+
+MAIN_AD_CREATE_SKIP_MESSAGE = (
+    'Skipped (Main AquaVerve: scheduler_enable_cro_promote off)'
+)
+
+
+def _main_scheduled_ad_create_blocked() -> bool:
+    """Main AquaVerve only. Unreadable profile fails closed (default is Main).
+
+    Substores (any brand other than AquaVerve) keep the pre-PR ad path.
+    """
+    try:
+        return bool(get_store_profile().scheduled_ad_create_blocked)
+    except Exception:
+        return True
+
+
 _UNREADABLE_OPS_WARNED = False
 
 
@@ -371,7 +394,7 @@ def update_health(task_name, status, message='', duration_sec=0.0):
         health['daemon_alive_at'] = datetime.now().isoformat()
     health.setdefault('tasks', {})
     health['tasks'][task_name] = {
-        'status': status,       # 'running', 'success', 'failed', 'timeout'
+        'status': status,       # 'running', 'success', 'failed', 'timeout', 'skipped'
         'message': message[:500],
         'at': datetime.now().isoformat(),
         'duration_sec': round(duration_sec, 1),
@@ -453,6 +476,13 @@ def _task_succeeded_today(task_name, now=None):
     }
     done_statuses = {'success', 'ok', 'partial_success', 'completed_with_errors'}
     if status == 'skipped':
+        # Visible gate skips still count as done today so recovery does not
+        # relaunch a job that already recorded why it did not run.
+        if str(task_name) in _GATE_SKIP_DONE_TODAY and at:
+            try:
+                return datetime.fromisoformat(at).date() == now.date()
+            except (TypeError, ValueError):
+                return False
         if str(task_name) not in audit_driven or not at:
             return False
         try:
@@ -1574,7 +1604,7 @@ def task_cro_promote():
         )
         update_health(
             'cro_promote',
-            'success',
+            'skipped',
             'Skipped (scheduler_enable_cro_promote off)',
         )
         return True, 'Skipped (scheduler_enable_cro_promote off)'
@@ -1608,24 +1638,19 @@ def task_ads_enroll():
     不跑 CRO diagnose / cro_promote: 那条链路依赖 daily_tasks 入队, ops 档没有
     daily_tasks, 硬接会天天 skip. 入驻仍复用主店同一套利润/黑名单守卫.
 
-    create_ad_safe 会新开广告, 因此还要 scheduler_enable_cro_promote
-    （默认 false）。scheduler_enable_ads 只决定这个任务是否进 ops 日程。
-    手动 ``scripts/store_marketing.py`` 不受此开关影响。
+    create_ad_safe 会新开广告。这个额外拦截只作用于主店 AquaVerve
+    （``scheduled_ad_create_blocked``）。AquaRides / GrovePop 在
+    ``scheduler_enable_ads`` 打开时仍按原路径跑。手动 CLI 不受影响。
     """
     if _task_succeeded_today('ads_enroll'):
         logger.info("↪ 跳过子店广告入驻: 今日已成功执行")
         return True, 'Skipped (already succeeded today)'
-    if not _cro_promote_scheduler_enabled():
+    if _main_scheduled_ad_create_blocked():
         logger.info(
-            "↪ 跳过子店广告入驻: scheduler_enable_cro_promote 未开启 "
-            "(create_ad_safe 不开广告)"
+            "↪ 跳过子店广告入驻: 主店 AquaVerve 且 scheduler_enable_cro_promote 未开启"
         )
-        update_health(
-            'ads_enroll',
-            'success',
-            'Skipped (scheduler_enable_cro_promote off)',
-        )
-        return True, 'Skipped (scheduler_enable_cro_promote off)'
+        update_health('ads_enroll', 'skipped', MAIN_AD_CREATE_SKIP_MESSAGE)
+        return True, MAIN_AD_CREATE_SKIP_MESSAGE
 
     run_task(
         'ads_enroll',
@@ -1642,24 +1667,20 @@ def task_ad_restore():
     """广告自动恢复审计 — 把因触底被关掉的广告在条件改善后重新打开 (Phase 3 闭环).
 
     依赖 09:30 daily_tasks 的跟价完成, 故安排在 09:40.
-    重新打开走 create_ad_safe, 属于开广告, 受 scheduler_enable_cro_promote
-    约束（默认 false）。手动 ``scripts/ad_restore_audit.py`` 不受此开关影响。
+    重新打开走 create_ad_safe。这个额外拦截只作用于主店 AquaVerve
+    （品牌身份与历史 mutex 相同）。其他店保持原路径。
+    手动 ``scripts/ad_restore_audit.py`` 不受此开关影响。
     关广告 / bid 回滚不走这里。
     """
     if _task_succeeded_today('ad_restore'):
         logger.info("↪ 跳过广告恢复审计: 今日已成功执行")
         return True, 'Skipped (already succeeded today)'
-    if not _cro_promote_scheduler_enabled():
+    if _main_scheduled_ad_create_blocked():
         logger.info(
-            "↪ 跳过广告恢复审计: scheduler_enable_cro_promote 未开启 "
-            "(create_ad_safe 不开广告)"
+            "↪ 跳过广告恢复审计: 主店 AquaVerve 且 scheduler_enable_cro_promote 未开启"
         )
-        update_health(
-            'ad_restore',
-            'success',
-            'Skipped (scheduler_enable_cro_promote off)',
-        )
-        return True, 'Skipped (scheduler_enable_cro_promote off)'
+        update_health('ad_restore', 'skipped', MAIN_AD_CREATE_SKIP_MESSAGE)
+        return True, MAIN_AD_CREATE_SKIP_MESSAGE
 
     run_task(
         'ad_restore',
@@ -2179,7 +2200,7 @@ def _setup_schedule_full():
     # 10:10 — MI 机会自动刊登 (READY 草稿 → eBay); 默认 dry-run, 需 env 开关才真发布
     schedule.every().day.at("10:10").do(task_auto_publish).tag('daily', 'auto_publish')
 
-    # 09:40 — 广告恢复 (create_ad_safe). 默认跳过, 需 scheduler_enable_cro_promote
+    # 09:40 — 广告恢复 (create_ad_safe). 主店 AquaVerve 默认跳过
     schedule.every().day.at("09:40").do(task_ad_restore).tag('daily', 'ad_restore')
     # S25: 周一 11:00 给运营发死链下架候选 (magic-link 人工确认)
     schedule.every().monday.at("11:00").do(task_cro_delist_email).tag('weekly', 'cro_delist_email')
@@ -2271,8 +2292,8 @@ def _setup_schedule_full():
     logger.info("  09:30  每日全量任务 (daily_tasks.py — 含库存同步+报告；智能调价仅周一/周四)")
     logger.info("  10:05  MI 流水线自检 (F32 — 异常发邮件)")
     logger.info(
-        "  09:40  广告恢复审计 (默认跳过; scheduler_enable_cro_promote 才 "
-        "ad_restore_audit --apply)"
+        "  09:40  广告恢复审计 (主店 AquaVerve 默认跳过; "
+        "scheduler_enable_cro_promote 才 ad_restore_audit --apply)"
     )
     logger.info(
         "  周二 10:00  分级 Bid 优化 (batch_smart_bid --apply --email"
@@ -3043,8 +3064,10 @@ def show_status():
                 dur = info.get('duration_sec', 0)
                 icon = {'success': '✅', 'failed': '❌', 'timeout': '⏰',
                         'running': '🔄', 'pending': '⏳', 'recovering': '🔄',
-                        'ok': '✅'}.get(st, '⚪')
-                print(f"  {icon} {name:20s} | {st:8s} | {at} | {dur:.0f}s")
+                        'ok': '✅', 'skipped': '⏭'}.get(st, '⚪')
+                msg = str(info.get('message') or '').strip()
+                extra = f" | {msg}" if st == 'skipped' and msg else ""
+                print(f"  {icon} {name:20s} | {st:8s} | {at} | {dur:.0f}s{extra}")
         except Exception:
             print("  (无法读取健康状态)")
     else:

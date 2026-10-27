@@ -59,6 +59,7 @@ class TestProfileDefaultsContract:
         assert p.ops_qc_autofix_enabled is False
         assert p.ops_ads_enabled is False
         assert p.cro_promote_scheduler_enabled is False
+        assert p.scheduled_ad_create_blocked is True
         assert p.cro_relist_scheduler_enabled is False
 
     def test_main_store_return_policy_is_buyer_paid_everywhere(self):

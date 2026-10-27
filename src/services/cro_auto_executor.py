@@ -32,14 +32,19 @@ Executor = Callable[..., Dict[str, Any]]
 AD_CREATE_OR_RAISE_ACTIONS = frozenset({"promote"})
 
 
-def _cro_promote_scheduler_enabled() -> bool:
-    """Fail-closed read of scheduler_enable_cro_promote."""
+def _main_scheduled_ad_create_blocked() -> bool:
+    """Queued promote is blocked only on Main AquaVerve.
+
+    Other brands keep the pre-PR path (the runner is invoked when the
+    caller opted promote back into the action set). Unreadable profile
+    fails closed because the default identity is Main.
+    """
     try:
         from src.utils.store_profile import get_store_profile
 
-        return bool(get_store_profile().cro_promote_scheduler_enabled)
+        return bool(get_store_profile().scheduled_ad_create_blocked)
     except Exception:
-        return False
+        return True
 
 
 def _load_promote_runner():
@@ -93,12 +98,12 @@ def _default_executor(action_type: str) -> Executor:
         return lambda *, apply_changes, limit, send_email: run(apply_changes, limit)
     if action_type == 'promote':
         def run_promote(*, apply_changes, limit, send_email):
-            if not _cro_promote_scheduler_enabled():
+            if _main_scheduled_ad_create_blocked():
                 return {
                     'pending_total': 0,
                     'done': [],
                     'failed': [],
-                    'skipped': ['scheduler_enable_cro_promote off'],
+                    'skipped': ['Main AquaVerve: scheduler_enable_cro_promote off'],
                     'ad_api_called': False,
                 }
             run = _load_promote_runner()
@@ -130,7 +135,7 @@ def execute_pending_actions(
             continue
         if (
             action_type in AD_CREATE_OR_RAISE_ACTIONS
-            and not _cro_promote_scheduler_enabled()
+            and _main_scheduled_ad_create_blocked()
         ):
             blocked_by_flag.append(action_type)
             continue

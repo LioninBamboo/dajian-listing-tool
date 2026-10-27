@@ -42,7 +42,7 @@
 | `scripts/cro_effect_audit.py` | 已完成动作效果验证与月报输入 | `scheduler_daemon.py` 09:55 / 手动 | 主路径 | 为 threshold feedback 提供依据 |
 | `scripts/cro_image_refresh.py` | CRO 队列主图刷新执行器 | `scheduler_daemon.py` 10:15 / 手动 | 主路径 | 消费 `cro_action_queue` 的 `image_refresh` |
 | `scripts/cro_fill_specifics.py` | CRO 队列 specifics 修复执行器 | `scheduler_daemon.py` 10:20 / 手动 | 主路径 | 消费 `fill_specifics` |
-| `scripts/cro_promote.py` | CRO promote 执行器 | 手动 CLI；调度器 10:25 仅当 `scheduler_enable_cro_promote: true` | 手动 / 可选调度 | 已推广提 bid，未推广通过 `create_ad_safe` 安全开广告。默认不自动跑。同一开关也拦住 `ad_restore` / `ads_enroll` / 队列 `promote` |
+| `scripts/cro_promote.py` | CRO promote 执行器 | 手动 CLI；调度器 10:25 仅当 `scheduler_enable_cro_promote: true` | 手动 / 可选调度 | 已推广提 bid，未推广通过 `create_ad_safe` 安全开广告。所有店默认不自动跑。`ad_restore` / `ads_enroll` / 队列 `promote` 只在主店 AquaVerve 被同一开关拦住 |
 | `scripts/cro_relist_lifecycle.py` | CRO relist 生命周期 | 调度器只跑 `--detect` / `--evaluate` | 本地检测；`--execute` 默认拒绝 | `--execute` 需 `scheduler_enable_cro_relist`。在卖 SKU 记 `still_live`；ActiveList 失败或空且 DB 有在售则整批中止 |
 | `scripts/cro_send_offer.py` | low_cvr → interested buyers 保本限时 offer | `scheduler_daemon.py` 10:35 / 手动 | 主路径 | 地板价 = PricingEngine 费率推导最低净利率 5%; 折扣 ≤10%; 30 天频控; 禁止还价 |
 | `scripts/cro_delist.py` | CRO 下架候选与确认链路 | 周一邮件 / 手动 | 主路径 | 保持 magic-link 人工确认 |

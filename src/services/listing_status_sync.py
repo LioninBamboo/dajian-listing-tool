@@ -68,6 +68,20 @@ def _item_text(item, *names, ns=None) -> str:
     return ""
 
 
+_OK_ACTIVE_LIST_ACKS = {"success", "warning"}
+
+
+def _active_list_ack_ok(root, ns) -> bool:
+    """True only for Trading Ack Success or Warning.
+
+    A missing Ack, Failure, or PartialFailure is not a complete ActiveList.
+    """
+    ack = root.findtext("ebay:Ack", default="", namespaces=ns)
+    if not str(ack or "").strip():
+        ack = root.findtext("Ack", default="")
+    return str(ack or "").strip().lower() in _OK_ACTIVE_LIST_ACKS
+
+
 def fetch_all_active_listings(trading=None, max_pages=20) -> tuple[list[LiveListing], int, bool]:
     """Fetch every ActiveList item as (item_id, sku).
 
@@ -75,8 +89,12 @@ def fetch_all_active_listings(trading=None, max_pages=20) -> tuple[list[LiveList
     Control listings stay Active and are included.
 
     Returns:
-        (listings, api_total, fetch_complete). Callers must not treat a
-        missing id as ended when fetch_complete is False.
+        (listings, api_total, fetch_complete). ``fetch_complete`` is False
+        when any page Ack is not Success/Warning, when a later page is empty
+        while eBay still reports more entries or pages, when the loop hits
+        ``max_pages``, or when ``api_total > 0`` and fewer rows came back.
+        Callers must not treat a missing id as ended when fetch_complete
+        is False.
     """
     if trading is None:
         trading = _get_trading_client()
@@ -117,6 +135,19 @@ def fetch_all_active_listings(trading=None, max_pages=20) -> tuple[list[LiveList
 
         root = ET.fromstring(response_text)
 
+        if not _active_list_ack_ok(root, ns):
+            ack_text = (
+                root.findtext("ebay:Ack", default="", namespaces=ns)
+                or root.findtext("Ack", default="")
+                or "(missing)"
+            )
+            logger.error(
+                "GetMyeBaySelling page %s Ack=%s — ActiveList incomplete",
+                page, ack_text,
+            )
+            fetch_complete = False
+            break
+
         if page == 1:
             total_elem = root.find(
                 './/ebay:ActiveList/ebay:PaginationResult/ebay:TotalNumberOfEntries', ns
@@ -125,10 +156,30 @@ def fetch_all_active_listings(trading=None, max_pages=20) -> tuple[list[LiveList
                 api_total = int(total_elem.text)
                 logger.info(f"  eBay API TotalNumberOfEntries: {api_total}")
 
+        total_pages = 0
+        total_pages_elem = root.find(
+            './/ebay:ActiveList/ebay:PaginationResult/ebay:TotalNumberOfPages', ns
+        )
+        if total_pages_elem is not None and str(total_pages_elem.text or "").strip():
+            total_pages = int(total_pages_elem.text)
+
         items = root.findall('.//ebay:ActiveList/ebay:ItemArray/ebay:Item', ns)
 
         if not items:
-            fetch_complete = True
+            # An empty page is the end of the list only when eBay is not
+            # still promising more rows or more pages. The 10/22 incident
+            # treated a short/empty ActiveList as complete.
+            more_expected = (
+                (api_total > 0 and len(listings) < api_total)
+                or (total_pages > page)
+            )
+            fetch_complete = not more_expected
+            if more_expected:
+                logger.error(
+                    "GetMyeBaySelling page %s empty before ActiveList finished "
+                    "(fetched=%d, api_total=%d, total_pages=%d)",
+                    page, len(listings), api_total, total_pages,
+                )
             break
 
         for item in items:
@@ -139,18 +190,20 @@ def fetch_all_active_listings(trading=None, max_pages=20) -> tuple[list[LiveList
             sku = _item_text(item, 'ebay:SKU', ns=ns)
             listings.append(LiveListing(item_id=item_id, sku=sku))
 
-        total_pages_elem = root.find(
-            './/ebay:ActiveList/ebay:PaginationResult/ebay:TotalNumberOfPages', ns
-        )
-        if total_pages_elem is not None:
-            total_pages = int(total_pages_elem.text)
-            if page >= total_pages:
-                fetch_complete = True
-                break
+        if total_pages and page >= total_pages:
+            fetch_complete = True
+            break
 
         logger.info(f"  Page {page}: {len(items)} items, cumulative {len(listings)}")
         time.sleep(0.5)
     else:
+        fetch_complete = False
+
+    if api_total > 0 and len(listings) < api_total:
+        logger.error(
+            "ActiveList short: fetched %d < api_total %d",
+            len(listings), api_total,
+        )
         fetch_complete = False
 
     logger.info(f"Total active listings from API: {len(listings)} "

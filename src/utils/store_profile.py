@@ -140,16 +140,15 @@ class StoreProfile:
     # store (scheduler_profile=full) ignores these flags.
     scheduler_enable_qc_autofix: bool = False
     scheduler_enable_ads: bool = False
-    # Opt-in automatic Promoted Listings ad *creation* and bid *raises*.
-    # Default / absent = False:
+    # Opt-in automatic Promoted Listings bid *raises* and the 10:25 promote job.
+    # Default / absent = False on every store (PR #45):
     # - task_cro_promote skips entirely
-    # - task_ad_restore skips (it re-opens ads via create_ad_safe)
-    # - task_ads_enroll skips (create_ad_safe)
     # - task_smart_bid runs with --no-raises (lowers / no-ops still apply)
-    # - cro_auto_executor will not run a queued `promote` into the ad API
-    # Flip in store_profile.local.yaml only. Manual CLI of cro_promote.py /
-    # ad_restore_audit.py / store_marketing.py / batch_smart_bid.py
-    # (without --no-raises) remains available. bid_rollback and ad removal stay on.
+    # Main AquaVerve additionally blocks ad_restore, ads_enroll, and a queued
+    # promote while this flag is false (see scheduled_ad_create_blocked).
+    # Other brands keep the previous ad path when the key is absent.
+    # Flip in store_profile.local.yaml only. Manual CLI remains available.
+    # bid_rollback and ad removal stay on.
     scheduler_enable_cro_promote: bool = False
     # Opt-in eBay End / Relist / revive. Default / absent = False:
     # scripts/cro_relist_lifecycle.py --execute refuses (non-zero, no eBay).
@@ -221,16 +220,31 @@ class StoreProfile:
 
     @property
     def cro_promote_scheduler_enabled(self) -> bool:
-        """True when scheduled jobs may create ads or raise ad rates.
+        """True when any store may run scheduled cro_promote or bid raises.
 
-        Gates ``task_cro_promote``, ``task_ad_restore``, ``task_ads_enroll``
-        (full skip when false) and the *raise* direction of ``task_smart_bid``
-        (``--no-raises`` when false). Also gates a queued ``promote`` action
-        inside ``cro_auto_executor``. Unlike ops ads/QC slices, applies on any
-        scheduler_profile (including main ``full``). Absent or false =
-        fail-closed. Lowering bids, deleting ads, and ``bid_rollback`` stay on.
+        Absent or false skips ``task_cro_promote`` and passes ``--no-raises``
+        to ``task_smart_bid`` on every store. Ad creation jobs
+        (``task_ad_restore``, ``task_ads_enroll``, queued ``promote``) are
+        not gated here; Main uses ``scheduled_ad_create_blocked``.
         """
         return bool(self.scheduler_enable_cro_promote)
+
+    @property
+    def scheduled_ad_create_blocked(self) -> bool:
+        """Block scheduled ad creation only on Main AquaVerve.
+
+        Identity is ``brand_name == "AquaVerve"``, the same check
+        ``resolved_scheduler_mutex_name`` uses for the historical Main mutex.
+        The flag defaults false and tracked ``config/store_profile.yaml``
+        does not set ``scheduler_enable_cro_promote``, so Main is blocked
+        with no yaml edit. AquaRides, GrovePop, and any other brand keep
+        the previous ``ad_restore`` / ``ads_enroll`` / queued-promote path
+        even when the key is absent. Explicit ``true`` on Main unblocks
+        those jobs.
+        """
+        if self.brand_name != "AquaVerve":
+            return False
+        return not bool(self.scheduler_enable_cro_promote)
 
     @property
     def cro_relist_scheduler_enabled(self) -> bool:

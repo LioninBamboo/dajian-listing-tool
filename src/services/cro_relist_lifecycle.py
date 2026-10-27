@@ -1423,8 +1423,10 @@ def execute_prechecked_relist(
     ``scheduler_enable_cro_relist`` (default false) must be on or this returns
     immediately with zero eBay calls. When it is on, a read-only ActiveList is
     fetched before any End/Relist/publish. Listings still active on eBay are
-    skipped with reason ``still_live``. A failed or empty ActiveList while the
-    DB still has live listings aborts the whole execute with no writes.
+    skipped with reason ``still_live``. The whole execute aborts with no eBay
+    writes when any page Ack is not Success/Warning, when ``api_total`` is
+    greater than the rows returned, when pagination ends early, or when the
+    fetch returns 0 rows while the DB still has live PUBLISHED listings.
 
     The publish dry-run is executed before withdrawing the old listing so local
     blockers do not strand a live SKU. That dry-run runs only after the
@@ -1474,7 +1476,7 @@ def execute_prechecked_relist(
         }
 
     try:
-        listings, _api_total, fetch_complete = _fetch_store_active_listings(trading_client)
+        listings, api_total, fetch_complete = _fetch_store_active_listings(trading_client)
     except Exception as exc:
         logger.warning("ActiveList fetch failed; aborting relist execute: %s", exc)
         return _execute_aborted_report(
@@ -1487,18 +1489,22 @@ def execute_prechecked_relist(
             ),
         )
 
-    if not fetch_complete:
+    listing_rows = list(listings or [])
+    reported_total = int(api_total or 0)
+    short_fetch = reported_total > 0 and len(listing_rows) < reported_total
+    if not fetch_complete or short_fetch:
         return _execute_aborted_report(
             apply_changes=True,
             selected=len(rows),
             reason="activelist_fetch_failed",
             message=(
-                "Aborted: eBay ActiveList fetch was incomplete. "
+                "Aborted: eBay ActiveList fetch was incomplete "
+                f"(complete={bool(fetch_complete)}, fetched={len(listing_rows)}, "
+                f"api_total={reported_total}). "
                 "Refusing to End/Relist/revive (fail closed, no writes)."
             ),
         )
 
-    listing_rows = list(listings or [])
     db_live = _db_live_listing_count(db_path)
     if len(listing_rows) == 0 and db_live > 0:
         return _execute_aborted_report(

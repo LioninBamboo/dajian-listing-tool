@@ -32,7 +32,7 @@ logs/cro_action_queue.jsonl
     +--> 10:15 scripts/cro_image_refresh.py
     +--> 10:20 scripts/cro_fill_specifics.py
     +--> 10:25 scripts/cro_promote.py   # gated: scheduler_enable_cro_promote (default off)
-    +--> 09:40 scripts/ad_restore_audit.py  # same flag; create_ad_safe
+    +--> 09:40 scripts/ad_restore_audit.py  # Main AquaVerve only; create_ad_safe
     +--> Mon 11:00 scripts/cro_delist.py (magic-link confirm path)
     |
     v
@@ -63,11 +63,11 @@ The current CRO-relevant schedule in scheduler_daemon.py is:
 | `09:45` | `ad_blacklist_cleanup.py` | Removes unrecoverable SKUs from ad spend |
 | `09:50` | `guard_anomaly_alert.py` | Guard anomaly alerting |
 | `09:55` | `task_cro_monthly_report()` | Effect-audit feedback gate |
-| `09:40` | `task_ad_restore()` | **Default skip.** Re-opens ads via `create_ad_safe` only when `scheduler_enable_cro_promote: true`. Manual `ad_restore_audit.py` remains. |
+| `09:40` | `task_ad_restore()` | **Main AquaVerve skips** while `scheduler_enable_cro_promote` is absent/false (health status `skipped`). Other brands keep the previous path. Manual `ad_restore_audit.py` remains. |
 | `10:00` | `task_cro_consume()` | Executes queued `price_drop` only. A queued `promote` is not sent to the ad API. |
 | `10:15` | `task_cro_image_refresh()` | Executes queued image refresh work |
 | `10:20` | `task_cro_fill_specifics()` | Executes queued specifics fixes |
-| `10:25` | `task_cro_promote()` | **Default skip.** Runs only when `scheduler_enable_cro_promote: true`. Then executes queued promote work (bid uplift / `create_ad_safe`). The same flag gates `cro_auto_executor` promote, `ad_restore`, and `ads_enroll`. Manual CLI remains available. |
+| `10:25` | `task_cro_promote()` | **Default skip on every store** (health status `skipped`) unless `scheduler_enable_cro_promote: true`. Queued `promote` inside `cro_auto_executor` is blocked only on Main AquaVerve. Manual CLI remains available. |
 | `10:30` | `task_cro_sentinel()` | Sends CRO alert signal and worsened-SKU output |
 | `10:35` | `task_cro_send_offer()` | Sends margin-floored seller-initiated offers to interested buyers of low-CVR listings |
 | `10:40` | `task_cro_lifecycle_detect()` | Relist-lifecycle candidate detection (local candidate rows only; no eBay mutation). `--execute` is not scheduled and requires `scheduler_enable_cro_relist` (default off) plus an ActiveList `still_live` gate. |

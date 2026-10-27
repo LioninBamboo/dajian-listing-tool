@@ -97,7 +97,11 @@ def test_queued_promote_flag_off_does_not_call_ad_api(tmp_queue, monkeypatch):
     assert load_pending(action_type='promote', queue_path=tmp_queue)
 
     monkeypatch.setattr(auto_mod, 'queue_stats', lambda: {'pending': 1})
-    monkeypatch.setattr(auto_mod, '_cro_promote_scheduler_enabled', lambda: False)
+    from src.utils.store_profile import StoreProfile
+    monkeypatch.setattr(
+        'src.utils.store_profile.get_store_profile',
+        lambda: StoreProfile(brand_name='AquaVerve', scheduler_profile='full'),
+    )
 
     def boom():
         raise AssertionError('promote runner must not load')
@@ -130,6 +134,40 @@ def test_queued_promote_flag_off_does_not_call_ad_api(tmp_queue, monkeypatch):
     skipped = runner(apply_changes=True, limit=10, send_email=False)
     assert skipped['ad_api_called'] is False
     assert skipped['done'] == []
+
+
+def test_aqua_queued_promote_still_runs_without_cro_promote_key(tmp_queue, monkeypatch):
+    """AquaRides keeps the pre-PR promote path when the key is absent."""
+    import src.services.cro_auto_executor as auto_mod
+    from src.utils.store_profile import StoreProfile
+
+    aqua = StoreProfile(
+        brand_name='AquaRides',
+        scheduler_profile='ops',
+        scheduler_enable_ads=True,
+    )
+    assert aqua.scheduler_enable_cro_promote is False
+    assert aqua.scheduled_ad_create_blocked is False
+    monkeypatch.setattr(auto_mod, 'queue_stats', lambda: {'pending': 1})
+    monkeypatch.setattr('src.utils.store_profile.get_store_profile', lambda: aqua)
+    monkeypatch.setattr(
+        auto_mod,
+        'SAFE_AUTO_ACTIONS',
+        ('price_drop', 'image_refresh', 'fill_specifics', 'promote'),
+    )
+    ad_calls = []
+
+    def fake_promote(*, apply_changes, limit, send_email):
+        ad_calls.append(apply_changes)
+        return {'pending_total': 1, 'done': ['AD-1'], 'failed': [], 'skipped': []}
+
+    rep = auto_mod.execute_pending_actions(
+        action_types=('promote',),
+        executor_map={'promote': fake_promote},
+        send_email=False,
+    )
+    assert ad_calls == [True]
+    assert rep['blocked_by_flag'] == []
 
 
 def test_write_auto_execution_report(tmp_path):

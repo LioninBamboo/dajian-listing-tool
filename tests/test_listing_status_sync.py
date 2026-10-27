@@ -131,10 +131,11 @@ class _FakeTrading:
         return self._pages[idx] if idx < len(self._pages) else None
 
 
-def _active_xml(item_ids, total_entries, total_pages):
+def _active_xml(item_ids, total_entries, total_pages, ack="Success"):
     items = "".join(f"<Item><ItemID>{i}</ItemID></Item>" for i in item_ids)
     return (
         '<GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">'
+        f"<Ack>{ack}</Ack>"
         '<ActiveList><PaginationResult>'
         f"<TotalNumberOfEntries>{total_entries}</TotalNumberOfEntries>"
         f"<TotalNumberOfPages>{total_pages}</TotalNumberOfPages>"
@@ -170,6 +171,7 @@ def test_fetch_incomplete_when_hits_max_pages():
 def test_fetch_active_listings_includes_sku():
     xml = (
         '<GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">'
+        '<Ack>Success</Ack>'
         '<ActiveList><PaginationResult>'
         '<TotalNumberOfEntries>1</TotalNumberOfEntries>'
         '<TotalNumberOfPages>1</TotalNumberOfPages>'
@@ -225,6 +227,45 @@ def test_active_readback_does_not_write_ended(patched, monkeypatch):
     assert res["stale_ended"] == []
     assert "LIVE-ENDED-DRIFT" in res["ended_unconfirmed"]
     assert _row(db, "LIVE-ENDED-DRIFT") == ("PUBLISHED", "999")
+
+
+def test_fetch_incomplete_when_ack_is_not_success_or_warning():
+    failure = _active_xml(["1"], 1, 1).replace("<Ack>Success</Ack>", "<Ack>Failure</Ack>")
+    _ids, _total, complete = lss.fetch_all_active_listing_ids(_FakeTrading([failure]))
+    assert complete is False
+
+    missing = _active_xml(["1"], 1, 1).replace("<Ack>Success</Ack>", "")
+    _ids, _total, complete = lss.fetch_all_active_listing_ids(_FakeTrading([missing]))
+    assert complete is False
+
+
+def test_fetch_complete_when_ack_is_warning_and_counts_match():
+    warning = _active_xml(["1", "2"], 2, 1).replace("<Ack>Success</Ack>", "<Ack>Warning</Ack>")
+    ids, total, complete = lss.fetch_all_active_listing_ids(_FakeTrading([warning]))
+    assert ids == {"1", "2"}
+    assert total == 2
+    assert complete is True
+
+
+def test_fetch_incomplete_when_rows_short_of_api_total():
+    # One page claims it is the last page but TotalNumberOfEntries is larger.
+    trading = _FakeTrading([_active_xml(["1"], 10, 1)])
+    ids, total, complete = lss.fetch_all_active_listing_ids(trading)
+    assert ids == {"1"}
+    assert total == 10
+    assert complete is False
+
+
+def test_fetch_incomplete_when_later_page_is_empty():
+    pages = [
+        _active_xml(["1", "2"], 5, 3),
+        _active_xml([], 5, 3),
+    ]
+    trading = _FakeTrading(pages)
+    ids, total, complete = lss.fetch_all_active_listing_ids(trading)
+    assert ids == {"1", "2"}
+    assert total == 5
+    assert complete is False
 
 
 def test_confirm_listing_ended_requires_positive_end_status():

@@ -693,6 +693,142 @@ def test_execute_aborts_when_activelist_empty_but_db_has_live(tmp_path: Path, mo
     assert _actions(db)[0]["status"] == "prechecked"
 
 
+def _selling_page(items, total_entries, total_pages, ack="Success"):
+    body = "".join(
+        f"<Item><ItemID>{iid}</ItemID><SKU>{sku}</SKU></Item>"
+        for iid, sku in items
+    )
+    return (
+        '<GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">'
+        f"<Ack>{ack}</Ack>"
+        "<ActiveList><PaginationResult>"
+        f"<TotalNumberOfEntries>{total_entries}</TotalNumberOfEntries>"
+        f"<TotalNumberOfPages>{total_pages}</TotalNumberOfPages>"
+        "</PaginationResult>"
+        f"<ItemArray>{body}</ItemArray></ActiveList>"
+        "</GetMyeBaySellingResponse>"
+    )
+
+
+class _PagingTrading:
+    def __init__(self, pages):
+        self.pages = list(pages)
+        self.calls: list[str] = []
+        self.ends: list[str] = []
+
+    def call(self, verb, payload):
+        self.calls.append(verb)
+        if not self.pages:
+            return None
+        return self.pages.pop(0)
+
+    def end_item(self, item_id, reason="NotAvailable"):
+        self.ends.append(item_id)
+        raise AssertionError("end_item")
+
+
+def _execute_pages(db, monkeypatch, pages):
+    monkeypatch.setattr(lifecycle, "_cro_relist_enabled", lambda: True)
+    monkeypatch.setattr(
+        "src.services.listing_status_sync.time.sleep",
+        lambda *_args, **_kwargs: None,
+    )
+    trading = _PagingTrading(pages)
+
+    def boom(_product):
+        raise AssertionError("publish")
+
+    result = execute_prechecked_relist(
+        limit=1,
+        apply_changes=True,
+        db_path=db,
+        trading_client=trading,
+        dry_run_publish_func=boom,
+        publish_func=boom,
+    )
+    return result, trading
+
+
+def test_execute_aborts_when_activelist_ack_is_not_success(tmp_path: Path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _precheck_one(db)
+    result, trading = _execute_pages(
+        db, monkeypatch, [_selling_page([("LIVE-9", "OTHER")], 1, 1, ack="Failure")]
+    )
+    assert result["aborted"] is True
+    assert result["reason"] == "activelist_fetch_failed"
+    assert result["ebay_calls"] == 0
+    assert trading.ends == []
+    assert _actions(db)[0]["status"] == "prechecked"
+
+
+def test_execute_aborts_when_api_total_exceeds_rows(tmp_path: Path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _precheck_one(db)
+    result, trading = _execute_pages(
+        db, monkeypatch, [_selling_page([("LIVE-9", "OTHER")], 10, 1)]
+    )
+    assert result["aborted"] is True
+    assert result["reason"] == "activelist_fetch_failed"
+    assert "api_total=10" in result["message"]
+    assert trading.ends == []
+    assert _actions(db)[0]["status"] == "prechecked"
+
+
+def test_execute_aborts_when_short_total_even_if_flagged_complete(tmp_path: Path, monkeypatch):
+    """Caller must not discard api_total when the fetcher says complete."""
+    db = tmp_path / "cro.db"
+    _precheck_one(db)
+    monkeypatch.setattr(lifecycle, "_cro_relist_enabled", lambda: True)
+    monkeypatch.setattr(
+        lifecycle,
+        "_fetch_store_active_listings",
+        lambda trading=None: ([_LiveListing("OTHER", "OTHER")], 10, True),
+    )
+    trading = _PagingTrading([])
+    result = execute_prechecked_relist(
+        limit=1,
+        apply_changes=True,
+        db_path=db,
+        trading_client=trading,
+        publish_func=lambda product: (_ for _ in ()).throw(AssertionError("publish")),
+    )
+    assert result["aborted"] is True
+    assert result["reason"] == "activelist_fetch_failed"
+    assert trading.ends == []
+    assert _actions(db)[0]["status"] == "prechecked"
+
+
+def test_execute_aborts_when_pagination_ends_early(tmp_path: Path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _precheck_one(db)
+    result, trading = _execute_pages(
+        db,
+        monkeypatch,
+        [
+            _selling_page([("A", "OTHER-A"), ("B", "OTHER-B")], 5, 3),
+            _selling_page([], 5, 3),
+        ],
+    )
+    assert result["aborted"] is True
+    assert result["reason"] == "activelist_fetch_failed"
+    assert trading.ends == []
+    assert len(trading.calls) == 2
+    assert _actions(db)[0]["status"] == "prechecked"
+
+
+def test_execute_aborts_when_zero_rows_and_db_published_via_api(tmp_path: Path, monkeypatch):
+    db = tmp_path / "cro.db"
+    _precheck_one(db)
+    result, trading = _execute_pages(
+        db, monkeypatch, [_selling_page([], 0, 0)]
+    )
+    assert result["aborted"] is True
+    assert result["reason"] == "activelist_empty_with_db_live"
+    assert trading.ends == []
+    assert _actions(db)[0]["status"] == "prechecked"
+
+
 def test_execute_aborts_when_activelist_incomplete(tmp_path: Path, monkeypatch):
     db = tmp_path / "cro.db"
     _precheck_one(db)
