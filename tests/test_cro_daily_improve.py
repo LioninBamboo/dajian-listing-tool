@@ -2670,3 +2670,206 @@ def test_more_than_24_signed_images_truncates_like_live(tmp_path, no_promote_mod
     assert len(written) == 24
     assert written == prepared
     assert dry["candidates"][0]["payload_n"] == len(written)
+
+
+def _init_token_db(path: Path, access: str = "acc-live", refresh: str = "ref-keep", expires_at: str = "2099-01-01T00:00:00") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    conn.execute(
+        """
+        CREATE TABLE oauth_tokens (
+            id INTEGER PRIMARY KEY,
+            access_token TEXT NOT NULL,
+            refresh_token TEXT,
+            token_type TEXT,
+            expires_at TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO oauth_tokens (access_token, refresh_token, token_type, expires_at) "
+        "VALUES (?,?,?,?)",
+        (access, refresh, "Bearer", expires_at),
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _deny_writes_authorizer(seen: list):
+    write_ops = {
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_UPDATE,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_CREATE_INDEX,
+        sqlite3.SQLITE_CREATE_TEMP_TABLE,
+        sqlite3.SQLITE_DROP_TABLE,
+    }
+
+    def authorizer(action, *_a):
+        if action in write_ops:
+            seen.append(action)
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    return authorizer
+
+
+def test_dry_run_never_writes_token_db_including_expired(tmp_path, monkeypatch, no_promote_module):
+    from src.clients.real_ebay_client import RealEbayClient
+    from src.services import ebay_auth
+    from scripts import cro_daily_improve as m
+
+    tokens = tmp_path / "main" / "ebay_tokens.db"
+    expired = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)).isoformat()
+    _init_token_db(tokens, access="old-acc", refresh="ref-keep", expires_at=expired)
+    token_hash = _sha(tokens)
+    writes_seen: list = []
+
+    class _RefreshResp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"access_token": "new-acc", "expires_in": 7200, "token_type": "Bearer"}
+
+        def raise_for_status(self):
+            return None
+
+    class _RefreshSession:
+        def post(self, *_a, **_k):
+            return _RefreshResp()
+
+    monkeypatch.setattr(ebay_auth, "_create_oauth_session", lambda: _RefreshSession())
+
+    def fake_get(self, sku):
+        assert self.oauth.get_valid_token() == "new-acc"
+        return _item(["https://live/old.jpg"], qty=2)
+
+    monkeypatch.setattr(RealEbayClient, "get_inventory_item", fake_get)
+
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        authorizer=_deny_writes_authorizer(writes_seen),
+        load_perf_fn=lambda _c: {"traffic_meta": {"api_ok": True}, "traffic": {}, "sales": {}},
+        load_pending_fn=lambda **k: [{
+            "sku": "W5230P450590",
+            "action": "image_refresh",
+            "listing_id": "188111",
+            "enqueued_at": _now().isoformat(),
+        }] if k.get("action_type") == "image_refresh" else [],
+        recent_terminal_fn=lambda **k: set(),
+        scheduler_succeeded_fn=lambda name: name == "daily_tasks",
+        load_local_product_fn=lambda sku: {
+            "images": [GIGA_URL, GIGA_URL_2], "title": "t", "description": "d",
+        },
+    )
+    ctx.token_db_path = tokens
+    rc = m.main(["--store", "main", "--out-dir", str(ctx.out_dir)], ctx=ctx)
+    assert rc == 0
+    assert writes_seen == []
+    assert _sha(tokens) == token_hash
+    stored = sqlite3.connect(str(tokens)).execute(
+        "SELECT access_token, refresh_token FROM oauth_tokens"
+    ).fetchone()
+    assert stored == ("old-acc", "ref-keep")
+
+
+def test_dry_run_exits_degraded_when_tokens_missing(tmp_path, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        load_perf_fn=lambda _c: {"traffic_meta": {"api_ok": True}},
+        load_pending_fn=lambda **k: [{
+            "sku": "W5230P450590",
+            "action": "image_refresh",
+            "listing_id": "188111",
+            "enqueued_at": _now().isoformat(),
+        }] if k.get("action_type") == "image_refresh" else [],
+        recent_terminal_fn=lambda **k: set(),
+        scheduler_succeeded_fn=lambda name: True,
+        load_local_product_fn=lambda sku: {
+            "images": [GIGA_URL, GIGA_URL_2], "title": "t", "description": "d",
+        },
+    )
+    rc = m.main(["--store", "main", "--out-dir", str(ctx.out_dir)], ctx=ctx)
+    assert rc == m.EXIT_DEGRADED
+    dry = json.loads(next(ctx.out_dir.glob("*_dry.json")).read_text(encoding="utf-8"))
+    assert dry["degraded"] is True
+    assert "token" in str(dry.get("error")).lower()
+
+
+def test_limit_rows_go_to_excluded_with_summary_count(tmp_path, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    skus_price = [f"P{i}" for i in range(4)]
+    skus_image = [f"I{i}" for i in range(3)]
+    products = [
+        {
+            "sku": sku,
+            "listing_id": f"L{sku}",
+            "selling_price": 120,
+            "total_cost": 40,
+            "images": [GIGA_URL, GIGA_URL_2],
+            "stock": 2,
+            "stock_known": True,
+            "title": sku,
+            "categoryId": "38208",
+        }
+        for sku in skus_price + skus_image
+    ]
+    items = {sku: _item(["https://live/old.jpg"], qty=3) for sku in skus_image}
+
+    def seeds(**k):
+        action = k.get("action_type")
+        if action == "price_drop":
+            return [{
+                "sku": sku,
+                "action": "price_drop",
+                "listing_id": f"L{sku}",
+                "enqueued_at": _now().isoformat(),
+                "detail": {"suggested_price": 90},
+            } for sku in skus_price]
+        if action == "image_refresh":
+            return [{
+                "sku": sku,
+                "action": "image_refresh",
+                "listing_id": f"L{sku}",
+                "enqueued_at": _now().isoformat(),
+            } for sku in skus_image]
+        return []
+
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        load_products_fn=lambda _c: [dict(p) for p in products],
+        load_perf_fn=lambda _c: {"traffic_meta": {"api_ok": True}},
+        load_pending_fn=seeds,
+        recent_terminal_fn=lambda **k: set(),
+        scheduler_succeeded_fn=lambda name: True,
+        read_live_price_fn=lambda sku, lid: 120,
+        precheck_price_fn=lambda **k: (True, "ok"),
+        compute_new_price_fn=lambda *a, **k: {"new_price": 90, "floor": 50, "strategy": "T"},
+        ebay_client_factory=lambda: GetOnlyClient(items),
+        load_local_product_fn=lambda sku: {
+            "images": [GIGA_URL, GIGA_URL_2], "title": "t", "description": "d",
+        },
+    )
+    rc = m.main(
+        ["--store", "main", "--limit-price", "2", "--limit-image", "1", "--out-dir", str(ctx.out_dir)],
+        ctx=ctx,
+    )
+    assert rc == 0
+    dry = json.loads(next(ctx.out_dir.glob("*_dry.json")).read_text(encoding="utf-8"))
+    price = [c for c in dry["candidates"] if c["action"] == "price_drop"]
+    image = [c for c in dry["candidates"] if c["action"] == "image_refresh"]
+    assert [c["sku"] for c in price] == ["P0", "P1"]
+    assert [c["sku"] for c in image] == ["I0"]
+    limited = dry["excluded"]["limit"]
+    assert {row["sku"] for row in limited} == {"P2", "P3", "I1", "I2"}
+    assert all(row["reason"] == "limit" for row in limited)
+    assert dry["summary"]["limit"] == 4
+    assert dry["summary"]["candidates"] == 3

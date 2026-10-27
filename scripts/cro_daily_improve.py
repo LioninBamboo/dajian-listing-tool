@@ -830,6 +830,88 @@ def compute_new_price(
     }
 
 
+class TokenLoadError(RuntimeError):
+    """Dry-run / --store-root could not load ebay_tokens.db read-only."""
+
+
+def build_readonly_oauth(
+    environment: str,
+    token_db_path: Path,
+    authorizer: Optional[Callable] = None,
+) -> Any:
+    """EbayOAuthService that never creates tables or writes ebay_tokens.db."""
+    from src.services.ebay_auth import TOKEN_REFRESH_SAFETY_MINUTES, EbayOAuthService
+
+    class ReadonlyEbayOAuthService(EbayOAuthService):
+        def __init__(self) -> None:
+            self._token_db_path = Path(token_db_path)
+            self._authorizer = authorizer
+            self._memory_token: Optional[Dict[str, Any]] = None
+            super().__init__(environment)
+
+        def _init_token_db(self) -> None:
+            return
+
+        def _save_token(self, token_data: Dict[str, Any]) -> None:
+            expires_in = token_data.get("expires_in", 7200)
+            expires_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+                seconds=int(expires_in or 7200),
+            )
+            self._memory_token = {
+                "access_token": token_data["access_token"],
+                "refresh_token": token_data.get("refresh_token"),
+                "token_type": token_data.get("token_type", "Bearer"),
+                "expires_at": expires_at.isoformat(),
+            }
+
+        def _get_stored_token(self) -> Optional[Dict[str, Any]]:
+            if self._memory_token:
+                return dict(self._memory_token)
+            path = self._token_db_path
+            if not path.exists():
+                return None
+            try:
+                conn = sqlite3.connect(readonly_sqlite_uri(path), uri=True)
+                if self._authorizer is not None:
+                    conn.set_authorizer(self._authorizer)
+                try:
+                    row = conn.execute(
+                        "SELECT access_token, refresh_token, token_type, expires_at "
+                        "FROM oauth_tokens ORDER BY created_at DESC LIMIT 1"
+                    ).fetchone()
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                return None
+            if not row:
+                return None
+            return {
+                "access_token": row[0],
+                "refresh_token": row[1],
+                "token_type": row[2],
+                "expires_at": row[3],
+            }
+
+        def require_tokens(self) -> Dict[str, Any]:
+            stored = self._get_stored_token()
+            if not stored or not stored.get("access_token"):
+                raise TokenLoadError(
+                    f"cannot load tokens from {self._token_db_path} (read-only)"
+                )
+            return stored
+
+        def get_valid_token(self) -> str:
+            stored = self.require_tokens()
+            expires_at = datetime.fromisoformat(str(stored["expires_at"]))
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if expires_at <= now + timedelta(minutes=TOKEN_REFRESH_SAFETY_MINUTES):
+                token_data = self.refresh_access_token()
+                return str(token_data["access_token"])
+            return str(stored["access_token"])
+
+    return ReadonlyEbayOAuthService()
+
+
 class ReadOnlyEbayClient:
     """Dry-run wrapper: live price + inventory GET only. Write APIs raise."""
 
@@ -858,12 +940,22 @@ class ReadOnlyEbayClient:
 
 def create_production_client(ctx: ImproveContext) -> Any:
     """Build the store-scoped eBay client. Caller holds store_root_runtime()."""
-    from src.clients.real_ebay_client import create_real_ebay_client
+    from src.clients.real_ebay_client import RealEbayClient, create_real_ebay_client
 
-    client = create_real_ebay_client(environment=ctx.ebay_environment or "SANDBOX")
-    if ctx.readonly_db:
+    if ctx.readonly_db or ctx.isolate_store_root:
+        token_path = Path(
+            ctx.token_db_path or (Path(ctx.store_root) / "ebay_tokens.db")
+        )
+        oauth = build_readonly_oauth(
+            environment=ctx.ebay_environment or "SANDBOX",
+            token_db_path=token_path,
+            authorizer=ctx.authorizer,
+        )
+        oauth.require_tokens()
+        # Skip EbayPolicyManager: its __init__ opens the collection DB read-write.
+        client = RealEbayClient(oauth, policy_manager=None)
         return ReadOnlyEbayClient(client)
-    return client
+    return create_real_ebay_client(environment=ctx.ebay_environment or "SANDBOX")
 
 
 def fetch_live_price_readonly(ctx: ImproveContext, sku: str, listing_id: str) -> Optional[float]:
@@ -881,6 +973,8 @@ def fetch_live_price_readonly(ctx: ImproveContext, sku: str, listing_id: str) ->
             return read_current_listing_price(
                 oauth, sku, listing_id or "", client=client, profile=ctx.profile,
             )
+    except TokenLoadError:
+        raise
     except Exception:
         return None
 
@@ -1116,6 +1210,23 @@ def build_read_only_context(
     }
 
 
+def report_summary(
+    candidates: List[Dict[str, Any]],
+    excluded: Dict[str, List[Any]],
+) -> Dict[str, Any]:
+    buckets = {
+        key: len(rows)
+        for key, rows in (excluded or {}).items()
+        if isinstance(rows, list)
+    }
+    return {
+        "candidates": len(candidates or []),
+        "excluded_total": sum(buckets.values()),
+        "limit": buckets.get("limit", 0),
+        "excluded": buckets,
+    }
+
+
 def empty_excluded() -> Dict[str, List[Any]]:
     return {
         "not_a_drop": [],
@@ -1308,8 +1419,15 @@ def build_candidates(
                 "payload_qty": inspected.get("payload_qty"),
             })
 
-    price_out = price_out[:limit_price]
-    image_out = image_out[:limit_image]
+    overflow: List[Dict[str, Any]] = []
+    if len(price_out) > limit_price:
+        overflow.extend(price_out[limit_price:])
+        price_out = price_out[:limit_price]
+    if len(image_out) > limit_image:
+        overflow.extend(image_out[limit_image:])
+        image_out = image_out[:limit_image]
+    for row in overflow:
+        _exclude(excluded, "limit", {**row, "reason": "limit"})
     return price_out + image_out, excluded, diagnoses, source, False
 
 
@@ -1816,6 +1934,7 @@ def run_improve(args: argparse.Namespace, ctx: ImproveContext) -> int:
                 "allowed_actions": sorted(effective_allowed_actions()),
                 "candidate_source": source,
                 "degraded": degraded,
+                "summary": report_summary(candidates, excluded),
                 "candidates": candidates,
                 "excluded": excluded,
                 "read_only_context": read_only,

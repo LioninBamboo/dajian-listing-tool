@@ -202,7 +202,8 @@ def diagnose_readonly(
     """
     allowed = frozenset({"price_drop", "image_refresh"})
     # Read-only: load_thresholds / filter_blacklisted open the store DB with
-    # as_uri()?mode=ro so dry-run / --store-root never create WAL/SHM.
+    # as_uri()?mode=ro. SQLite may still allocate empty -wal/-shm sidecars for
+    # a WAL database in a writable directory; mode=ro never writes page content.
     learned_thresholds = load_thresholds(db_path=db_path)
     kept, blacklisted = filter_blacklisted(products, db_path=db_path)
     diagnoses = diagnose_batch(
