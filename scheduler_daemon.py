@@ -848,19 +848,46 @@ def _should_resume_daily_inventory(task_name='daily_tasks', now=None):
     has_evidence = _has_partial_daily_run_evidence_today(task_name, now=now)
     if _inventory_resume_already_consumed(task_name, now=now):
         if has_evidence:
-            marker = _read_inventory_resume_marker(task_name, now=now) or {}
-            if not marker.get('blocked_alert_emitted'):
-                marker['blocked_alert_emitted'] = True
-                try:
-                    _write_inventory_resume_marker(task_name, marker, now=now)
-                except Exception:
-                    pass
-                _alert_inventory_resume(
-                    f"{task_name}: resume blocked by today's marker while dead-pid "
-                    f"lock remains (outcome={marker.get('outcome')}); SKUs may remain unsynced"
-                )
+            _emit_blocked_resume_alert_once(task_name, now=now)
         return False
     return has_evidence
+
+
+def _emit_blocked_resume_alert_once(task_name='daily_tasks', now=None, *, reason=None):
+    """Atomically claim + emit the blocked-resume alert at most once per day."""
+    now = now or datetime.now()
+    path = _inventory_resume_marker_path(task_name, now=now)
+    gate = path.with_name(path.name + '.blocked_alert')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        gate_fd = os.open(str(gate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(gate_fd, b'1')
+            os.fsync(gate_fd)
+        finally:
+            os.close(gate_fd)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+
+    marker = _read_inventory_resume_marker(task_name, now=now) or {
+        'date': now.strftime('%Y%m%d'),
+    }
+    if marker.get('blocked_alert_emitted'):
+        return False
+    marker['blocked_alert_emitted'] = True
+    try:
+        # Durable marker rewrite is tmp + os.replace (atomic on POSIX/Windows).
+        _write_inventory_resume_marker(task_name, marker, now=now)
+    except Exception:
+        pass
+    text = reason or (
+        f"{task_name}: resume blocked by today's marker while dead-pid "
+        f"lock remains (outcome={marker.get('outcome')}); SKUs may remain unsynced"
+    )
+    _alert_inventory_resume(text)
+    return True
 
 
 def _iso_at_or_none(value):
@@ -982,7 +1009,14 @@ def clear_stale_running_tasks():
 
 # ─── 任务执行器 ──────────────────────────────────────────
 
-def run_task(task_name, cmd_args, timeout_sec=3600, on_worker_claimed=None):
+def run_task(
+    task_name,
+    cmd_args,
+    timeout_sec=3600,
+    on_worker_claimed=None,
+    *,
+    preserve_health_on_handshake_miss=False,
+):
     """
     在子进程中执行任务
 
@@ -990,6 +1024,9 @@ def run_task(task_name, cmd_args, timeout_sec=3600, on_worker_claimed=None):
     - 超时自动杀死
     - 返回 (success, message)
     - on_worker_claimed: optional callback after this run's worker claims the lock
+    - preserve_health_on_handshake_miss: when True (inventory resume), do not
+      overwrite health with ``failed`` on handshake timeout / non-75 claim miss
+      so the prior crash-eligible status remains for bounded retries
     """
     if not _job_is_allowed(task_name):
         _log_skip_disallowed(task_name, via='run_task')
@@ -1059,7 +1096,8 @@ def run_task(task_name, cmd_args, timeout_sec=3600, on_worker_claimed=None):
             )
             msg = 'Worker lock handshake timed out'
             logger.error(f"❌ 任务启动失败: {task_name}: {msg}")
-            update_health(task_name, 'failed', msg, time.time() - start_time)
+            if not preserve_health_on_handshake_miss:
+                update_health(task_name, 'failed', msg, time.time() - start_time)
             return False, msg
 
         if not handshake.get('claimed'):
@@ -1074,7 +1112,8 @@ def run_task(task_name, cmd_args, timeout_sec=3600, on_worker_claimed=None):
                 return True, 'Skipped (already running or recovering)'
             msg = f'Worker lock handshake failed (exit={returncode})'
             logger.error(f"❌ 任务启动失败: {task_name}: {msg}")
-            update_health(task_name, 'failed', msg, time.time() - start_time)
+            if not preserve_health_on_handshake_miss:
+                update_health(task_name, 'failed', msg, time.time() - start_time)
             return False, msg
 
         worker_pid = int(handshake.get('worker_pid') or proc.pid)
@@ -1528,9 +1567,10 @@ def task_daily_full():
             [str(PROJECT_ROOT / 'daily_tasks.py'), '--sync-only'],
             timeout_sec=TASK_TIMEOUT['daily_tasks'],
             on_worker_claimed=_on_claimed,
+            preserve_health_on_handshake_miss=True,
         )
-        # Exit 75 / handshake miss: worker never claimed — leave health unchanged;
-        # bounded retries with backoff (marker outcome=exit75).
+        # Exit 75 / handshake miss: worker never claimed — leave health unchanged
+        # (preserve_health_on_handshake_miss); bounded retries with backoff.
         if message == _RESUME_LOCK_SKIP_MESSAGE or 'handshake timed out' in message.lower():
             exit75_retries += 1
             prior_marker = _read_inventory_resume_marker('daily_tasks', now=now) or {}
@@ -1556,6 +1596,16 @@ def task_daily_full():
                 _RESUME_EXIT75_MAX,
                 status,
             )
+            if exit75_retries >= _RESUME_EXIT75_MAX:
+                _emit_blocked_resume_alert_once(
+                    'daily_tasks',
+                    now=now,
+                    reason=(
+                        f"daily_tasks: inventory resume handshake/exit75 retries exhausted "
+                        f"({exit75_retries}/{_RESUME_EXIT75_MAX}); SKUs may remain unsynced "
+                        "— not falling back to full daily apply"
+                    ),
+                )
             return True, message if message == _RESUME_LOCK_SKIP_MESSAGE else _RESUME_LOCK_SKIP_MESSAGE
         if ok:
             prior_marker = _read_inventory_resume_marker('daily_tasks', now=now) or {}

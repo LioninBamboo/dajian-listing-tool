@@ -1173,6 +1173,150 @@ def test_exit75_resume_allows_bounded_retry_after_backoff(tmp_path, monkeypatch)
     assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
 
 
+def test_resume_handshake_timeout_keeps_status_for_bounded_retry(tmp_path, monkeypatch):
+    """Resume handshake timeout must not write health=failed (blocks retry + full daily)."""
+    import subprocess
+
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    log_dir = tmp_path / 'logs'
+    log_dir.mkdir()
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'interrupted',
+                    'at': '2026-05-11T09:40:00',
+                    'message': 'partial before crash',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'LOG_DIR', log_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+    monkeypatch.setattr(scheduler_daemon, '_notify_failure', lambda *a, **k: None)
+    monkeypatch.setattr(scheduler_daemon, '_terminate_task_worker', lambda *a, **k: None)
+
+    class _FakeProc:
+        pid = 4242
+        returncode = 1
+
+        def poll(self):
+            # Exit immediately so handshake wait ends without sleeping 15s.
+            return 1
+
+        def wait(self, timeout=None):
+            return 1
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(scheduler_daemon.time, 'sleep', lambda *_: None)
+
+    ok, message = scheduler_daemon.run_task(
+        'daily_tasks',
+        [sys.executable, '-c', 'pass'],
+        timeout_sec=5,
+        preserve_health_on_handshake_miss=True,
+    )
+    assert ok is False
+    assert 'handshake timed out' in message.lower()
+    health = json.loads(health_path.read_text(encoding='utf-8'))
+    assert health['tasks']['daily_tasks']['status'] == 'interrupted'
+    assert health['tasks']['daily_tasks']['at'] == '2026-05-11T09:40:00'
+
+    # Still resume-eligible after a preserve-health handshake miss + exit75 marker.
+    scheduler_daemon._write_inventory_resume_marker(
+        'daily_tasks',
+        {
+            'date': '20260511',
+            'outcome': 'exit75',
+            'exit75_retries': 1,
+            'last_exit75_at': '2026-05-11T11:00:00',
+            'handshake_claimed': False,
+        },
+    )
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is True
+
+
+def test_resume_handshake_timeout_exhaust_alerts_no_full_daily(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'interrupted',
+                    'at': '2026-05-11T09:40:00',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+    alerts = []
+    monkeypatch.setattr(
+        scheduler_daemon,
+        '_alert_inventory_resume',
+        lambda msg, **kwargs: alerts.append(msg),
+    )
+    # Seed marker just below the exhaust threshold so one more timeout finishes it.
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    (lock_dir / 'daily_tasks.inventory_resume.20260511.json').write_text(
+        json.dumps({
+            'date': '20260511',
+            'outcome': 'exit75',
+            'exit75_retries': scheduler_daemon._RESUME_EXIT75_MAX - 1,
+            'last_exit75_at': '2026-05-11T11:00:00',
+            'handshake_claimed': False,
+            'never_claimed_retry_used': False,
+        }),
+        encoding='utf-8',
+    )
+    calls = []
+
+    def _fake_run_task(*args, **kwargs):
+        assert kwargs.get('preserve_health_on_handshake_miss') is True
+        calls.append('run')
+        return False, 'Worker lock handshake timed out'
+
+    monkeypatch.setattr(scheduler_daemon, 'run_task', _fake_run_task)
+
+    ok, message = scheduler_daemon.task_daily_full()
+    assert ok is True
+    assert message == scheduler_daemon._RESUME_LOCK_SKIP_MESSAGE
+    health = json.loads(health_path.read_text(encoding='utf-8'))
+    assert health['tasks']['daily_tasks']['status'] == 'interrupted'
+    marker = scheduler_daemon._read_inventory_resume_marker('daily_tasks')
+    assert marker['exit75_retries'] == scheduler_daemon._RESUME_EXIT75_MAX
+    assert marker['outcome'] == 'exit75'
+    assert any('exhausted' in a.lower() or 'unsynced' in a.lower() for a in alerts)
+
+    # Exhausted: no more --sync-only, and full daily must not re-apply.
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
+    calls.clear()
+    ok2, msg2 = scheduler_daemon.task_daily_full()
+    assert ok2 is True
+    assert calls == []
+    assert 'already' in msg2.lower() or 'started' in msg2.lower() or 'claim' in msg2.lower()
+    assert '--sync-only' not in msg2.lower()
+
+
 def test_task_daily_full_resume_exit_0_marks_resumed_inventory(tmp_path, monkeypatch):
     health_path = tmp_path / '_scheduler_health.json'
     lock_dir = tmp_path / '_task_locks'

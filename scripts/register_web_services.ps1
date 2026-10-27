@@ -52,14 +52,16 @@ if (-not (Test-Path $python)) {
 
 # Resolve brand/ports from THIS checkout's .env + store profile. Abort on failure —
 # never fall back to a generic 'Dajian Web Services' task name.
-$portJson = & $python -m src.utils.store_ports --format json 2>&1 | Out-String
+# Parse stdout only (no 2>&1): PS 5.1 merges stderr warnings into the success
+# stream and would break ConvertFrom-Json.
+$portJson = & $python -m src.utils.store_ports --format json | Out-String
 if ($LASTEXITCODE -ne 0) {
-    throw "store_ports lookup failed (exit=$LASTEXITCODE): $portJson"
+    throw "store_ports lookup failed (exit=$LASTEXITCODE)"
 }
 try {
     $ports = $portJson | ConvertFrom-Json
 } catch {
-    throw "store_ports returned non-JSON output: $portJson"
+    throw "store_ports returned non-JSON stdout: $portJson"
 }
 $brand = [string]$ports.brand_name
 if (-not $brand) {
