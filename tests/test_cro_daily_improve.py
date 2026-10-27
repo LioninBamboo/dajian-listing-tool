@@ -242,6 +242,7 @@ def test_promote_cannot_be_enabled(tmp_path, monkeypatch, no_promote_module):
     bad = {
         "schema": "cro_daily_improve/v1",
         "store": "main",
+        "mode": "dry",
         "created_at": _now().isoformat(),
         "expires_at": (_now() + timedelta(hours=12)).isoformat(),
         "candidates": [
@@ -793,6 +794,7 @@ def test_image_qty_and_giga_sig(tmp_path, no_promote_module):
     cand = {
         "schema": "cro_daily_improve/v1",
         "store": "main",
+        "mode": "dry",
         "created_at": _now().isoformat(),
         "expires_at": (_now() + timedelta(hours=2)).isoformat(),
         "candidates": [{
@@ -838,6 +840,7 @@ def test_preflight_sha_lock_and_mismatch(tmp_path, monkeypatch, no_promote_modul
     cand = {
         "schema": "cro_daily_improve/v1",
         "store": "main",
+        "mode": "dry",
         "created_at": _now().isoformat(),
         "expires_at": (_now() + timedelta(hours=2)).isoformat(),
         "candidates": [{"action": "price_drop", "sku": "W5230P450590", "live_price": 10, "new_price": 9}],
@@ -1436,6 +1439,7 @@ def test_live_price_drop_never_calls_ad_apis(tmp_path, monkeypatch, no_promote_m
     cand = {
         "schema": "cro_daily_improve/v1",
         "store": "main",
+        "mode": "dry",
         "created_at": _now().isoformat(),
         "expires_at": (_now() + timedelta(hours=2)).isoformat(),
         "candidates": [{
@@ -1492,6 +1496,7 @@ def test_live_price_fail_closed_missing_cost_and_exception(tmp_path, monkeypatch
     cand = {
         "schema": "cro_daily_improve/v1",
         "store": "main",
+        "mode": "dry",
         "created_at": _now().isoformat(),
         "expires_at": (_now() + timedelta(hours=2)).isoformat(),
         "candidates": [{
@@ -1589,6 +1594,7 @@ def test_live_image_put_error_continues_batch(tmp_path, no_promote_module):
     cand = {
         "schema": "cro_daily_improve/v1",
         "store": "main",
+        "mode": "dry",
         "created_at": _now().isoformat(),
         "expires_at": (_now() + timedelta(hours=2)).isoformat(),
         "candidates": [
@@ -1650,6 +1656,7 @@ def test_live_revalidates_raise_force_skip_and_oos(tmp_path, no_promote_module):
     cand = {
         "schema": "cro_daily_improve/v1",
         "store": "main",
+        "mode": "dry",
         "created_at": _now().isoformat(),
         "expires_at": (_now() + timedelta(hours=2)).isoformat(),
         "candidates": [
@@ -1788,3 +1795,261 @@ def test_store_root_aqua_uses_trading_profile_not_main(tmp_path, monkeypatch, no
         "brand": "AquaRides",
     }
     assert get_store_profile().brand_name == "AquaVerve"
+
+
+def test_pid_alive_win32_never_calls_os_kill(monkeypatch, no_promote_module):
+    from scripts import cro_daily_improve as m
+    import src.utils.process_identity as process_identity
+
+    monkeypatch.setattr(m.sys, "platform", "win32")
+    monkeypatch.setattr(process_identity.sys, "platform", "win32")
+
+    def boom_kill(*_a, **_k):
+        raise AssertionError("os.kill must not be called on win32")
+
+    monkeypatch.setattr(os, "kill", boom_kill)
+    monkeypatch.setattr(m.os, "kill", boom_kill)
+    monkeypatch.setattr(process_identity.os, "kill", boom_kill)
+
+    assert m.pid_alive(os.getpid()) is False
+    assert m.pid_alive(1, "win-filetime:1") is False
+
+
+def test_lock_stores_creation_marker_and_rejects_reused_pid(tmp_path, no_promote_module):
+    from scripts import cro_daily_improve as m
+    from src.utils.process_identity import get_process_creation_marker
+
+    lock = tmp_path / "locks" / "cro_daily_improve.lock"
+    now = _now()
+    assert m.acquire_lock(lock, now) is None
+    data = json.loads(lock.read_text(encoding="utf-8"))
+    assert data["pid"] == os.getpid()
+    assert data["creation_marker"] == get_process_creation_marker(os.getpid())
+    assert data["creation_marker"]
+    assert m.acquire_lock(lock, now) == m.EXIT_LOCK
+
+    lock.write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "creation_marker": "win-filetime:reused-pid",
+            "at": now.isoformat(),
+            "name": "cro_daily_improve",
+        }),
+        encoding="utf-8",
+    )
+    assert m.acquire_lock(lock, now) is None
+    data = json.loads(lock.read_text(encoding="utf-8"))
+    assert data["creation_marker"] == get_process_creation_marker(os.getpid())
+    m.release_lock(lock)
+    assert not lock.exists()
+
+
+def test_acquire_lock_uses_atomic_excl(tmp_path, monkeypatch, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    seen = []
+    real_open = os.open
+
+    def wrapped(path, flags, *args, **kwargs):
+        seen.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(m.os, "open", wrapped)
+    lock = tmp_path / "atomic.lock"
+    assert m.acquire_lock(lock, _now()) is None
+    assert seen
+    assert seen[0] & os.O_CREAT
+    assert seen[0] & os.O_EXCL
+    m.release_lock(lock)
+
+
+def test_strip_oss_keeps_raw_giga_sig_bytes():
+    from scripts.cro_image_refresh import giga_sig_params, strip_oss_keep_giga_sig
+
+    plain = "https://b2bfiles1.gigab2b.cn/img/a.jpg?x-cc=1&x-cu=2&x-ct=3&x-cs=a/b=%20c"
+    assert strip_oss_keep_giga_sig(plain) == plain
+    assert strip_oss_keep_giga_sig(plain) is plain
+
+    src = (
+        "https://b2bfiles1.gigab2b.cn/img/a.jpg"
+        "?x-oss-process=image/resize,w_800&x-cc=1&x-cu=2&x-ct=3&x-cs=a/b=%20c"
+    )
+    out = strip_oss_keep_giga_sig(src)
+    assert "x-oss-process" not in out
+    assert out == (
+        "https://b2bfiles1.gigab2b.cn/img/a.jpg?x-cc=1&x-cu=2&x-ct=3&x-cs=a/b=%20c"
+    )
+    assert giga_sig_params(src)["x-cs"] == "a/b=%20c"
+    assert giga_sig_params(out)["x-cs"] == "a/b=%20c"
+    assert "x-cs=a/b=%20c" in src
+    assert "x-cs=a/b=%20c" in out
+    for key in ("x-cc", "x-cu", "x-ct", "x-cs"):
+        raw = f"{key}={giga_sig_params(src)[key]}"
+        assert raw in src and raw in out
+
+
+def test_candidates_require_mode_ttl_mtime_and_recap(tmp_path, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    now = _now()
+
+    def _write(name: str, payload: dict) -> Path:
+        path = tmp_path / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    base = {
+        "schema": "cro_daily_improve/v1",
+        "store": "main",
+        "mode": "dry",
+        "created_at": now.isoformat(),
+        "expires_at": (now + timedelta(hours=2)).isoformat(),
+        "candidates": [{"action": "price_drop", "sku": "A", "live_price": 10, "new_price": 9}],
+    }
+
+    missing_created = dict(base)
+    missing_created.pop("created_at")
+    path = _write("no_created.json", missing_created)
+    data, err = m.validate_candidates_file(path, _sha(path), now, "main")
+    assert data is None and err == m.EXIT_USAGE
+
+    missing_expires = dict(base)
+    missing_expires.pop("expires_at")
+    path = _write("no_expires.json", missing_expires)
+    data, err = m.validate_candidates_file(path, _sha(path), now, "main")
+    assert data is None and err == m.EXIT_USAGE
+
+    missing_mode = dict(base)
+    missing_mode.pop("mode")
+    path = _write("no_mode.json", missing_mode)
+    data, err = m.validate_candidates_file(path, _sha(path), now, "main")
+    assert data is None and err == m.EXIT_USAGE
+
+    live_mode = dict(base)
+    live_mode["mode"] = "live"
+    path = _write("live_mode.json", live_mode)
+    data, err = m.validate_candidates_file(path, _sha(path), now, "main")
+    assert data is None and err == m.EXIT_USAGE
+
+    stale = dict(base)
+    path = _write("stale.json", stale)
+    old = datetime.now().timestamp() - (25 * 3600)
+    os.utime(path, (old, old))
+    data, err = m.validate_candidates_file(path, _sha(path), now, "main")
+    assert data is None and err == m.EXIT_EXPIRED
+
+    over = dict(base)
+    over["candidates"] = (
+        [
+            {"action": "price_drop", "sku": f"P{i}", "live_price": 10, "new_price": 9}
+            for i in range(m.LIMIT_PRICE_MAX + 5)
+        ]
+        + [
+            {"action": "image_refresh", "sku": f"I{i}", "reason": "lead"}
+            for i in range(m.LIMIT_IMAGE_MAX + 5)
+        ]
+    )
+    path = _write("over.json", over)
+    data, err = m.validate_candidates_file(path, _sha(path), now, "main")
+    assert err is None and data is not None
+    price = [c for c in data["candidates"] if c["action"] == "price_drop"]
+    image = [c for c in data["candidates"] if c["action"] == "image_refresh"]
+    assert len(price) == m.LIMIT_PRICE_MAX
+    assert len(image) == m.LIMIT_IMAGE_MAX
+    assert price[0]["sku"] == "P0"
+    assert image[0]["sku"] == "I0"
+
+
+def test_live_price_skips_when_live_changed(tmp_path, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    writes = []
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        ebay_environment="PRODUCTION",
+        read_live_price_fn=lambda sku, lid: 120.10,
+        write_price_fn=lambda *a, **k: writes.append(a) or True,
+        write_price_db_fn=lambda *a, **k: writes.append(("db", a)) or True,
+        recent_terminal_fn=lambda **k: set(),
+        mark_done_fn=lambda *a, **k: 0,
+    )
+    cand = {
+        "schema": "cro_daily_improve/v1",
+        "store": "main",
+        "mode": "dry",
+        "created_at": _now().isoformat(),
+        "expires_at": (_now() + timedelta(hours=2)).isoformat(),
+        "candidates": [{
+            "action": "price_drop",
+            "sku": "W5230P450590",
+            "listing_id": "188111",
+            "live_price": 120.00,
+            "new_price": 110,
+        }],
+    }
+    path = tmp_path / "changed.json"
+    path.write_text(json.dumps(cand), encoding="utf-8")
+    rc = m.main(
+        [
+            "--store", "main", "--live",
+            "--candidates", str(path),
+            "--approve-sha256", _sha(path),
+            "--out-dir", str(ctx.out_dir),
+        ],
+        ctx=ctx,
+    )
+    assert rc == 0
+    assert writes == []
+    live = json.loads(next(ctx.out_dir.glob("*_live.json")).read_text(encoding="utf-8"))
+    assert live["results"][0]["status"] == "skipped"
+    assert live["results"][0]["reason"] == "live_changed"
+
+    writes.clear()
+    within_ctx = _ctx(
+        tmp_path / "within", "main", _main_profile(),
+        ebay_environment="PRODUCTION",
+        read_live_price_fn=lambda sku, lid: 120.04,
+        write_price_fn=lambda *a, **k: writes.append(a) or True,
+        write_price_db_fn=lambda *a, **k: True,
+        precheck_price_fn=lambda **k: (True, "ok"),
+        verify_price_fn=lambda *a, **k: (True, 110),
+        recent_terminal_fn=lambda **k: set(),
+        mark_done_fn=lambda *a, **k: 0,
+    )
+    rc = m.main(
+        [
+            "--store", "main", "--live",
+            "--candidates", str(path),
+            "--approve-sha256", _sha(path),
+            "--out-dir", str(within_ctx.out_dir),
+        ],
+        ctx=within_ctx,
+    )
+    assert rc == 0
+    within = json.loads(next(within_ctx.out_dir.glob("*_live.json")).read_text(encoding="utf-8"))
+    assert within["results"][0]["status"] == "done"
+    assert writes
+
+
+def test_dry_run_exception_writes_degraded_report_and_releases_lock(tmp_path, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    def boom(_ctx):
+        raise RuntimeError("load exploded")
+
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        load_products_fn=boom,
+        load_perf_fn=lambda _c: {"traffic_meta": {"api_ok": True}},
+        ebay_client_factory=lambda: GetOnlyClient(),
+    )
+    rc = m.main(["--store", "main", "--out-dir", str(ctx.out_dir)], ctx=ctx)
+    assert rc == 0
+    reports = list(ctx.out_dir.glob("*_dry.json"))
+    assert reports
+    dry = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert dry["degraded"] is True
+    assert "load exploded" in str(dry.get("error"))
+    assert dry["mode"] == "dry"
+    assert dry["writes"] == {"db": 0, "queue": 0, "ebay": 0}
+    assert not ctx.lock_path.exists()

@@ -27,6 +27,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.utils.process_identity import (  # noqa: E402
+    get_process_creation_marker,
+    is_process_identity_alive,
+)
+
 # Structural lock: never consult a patched ALLOWED_ACTIONS for promote.
 _STRUCTURAL_ALLOWED: frozenset[str] = frozenset({"price_drop", "image_refresh"})
 ALLOWED_ACTIONS: frozenset[str] = frozenset({"price_drop", "image_refresh"})
@@ -214,12 +219,9 @@ def sha256_matches(file_hex: str, approve: str) -> bool:
     return got == want or got.startswith(want)
 
 
-def pid_alive(pid: int) -> bool:
-    try:
-        os.kill(int(pid), 0)
-    except (OSError, TypeError, ValueError):
-        return False
-    return True
+def pid_alive(pid: int, creation_marker: Optional[str] = None) -> bool:
+    """Windows-safe liveness: OpenProcess + creation marker, never os.kill."""
+    return is_process_identity_alive(pid, creation_marker)
 
 
 def match_store_profile(store: str, profile: Any) -> None:
@@ -619,25 +621,49 @@ def queue_is_fresh(ctx: ImproveContext, rows: Iterable[Dict[str, Any]]) -> bool:
 
 def acquire_lock(lock_path: Path, now: datetime) -> Optional[int]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if lock_path.exists():
-        try:
-            data = json.loads(lock_path.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-        pid = data.get("pid")
-        try:
-            holder = int(pid)
-        except (TypeError, ValueError):
-            holder = None
-        if holder is not None and pid_alive(holder):
-            return EXIT_LOCK
     payload = {
         "pid": os.getpid(),
         "at": now.isoformat(),
         "name": "cro_daily_improve",
+        "creation_marker": get_process_creation_marker(os.getpid()),
     }
-    lock_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    return None
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                data = json.loads(lock_path.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            try:
+                holder = int(data.get("pid"))
+            except (TypeError, ValueError):
+                holder = None
+            marker = data.get("creation_marker")
+            if holder is not None and pid_alive(holder, marker):
+                return EXIT_LOCK
+            try:
+                lock_path.unlink()
+            except OSError:
+                return EXIT_LOCK
+            continue
+        try:
+            os.write(fd, encoded)
+            os.fsync(fd)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            raise
+        os.close(fd)
+        return None
+    return EXIT_LOCK
 
 
 def release_lock(lock_path: Path) -> None:
@@ -1308,13 +1334,19 @@ def validate_candidates_file(path: Path, approve: str, now: datetime, store: str
         return None, EXIT_USAGE
     if str(data.get("store") or "") != store:
         return None, EXIT_USAGE
+    if str(data.get("mode") or "") != "dry":
+        return None, EXIT_USAGE
     created = _parse_ts(data.get("created_at"), CST)
     expires = _parse_ts(data.get("expires_at"), CST)
-    if expires is None and created is not None:
-        expires = created + CANDIDATES_TTL
-    if expires is not None and now > expires:
+    if created is None or expires is None:
+        return None, EXIT_USAGE
+    if now > expires or now - created > CANDIDATES_TTL:
         return None, EXIT_EXPIRED
-    if created is not None and now - created > CANDIDATES_TTL:
+    try:
+        age_sec = max(0.0, datetime.now(timezone.utc).timestamp() - path.stat().st_mtime)
+    except OSError:
+        return None, EXIT_USAGE
+    if age_sec > CANDIDATES_TTL.total_seconds():
         return None, EXIT_EXPIRED
     rows = list(data.get("candidates") or [])
     allowed = effective_allowed_actions()
@@ -1322,6 +1354,21 @@ def validate_candidates_file(path: Path, approve: str, now: datetime, store: str
         action = str(row.get("action") or "")
         if action not in allowed:
             return None, EXIT_DISALLOWED
+    price_n = 0
+    image_n = 0
+    capped: List[Dict[str, Any]] = []
+    for row in rows:
+        action = str(row.get("action") or "")
+        if action == "price_drop":
+            if price_n >= LIMIT_PRICE_MAX:
+                continue
+            price_n += 1
+        elif action == "image_refresh":
+            if image_n >= LIMIT_IMAGE_MAX:
+                continue
+            image_n += 1
+        capped.append(row)
+    data["candidates"] = capped
     return data, None
 
 
@@ -1346,6 +1393,16 @@ def apply_price_live(ctx: ImproveContext, cand: Dict[str, Any]) -> Dict[str, Any
             return {
                 "sku": sku, "action": "price_drop", "status": "skipped",
                 "reason": "live_price_unavailable", "before": None, "after": None,
+            }
+        cand_live = cand.get("live_price")
+        try:
+            live_delta = abs(float(live) - float(cand_live))
+        except (TypeError, ValueError):
+            live_delta = None
+        if live_delta is None or live_delta > 0.05:
+            return {
+                "sku": sku, "action": "price_drop", "status": "skipped",
+                "reason": "live_changed", "before": live, "after": None,
             }
         drop_reason = price_drop_skip_reason(float(live), new_price)
         if drop_reason:
@@ -1648,14 +1705,28 @@ def run_improve(args: argparse.Namespace, ctx: ImproveContext) -> int:
                 }
                 write_reports(report, ctx.out_dir, f"{ctx.store}_{stamp}_live")
         else:
-            products = load_published_products(ctx)
-            perf = load_performance_readonly(ctx)
-            merge_performance(products, perf)
-            market_data = load_market_data(ctx)
-            candidates, excluded, diagnoses, source, degraded = build_candidates(
-                ctx, products, perf, market_data, limit_price, limit_image,
-            )
-            stock_map = load_stock_map(ctx, products)
+            error = None
+            candidates: List[Dict[str, Any]] = []
+            excluded = empty_excluded()
+            diagnoses: Dict[str, Any] = {}
+            source = "error"
+            degraded = False
+            read_only: Dict[str, Any] = {}
+            try:
+                products = load_published_products(ctx)
+                perf = load_performance_readonly(ctx)
+                merge_performance(products, perf)
+                market_data = load_market_data(ctx)
+                candidates, excluded, diagnoses, source, degraded = build_candidates(
+                    ctx, products, perf, market_data, limit_price, limit_image,
+                )
+                stock_map = load_stock_map(ctx, products)
+                read_only = build_read_only_context(
+                    ctx.store, products, diagnoses, perf, stock_map,
+                )
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                degraded = True
             report = {
                 "schema": SCHEMA,
                 "run_id": run_id,
@@ -1671,11 +1742,11 @@ def run_improve(args: argparse.Namespace, ctx: ImproveContext) -> int:
                 "degraded": degraded,
                 "candidates": candidates,
                 "excluded": excluded,
-                "read_only_context": build_read_only_context(
-                    ctx.store, products, diagnoses, perf, stock_map,
-                ),
+                "read_only_context": read_only,
                 "writes": {"db": 0, "queue": 0, "ebay": 0},
             }
+            if error:
+                report["error"] = error
             write_reports(report, ctx.out_dir, f"{ctx.store}_{stamp}_dry")
         loaded = abort_if_promote_loaded()
         if loaded is not None:

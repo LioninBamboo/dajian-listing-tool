@@ -26,7 +26,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -287,34 +287,39 @@ def live_quantity(item: Dict[str, Any]) -> Optional[int]:
 
 
 def giga_sig_params(url: str) -> Dict[str, str]:
+    """Raw query values (not decoded) so x-c* bytes stay comparable."""
     if not url or not isinstance(url, str) or "?" not in url:
         return {}
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query, keep_blank_values=True)
+    query = url.split("?", 1)[1].split("#", 1)[0]
     out: Dict[str, str] = {}
-    for key in GIGA_SIG_KEYS:
-        vals = qs.get(key)
-        if vals:
-            out[key] = vals[0]
+    for part in query.split("&"):
+        if "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        if key in GIGA_SIG_KEYS and key not in out:
+            out[key] = val
     return out
 
 
 def strip_oss_keep_giga_sig(url: str) -> str:
-    """Drop x-oss-process only; keep GigaB2B x-cc/x-cu/x-ct/x-cs intact."""
-    if not url or not isinstance(url, str) or "?" not in url:
+    """Drop only the raw x-oss-process &-segment; never re-encode the query."""
+    if not url or not isinstance(url, str):
         return url or ""
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query, keep_blank_values=True)
-    qs.pop("x-oss-process", None)
-    pairs: List[tuple[str, str]] = []
-    for key, vals in qs.items():
-        for val in vals:
-            pairs.append((key, val))
-    new_query = urlencode(pairs)
-    return urlunparse((
-        parsed.scheme, parsed.netloc, parsed.path,
-        parsed.params, new_query, parsed.fragment,
-    ))
+    if "?" not in url:
+        return url
+    head, _, rest = url.partition("?")
+    query, hash_sep, fragment = rest.partition("#")
+    parts = query.split("&")
+    kept = [part for part in parts if part.split("=", 1)[0] != "x-oss-process"]
+    if kept == parts:
+        return url
+    rebuilt = head
+    joined = "&".join(kept)
+    if joined:
+        rebuilt += "?" + joined
+    if hash_sep:
+        rebuilt += "#" + fragment
+    return rebuilt
 
 
 def urls_keep_giga_sigs(source_urls: List[str], dest_urls: List[str]) -> bool:
