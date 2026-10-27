@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import types
 from datetime import datetime
@@ -1193,7 +1194,7 @@ def test_resume_handshake_timeout_keeps_status_for_bounded_retry(tmp_path, monke
         }, ensure_ascii=False),
         encoding='utf-8',
     )
-    _write_today_dead_lock(lock_dir)
+    _write_today_dead_lock(lock_dir, owner_token='crash-owner-token')
     monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
     monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
     monkeypatch.setattr(scheduler_daemon, 'LOG_DIR', log_dir)
@@ -1202,6 +1203,12 @@ def test_resume_handshake_timeout_keeps_status_for_bounded_retry(tmp_path, monke
     monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
     monkeypatch.setattr(scheduler_daemon, '_notify_failure', lambda *a, **k: None)
     monkeypatch.setattr(scheduler_daemon, '_terminate_task_worker', lambda *a, **k: None)
+    invalidate_calls = []
+    monkeypatch.setattr(
+        scheduler_daemon,
+        '_invalidate_lock_as_daemon_kill',
+        lambda *a, **k: invalidate_calls.append((a, k)) or False,
+    )
 
     class _FakeProc:
         pid = 4242
@@ -1234,6 +1241,10 @@ def test_resume_handshake_timeout_keeps_status_for_bounded_retry(tmp_path, monke
     health = json.loads(health_path.read_text(encoding='utf-8'))
     assert health['tasks']['daily_tasks']['status'] == 'interrupted'
     assert health['tasks']['daily_tasks']['at'] == '2026-05-11T09:40:00'
+    # Resume path must not wipe today's crash lock / partial-run evidence.
+    assert invalidate_calls == []
+    assert (lock_dir / 'daily_tasks.lock').exists()
+    assert scheduler_daemon._has_partial_daily_run_evidence_today('daily_tasks') is True
 
     # Still resume-eligible after a preserve-health handshake miss + exit75 marker.
     scheduler_daemon._write_inventory_resume_marker(
@@ -1247,6 +1258,195 @@ def test_resume_handshake_timeout_keeps_status_for_bounded_retry(tmp_path, monke
         },
     )
     assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is True
+
+
+def test_resume_marker_blocks_full_daily_even_when_recovering(tmp_path, monkeypatch):
+    """Today's resume marker counts as started — recovering health must not open full apply."""
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir(parents=True)
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'recovering',
+                    'at': '2026-05-11T11:15:00',
+                    'message': 'Watchdog launched recovery after 09:50',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    (lock_dir / 'daily_tasks.inventory_resume.20260511.json').write_text(
+        json.dumps({
+            'date': '20260511',
+            'outcome': 'exit75',
+            'exit75_retries': 1,
+            'handshake_claimed': False,
+        }),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
+    calls = []
+    monkeypatch.setattr(
+        scheduler_daemon,
+        'run_task',
+        lambda *a, **k: calls.append((a, k)) or (True, 'nope'),
+    )
+
+    assert scheduler_daemon._task_already_started_today('daily_tasks') is True
+    # No dead lock => resume path skipped; marker still blocks full daily.
+    ok, message = scheduler_daemon.task_daily_full()
+    assert ok is True
+    assert calls == []
+    assert 'already started' in message.lower()
+
+
+def test_backoff_alert_does_not_steal_exhausted_alert(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'interrupted',
+                    'at': '2026-05-11T09:40:00',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+    alerts = []
+    monkeypatch.setattr(
+        scheduler_daemon,
+        '_alert_inventory_resume',
+        lambda msg, **kwargs: alerts.append(msg),
+    )
+    # In backoff window (retry 1, 5s ago; first backoff is 30s).
+    scheduler_daemon._write_inventory_resume_marker(
+        'daily_tasks',
+        {
+            'date': '20260511',
+            'outcome': 'exit75',
+            'exit75_retries': 1,
+            'last_exit75_at': '2026-05-11T12:47:25',
+            'handshake_claimed': False,
+        },
+    )
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
+    assert any('backoff' in a.lower() for a in alerts)
+    assert not any('exhaust' in a.lower() for a in alerts)
+
+    # Exhaust later — must still be able to fire exhausted alert (separate gate).
+    alerts.clear()
+    scheduler_daemon._write_inventory_resume_marker(
+        'daily_tasks',
+        {
+            'date': '20260511',
+            'outcome': 'exit75',
+            'exit75_retries': scheduler_daemon._RESUME_EXIT75_MAX,
+            'last_exit75_at': '2026-05-11T11:00:00',
+            'handshake_claimed': False,
+        },
+    )
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
+    assert any('exhaust' in a.lower() for a in alerts)
+
+
+def test_non75_claim_miss_writes_failed_and_alerts(tmp_path, monkeypatch):
+    import subprocess
+
+    log_dir = tmp_path / 'logs'
+    lock_dir = log_dir / '_task_locks'
+    health_path = log_dir / '_scheduler_health.json'
+    log_dir.mkdir()
+    lock_dir.mkdir()
+    health_path.write_text(json.dumps({'tasks': {}}), encoding='utf-8')
+    monkeypatch.setattr(scheduler_daemon, 'LOG_DIR', log_dir)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, '_notify_failure', lambda *a, **k: None)
+    monkeypatch.setattr(scheduler_daemon, '_terminate_task_worker', lambda *a, **k: None)
+    alerts = []
+    monkeypatch.setattr(
+        scheduler_daemon,
+        '_alert_inventory_resume',
+        lambda msg, **kwargs: alerts.append(msg),
+    )
+
+    class _FakeProc:
+        pid = 9999
+        returncode = 42
+
+        def poll(self):
+            return 42
+
+        def wait(self, timeout=None):
+            return 42
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
+
+    def _popen_unclaimed(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get('args')
+        hs = None
+        for i, part in enumerate(cmd):
+            if part == '--handshake-path':
+                hs = Path(cmd[i + 1])
+                break
+        assert hs is not None
+        hs.write_text(json.dumps({'claimed': False, 'worker_pid': 0}), encoding='utf-8')
+        return _FakeProc()
+
+    monkeypatch.setattr(subprocess, 'Popen', _popen_unclaimed)
+
+    ok, message = scheduler_daemon.run_task(
+        'daily_tasks',
+        [sys.executable, '-c', 'pass'],
+        timeout_sec=5,
+        preserve_health_on_handshake_miss=False,
+    )
+    assert ok is False
+    assert 'handshake failed' in message.lower()
+    health = json.loads(health_path.read_text(encoding='utf-8'))
+    assert health['tasks']['daily_tasks']['status'] == 'failed'
+    assert any('handshake failed' in a.lower() for a in alerts)
+
+
+def test_write_inventory_resume_marker_retries_permission_error(tmp_path, monkeypatch):
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir()
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    calls = {'n': 0}
+    real_replace = os.replace
+
+    def _flaky_replace(src, dst):
+        calls['n'] += 1
+        if calls['n'] < 3:
+            raise PermissionError('win32 sharing')
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(scheduler_daemon.os, 'replace', _flaky_replace)
+    monkeypatch.setattr(scheduler_daemon.time, 'sleep', lambda *_: None)
+    path = scheduler_daemon._write_inventory_resume_marker(
+        'daily_tasks',
+        {'date': '20260511', 'outcome': 'pending'},
+    )
+    assert path.exists()
+    assert calls['n'] == 3
+    assert scheduler_daemon._read_inventory_resume_marker('daily_tasks')['outcome'] == 'pending'
 
 
 def test_resume_handshake_timeout_exhaust_alerts_no_full_daily(tmp_path, monkeypatch):

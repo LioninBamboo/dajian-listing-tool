@@ -493,8 +493,16 @@ def _task_already_started_today(task_name, now=None):
 
     Watchdog ``recovering`` without durable partial-run evidence is a late
     first-launch marker only — it must not block the normal full daily path.
+
+    Exception: today's inventory-resume marker means a --sync-only round already
+    began (even if health is still ``recovering``) — never open a full apply.
     """
     now = now or datetime.now()
+    marker = _read_inventory_resume_marker(task_name, now=now)
+    if marker:
+        day = str(marker.get('date') or '')
+        if not day or day == now.strftime('%Y%m%d'):
+            return True
     info = _get_task_health(task_name)
     if not info:
         return False
@@ -548,11 +556,42 @@ def _read_inventory_resume_marker(task_name='daily_tasks', now=None):
 
 
 def _write_inventory_resume_marker(task_name, payload, now=None):
+    """Atomically rewrite today's resume marker (unique tmp + replace).
+
+    On Windows, ``os.replace`` can raise ``PermissionError`` if another handle
+    briefly holds the target; retry a few times and never crash the daemon.
+    """
     path = _inventory_resume_marker_path(task_name, now=now)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + '.tmp')
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
-    os.replace(tmp, path)
+    tmp = path.with_name(f'{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp')
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    except OSError as exc:
+        logger.warning("inventory resume marker write failed: %s", exc)
+        return path
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return path
+        except PermissionError as exc:
+            if attempt >= 4:
+                logger.warning(
+                    "inventory resume marker replace failed after retries: %s",
+                    exc,
+                )
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return path
+            time.sleep(0.05 * (attempt + 1))
+        except OSError as exc:
+            logger.warning("inventory resume marker replace failed: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return path
     return path
 
 
@@ -848,21 +887,29 @@ def _should_resume_daily_inventory(task_name='daily_tasks', now=None):
     has_evidence = _has_partial_daily_run_evidence_today(task_name, now=now)
     if _inventory_resume_already_consumed(task_name, now=now):
         if has_evidence:
-            _emit_blocked_resume_alert_once(task_name, now=now)
+            _emit_resume_consumed_alert(task_name, now=now)
         return False
     return has_evidence
 
 
-def _emit_blocked_resume_alert_once(task_name='daily_tasks', now=None, *, reason=None):
-    """Atomically claim + emit the blocked-resume alert at most once per day."""
+# Once-per-day alert gates (separate files so backoff cannot steal exhausted).
+_RESUME_ALERT_KIND_BLOCKED = 'blocked'
+_RESUME_ALERT_KIND_BACKOFF = 'backoff'
+_RESUME_ALERT_KIND_EXHAUSTED = 'retries_exhausted'
+_RESUME_ALERT_KIND_CLAIM_MISS = 'claim_miss'
+
+
+def _emit_resume_alert_once(task_name, kind, message, *, now=None, marker_flag=None):
+    """Atomically claim one alert kind for today (O_EXCL gate) and emit it."""
     now = now or datetime.now()
+    safe_kind = ''.join(ch if ch.isalnum() or ch in {'-', '_'} else '_' for ch in str(kind))
     path = _inventory_resume_marker_path(task_name, now=now)
-    gate = path.with_name(path.name + '.blocked_alert')
+    gate = path.with_name(f'{path.name}.{safe_kind}.alert')
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         gate_fd = os.open(str(gate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         try:
-            os.write(gate_fd, b'1')
+            os.write(gate_fd, str(kind).encode('utf-8'))
             os.fsync(gate_fd)
         finally:
             os.close(gate_fd)
@@ -871,23 +918,81 @@ def _emit_blocked_resume_alert_once(task_name='daily_tasks', now=None, *, reason
     except OSError:
         return False
 
-    marker = _read_inventory_resume_marker(task_name, now=now) or {
-        'date': now.strftime('%Y%m%d'),
-    }
-    if marker.get('blocked_alert_emitted'):
-        return False
-    marker['blocked_alert_emitted'] = True
-    try:
-        # Durable marker rewrite is tmp + os.replace (atomic on POSIX/Windows).
-        _write_inventory_resume_marker(task_name, marker, now=now)
-    except Exception:
-        pass
-    text = reason or (
-        f"{task_name}: resume blocked by today's marker while dead-pid "
-        f"lock remains (outcome={marker.get('outcome')}); SKUs may remain unsynced"
-    )
-    _alert_inventory_resume(text)
+    if marker_flag:
+        marker = _read_inventory_resume_marker(task_name, now=now) or {
+            'date': now.strftime('%Y%m%d'),
+        }
+        if marker.get(marker_flag):
+            return False
+        marker[marker_flag] = True
+        try:
+            _write_inventory_resume_marker(task_name, marker, now=now)
+        except Exception:
+            pass
+    _alert_inventory_resume(message)
     return True
+
+
+def _emit_resume_consumed_alert(task_name='daily_tasks', now=None):
+    """Choose backoff / exhausted / blocked alert without sharing one gate."""
+    now = now or datetime.now()
+    marker = _read_inventory_resume_marker(task_name, now=now) or {}
+    outcome = str(marker.get('outcome') or '').lower()
+    if outcome == 'exit75':
+        retries = int(marker.get('exit75_retries') or 0)
+        if retries >= _RESUME_EXIT75_MAX:
+            return _emit_resume_alert_once(
+                task_name,
+                _RESUME_ALERT_KIND_EXHAUSTED,
+                (
+                    f"{task_name}: inventory resume handshake/exit75 retries exhausted "
+                    f"({retries}/{_RESUME_EXIT75_MAX}); SKUs may remain unsynced "
+                    "— not falling back to full daily apply"
+                ),
+                now=now,
+                marker_flag='exhausted_alert_emitted',
+            )
+        return _emit_resume_alert_once(
+            task_name,
+            _RESUME_ALERT_KIND_BACKOFF,
+            (
+                f"{task_name}: inventory resume waiting exit75 backoff "
+                f"(retry {retries}/{_RESUME_EXIT75_MAX}); SKUs may remain unsynced"
+            ),
+            now=now,
+            marker_flag='backoff_alert_emitted',
+        )
+    return _emit_resume_alert_once(
+        task_name,
+        _RESUME_ALERT_KIND_BLOCKED,
+        (
+            f"{task_name}: resume blocked by today's marker while dead-pid "
+            f"lock remains (outcome={outcome or 'pending'}); SKUs may remain unsynced"
+        ),
+        now=now,
+        marker_flag='blocked_alert_emitted',
+    )
+
+
+def _emit_blocked_resume_alert_once(task_name='daily_tasks', now=None, *, reason=None):
+    """Compat wrapper: emit retries-exhausted or blocked alert (separate gates)."""
+    if reason and 'exhaust' in str(reason).lower():
+        return _emit_resume_alert_once(
+            task_name,
+            _RESUME_ALERT_KIND_EXHAUSTED,
+            reason,
+            now=now,
+            marker_flag='exhausted_alert_emitted',
+        )
+    if reason:
+        return _emit_resume_alert_once(
+            task_name,
+            _RESUME_ALERT_KIND_BLOCKED,
+            reason,
+            now=now,
+            marker_flag='blocked_alert_emitted',
+        )
+    return _emit_resume_consumed_alert(task_name, now=now)
 
 
 def _iso_at_or_none(value):
@@ -1089,11 +1194,13 @@ def run_task(
 
         if not handshake:
             _terminate_task_worker(proc, proc.pid)
-            # Only invalidate if THIS run's token owns the lock (worker may have
-            # written the lock then died before handshake). Never touch foreign locks.
-            _invalidate_lock_as_daemon_kill(
-                task_name, reason='handshake_timeout', owner_token=owner_token
-            )
+            # Resume path: never invalidate — the worker may already own today's
+            # crash lock + partial-run evidence that later --sync-only needs.
+            # Non-resume: only invalidate if THIS run's token owns the lock.
+            if not preserve_health_on_handshake_miss:
+                _invalidate_lock_as_daemon_kill(
+                    task_name, reason='handshake_timeout', owner_token=owner_token
+                )
             msg = 'Worker lock handshake timed out'
             logger.error(f"❌ 任务启动失败: {task_name}: {msg}")
             if not preserve_health_on_handshake_miss:
@@ -1114,6 +1221,14 @@ def run_task(
             logger.error(f"❌ 任务启动失败: {task_name}: {msg}")
             if not preserve_health_on_handshake_miss:
                 update_health(task_name, 'failed', msg, time.time() - start_time)
+                _emit_resume_alert_once(
+                    task_name,
+                    _RESUME_ALERT_KIND_CLAIM_MISS,
+                    (
+                        f"{task_name}: worker lock handshake failed "
+                        f"(exit={returncode}); health marked failed"
+                    ),
+                )
             return False, msg
 
         worker_pid = int(handshake.get('worker_pid') or proc.pid)
@@ -1597,14 +1712,16 @@ def task_daily_full():
                 status,
             )
             if exit75_retries >= _RESUME_EXIT75_MAX:
-                _emit_blocked_resume_alert_once(
+                _emit_resume_alert_once(
                     'daily_tasks',
-                    now=now,
-                    reason=(
+                    _RESUME_ALERT_KIND_EXHAUSTED,
+                    (
                         f"daily_tasks: inventory resume handshake/exit75 retries exhausted "
                         f"({exit75_retries}/{_RESUME_EXIT75_MAX}); SKUs may remain unsynced "
                         "— not falling back to full daily apply"
                     ),
+                    now=now,
+                    marker_flag='exhausted_alert_emitted',
                 )
             return True, message if message == _RESUME_LOCK_SKIP_MESSAGE else _RESUME_LOCK_SKIP_MESSAGE
         if ok:
