@@ -1124,8 +1124,11 @@ class InventorySyncService:
                 # precheck_price 已写过详细 ERROR 日志, 这里直接拒绝
                 return False
         except Exception as guard_exc:
-            # 守门员自身异常不能阻塞改价 (fail-open), 但要记录
-            self.logger.warning(f"⚠️ [PRICE GUARD] {sku}: 守门员异常, 放行: {guard_exc}")
+            # 守门员自身异常 → fail-closed: 跳过该 SKU, 不调任何 eBay 改价 API
+            self.logger.error(
+                f"🚫 [PRICE GUARD] {sku}: 守门员异常, 拒绝改价 (fail-closed): {guard_exc}"
+            )
+            return False
 
         import requests
         from src.services.ebay_auth import EbayOAuthService
