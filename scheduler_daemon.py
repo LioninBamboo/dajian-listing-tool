@@ -352,28 +352,43 @@ def release_lock():
 
 
 def _is_pid_alive(pid):
-    """检查 PID 是否存活 (Windows 兼容)"""
-    def _tasklist_pid_alive() -> bool:
-        try:
-            result = subprocess.run(
-                ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
-                capture_output=True, text=True, timeout=5
-            )
-            return str(pid) in result.stdout
-        except Exception:
-            return False
+    """检查 PID 是否存活。
 
+    Windows: OpenProcess / tasklist only — never ``os.kill(pid, 0)``.
+    POSIX: ``process_identity`` (/proc) with os.kill fallback there only.
+    """
     try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if handle:
-            kernel32.CloseHandle(handle)
-            return True
-        return _tasklist_pid_alive()
-    except Exception:
-        return _tasklist_pid_alive()
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+
+    if sys.platform == 'win32':
+        def _tasklist_pid_alive() -> bool:
+            try:
+                result = subprocess.run(
+                    ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
+                    capture_output=True, text=True, timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                return str(pid) in result.stdout
+            except Exception:
+                return False
+
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return _tasklist_pid_alive()
+        except Exception:
+            return _tasklist_pid_alive()
+
+    return is_process_identity_alive(pid)
 
 
 # ─── 健康状态 ─────────────────────────────────────────────
@@ -422,6 +437,8 @@ def _get_task_health(task_name):
 _TASK_STARTED_TODAY_STATUSES = {
     'running',
     'recovering',
+    'interrupted',
+    'resumed_inventory',
     'success',
     'ok',
     'partial_success',
@@ -429,7 +446,6 @@ _TASK_STARTED_TODAY_STATUSES = {
     'timeout',
     'failed',
 }
-
 
 def _newer_qualifying_audit_since(since_iso, now=None):
     """True when a same-day full live_audit appeared after a skipped run."""
@@ -512,8 +528,19 @@ def _task_already_started_today(task_name, now=None):
 
     daily_tasks may only open one round per calendar day. Timeout is not success
     (CRO still waits), but it must not trigger another apply.
+
+    Watchdog ``recovering`` without durable partial-run evidence is a late
+    first-launch marker only — it must not block the normal full daily path.
+
+    Exception: today's inventory-resume marker means a --sync-only round already
+    began (even if health is still ``recovering``) — never open a full apply.
     """
     now = now or datetime.now()
+    marker = _read_inventory_resume_marker(task_name, now=now)
+    if marker:
+        day = str(marker.get('date') or '')
+        if not day or day == now.strftime('%Y%m%d'):
+            return True
     info = _get_task_health(task_name)
     if not info:
         return False
@@ -525,7 +552,680 @@ def _task_already_started_today(task_name, now=None):
         last_dt = datetime.fromisoformat(at)
     except (TypeError, ValueError):
         return False
-    return last_dt.date() == now.date()
+    if last_dt.date() != now.date():
+        return False
+    if status == 'recovering' and not _has_partial_daily_run_evidence_today(task_name, now=now):
+        return False
+    return True
+
+
+# Health statuses that may qualify for crash inventory resume (with dead lock).
+_RESUME_ELIGIBLE_STATUSES = frozenset({'interrupted', 'recovering', 'running'})
+# Explicit terminal outcomes that must never re-enter --sync-only resume.
+_RESUME_BLOCKING_STATUSES = frozenset({
+    'timeout',
+    'failed',
+    'success',
+    'ok',
+    'partial_success',
+    'completed_with_errors',
+    'resumed_inventory',
+})
+_RESUME_EXIT75_MAX = 3
+_RESUME_EXIT75_BACKOFF_SEC = (30, 120, 300)  # after 1st/2nd/3rd exit-75
+# Must match run_task handshake wait; pending older than this is a dead launch.
+_RESUME_HANDSHAKE_TIMEOUT_SEC = 15
+# Process-local fallback when durable marker I/O fails (same calendar day only).
+_RESUME_MARKER_MEMORY: dict[str, dict] = {}
+# Monotonic write sequence per day/task (also stamped into marker payloads).
+_RESUME_WRITE_SEQ: dict[str, int] = {}
+
+
+def _inventory_resume_marker_path(task_name='daily_tasks', now=None):
+    now = now or datetime.now()
+    day = now.strftime('%Y%m%d')
+    safe = ''.join(ch if ch.isalnum() or ch in {'-', '_'} else '_' for ch in str(task_name))
+    return TASK_LOCK_DIR / f'{safe}.inventory_resume.{day}.json'
+
+
+def _resume_marker_memory_key(task_name='daily_tasks', now=None):
+    now = now or datetime.now()
+    # Include TASK_LOCK_DIR so tests / multi-checkout paths do not share state.
+    return f"{TASK_LOCK_DIR}:{now.strftime('%Y%m%d')}:{task_name}"
+
+
+def _resume_write_seq_value(payload) -> int:
+    try:
+        return int((payload or {}).get('write_seq') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _next_resume_write_seq(task_name='daily_tasks', now=None, *, at_least=0) -> int:
+    key = _resume_marker_memory_key(task_name, now=now)
+    current = max(int(_RESUME_WRITE_SEQ.get(key) or 0), int(at_least or 0))
+    nxt = current + 1
+    _RESUME_WRITE_SEQ[key] = nxt
+    return nxt
+
+
+def _stamp_resume_write_seq(task_name, payload, now=None) -> dict:
+    data = dict(payload or {})
+    data['write_seq'] = _next_resume_write_seq(
+        task_name,
+        now=now,
+        at_least=_resume_write_seq_value(data),
+    )
+    return data
+
+
+def _remember_resume_marker(task_name, payload, now=None):
+    if not isinstance(payload, dict):
+        return
+    key = _resume_marker_memory_key(task_name, now=now)
+    existing = _RESUME_MARKER_MEMORY.get(key)
+    if existing and _resume_write_seq_value(existing) > _resume_write_seq_value(payload):
+        return
+    _RESUME_MARKER_MEMORY[key] = dict(payload)
+    seq = _resume_write_seq_value(payload)
+    if seq > int(_RESUME_WRITE_SEQ.get(key) or 0):
+        _RESUME_WRITE_SEQ[key] = seq
+
+
+def _marker_file_within_handshake_window(path, now=None) -> bool:
+    """True when marker file mtime is still inside the handshake wait window.
+
+    Uses wall-clock ``time.time()`` (not the injectible ``datetime.now``) so a
+    concurrent claimer reading a just-created empty file still sees it as
+    in-flight under test clocks that freeze ``datetime.now``.
+    """
+    del now  # mtime age is wall-clock; kept for call-site symmetry
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    return age < _RESUME_HANDSHAKE_TIMEOUT_SEC
+
+
+def _load_resume_marker_from_disk(path):
+    """Return parsed dict, or None when missing/empty/unparseable."""
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding='utf-8').strip()
+        if not raw:
+            return None
+        data = json.loads(raw)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _read_inventory_resume_marker(task_name='daily_tasks', now=None):
+    """Prefer the newer of durable file vs in-memory fallback (by write_seq)."""
+    path = _inventory_resume_marker_path(task_name, now=now)
+    disk = _load_resume_marker_from_disk(path)
+    mem = _RESUME_MARKER_MEMORY.get(_resume_marker_memory_key(task_name, now=now))
+    mem = dict(mem) if isinstance(mem, dict) else None
+    if disk and mem:
+        if _resume_write_seq_value(mem) > _resume_write_seq_value(disk):
+            return mem
+        _remember_resume_marker(task_name, disk, now=now)
+        return disk
+    if disk:
+        _remember_resume_marker(task_name, disk, now=now)
+        return disk
+    if mem:
+        return mem
+    return None
+
+
+def _write_inventory_resume_marker(task_name, payload, now=None) -> bool:
+    """Atomically rewrite today's resume marker (unique tmp + replace).
+
+    Returns True only when the durable file was successfully replaced.
+    On Windows, ``os.replace`` can raise ``PermissionError`` if another handle
+    briefly holds the target; retry a few times and never crash the daemon.
+    Callers must not treat a False return as success (do not launch resume).
+    Always stamps a monotonic ``write_seq`` so memory can beat a stale on-disk
+    copy after a failed later write.
+    """
+    path = _inventory_resume_marker_path(task_name, now=now)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _stamp_resume_write_seq(task_name, payload, now=now)
+    tmp = path.with_name(f'{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp')
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    except OSError as exc:
+        logger.warning("inventory resume marker write failed: %s", exc)
+        _remember_resume_marker(task_name, payload, now=now)
+        return False
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            _remember_resume_marker(task_name, payload, now=now)
+            return True
+        except PermissionError as exc:
+            if attempt >= 4:
+                logger.warning(
+                    "inventory resume marker replace failed after retries: %s",
+                    exc,
+                )
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                _remember_resume_marker(task_name, payload, now=now)
+                return False
+            time.sleep(0.05 * (attempt + 1))
+        except OSError as exc:
+            logger.warning("inventory resume marker replace failed: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            _remember_resume_marker(task_name, payload, now=now)
+            return False
+    _remember_resume_marker(task_name, payload, now=now)
+    return False
+
+
+def _pending_resume_launch_is_stale(marker, now=None):
+    """True when a pending marker is older than the handshake wait window."""
+    now = now or datetime.now()
+    launched = _iso_at_or_none((marker or {}).get('launched_at'))
+    if launched is None:
+        return True
+    return (now - launched).total_seconds() >= _RESUME_HANDSHAKE_TIMEOUT_SEC
+
+
+def _alert_inventory_resume(message, *, now=None):
+    """Surface resume-gate alerts in logs and health for digest/watchdog."""
+    text = str(message or '').strip() or 'inventory resume alert'
+    logger.warning("[INVENTORY RESUME ALERT] %s", text)
+    try:
+        update_health(
+            '_inventory_resume_alert',
+            'alert',
+            text[:500],
+        )
+    except Exception:
+        pass
+
+
+def _resume_launcher_alive(marker):
+    """True when the process that wrote the pending resume marker is still alive."""
+    if not isinstance(marker, dict):
+        return False
+    try:
+        pid = int(marker.get('launcher_pid') or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    creation = marker.get('launcher_creation_marker') or ''
+    if creation:
+        return bool(is_process_identity_alive(pid, creation))
+    return bool(_is_pid_alive(pid))
+
+
+def _inventory_resume_already_consumed(task_name='daily_tasks', now=None):
+    """True when today's durable resume marker forbids another --sync-only launch.
+
+    Exception: a ``pending`` marker with no handshake/claim (worker never started,
+    e.g. reboot right after launch) may allow exactly one more attempt when
+    ``never_claimed_retry_used`` is still false and the original launcher is dead.
+
+    Empty/unparseable marker files whose mtime is still inside the handshake
+    window are treated as in-flight (consumed) — never as a free retry slot.
+    """
+    now = now or datetime.now()
+    path = _inventory_resume_marker_path(task_name, now=now)
+    marker = _read_inventory_resume_marker(task_name, now=now)
+    if not marker:
+        if path.exists() and _marker_file_within_handshake_window(path, now=now):
+            return True
+        if path.exists() and not _marker_file_within_handshake_window(path, now=now):
+            # Stale unreadable: allow the one never-claimed retry unless gate used.
+            gate = path.with_name(path.name + '.never_claimed_retry')
+            return gate.exists()
+        return False
+    day = str(marker.get('date') or '')
+    if day and day != now.strftime('%Y%m%d'):
+        return False
+    outcome = str(marker.get('outcome') or '').lower()
+    handshake_claimed = bool(marker.get('handshake_claimed'))
+    if outcome == 'exit75':
+        retries = int(marker.get('exit75_retries') or 0)
+        if retries >= _RESUME_EXIT75_MAX:
+            return True
+        last = _iso_at_or_none(marker.get('last_exit75_at'))
+        if last is None:
+            return False
+        backoff_idx = min(max(retries - 1, 0), len(_RESUME_EXIT75_BACKOFF_SEC) - 1)
+        wait_sec = _RESUME_EXIT75_BACKOFF_SEC[backoff_idx]
+        return (now - last).total_seconds() < wait_sec
+    if outcome in {'', 'pending'} and not handshake_claimed:
+        stale = _pending_resume_launch_is_stale(marker, now=now)
+        # Still launching within handshake window: treat as consumed.
+        if _resume_launcher_alive(marker) and not stale:
+            return True
+        # Dead / stale pending (reboot or hung past handshake window): one retry.
+        if not marker.get('never_claimed_retry_used'):
+            return False
+        return True
+    # claimed / success / failed / pending-with-handshake — never resume again
+    return True
+
+
+def _emit_claim_write_failed_alert(task_name, now=None, *, detail=''):
+    text = (
+        f"{task_name}: inventory resume marker initial claim write failed"
+        + (f" ({detail})" if detail else '')
+        + "; not launching --sync-only"
+    )
+    return _emit_resume_alert_once(
+        task_name,
+        _RESUME_ALERT_KIND_CLAIM_WRITE,
+        text,
+        now=now,
+        marker_flag='claim_write_failed_alert_emitted',
+    )
+
+
+def _try_claim_inventory_resume_marker(task_name, launch_token, *, prior_status='', now=None):
+    """Atomically claim today's resume slot (O_CREAT|O_EXCL) or take the one never-claimed retry.
+
+    Returns (claimed: bool, marker: dict|None). Only one winner across watchdog/daemon.
+    Durable marker write failures return claimed=False (do not launch resume).
+
+    Empty/unparseable marker files inside the handshake window are in-flight:
+    do not never-claimed-retry and do not overwrite.
+    """
+    now = now or datetime.now()
+    path = _inventory_resume_marker_path(task_name, now=now)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    day = now.strftime('%Y%m%d')
+    launcher_pid = os.getpid()
+    launcher_marker = get_process_creation_marker(launcher_pid) or ''
+    fresh = _stamp_resume_write_seq(
+        task_name,
+        {
+            'date': day,
+            'launch_token': launch_token,
+            'launched_at': now.isoformat(),
+            'prior_status': prior_status,
+            'outcome': 'pending',
+            'handshake_claimed': False,
+            'never_claimed_retry_used': False,
+            'exit75_retries': 0,
+            'launcher_pid': launcher_pid,
+            'launcher_creation_marker': launcher_marker,
+        },
+        now=now,
+    )
+
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            payload = json.dumps(fresh, ensure_ascii=False, indent=2).encode('utf-8')
+            os.write(fd, payload)
+            os.fsync(fd)
+        except OSError as exc:
+            logger.warning("inventory resume marker create write failed: %s", exc)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            _remember_resume_marker(task_name, fresh, now=now)
+            _emit_claim_write_failed_alert(task_name, now=now, detail=str(exc))
+            return False, None
+        else:
+            os.close(fd)
+        _remember_resume_marker(task_name, fresh, now=now)
+        return True, fresh
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        logger.warning("inventory resume marker create failed: %s", exc)
+        _emit_claim_write_failed_alert(task_name, now=now, detail=str(exc))
+        return False, None
+
+    # File exists: parse carefully — empty/partial create is not a free retry slot.
+    disk = _load_resume_marker_from_disk(path)
+    if disk is None and path.exists():
+        if _marker_file_within_handshake_window(path, now=now):
+            # Winner is still writing / fsyncing — treat as in-flight.
+            return False, None
+        # Stale unreadable: one never-claimed retry may reclaim the slot.
+        existing = {
+            'date': day,
+            'outcome': 'pending',
+            'handshake_claimed': False,
+            'never_claimed_retry_used': False,
+            'exit75_retries': 0,
+            'launched_at': None,
+        }
+    else:
+        existing = _read_inventory_resume_marker(task_name, now=now) or disk or {}
+
+    outcome = str(existing.get('outcome') or '').lower()
+    handshake_claimed = bool(existing.get('handshake_claimed'))
+    stale_pending = _pending_resume_launch_is_stale(existing, now=now)
+    launcher_dead = not _resume_launcher_alive(existing) or stale_pending
+
+    # Never-claimed pending (reboot / hung past handshake window): one extra attempt.
+    if (
+        outcome in {'', 'pending'}
+        and not handshake_claimed
+        and not existing.get('never_claimed_retry_used')
+        and launcher_dead
+    ):
+        retry_gate = path.with_name(path.name + '.never_claimed_retry')
+        try:
+            gate_fd = os.open(str(retry_gate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(gate_fd, launch_token.encode('utf-8'))
+                os.fsync(gate_fd)
+            finally:
+                os.close(gate_fd)
+        except FileExistsError:
+            return False, existing
+        except OSError as exc:
+            logger.warning("inventory resume never-claimed gate failed: %s", exc)
+            return False, existing
+        retry_payload = {
+            **existing,
+            'date': day,
+            'launch_token': launch_token,
+            'launched_at': now.isoformat(),
+            'prior_status': prior_status or existing.get('prior_status'),
+            'outcome': 'pending',
+            'handshake_claimed': False,
+            'never_claimed_retry_used': True,
+            'exit75_retries': int(existing.get('exit75_retries') or 0),
+            'last_exit75_at': existing.get('last_exit75_at'),
+            'launcher_pid': launcher_pid,
+            'launcher_creation_marker': launcher_marker,
+        }
+        if not _write_inventory_resume_marker(task_name, retry_payload, now=now):
+            _alert_inventory_resume(
+                f"{task_name}: never-claimed retry marker durable write failed; "
+                "not launching inventory resume"
+            )
+            return False, existing
+        reason = (
+            f"{task_name}: stale pending marker past handshake window "
+            f"({_RESUME_HANDSHAKE_TIMEOUT_SEC}s); allowing one extra inventory resume today"
+            if stale_pending and _resume_launcher_alive(existing)
+            else f"{task_name}: never-claimed pending marker; allowing one extra inventory resume today"
+        )
+        _alert_inventory_resume(reason)
+        return True, retry_payload
+
+    # Exit-75 bounded retry window.
+    if outcome == 'exit75' and not _inventory_resume_already_consumed(task_name, now=now):
+        retry_payload = {
+            **existing,
+            'date': day,
+            'launch_token': launch_token,
+            'launched_at': now.isoformat(),
+            'prior_status': prior_status or existing.get('prior_status'),
+            'outcome': 'pending',
+            'handshake_claimed': False,
+            'exit75_retries': int(existing.get('exit75_retries') or 0),
+            'last_exit75_at': existing.get('last_exit75_at'),
+            'launcher_pid': launcher_pid,
+            'launcher_creation_marker': launcher_marker,
+            'never_claimed_retry_used': existing.get('never_claimed_retry_used', False),
+        }
+        if not _write_inventory_resume_marker(task_name, retry_payload, now=now):
+            _alert_inventory_resume(
+                f"{task_name}: exit75 retry marker durable write failed; "
+                "not launching inventory resume"
+            )
+            return False, existing
+        return True, retry_payload
+
+    if _has_partial_daily_run_evidence_today(task_name, now=now):
+        _alert_inventory_resume(
+            f"{task_name}: inventory resume blocked by today's marker "
+            f"(outcome={outcome or 'pending'}, handshake_claimed={handshake_claimed}); "
+            "dead-pid lock still present — SKUs may remain unsynced"
+        )
+    return False, existing
+
+
+def _mark_resume_handshake_claimed(task_name, launch_token, now=None):
+    now = now or datetime.now()
+    marker = _read_inventory_resume_marker(task_name, now=now)
+    if not marker or marker.get('launch_token') != launch_token:
+        return False
+    marker['handshake_claimed'] = True
+    if str(marker.get('outcome') or '').lower() == 'pending':
+        marker['outcome'] = 'claimed'
+    return _write_inventory_resume_marker(task_name, marker, now=now)
+
+
+def _invalidate_lock_as_daemon_kill(task_name, reason='timeout', *, owner_token=None):
+    """Mark/remove ONLY this run's lock (matching owner_token).
+
+    Never touch a foreign/live worker lock or a crash lock resume still needs.
+    Callers on the unclaimed-handshake path must not invoke this.
+    """
+    if not owner_token:
+        logger.info("↪ skip lock invalidate (%s): missing owner_token", reason)
+        return False
+    lock_path = _task_lock_path(task_name)
+    if not lock_path.exists():
+        return False
+    try:
+        lock_info = json.loads(lock_path.read_text(encoding='utf-8'))
+        if not isinstance(lock_info, dict):
+            lock_info = {}
+    except Exception:
+        logger.info("↪ skip lock invalidate (%s): unreadable lock", reason)
+        return False
+    if lock_info.get('owner_token') != owner_token:
+        logger.info(
+            "↪ skip lock invalidate (%s): foreign owner_token on %s",
+            reason,
+            lock_path.name,
+        )
+        return False
+    lock_info['killed_by_daemon'] = True
+    lock_info['daemon_kill_reason'] = str(reason)
+    lock_info['daemon_kill_at'] = datetime.now().isoformat()
+    try:
+        tmp = lock_path.with_suffix(lock_path.suffix + '.tmp')
+        tmp.write_text(json.dumps(lock_info, ensure_ascii=False, indent=2), encoding='utf-8')
+        os.replace(tmp, lock_path)
+    except OSError:
+        pass
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        logger.info(
+            "↪ 任务锁保留但已标记 daemon_kill (%s): %s",
+            reason,
+            lock_path.name,
+        )
+    return True
+
+
+def _today_stale_daily_lock_info(task_name='daily_tasks', now=None):
+    """Return today's stale (dead-pid) crash lock payload, else None.
+
+    Durable evidence that daily_tasks actually started today and the worker
+    died — independent of watchdog ``recovering`` health writes. Locks the
+    daemon itself killed on timeout are excluded.
+    """
+    now = now or datetime.now()
+    lock_path = _task_lock_path(task_name)
+    if not lock_path.exists():
+        return None
+    timeout_sec = int(TASK_TIMEOUT.get(task_name, 3600))
+    try:
+        lock_info = json.loads(lock_path.read_text(encoding='utf-8'))
+        timeout_sec = int(lock_info.get('timeout_sec') or timeout_sec)
+    except Exception:
+        return None
+    if lock_info.get('killed_by_daemon'):
+        return None
+    started_at = _iso_at_or_none(lock_info.get('started_at'))
+    if started_at is None or started_at.date() != now.date():
+        return None
+    if not _task_lock_is_stale(lock_info, timeout_sec, now=now):
+        return None
+    return lock_info
+
+
+def _has_partial_daily_run_evidence_today(task_name='daily_tasks', now=None):
+    """True when durable markers show daily_tasks partially ran today."""
+    return _today_stale_daily_lock_info(task_name, now=now) is not None
+
+
+def _should_resume_daily_inventory(task_name='daily_tasks', now=None):
+    """True when a mid-run crash left unfinished inventory work today.
+
+    Resume is inventory-sync only (``daily_tasks.py --sync-only`` with
+    skip_synced_today). Never a blind full re-apply of live steps.
+
+    Requires ALL of:
+    - health status in interrupted/recovering/running (not timeout/failed/success)
+    - today's dead-pid lock that was NOT daemon-timeout-killed
+    - no durable once-per-day resume marker already consumed (exit-75 / one
+      never-claimed retry may still proceed)
+    """
+    now = now or datetime.now()
+    info = _get_task_health(task_name)
+    status = str((info or {}).get('status', '')).lower()
+    if status in _RESUME_BLOCKING_STATUSES:
+        return False
+    if status and status not in _RESUME_ELIGIBLE_STATUSES:
+        return False
+    if _task_run_lock_is_active(task_name, now=now):
+        return False
+    has_evidence = _has_partial_daily_run_evidence_today(task_name, now=now)
+    if _inventory_resume_already_consumed(task_name, now=now):
+        if has_evidence:
+            _emit_resume_consumed_alert(task_name, now=now)
+        return False
+    return has_evidence
+
+
+# Once-per-day alert gates (separate files so backoff cannot steal exhausted).
+_RESUME_ALERT_KIND_BLOCKED = 'blocked'
+_RESUME_ALERT_KIND_BACKOFF = 'backoff'
+_RESUME_ALERT_KIND_EXHAUSTED = 'retries_exhausted'
+_RESUME_ALERT_KIND_CLAIM_MISS = 'claim_miss'
+_RESUME_ALERT_KIND_CLAIM_WRITE = 'claim_write_failed'
+
+
+def _emit_resume_alert_once(task_name, kind, message, *, now=None, marker_flag=None):
+    """Atomically claim one alert kind for today (O_EXCL gate) and emit it."""
+    now = now or datetime.now()
+    safe_kind = ''.join(ch if ch.isalnum() or ch in {'-', '_'} else '_' for ch in str(kind))
+    path = _inventory_resume_marker_path(task_name, now=now)
+    gate = path.with_name(f'{path.name}.{safe_kind}.alert')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        gate_fd = os.open(str(gate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            try:
+                os.write(gate_fd, str(kind).encode('utf-8'))
+                os.fsync(gate_fd)
+            except OSError:
+                # Exclusive create already owns the once-slot; still emit.
+                pass
+        finally:
+            os.close(gate_fd)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+
+    if marker_flag:
+        marker = _read_inventory_resume_marker(task_name, now=now) or {
+            'date': now.strftime('%Y%m%d'),
+        }
+        if marker.get(marker_flag):
+            # Gate won but flag already set (rare); still count as emitted.
+            _alert_inventory_resume(message)
+            return True
+        marker[marker_flag] = True
+        try:
+            _write_inventory_resume_marker(task_name, marker, now=now)
+        except Exception:
+            pass
+    _alert_inventory_resume(message)
+    return True
+
+
+def _emit_resume_consumed_alert(task_name='daily_tasks', now=None):
+    """Choose backoff / exhausted / blocked alert without sharing one gate."""
+    now = now or datetime.now()
+    marker = _read_inventory_resume_marker(task_name, now=now) or {}
+    outcome = str(marker.get('outcome') or '').lower()
+    if outcome == 'exit75':
+        retries = int(marker.get('exit75_retries') or 0)
+        if retries >= _RESUME_EXIT75_MAX:
+            return _emit_resume_alert_once(
+                task_name,
+                _RESUME_ALERT_KIND_EXHAUSTED,
+                (
+                    f"{task_name}: inventory resume handshake/exit75 retries exhausted "
+                    f"({retries}/{_RESUME_EXIT75_MAX}); SKUs may remain unsynced "
+                    "— not falling back to full daily apply"
+                ),
+                now=now,
+                marker_flag='exhausted_alert_emitted',
+            )
+        return _emit_resume_alert_once(
+            task_name,
+            _RESUME_ALERT_KIND_BACKOFF,
+            (
+                f"{task_name}: inventory resume waiting exit75 backoff "
+                f"(retry {retries}/{_RESUME_EXIT75_MAX}); SKUs may remain unsynced"
+            ),
+            now=now,
+            marker_flag='backoff_alert_emitted',
+        )
+    return _emit_resume_alert_once(
+        task_name,
+        _RESUME_ALERT_KIND_BLOCKED,
+        (
+            f"{task_name}: resume blocked by today's marker while dead-pid "
+            f"lock remains (outcome={outcome or 'pending'}); SKUs may remain unsynced"
+        ),
+        now=now,
+        marker_flag='blocked_alert_emitted',
+    )
+
+
+def _emit_blocked_resume_alert_once(task_name='daily_tasks', now=None, *, reason=None):
+    """Compat wrapper: emit retries-exhausted or blocked alert (separate gates)."""
+    if reason and 'exhaust' in str(reason).lower():
+        return _emit_resume_alert_once(
+            task_name,
+            _RESUME_ALERT_KIND_EXHAUSTED,
+            reason,
+            now=now,
+            marker_flag='exhausted_alert_emitted',
+        )
+    if reason:
+        return _emit_resume_alert_once(
+            task_name,
+            _RESUME_ALERT_KIND_BLOCKED,
+            reason,
+            now=now,
+            marker_flag='blocked_alert_emitted',
+        )
+    return _emit_resume_consumed_alert(task_name, now=now)
 
 
 def _iso_at_or_none(value):
@@ -647,13 +1347,24 @@ def clear_stale_running_tasks():
 
 # ─── 任务执行器 ──────────────────────────────────────────
 
-def run_task(task_name, cmd_args, timeout_sec=3600):
+def run_task(
+    task_name,
+    cmd_args,
+    timeout_sec=3600,
+    on_worker_claimed=None,
+    *,
+    preserve_health_on_handshake_miss=False,
+):
     """
     在子进程中执行任务
 
     - 完全独立进程 (不占用守护进程的内存/状态)
     - 超时自动杀死
     - 返回 (success, message)
+    - on_worker_claimed: optional callback after this run's worker claims the lock
+    - preserve_health_on_handshake_miss: when True (inventory resume), do not
+      overwrite health with ``failed`` on handshake timeout / non-75 claim miss
+      so the prior crash-eligible status remains for bounded retries
     """
     if not _job_is_allowed(task_name):
         _log_skip_disallowed(task_name, via='run_task')
@@ -702,7 +1413,7 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
         # The actual worker atomically owns the lock before it executes target
         # code. This avoids a Windows parent-crash leaving an untracked child.
         handshake = None
-        handshake_deadline = time.time() + 15
+        handshake_deadline = time.time() + _RESUME_HANDSHAKE_TIMEOUT_SEC
         while time.time() < handshake_deadline:
             if handshake_path.exists():
                 try:
@@ -716,9 +1427,17 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
 
         if not handshake:
             _terminate_task_worker(proc, proc.pid)
+            # Resume path: never invalidate — the worker may already own today's
+            # crash lock + partial-run evidence that later --sync-only needs.
+            # Non-resume: only invalidate if THIS run's token owns the lock.
+            if not preserve_health_on_handshake_miss:
+                _invalidate_lock_as_daemon_kill(
+                    task_name, reason='handshake_timeout', owner_token=owner_token
+                )
             msg = 'Worker lock handshake timed out'
             logger.error(f"❌ 任务启动失败: {task_name}: {msg}")
-            update_health(task_name, 'failed', msg, time.time() - start_time)
+            if not preserve_health_on_handshake_miss:
+                update_health(task_name, 'failed', msg, time.time() - start_time)
             return False, msg
 
         if not handshake.get('claimed'):
@@ -726,16 +1445,33 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
                 returncode = proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 _terminate_task_worker(proc, proc.pid)
+                # Unclaimed path: another worker holds the lock — NEVER invalidate.
                 returncode = proc.returncode
             if returncode == 75:
                 logger.info(f"↪ 跳过任务 {task_name}: 已有实际工作进程持有任务锁")
                 return True, 'Skipped (already running or recovering)'
             msg = f'Worker lock handshake failed (exit={returncode})'
             logger.error(f"❌ 任务启动失败: {task_name}: {msg}")
-            update_health(task_name, 'failed', msg, time.time() - start_time)
+            if not preserve_health_on_handshake_miss:
+                update_health(task_name, 'failed', msg, time.time() - start_time)
+            # Always surface claim-miss (resume + non-resume); resume keeps prior health.
+            _emit_resume_alert_once(
+                task_name,
+                _RESUME_ALERT_KIND_CLAIM_MISS,
+                (
+                    f"{task_name}: worker lock handshake failed "
+                    f"(exit={returncode})"
+                    + ('' if preserve_health_on_handshake_miss else '; health marked failed')
+                ),
+            )
             return False, msg
 
         worker_pid = int(handshake.get('worker_pid') or proc.pid)
+        if on_worker_claimed is not None:
+            try:
+                on_worker_claimed(owner_token, handshake)
+            except Exception as exc:
+                logger.warning("on_worker_claimed hook failed: %s", exc)
         update_health(task_name, 'running', f'Started: {cmd_str}')
 
         # Poll frequently for short tasks while refreshing the daemon heartbeat
@@ -751,6 +1487,9 @@ def run_task(task_name, cmd_args, timeout_sec=3600):
             if duration >= timeout_sec:
                 logger.error(f"⏰ 任务超时 ({timeout_sec}s): {task_name}")
                 _terminate_task_worker(proc, worker_pid)
+                _invalidate_lock_as_daemon_kill(
+                    task_name, reason='timeout', owner_token=owner_token
+                )
                 update_health(task_name, 'timeout', f'Killed after {timeout_sec}s', duration)
                 update_health('_daemon', 'running', f'Timeout while waiting for {task_name}')
                 _notify_failure(task_name, f'任务超时 ({timeout_sec}秒), 已强制终止')
@@ -1139,11 +1878,144 @@ def task_giga_dropship_sync():
     run_task('giga_dropship_sync', cmd, timeout_sec=TASK_TIMEOUT['giga_dropship_sync'])
 
 
+_RESUME_LOCK_SKIP_MESSAGE = 'Skipped (already running or recovering)'
+
+
 def task_daily_full():
     """每日全量任务 (分析 + 库存同步 + 报告；智能调价仅周一/周四执行)"""
     if _is_ops_scheduler():
         logger.info("↪ ops 档 --task daily 转去库存运营包，避免子店跑主店全量")
         return task_ops_daily()
+
+    # Mid-run crash with durable evidence (today's dead-pid lock): finish
+    # remaining inventory only. Never use watchdog recovering alone — that
+    # marker is also written for a late first launch after 09:50.
+    if _should_resume_daily_inventory('daily_tasks'):
+        now = datetime.now()
+        info = _get_task_health('daily_tasks')
+        status = str(info.get('status', '')).lower() or 'unknown'
+        launch_token = uuid.uuid4().hex
+        claimed, marker = _try_claim_inventory_resume_marker(
+            'daily_tasks',
+            launch_token,
+            prior_status=status,
+            now=now,
+        )
+        if not claimed:
+            return True, f'Skipped (inventory resume claim lost or already consumed: {status})'
+        exit75_retries = int((marker or {}).get('exit75_retries') or 0)
+
+        def _on_claimed(_owner_token, _handshake):
+            _mark_resume_handshake_claimed('daily_tasks', launch_token, now=now)
+
+        logger.info(
+            "↪ daily_tasks 今日有未完成库存同步证据 (status=%s)：--sync-only，禁止全量二次 apply",
+            status,
+        )
+        ok, message = run_task(
+            'daily_tasks',
+            [str(PROJECT_ROOT / 'daily_tasks.py'), '--sync-only'],
+            timeout_sec=TASK_TIMEOUT['daily_tasks'],
+            on_worker_claimed=_on_claimed,
+            preserve_health_on_handshake_miss=True,
+        )
+        # Exit 75 / handshake timeout / non-75 claim miss: worker never claimed —
+        # leave health unchanged; marker stays handshake_claimed=False for retries.
+        claim_miss = (not ok) and 'handshake failed' in message.lower()
+        if (
+            message == _RESUME_LOCK_SKIP_MESSAGE
+            or 'handshake timed out' in message.lower()
+            or claim_miss
+        ):
+            exit75_retries += 1
+            prior_marker = _read_inventory_resume_marker('daily_tasks', now=now) or {}
+            wrote = _write_inventory_resume_marker(
+                'daily_tasks',
+                {
+                    **prior_marker,
+                    'date': now.strftime('%Y%m%d'),
+                    'launch_token': launch_token,
+                    'launched_at': now.isoformat(),
+                    'prior_status': status,
+                    'outcome': 'exit75',
+                    'handshake_claimed': False,
+                    'exit75_retries': exit75_retries,
+                    'last_exit75_at': datetime.now().isoformat(),
+                    'never_claimed_retry_used': prior_marker.get('never_claimed_retry_used', False),
+                    'last_claim_miss': bool(claim_miss),
+                },
+                now=now,
+            )
+            if not wrote:
+                logger.warning(
+                    "inventory resume exit75/claim-miss marker durable write failed "
+                    "(in-memory fallback active)"
+                )
+            logger.info(
+                "↪ inventory resume 未拿到锁 (exit75 retry %s/%s)，保持原 status=%s",
+                exit75_retries,
+                _RESUME_EXIT75_MAX,
+                status,
+            )
+            if exit75_retries >= _RESUME_EXIT75_MAX:
+                _emit_resume_alert_once(
+                    'daily_tasks',
+                    _RESUME_ALERT_KIND_EXHAUSTED,
+                    (
+                        f"daily_tasks: inventory resume handshake/exit75 retries exhausted "
+                        f"({exit75_retries}/{_RESUME_EXIT75_MAX}); SKUs may remain unsynced "
+                        "— not falling back to full daily apply"
+                    ),
+                    now=now,
+                    marker_flag='exhausted_alert_emitted',
+                )
+            return True, message if message == _RESUME_LOCK_SKIP_MESSAGE else _RESUME_LOCK_SKIP_MESSAGE
+        if ok:
+            prior_marker = _read_inventory_resume_marker('daily_tasks', now=now) or {}
+            if not _write_inventory_resume_marker(
+                'daily_tasks',
+                {
+                    **prior_marker,
+                    'date': now.strftime('%Y%m%d'),
+                    'launch_token': launch_token,
+                    'launched_at': now.isoformat(),
+                    'prior_status': status,
+                    'outcome': 'success',
+                    'handshake_claimed': True,
+                    'exit75_retries': exit75_retries,
+                },
+                now=now,
+            ):
+                logger.warning("inventory resume success marker durable write failed")
+            update_health(
+                'daily_tasks',
+                'resumed_inventory',
+                f'Inventory resume after {status}: {message}',
+            )
+            return True, f'Resumed inventory after {status}: {message}'
+        prior_marker = _read_inventory_resume_marker('daily_tasks', now=now) or {}
+        if not _write_inventory_resume_marker(
+            'daily_tasks',
+            {
+                **prior_marker,
+                'date': now.strftime('%Y%m%d'),
+                'launch_token': launch_token,
+                'launched_at': now.isoformat(),
+                'prior_status': status,
+                'outcome': 'failed',
+                'handshake_claimed': True,
+                'exit75_retries': exit75_retries,
+                'message': message,
+            },
+            now=now,
+        ):
+            logger.warning("inventory resume failed marker durable write failed")
+        update_health(
+            'daily_tasks',
+            'failed',
+            f'Inventory resume after {status}: {message}',
+        )
+        return False, f'Resumed inventory after {status}: {message}'
 
     if _task_already_started_today('daily_tasks'):
         info = _get_task_health('daily_tasks')
@@ -2418,8 +3290,17 @@ def recover_missed_tasks(log_when_clean=True):
             if _task_succeeded_today(task_name, now=now):
                 continue
 
-            # daily_tasks: 当日已启动过（含 timeout/failed）禁止再开一轮
-            if task_name == 'daily_tasks' and _task_already_started_today(task_name, now=now):
+            resume_inventory = (
+                task_name == 'daily_tasks'
+                and _should_resume_daily_inventory(task_name, now=now)
+            )
+            # daily_tasks: started today blocks a second full apply, except the
+            # recovering/interrupted + stale-lock inventory resume path.
+            if (
+                task_name == 'daily_tasks'
+                and not resume_inventory
+                and _task_already_started_today(task_name, now=now)
+            ):
                 continue
             
             # 未到补跑窗口（给定时任务留出执行时间）
@@ -2430,11 +3311,14 @@ def recover_missed_tasks(log_when_clean=True):
             if depends_on and not _task_succeeded_today(str(depends_on), now=now):
                 continue
 
-            if _task_in_progress_or_recovered_today(task_name, scheduled_dt, now=now):
+            if (
+                not resume_inventory
+                and _task_in_progress_or_recovered_today(task_name, scheduled_dt, now=now)
+            ):
                 continue
 
             last_run = _get_task_health(task_name).get('at', '')
-            if last_run:
+            if last_run and not resume_inventory:
                 try:
                     last_dt = datetime.fromisoformat(last_run)
                 except (ValueError, TypeError):
@@ -2444,6 +3328,12 @@ def recover_missed_tasks(log_when_clean=True):
                 logger.info(
                     f"  ⚠️ 发现遗漏任务: {config['label']} "
                     f"(上次运行: {last_run}, 今日计划: {scheduled_time})"
+                )
+            elif resume_inventory:
+                logger.info(
+                    f"  ⚠️ 恢复未完成库存同步: {config['label']} "
+                    f"(status={_get_task_health(task_name).get('status')}, "
+                    f"禁止全量二次 apply)"
                 )
             else:
                 logger.info(

@@ -398,11 +398,13 @@ def _task_in_progress_today(health, task_name, today):
 
 
 def _task_already_started_today(health, task_name, today):
-    """daily_tasks: 当日已启动过（含 timeout/failed）则不再补跑."""
+    """daily_tasks: 当日已启动过（含 timeout/failed/inventory resume）则不再补跑."""
     info = _get_task_info(health, task_name)
     if str(info.get('status', '')).lower() not in {
         'running',
         'recovering',
+        'interrupted',
+        'resumed_inventory',
         'success',
         'ok',
         'partial_success',

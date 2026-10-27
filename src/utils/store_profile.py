@@ -166,6 +166,13 @@ class StoreProfile:
     def server_base_url(self) -> str:
         return f"http://localhost:{self.server_port}"
 
+    @property
+    def streamlit_port(self) -> int:
+        """Derived UI port: 8501 for Main (:8000), 8502 for :8001, 8503 for :8002."""
+        from src.utils.store_ports import derive_streamlit_port
+
+        return derive_streamlit_port(self.server_port)
+
     def fallback_listing_policies(self) -> Dict[str, str]:
         return {
             "fulfillmentPolicyId": self.fallback_fulfillment_policy_id,
