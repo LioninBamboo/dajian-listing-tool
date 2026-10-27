@@ -391,12 +391,20 @@ def _get_task_health(task_name):
 _TASK_STARTED_TODAY_STATUSES = {
     'running',
     'recovering',
+    'interrupted',
+    'resumed_inventory',
     'success',
     'ok',
     'partial_success',
     'completed_with_errors',
     'timeout',
     'failed',
+}
+
+# Crash/shutdown mid-run: resume unfinished inventory sync only (never full re-apply).
+_DAILY_RESUME_INVENTORY_STATUSES = {
+    'recovering',
+    'interrupted',
 }
 
 
@@ -488,6 +496,34 @@ def _task_already_started_today(task_name, now=None):
     except (TypeError, ValueError):
         return False
     return last_dt.date() == now.date()
+
+
+def _should_resume_daily_inventory(task_name='daily_tasks', now=None):
+    """True when a crash/shutdown left daily_tasks recovering/interrupted today.
+
+    Resume is inventory-sync only (``daily_tasks.py --sync-only`` with
+    skip_synced_today). Never a blind full re-apply of live steps.
+    A still-running worker (active lock) blocks resume.
+    """
+    now = now or datetime.now()
+    info = _get_task_health(task_name)
+    if not info:
+        return False
+    status = str(info.get('status', '')).lower()
+    if status not in _DAILY_RESUME_INVENTORY_STATUSES:
+        return False
+    at = info.get('at')
+    if not at:
+        return False
+    try:
+        last_dt = datetime.fromisoformat(at)
+    except (TypeError, ValueError):
+        return False
+    if last_dt.date() != now.date():
+        return False
+    if _task_run_lock_is_active(task_name, now=now):
+        return False
+    return True
 
 
 def _iso_at_or_none(value):
@@ -1106,6 +1142,32 @@ def task_daily_full():
     if _is_ops_scheduler():
         logger.info("↪ ops 档 --task daily 转去库存运营包，避免子店跑主店全量")
         return task_ops_daily()
+
+    # Crash/shutdown mid-run (watchdog recovering / daemon interrupted): finish
+    # remaining inventory sync only. skip_synced_today skips already-applied SKUs;
+    # do NOT re-run smart_reprice / health autofix / other live steps.
+    if _should_resume_daily_inventory('daily_tasks'):
+        info = _get_task_health('daily_tasks')
+        status = str(info.get('status', '')).lower() or 'unknown'
+        logger.info(
+            "↪ daily_tasks status=%s：恢复未完成库存同步 (--sync-only)，禁止全量二次 apply",
+            status,
+        )
+        ok, message = run_task(
+            'daily_tasks',
+            [str(PROJECT_ROOT / 'daily_tasks.py'), '--sync-only'],
+            timeout_sec=TASK_TIMEOUT['daily_tasks'],
+        )
+        # Mark as resumed_inventory so double-apply stays blocked, but CRO
+        # dependents (which require success/partial_success) do not unlock
+        # against a queue that was never rebuilt.
+        final_status = 'resumed_inventory' if ok else 'failed'
+        update_health(
+            'daily_tasks',
+            final_status,
+            f'Inventory resume after {status}: {message}',
+        )
+        return ok, f'Resumed inventory after {status}: {message}'
 
     if _task_already_started_today('daily_tasks'):
         info = _get_task_health('daily_tasks')
@@ -2312,9 +2374,13 @@ def recover_missed_tasks(log_when_clean=True):
             if _task_succeeded_today(task_name, now=now):
                 continue
 
-            # daily_tasks: 当日已启动过（含 timeout/failed）禁止再开一轮
-            if task_name == 'daily_tasks' and _task_already_started_today(task_name, now=now):
-                continue
+            # daily_tasks: 当日已启动过（含 timeout/failed）禁止再开一轮，
+            # 但 recovering/interrupted + stale lock 走 inventory resume。
+            if task_name == 'daily_tasks':
+                if _should_resume_daily_inventory(task_name, now=now):
+                    pass  # fall through to resume via task_daily_full
+                elif _task_already_started_today(task_name, now=now):
+                    continue
             
             # 未到补跑窗口（给定时任务留出执行时间）
             if now < recovery_window_start:
@@ -2324,11 +2390,18 @@ def recover_missed_tasks(log_when_clean=True):
             if depends_on and not _task_succeeded_today(str(depends_on), now=now):
                 continue
 
-            if _task_in_progress_or_recovered_today(task_name, scheduled_dt, now=now):
+            # recovering with stale lock is handled by the resume path above;
+            # only skip when a live recovery worker is still holding the lock.
+            if task_name == 'daily_tasks' and _should_resume_daily_inventory(task_name, now=now):
+                pass
+            elif _task_in_progress_or_recovered_today(task_name, scheduled_dt, now=now):
                 continue
 
+            resume_inventory = (
+                task_name == 'daily_tasks' and _should_resume_daily_inventory(task_name, now=now)
+            )
             last_run = _get_task_health(task_name).get('at', '')
-            if last_run:
+            if last_run and not resume_inventory:
                 try:
                     last_dt = datetime.fromisoformat(last_run)
                 except (ValueError, TypeError):
@@ -2338,6 +2411,12 @@ def recover_missed_tasks(log_when_clean=True):
                 logger.info(
                     f"  ⚠️ 发现遗漏任务: {config['label']} "
                     f"(上次运行: {last_run}, 今日计划: {scheduled_time})"
+                )
+            elif resume_inventory:
+                logger.info(
+                    f"  ⚠️ 恢复未完成库存同步: {config['label']} "
+                    f"(status={_get_task_health(task_name).get('status')}, "
+                    f"禁止全量二次 apply)"
                 )
             else:
                 logger.info(

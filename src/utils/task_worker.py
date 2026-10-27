@@ -32,9 +32,14 @@ def _write_json_atomic(path: Path, payload: dict, token: str) -> None:
 
 
 def _lock_is_stale(lock_info: dict, timeout_sec: int, now: datetime) -> bool:
-    pid = int(lock_info.get("worker_pid") or lock_info.get("pid") or 0)
+    try:
+        pid = int(lock_info.get("worker_pid") or lock_info.get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
     marker = lock_info.get("worker_creation_marker")
     if pid:
+        # A lock whose worker PID is no longer alive is always stale and may
+        # be taken over (PID reuse is guarded by creation_marker when present).
         return not is_process_identity_alive(pid, marker)
 
     try:
@@ -111,6 +116,12 @@ def _acquire_worker_lock(
                 existing = {}
             if not _lock_is_stale(existing, timeout_sec, datetime.now()):
                 return None
+            stale_pid = existing.get("worker_pid") or existing.get("pid") or "?"
+            print(
+                f"[task_worker] stale lock takeover: {lock_path.name} "
+                f"pid={stale_pid} no longer alive; reclaiming",
+                file=sys.stderr,
+            )
             if _try_reap_observed_stale_lock(
                 lock_path,
                 observed_text=observed_text or "",

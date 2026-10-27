@@ -110,6 +110,70 @@ def test_live_worker_lock_never_expires_only_because_timeout_elapsed(monkeypatch
     ) is False
 
 
+def test_lock_with_dead_pid_is_stale(monkeypatch):
+    monkeypatch.setattr(task_worker, 'is_process_identity_alive', lambda pid, marker: False)
+
+    assert task_worker._lock_is_stale(
+        {
+            'worker_pid': 99999,
+            'worker_creation_marker': 'dead-worker',
+            'started_at': datetime.now().isoformat(),
+            'timeout_sec': 10800,
+        },
+        timeout_sec=10800,
+        now=datetime.now(),
+    ) is True
+
+
+def test_worker_takes_over_stale_dead_pid_lock_and_logs(tmp_path, monkeypatch, capsys):
+    lock_path = tmp_path / 'daily_tasks.lock'
+    handshake_path = tmp_path / 'handshake.json'
+    health_path = tmp_path / 'health.json'
+    target_output = tmp_path / 'ran.txt'
+    target_path = tmp_path / 'target.py'
+    target_path.write_text(
+        "from pathlib import Path\nPath(__import__('sys').argv[1]).write_text('ok')\n",
+        encoding='utf-8',
+    )
+    lock_path.write_text(
+        json.dumps({
+            'task_name': 'daily_tasks',
+            'pid': 424242,
+            'worker_pid': 424242,
+            'worker_creation_marker': 'dead-before-reboot',
+            'owner_token': 'killed-worker',
+            'started_at': datetime.now().isoformat(),
+            'timeout_sec': 10800,
+        }),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(
+        task_worker,
+        'is_process_identity_alive',
+        lambda pid, marker: pid != 424242,
+    )
+
+    result = task_worker.main([
+        '--task-name', 'daily_tasks',
+        '--lock-path', str(lock_path),
+        '--handshake-path', str(handshake_path),
+        '--health-path', str(health_path),
+        '--owner-token', 'replacement-worker',
+        '--timeout-sec', '10800',
+        '--parent-pid', str(os.getpid()),
+        '--parent-creation-marker', get_process_creation_marker(os.getpid()) or '',
+        '--', str(target_path), str(target_output),
+    ])
+
+    err = capsys.readouterr().err
+    assert result == 0
+    assert target_output.read_text(encoding='utf-8') == 'ok'
+    assert 'stale lock takeover' in err
+    assert '424242' in err
+    assert json.loads(handshake_path.read_text(encoding='utf-8'))['claimed'] is True
+    assert not lock_path.exists()
+
+
 def test_worker_fails_closed_on_recent_unreadable_lock(tmp_path):
     lock_path = tmp_path / 'daily_tasks.lock'
     handshake_path = tmp_path / 'handshake.json'

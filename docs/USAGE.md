@@ -22,14 +22,31 @@ start.bat
 说明：
 
 - 默认自动化入口是 `scheduler_daemon.py`，不是旧的一次性 `daily_tasks.py` 窗口。
+- `start.bat` / `stop.bat` / `check_services.bat` 从**本店** `store_profile` 推导端口（FastAPI=`server.port`，Streamlit=`8501+(port-8000)`），不会误判其他店的 `:8000/:8501` 为“已启动”。
 - `start.bat` 会尽量复用已有进程，避免重复起多个窗口。
 - `daily_tasks.py` 是日常工作负载入口，不是长期驻留调度器。
+
+### 仅启动 Web（不含调度）
+
+登录后若只需 FastAPI + Streamlit（例如调度已由计划任务拉起）：
+
+```bash
+start_web.bat
+```
+
+检查本店端口是否在听：
+
+```bash
+check_services.bat
+```
 
 ### 停止服务
 
 ```bash
 stop.bat
 ```
+
+只停**本店** profile 端口上的进程，不会误杀其他 clone。
 
 ### 查看调度状态
 
@@ -39,11 +56,21 @@ python scheduler_daemon.py --status
 
 ### 重新注册计划任务 / 看门狗
 
-首次配置或系统任务丢失时：
+首次配置或系统任务丢失时（调度守护 + 看门狗）：
 
 ```bash
 setup_scheduled_tasks.bat
 ```
+
+### 登录自启：仅 Web 服务（每店单独注册）
+
+重启后若只想自动拉起 FastAPI/Streamlit、**不**再起一份调度守护：
+
+```bash
+setup_web_services.bat
+```
+
+该脚本会以管理员调用 `scripts/register_web_services.ps1`，按本店 brand 注册 `AtLogOn` 任务（`MultipleInstances IgnoreNew` + `start_web.bat` 端口占用跳过，幂等、不重复起进程）。**不会**替你假定已注册——需在每个 Windows 店铺目录各跑一次。
 
 ## 2. 当前产品工作流
 

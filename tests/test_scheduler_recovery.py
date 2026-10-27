@@ -446,6 +446,227 @@ def test_task_daily_full_skips_after_today_timeout(tmp_path, monkeypatch):
     assert 'already' in result[1].lower() or 'timeout' in result[1].lower()
 
 
+def test_task_lock_dead_pid_is_stale(monkeypatch):
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+    assert scheduler_daemon._task_lock_is_stale(
+        {
+            'worker_pid': 9101441,
+            'started_at': '2026-05-11T09:35:00',
+            'timeout_sec': 14400,
+        },
+        timeout_sec=14400,
+        now=FixedNoonDateTime(2026, 5, 11, 12, 47, 30),
+    ) is True
+
+
+def test_should_resume_daily_inventory_when_recovering_and_lock_stale(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir()
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'recovering',
+                    'at': '2026-05-11T11:15:00',
+                    'message': 'Watchdog launched recovery after 09:50',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    (lock_dir / 'daily_tasks.lock').write_text(
+        json.dumps({
+            'task_name': 'daily_tasks',
+            'pid': 555,
+            'worker_pid': 555,
+            'started_at': '2026-05-11T09:30:00',
+            'timeout_sec': 14400,
+        }),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is True
+
+
+def test_should_not_resume_when_worker_lock_still_alive(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir()
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'recovering',
+                    'at': '2026-05-11T11:15:00',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    (lock_dir / 'daily_tasks.lock').write_text(
+        json.dumps({
+            'worker_pid': 777,
+            'worker_creation_marker': 'live-777',
+            'started_at': '2026-05-11T11:15:00',
+            'timeout_sec': 14400,
+        }),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(
+        scheduler_daemon,
+        'is_process_identity_alive',
+        lambda pid, marker: pid == 777,
+    )
+
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is False
+
+
+def test_task_daily_full_resumes_inventory_only_when_recovering(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'recovering',
+                    'at': '2026-05-11T11:12:00',
+                    'message': 'Watchdog launched recovery after 09:50',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
+    calls = []
+
+    def _fake_run_task(name, cmd, timeout_sec=0):
+        calls.append((name, [str(x) for x in cmd], timeout_sec))
+        return True, 'Success in 12s'
+
+    monkeypatch.setattr(scheduler_daemon, 'run_task', _fake_run_task)
+
+    ok, message = scheduler_daemon.task_daily_full()
+
+    assert ok is True
+    assert 'resumed inventory' in message.lower()
+    assert len(calls) == 1
+    assert calls[0][0] == 'daily_tasks'
+    assert calls[0][1][-1] == '--sync-only'
+    assert '--sync-only' in calls[0][1]
+    # Must not launch a blind full daily_tasks.py without --sync-only
+    assert not (len(calls[0][1]) == 1 and calls[0][1][0].endswith('daily_tasks.py'))
+    health = json.loads(health_path.read_text(encoding='utf-8'))
+    assert health['tasks']['daily_tasks']['status'] == 'resumed_inventory'
+
+
+def test_task_daily_full_skips_completed_success_not_resume(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'success',
+                    'at': '2026-05-11T10:00:00',
+                    'message': 'OK',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
+    calls = []
+    monkeypatch.setattr(
+        scheduler_daemon,
+        'run_task',
+        lambda *args, **kwargs: calls.append(args) or (True, 'nope'),
+    )
+
+    result = scheduler_daemon.task_daily_full()
+
+    assert calls == []
+    assert result[0] is True
+    assert 'already started' in result[1].lower()
+
+
+def test_recover_missed_tasks_resumes_recovering_daily_inventory(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'recovering',
+                    'at': '2026-05-11T11:20:00',
+                    'message': 'Watchdog launched recovery after 09:50',
+                },
+            },
+            'watchdog_recovery': {
+                'daily_tasks': {
+                    'at': '2026-05-11T11:20:00',
+                    'reason': 'overdue past 09:50',
+                },
+            },
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    calls: list[str] = []
+
+    def _record(name: str):
+        def runner():
+            calls.append(name)
+            return True, f'mocked {name}'
+        return runner
+
+    def _resume_daily():
+        calls.append('daily_tasks_resume')
+        return True, 'Resumed inventory after recovering'
+
+    monkeypatch.setattr(scheduler_daemon, 'task_title_optimize', _record('title_optimize'))
+    monkeypatch.setattr(scheduler_daemon, 'task_listing_audit', _record('listing_audit'))
+    monkeypatch.setattr(scheduler_daemon, 'task_daily_full', _resume_daily)
+    monkeypatch.setattr(scheduler_daemon, 'task_mi_self_check', _record('mi_self_check'))
+    monkeypatch.setattr(scheduler_daemon, 'task_ad_restore', _record('ad_restore'))
+    monkeypatch.setattr(scheduler_daemon, 'task_blacklist_cleanup', _record('blacklist_cleanup'))
+    monkeypatch.setattr(scheduler_daemon, 'task_guard_anomaly', _record('guard_anomaly'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_monthly_report', _record('cro_monthly_report'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_consume', _record('cro_consume'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_image_refresh', _record('cro_image_refresh'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_fill_specifics', _record('cro_fill_specifics'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_promote', _record('cro_promote'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_sentinel', _record('cro_sentinel'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_delist_email', _record('cro_delist_email'))
+    monkeypatch.setattr(scheduler_daemon, 'task_health_check', _record('health_check'))
+    monkeypatch.setattr(scheduler_daemon, 'task_smart_bid', _record('smart_bid'))
+    monkeypatch.setattr(scheduler_daemon, 'task_bid_rollback', _record('bid_rollback'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_learn_thresholds', _record('cro_learn_thresholds'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_promote_thresholds', _record('cro_promote_thresholds'))
+    monkeypatch.setattr(scheduler_daemon, 'task_cro_ops_snapshot', _record('cro_ops_snapshot'))
+    _stub_recent_recovery_tasks(monkeypatch, _record)
+
+    scheduler_daemon.recover_missed_tasks(log_when_clean=False)
+
+    assert 'daily_tasks_resume' in calls
+    # CRO still waits for a true daily_tasks success; resume must not unlock it.
+    assert 'cro_consume' not in calls
+    assert 'cro_promote' not in calls
+
+
 def test_daily_tasks_timeout_is_four_hours():
     assert scheduler_daemon.TASK_TIMEOUT['daily_tasks'] == 14400
 
