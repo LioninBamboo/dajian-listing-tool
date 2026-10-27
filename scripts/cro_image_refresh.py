@@ -347,11 +347,60 @@ def urls_keep_giga_sigs(source_urls: List[str], dest_urls: List[str]) -> bool:
     return True
 
 
+_INVENTORY_GET_ONLY_KEYS = frozenset({"sku", "href"})
+_PAYLOAD_ALIAS_KEYS = frozenset({"image_urls", "quantity"})
+
+
+def payload_image_urls(payload: Optional[Dict[str, Any]]) -> List[str]:
+    if not payload:
+        return []
+    aliases = payload.get("image_urls")
+    if aliases:
+        return list(aliases)
+    return list(((payload.get("product") or {}).get("imageUrls")) or [])
+
+
+def inventory_put_body(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Inventory API body: live GET copy minus GET-only / alias keys."""
+    body = copy.deepcopy(payload)
+    for key in list(body.keys()):
+        if key in _INVENTORY_GET_ONLY_KEYS or key in _PAYLOAD_ALIAS_KEYS:
+            body.pop(key, None)
+    return body
+
+
+def put_strict_inventory_item(client: Any, sku: str, payload: Dict[str, Any]) -> Any:
+    """PUT the inventory item as a whole. Prefer raw session PUT (no rebuild)."""
+    body = inventory_put_body(payload)
+    session = getattr(client, "session", None)
+    oauth = getattr(client, "oauth", None)
+    base = getattr(client, "base_url", None)
+    if session is not None and oauth is not None and base:
+        token = oauth.get_valid_token()
+        url = f"{str(base).rstrip('/')}/sell/inventory/v1/inventory_item/{sku}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Content-Language": "en-US",
+        }
+        resp = session.put(url, headers=headers, json=body, timeout=60)
+        code = int(getattr(resp, "status_code", 0) or 0)
+        if code not in (200, 204):
+            text = getattr(resp, "text", "") or ""
+            raise RuntimeError(f"inventory PUT {code}: {text[:200]}")
+        return resp
+    return client.create_or_replace_inventory_item(sku, payload)
+
+
 def build_strict_refresh_payload(
     item: Dict[str, Any],
     local: Dict[str, Any],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Build PUT payload without defaulting qty and without stripping x-c*."""
+    """Copy the live GET item; replace only product.imageUrls.
+
+    Never default qty to 1. Keep GigaB2B x-c* params, packageWeightAndSize,
+    locale, full availability, and product identifiers (upc/ean/mpn/brand/epid).
+    """
     qty = live_quantity(item)
     if qty is None:
         return None, "qty_unknown"
@@ -361,18 +410,14 @@ def build_strict_refresh_payload(
     prepared = [strip_oss_keep_giga_sig(u) for u in local_images]
     if not urls_keep_giga_sigs(local_images, prepared):
         return None, "image_sig_stripped"
-    product = item.get("product") or {}
-    title = (product.get("title") or local.get("title") or "").strip()
-    description = (product.get("description") or local.get("description") or title).strip()
-    description = description[:4000] or (title[:4000] if title else "")
-    return {
-        "title": title,
-        "description": description,
-        "image_urls": prepared,
-        "condition": item.get("condition", "NEW"),
-        "quantity": qty,
-        "aspects": product.get("aspects") or {},
-    }, None
+    payload = copy.deepcopy(item) if isinstance(item, dict) else {}
+    product = dict(payload.get("product") or {})
+    product["imageUrls"] = prepared
+    payload["product"] = product
+    # Aliases for callers/tests that still read the builder-style keys.
+    payload["image_urls"] = prepared
+    payload["quantity"] = qty
+    return payload, None
 
 
 def _refresh_one(client, sku: str, local: Dict[str, Any]) -> Dict[str, Any]:

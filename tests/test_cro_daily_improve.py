@@ -683,12 +683,43 @@ def test_image_qty_and_giga_sig(tmp_path, no_promote_module):
     assert payload is None and reason == "qty_zero"
 
     item_ok = _item(["https://old.jpg"], qty=7)
+    item_ok["locale"] = "en_US"
+    item_ok["sku"] = "W5230P450590"
+    item_ok["href"] = "https://api.ebay.com/sell/inventory/v1/inventory_item/W5230P450590"
+    item_ok["availability"]["shipToLocationAvailability"]["allocationByFormat"] = {"auction": 0}
+    item_ok["packageWeightAndSize"] = {
+        "weight": {"value": 12.5, "unit": "POUND"},
+        "dimensions": {"length": 20, "width": 10, "height": 8, "unit": "INCH"},
+    }
+    item_ok["product"]["brand"] = "AquaVerve"
+    item_ok["product"]["mpn"] = "AV-1"
+    item_ok["product"]["upc"] = ["123456789012"]
+    item_ok["product"]["ean"] = ["1234567890123"]
+    item_ok["product"]["epid"] = "1234567890"
     payload, reason = build_strict_refresh_payload(
         item_ok, {"images": [GIGA_URL, GIGA_URL_2], "title": "t", "description": "d"},
     )
     assert reason is None
     assert payload["quantity"] == 7
     assert urls_keep_giga_sigs([GIGA_URL, GIGA_URL_2], payload["image_urls"])
+    assert payload["packageWeightAndSize"] == item_ok["packageWeightAndSize"]
+    assert payload["locale"] == "en_US"
+    assert payload["availability"]["shipToLocationAvailability"]["quantity"] == 7
+    assert payload["availability"]["shipToLocationAvailability"]["allocationByFormat"] == {"auction": 0}
+    assert payload["product"]["upc"] == ["123456789012"]
+    assert payload["product"]["ean"] == ["1234567890123"]
+    assert payload["product"]["mpn"] == "AV-1"
+    assert payload["product"]["brand"] == "AquaVerve"
+    assert payload["product"]["epid"] == "1234567890"
+    assert payload["product"]["imageUrls"] == payload["image_urls"]
+    from scripts.cro_image_refresh import inventory_put_body
+    put_body = inventory_put_body(payload)
+    assert "image_urls" not in put_body
+    assert "quantity" not in put_body
+    assert "sku" not in put_body
+    assert "href" not in put_body
+    assert put_body["packageWeightAndSize"] == item_ok["packageWeightAndSize"]
+    assert put_body["product"]["imageUrls"] == payload["image_urls"]
 
     class SigStripClient:
         def __init__(self):
@@ -1026,8 +1057,20 @@ def test_store_root_live_rejected_by_parser():
     assert exc.value.code == 2
 
 
-def _write_store_yaml(path: Path, brand: str, scheduler: str, tree_id: str = "0") -> Path:
+def _write_store_yaml(
+    path: Path,
+    brand: str,
+    scheduler: str,
+    tree_id: str = "0",
+    listing_channel: str = "",
+    ebay_site_id: str = "",
+) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    ebay_extra = ""
+    if listing_channel:
+        ebay_extra += f"  listing_channel: {listing_channel}\n"
+    if ebay_site_id:
+        ebay_extra += f'  ebay_site_id: "{ebay_site_id}"\n'
     path.write_text(
         textwrap.dedent(
             f"""
@@ -1038,7 +1081,9 @@ def _write_store_yaml(path: Path, brand: str, scheduler: str, tree_id: str = "0"
             ebay:
               category_tree_id: "{tree_id}"
             """
-        ),
+        ).rstrip()
+        + "\n"
+        + ebay_extra,
         encoding="utf-8",
     )
     return path
@@ -1342,6 +1387,23 @@ def test_production_context_wires_readonly_gets(tmp_path, monkeypatch, no_promot
     assert imgs
     assert os.environ.get("EBAY_APP_ID") == "MAIN_APP"
 
+    dummy = tmp_path / "dummy.json"
+    dummy.write_text("{}", encoding="utf-8")
+    live_args = m.parse_args([
+        "--store", "main",
+        "--live",
+        "--candidates", str(dummy),
+        "--approve-sha256", "deadbeefdead",
+        "--out-dir", str(tmp_path / "wired-live"),
+    ])
+    live_ctx = m.build_context(live_args, profile=_main_profile())
+    assert live_ctx.ebay_client_factory is not None
+    assert live_ctx.read_live_price_fn is not None
+    assert live_ctx.write_price_fn is not None
+    assert live_ctx.verify_price_fn is not None
+    assert live_ctx.readonly_db is False
+    assert live_ctx.isolate_store_root is False
+
 
 def test_live_price_drop_never_calls_ad_apis(tmp_path, monkeypatch, no_promote_module):
     from scripts import cro_daily_improve as m
@@ -1458,7 +1520,7 @@ def test_live_price_fail_closed_missing_cost_and_exception(tmp_path, monkeypatch
     assert writes == []
 
     boom_ctx = _ctx(
-        tmp_path, "main", _main_profile(),
+        tmp_path / "boom_home", "main", _main_profile(),
         ebay_environment="PRODUCTION",
         precheck_price_fn=lambda **k: (_ for _ in ()).throw(RuntimeError("db locked")),
         read_live_price_fn=lambda sku, lid: 120,
@@ -1565,3 +1627,164 @@ def test_live_image_put_error_continues_batch(tmp_path, no_promote_module):
     assert "SKU1" in done_skus and "SKU3" in done_skus
     assert "SKU2" not in done_skus
     assert not ctx.lock_path.exists()
+
+
+def test_live_revalidates_raise_force_skip_and_oos(tmp_path, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    writes = []
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        db_rows=[
+            {"sku": "RAISE", "suggested_price": 120, "stock": 3, "listing_id": "L-RAISE"},
+            {"sku": "W465P451141", "suggested_price": 55, "stock": 2, "listing_id": "L-SKIP"},
+            {"sku": "OOS", "suggested_price": 80, "stock": 0, "listing_id": "L-OOS"},
+        ],
+        ebay_environment="PRODUCTION",
+        read_live_price_fn=lambda sku, lid: 120,
+        write_price_fn=lambda *a, **k: writes.append(a) or True,
+        write_price_db_fn=lambda *a, **k: writes.append(("db", a)) or True,
+        recent_terminal_fn=lambda **k: set(),
+        mark_done_fn=lambda *a, **k: 0,
+    )
+    cand = {
+        "schema": "cro_daily_improve/v1",
+        "store": "main",
+        "created_at": _now().isoformat(),
+        "expires_at": (_now() + timedelta(hours=2)).isoformat(),
+        "candidates": [
+            {"action": "price_drop", "sku": "RAISE", "listing_id": "L-RAISE",
+             "live_price": 120, "new_price": 130},
+            {"action": "price_drop", "sku": "W465P451141", "listing_id": "L-SKIP",
+             "live_price": 120, "new_price": 100},
+            {"action": "price_drop", "sku": "OOS", "listing_id": "L-OOS",
+             "live_price": 120, "new_price": 100},
+        ],
+    }
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(cand), encoding="utf-8")
+    rc = m.main(
+        [
+            "--store", "main", "--live",
+            "--candidates", str(path),
+            "--approve-sha256", _sha(path),
+            "--out-dir", str(ctx.out_dir),
+        ],
+        ctx=ctx,
+    )
+    assert rc == 0
+    assert writes == []
+    live = json.loads(next(ctx.out_dir.glob("*_live.json")).read_text(encoding="utf-8"))
+    by_sku = {row["sku"]: row for row in live["results"]}
+    assert by_sku["RAISE"]["status"] == "skipped"
+    assert by_sku["RAISE"]["reason"] == "not_a_drop"
+    assert by_sku["W465P451141"]["status"] == "skipped"
+    assert by_sku["W465P451141"]["reason"] == "force_skip"
+    assert by_sku["OOS"]["status"] == "skipped"
+    assert by_sku["OOS"]["reason"] == "stock_zero"
+
+
+def test_dry_run_does_not_fallback_to_suggested_price(tmp_path, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        load_products_fn=lambda _c: [{
+            "sku": "W5230P450590",
+            "listing_id": "188111",
+            "selling_price": 120,
+            "total_cost": 50,
+            "stock": 3,
+            "stock_known": True,
+            "images": [GIGA_URL],
+            "title": "Sofa",
+        }],
+        load_perf_fn=lambda _c: {"traffic_meta": {"api_ok": True}},
+        load_pending_fn=lambda **k: [{
+            "sku": "W5230P450590",
+            "action": "price_drop",
+            "listing_id": "188111",
+            "enqueued_at": _now().isoformat(),
+            "detail": {"suggested_price": 100},
+        }] if k.get("action_type") == "price_drop" else [],
+        recent_terminal_fn=lambda **k: set(),
+        scheduler_succeeded_fn=lambda name: True,
+        read_live_price_fn=lambda sku, lid: None,
+        compute_new_price_fn=lambda *a, **k: {"new_price": 100, "floor": 55, "strategy": "T"},
+        ebay_client_factory=lambda: GetOnlyClient(),
+    )
+    rc = m.main(["--store", "main", "--out-dir", str(ctx.out_dir)], ctx=ctx)
+    assert rc == 0
+    dry = json.loads(next(ctx.out_dir.glob("*_dry.json")).read_text(encoding="utf-8"))
+    assert dry["candidates"] == []
+    assert any(r["sku"] == "W5230P450590" for r in dry["excluded"]["live_price_unavailable"])
+
+
+def test_store_root_aqua_uses_trading_profile_not_main(tmp_path, monkeypatch, no_promote_module):
+    from scripts import cro_daily_improve as m
+    import scripts.batch_smart_reprice as reprice
+    from src.utils.store_profile import get_store_profile, reset_store_profile_cache
+
+    main_yaml = _write_store_yaml(
+        tmp_path / "main_profile.yaml", "AquaVerve", "full",
+    )
+    aqua_root = tmp_path / "AquaRides_Listing_Tool"
+    _write_store_yaml(
+        aqua_root / "config" / "store_profile.yaml",
+        "AquaRides",
+        "ops",
+        tree_id="100",
+        listing_channel="trading",
+        ebay_site_id="100",
+    )
+    db = aqua_root / "ebay_collection.db"
+    _init_db(db, [{"sku": "W465P170804", "stock": 2, "listing_id": "188802002738"}])
+    aqua_root.joinpath(".env").write_text(
+        "EBAY_ENVIRONMENT=SANDBOX\nEBAY_APP_ID=AQUA_APP\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("STORE_PROFILE_PATH", str(main_yaml))
+    monkeypatch.setenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    reset_store_profile_cache()
+    assert get_store_profile().brand_name == "AquaVerve"
+    assert str(getattr(get_store_profile(), "listing_channel", "inventory") or "inventory") != "trading"
+
+    seen = {}
+
+    def fake_trading(oauth, listing_id, profile=None):
+        seen["listing_id"] = listing_id
+        seen["site"] = str(getattr(profile, "ebay_site_id", "") or "")
+        seen["channel"] = str(getattr(profile, "listing_channel", "") or "")
+        seen["brand"] = str(getattr(profile, "brand_name", "") or "")
+        return 88.0
+
+    def boom_offers(*_a, **_k):
+        raise AssertionError("Inventory get_offers_by_sku must not run for Aqua Trading")
+
+    monkeypatch.setattr(reprice, "fetch_trading_item_price", fake_trading)
+    monkeypatch.setattr(m, "create_production_client", lambda ctx: type("C", (), {
+        "oauth": _OAuth(),
+        "get_offers_by_sku": staticmethod(boom_offers),
+        "get_inventory_item": staticmethod(lambda sku: None),
+    })())
+
+    args = m.parse_args([
+        "--store", "aqua",
+        "--store-root", str(aqua_root),
+        "--out-dir", str(tmp_path / "aqua-wired"),
+    ])
+    ctx = m.build_context(args)
+    assert ctx.ebay_client_factory is not None
+    assert ctx.read_live_price_fn is not None
+    assert ctx.isolate_store_root is True
+    assert ctx.profile.listing_channel == "trading"
+    assert ctx.profile.ebay_site_id == "100"
+    price = m.read_live_price(ctx, "W465P170804", "188802002738")
+    assert price == 88.0
+    assert seen == {
+        "listing_id": "188802002738",
+        "site": "100",
+        "channel": "trading",
+        "brand": "AquaRides",
+    }
+    assert get_store_profile().brand_name == "AquaVerve"

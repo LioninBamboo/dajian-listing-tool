@@ -681,6 +681,18 @@ def guard_price_fail_closed(
     return True, reason_s or "ok"
 
 
+def price_drop_skip_reason(live_price: float, new_price: float) -> Optional[str]:
+    """Shared dry-run / LIVE drop check. Only a strictly lower price is a drop."""
+    if new_price >= float(live_price):
+        return "not_a_drop"
+    return None
+
+
+def current_stock_reason(ctx: ImproveContext, sku: str) -> Optional[str]:
+    products = load_published_products(ctx)
+    return stock_exclude_reason(sku, load_stock_map(ctx, products))
+
+
 def stock_exclude_reason(sku: str, stock_map: Dict[str, Optional[int]]) -> Optional[str]:
     if sku not in stock_map:
         return "stock_unknown"
@@ -787,7 +799,7 @@ def fetch_live_price_readonly(ctx: ImproveContext, sku: str, listing_id: str) ->
             inner = getattr(client, "_inner", client)
             oauth = oauth or getattr(inner, "oauth", None)
             return read_current_listing_price(
-                oauth, sku, listing_id or "", client=client,
+                oauth, sku, listing_id or "", client=client, profile=ctx.profile,
             )
     except Exception:
         return None
@@ -822,7 +834,9 @@ def write_price_ebay_only(
         if oauth is None:
             return False
         if reprice_write_channel(listing_id, profile=ctx.profile) == "trading":
-            return bool(update_trading_price(oauth, sku, new_price, listing_id))
+            return bool(update_trading_price(
+                oauth, sku, new_price, listing_id, profile=ctx.profile,
+            ))
         getter = getattr(inner, "get_offers_by_sku", None) or getattr(client, "get_offers_by_sku", None)
         if getter is None:
             return False
@@ -909,6 +923,7 @@ def inspect_image(
     from scripts.cro_image_refresh import (
         _should_refresh,
         build_strict_refresh_payload,
+        payload_image_urls,
         urls_keep_giga_sigs,
     )
 
@@ -938,7 +953,7 @@ def inspect_image(
         result["status"] = "excluded"
         result["reason"] = payload_reason
         return result
-    if payload is not None and not urls_keep_giga_sigs(local_images, payload.get("image_urls") or []):
+    if payload is not None and not urls_keep_giga_sigs(local_images, payload_image_urls(payload)):
         result["status"] = "excluded"
         result["reason"] = "image_sig_stripped"
         return result
@@ -1034,6 +1049,7 @@ def empty_excluded() -> Dict[str, List[Any]]:
         "image_sig_stripped": [],
         "image_skip": [],
         "limit": [],
+        "live_price_unavailable": [],
         "other": [],
     }
 
@@ -1147,17 +1163,18 @@ def build_candidates(
                 continue
             live_price = read_live_price(ctx, sku, listing_id)
             if live_price is None:
-                try:
-                    live_price = float(product.get("selling_price") or 0) or None
-                except (TypeError, ValueError):
-                    live_price = None
+                _exclude(excluded, "live_price_unavailable", {
+                    "sku": sku, "action": action, "reason": "live_price_unavailable",
+                })
+                continue
             priced = compute_new_price(ctx, product, live_price, market_data, seed)
-            if not priced or live_price is None:
+            if not priced:
                 _exclude(excluded, "other", {"sku": sku, "action": action, "reason": "price_unavailable"})
                 continue
             new_price = float(priced["new_price"])
-            if new_price >= float(live_price):
-                _exclude(excluded, "not_a_drop", {
+            drop_reason = price_drop_skip_reason(float(live_price), new_price)
+            if drop_reason:
+                _exclude(excluded, drop_reason, {
                     "sku": sku,
                     "listing_id": listing_id,
                     "live_price": float(live_price),
@@ -1312,13 +1329,29 @@ def apply_price_live(ctx: ImproveContext, cand: Dict[str, Any]) -> Dict[str, Any
     sku = str((cand or {}).get("sku") or "")
     try:
         listing_id = str(cand.get("listing_id") or "")
-        expected_live = float(cand["live_price"])
         new_price = float(cand["new_price"])
-        live = read_live_price(ctx, sku, listing_id)
-        if live is None or abs(float(live) - expected_live) > 0.009:
+        if sku in force_skip_skus(ctx.profile):
             return {
                 "sku": sku, "action": "price_drop", "status": "skipped",
-                "reason": "price_moved", "before": live, "after": None,
+                "reason": "force_skip", "before": None, "after": None,
+            }
+        stock_reason = current_stock_reason(ctx, sku)
+        if stock_reason:
+            return {
+                "sku": sku, "action": "price_drop", "status": "skipped",
+                "reason": stock_reason, "before": None, "after": None,
+            }
+        live = read_live_price(ctx, sku, listing_id)
+        if live is None:
+            return {
+                "sku": sku, "action": "price_drop", "status": "skipped",
+                "reason": "live_price_unavailable", "before": None, "after": None,
+            }
+        drop_reason = price_drop_skip_reason(float(live), new_price)
+        if drop_reason:
+            return {
+                "sku": sku, "action": "price_drop", "status": "skipped",
+                "reason": drop_reason, "before": live, "after": None,
             }
         ok, reason = guard_price_fail_closed(ctx, sku, new_price, listing_id)
         if not ok:
@@ -1352,12 +1385,12 @@ def apply_price_live(ctx: ImproveContext, cand: Dict[str, Any]) -> Dict[str, Any
                     ctx.writes["db"] += 1
             return {
                 "sku": sku, "action": "price_drop", "status": "done",
-                "before": expected_live, "after": readback if readback is not None else new_price,
+                "before": live, "after": readback if readback is not None else new_price,
                 "readback": readback, "reason": "ok",
             }
         return {
             "sku": sku, "action": "price_drop", "status": "failed",
-            "before": expected_live, "after": readback, "reason": "write_or_verify_failed",
+            "before": live, "after": readback, "reason": "write_or_verify_failed",
         }
     except Exception as exc:
         return {
@@ -1394,11 +1427,18 @@ def apply_image_live(ctx: ImproveContext, cand: Dict[str, Any]) -> Dict[str, Any
     from scripts.cro_image_refresh import (
         _should_refresh,
         build_strict_refresh_payload,
+        payload_image_urls,
+        put_strict_inventory_item,
         urls_keep_giga_sigs,
     )
 
     sku = str((cand or {}).get("sku") or "")
     try:
+        if sku in force_skip_skus(ctx.profile):
+            return {
+                "sku": sku, "action": "image_refresh", "status": "skipped",
+                "reason": "force_skip",
+            }
         with store_root_runtime(ctx):
             client = get_ebay_client(ctx)
             if client is None:
@@ -1421,11 +1461,11 @@ def apply_image_live(ctx: ImproveContext, cand: Dict[str, Any]) -> Dict[str, Any
             payload, reason = build_strict_refresh_payload(item, local)
             if reason:
                 return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": reason}
-            if payload is None or not urls_keep_giga_sigs(local_images, payload.get("image_urls") or []):
+            if payload is None or not urls_keep_giga_sigs(local_images, payload_image_urls(payload)):
                 return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": "image_sig_stripped"}
             if not need:
                 return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": "live already healthy"}
-            client.create_or_replace_inventory_item(sku, payload)
+            put_strict_inventory_item(client, sku, payload)
             ctx.writes["ebay"] += 1
             item2 = client.get_inventory_item(sku) or {}
             live2 = list(((item2.get("product") or {}).get("imageUrls")) or [])
@@ -1508,6 +1548,11 @@ def build_context(args: argparse.Namespace, profile: Any = None) -> ImproveConte
         store_env=store_env,
         isolate_store_root=isolate,
     )
+    return attach_production_io(ctx)
+
+
+def attach_production_io(ctx: ImproveContext) -> ImproveContext:
+    """Wire real eBay I/O on every build_context path (dry-run, LIVE, store-root)."""
     ctx.ebay_client_factory = lambda: create_production_client(ctx)
     ctx.read_live_price_fn = lambda sku, lid: fetch_live_price_readonly(ctx, sku, lid)
     ctx.write_price_fn = lambda sku, price, lid: write_price_ebay_only(ctx, sku, price, lid)
