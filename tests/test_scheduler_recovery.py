@@ -1429,6 +1429,7 @@ def test_write_inventory_resume_marker_retries_permission_error(tmp_path, monkey
     lock_dir.mkdir()
     monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
     monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    scheduler_daemon._RESUME_MARKER_MEMORY.clear()
     calls = {'n': 0}
     real_replace = os.replace
 
@@ -1440,13 +1441,181 @@ def test_write_inventory_resume_marker_retries_permission_error(tmp_path, monkey
 
     monkeypatch.setattr(scheduler_daemon.os, 'replace', _flaky_replace)
     monkeypatch.setattr(scheduler_daemon.time, 'sleep', lambda *_: None)
-    path = scheduler_daemon._write_inventory_resume_marker(
+    assert scheduler_daemon._write_inventory_resume_marker(
         'daily_tasks',
         {'date': '20260511', 'outcome': 'pending'},
-    )
-    assert path.exists()
+    ) is True
     assert calls['n'] == 3
     assert scheduler_daemon._read_inventory_resume_marker('daily_tasks')['outcome'] == 'pending'
+
+
+def test_marker_write_failure_does_not_launch_resume(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'interrupted',
+                    'at': '2026-05-11T09:40:00',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+    scheduler_daemon._RESUME_MARKER_MEMORY.clear()
+    # Seed exit75 so claim takes the rewrite path (not O_CREAT).
+    scheduler_daemon._write_inventory_resume_marker(
+        'daily_tasks',
+        {
+            'date': '20260511',
+            'outcome': 'exit75',
+            'exit75_retries': 1,
+            'last_exit75_at': '2026-05-11T11:00:00',
+            'handshake_claimed': False,
+        },
+    )
+    monkeypatch.setattr(
+        scheduler_daemon,
+        '_write_inventory_resume_marker',
+        lambda *a, **k: False,
+    )
+    calls = []
+    monkeypatch.setattr(
+        scheduler_daemon,
+        'run_task',
+        lambda *a, **k: calls.append('run') or (True, 'nope'),
+    )
+    ok, message = scheduler_daemon.task_daily_full()
+    assert ok is True
+    assert calls == []
+    assert 'claim lost' in message.lower() or 'consumed' in message.lower()
+
+
+def test_stale_pending_marker_allows_bounded_retry_with_alert(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir(parents=True)
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'interrupted',
+                    'at': '2026-05-11T09:40:00',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir)
+    # Pending launched well past handshake window; launcher PID still "alive".
+    (lock_dir / 'daily_tasks.inventory_resume.20260511.json').write_text(
+        json.dumps({
+            'date': '20260511',
+            'launch_token': 'old',
+            'launched_at': '2026-05-11T12:40:00',
+            'outcome': 'pending',
+            'handshake_claimed': False,
+            'never_claimed_retry_used': False,
+            'launcher_pid': os.getpid(),
+            'launcher_creation_marker': 'alive-marker',
+        }),
+        encoding='utf-8',
+    )
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
+    self_pid = os.getpid()
+    # Crash lock worker (pid 555) is dead; marker launcher (this process) looks alive.
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: pid == self_pid)
+    monkeypatch.setattr(
+        scheduler_daemon,
+        'is_process_identity_alive',
+        lambda pid, marker: pid == self_pid,
+    )
+    scheduler_daemon._RESUME_MARKER_MEMORY.clear()
+    alerts = []
+    monkeypatch.setattr(
+        scheduler_daemon,
+        '_alert_inventory_resume',
+        lambda msg, **kwargs: alerts.append(msg),
+    )
+    calls = []
+
+    def _fake_run_task(*args, **kwargs):
+        calls.append('run')
+        return True, 'Success in 1s'
+
+    monkeypatch.setattr(scheduler_daemon, 'run_task', _fake_run_task)
+
+    assert scheduler_daemon._pending_resume_launch_is_stale(
+        scheduler_daemon._read_inventory_resume_marker('daily_tasks')
+    ) is True
+    assert scheduler_daemon._should_resume_daily_inventory('daily_tasks') is True
+    ok, message = scheduler_daemon.task_daily_full()
+    assert ok is True
+    assert len(calls) == 1
+    assert any('stale' in a.lower() or 'never-claimed' in a.lower() for a in alerts)
+    marker = scheduler_daemon._read_inventory_resume_marker('daily_tasks')
+    assert marker.get('never_claimed_retry_used') is True or marker.get('outcome') == 'success'
+
+
+def test_resume_non75_claim_miss_keeps_unclaimed_marker_and_alerts(tmp_path, monkeypatch):
+    health_path = tmp_path / '_scheduler_health.json'
+    lock_dir = tmp_path / '_task_locks'
+    health_path.write_text(
+        json.dumps({
+            'tasks': {
+                'daily_tasks': {
+                    'status': 'interrupted',
+                    'at': '2026-05-11T09:40:00',
+                },
+            }
+        }, ensure_ascii=False),
+        encoding='utf-8',
+    )
+    _write_today_dead_lock(lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'HEALTH_FILE', health_path)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    monkeypatch.setattr(scheduler_daemon, '_is_ops_scheduler', lambda: False)
+    monkeypatch.setattr(scheduler_daemon, '_is_pid_alive', lambda pid: False)
+    scheduler_daemon._RESUME_MARKER_MEMORY.clear()
+    alerts = []
+    monkeypatch.setattr(
+        scheduler_daemon,
+        '_alert_inventory_resume',
+        lambda msg, **kwargs: alerts.append(msg),
+    )
+
+    def _fake_run_task(*args, **kwargs):
+        assert kwargs.get('preserve_health_on_handshake_miss') is True
+        # Mirror run_task resume-path claim-miss alert.
+        scheduler_daemon._emit_resume_alert_once(
+            'daily_tasks',
+            scheduler_daemon._RESUME_ALERT_KIND_CLAIM_MISS,
+            'daily_tasks: worker lock handshake failed (exit=42)',
+        )
+        return False, 'Worker lock handshake failed (exit=42)'
+
+    monkeypatch.setattr(scheduler_daemon, 'run_task', _fake_run_task)
+
+    ok, message = scheduler_daemon.task_daily_full()
+    assert ok is True
+    assert message == scheduler_daemon._RESUME_LOCK_SKIP_MESSAGE
+    health = json.loads(health_path.read_text(encoding='utf-8'))
+    assert health['tasks']['daily_tasks']['status'] == 'interrupted'
+    marker = scheduler_daemon._read_inventory_resume_marker('daily_tasks')
+    assert marker['handshake_claimed'] is False
+    assert marker['outcome'] == 'exit75'
+    assert any('handshake failed' in a.lower() for a in alerts)
 
 
 def test_resume_handshake_timeout_exhaust_alerts_no_full_daily(tmp_path, monkeypatch):
