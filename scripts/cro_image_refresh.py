@@ -8,7 +8,7 @@
      c. 若本地图数 > 1 且与远端首图不同 (或远端只有 1 张)
         → 以 live GET 的深拷贝作为 PUT 体, 只替换 product.imageUrls
         live quantity 缺失 / 无法解析 / <= 0 时跳过, 绝不默认成 1, 也不发 PUT
-     d. 二次 GET 验证生效后才 mark_done
+     d. 二次 GET, 读回 imageUrls 张数必须等于写出张数, 少一张也失败并留在队列
   3. 改完写 logs/cro_image_refresh_<date>.json + 可选邮件汇总
 
 PUT 体是完整 inventory item (createOrReplace 会整单替换). 不走
@@ -77,7 +77,8 @@ def _load_local_images(sku: str) -> List[str]:
     return _load_local_product(sku)['images']
 
 
-# GET 回包里不能原样写回的字段. locale / availability / packageWeightAndSize 要保留.
+# GET 回包里不能原样写回的字段. locale / availability 要保留.
+# packageWeightAndSize 保留, 但 weight.value <= 0 不能写回 (eBay 25709).
 _GET_ONLY_INVENTORY_KEYS = ('sku', 'inventoryItemGroupKeys', 'href')
 _RETRYABLE_SKIP_REASONS = frozenset({
     'live quantity missing',
@@ -162,6 +163,27 @@ def _image_url_drop_oss_process(url: str) -> str:
     return body[:qmark] + '?' + '&'.join(kept) + fragment
 
 
+def _omit_nonpositive_package_weight(body: Dict[str, Any]) -> None:
+    """去掉 weight.value <= 0. 块里没有别的字段时连 packageWeightAndSize 一起去掉.
+
+    与其它 inventory PUT 一样: eBay 拒收 <= 0 的重量. 正数重量和尺寸原样保留.
+    """
+    pkg = body.get('packageWeightAndSize')
+    if not isinstance(pkg, dict):
+        return
+    weight = pkg.get('weight')
+    if isinstance(weight, dict):
+        try:
+            value = float(weight.get('value', 0))
+        except (TypeError, ValueError):
+            pkg.pop('weight', None)
+        else:
+            if value <= 0:
+                pkg.pop('weight', None)
+    if not pkg:
+        body.pop('packageWeightAndSize', None)
+
+
 def _inventory_refresh_put_body(item: Dict[str, Any], image_urls: List[str]) -> Dict[str, Any]:
     """深拷贝 live GET, 只替换 product.imageUrls."""
     body = copy.deepcopy(item)
@@ -173,6 +195,7 @@ def _inventory_refresh_put_body(item: Dict[str, Any], image_urls: List[str]) -> 
     if not isinstance(product, dict):
         raise RuntimeError('live product missing')
     product['imageUrls'] = list(image_urls)
+    _omit_nonpositive_package_weight(body)
     return body
 
 
@@ -207,6 +230,17 @@ def _put_inventory_refresh(client: Any, sku: str, body: Dict[str, Any]) -> None:
     if code not in (200, 204):
         detail = getattr(response, 'text', '') or ''
         raise RuntimeError(f'inventory PUT HTTP {code}: {detail[:300]}')
+
+
+def _readback_image_urls(item: Any) -> List[Any]:
+    """POST-PUT 读回的 imageUrls. 不清洗、不重编码签名参数, 只取列表本身."""
+    if not isinstance(item, dict):
+        return []
+    product = item.get('product')
+    if not isinstance(product, dict):
+        return []
+    raw = product.get('imageUrls') or []
+    return list(raw) if isinstance(raw, list) else []
 
 
 def _skip_row(sku: str, reason: str, **extra: Any) -> Dict[str, Any]:
@@ -282,16 +316,10 @@ def _refresh_one(client, sku: str, local: Dict[str, Any]) -> Dict[str, Any]:
         item2 = client.get_inventory_item(sku) or {}
     except Exception as e:
         return {'sku': sku, 'status': 'failed', 'reason': f'verification GET failed: {e}'}
-    live2 = []
-    if isinstance(item2, dict):
-        raw_live2 = ((item2.get('product') or {}).get('imageUrls')) or []
-        live2 = raw_live2 if isinstance(raw_live2, list) else []
+    live2 = _readback_image_urls(item2)
     expected_count = len(prepared)
-    if not live2:
-        return {'sku': sku, 'status': 'failed',
-                'reason': 'verification mismatch',
-                'expected_count': expected_count, 'live_n': 0}
-    if len(live2) < max(1, expected_count - 1):
+    # 写出几张, 读回就必须几张. 少一张记 failed, 不 mark_done, SKU 留在队列.
+    if len(live2) != expected_count:
         return {'sku': sku, 'status': 'failed',
                 'reason': 'verification image count mismatch',
                 'expected_count': expected_count, 'live_n': len(live2)}

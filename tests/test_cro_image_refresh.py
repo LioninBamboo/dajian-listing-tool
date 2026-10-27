@@ -55,9 +55,10 @@ class _Session:
 
 
 class FakeClient:
-    def __init__(self, items, explode=()):
+    def __init__(self, items, explode=(), readback=None):
         self.items = items
         self.explode = set(explode)
+        self.readback = readback or {}
         self.session = _Session(self)
         self.base_url = 'https://api.ebay.test'
         self.oauth = _OAuth()
@@ -67,6 +68,14 @@ class FakeClient:
 
     def get_inventory_item(self, sku):
         if sku in self.put_by_sku:
+            if sku in self.readback:
+                item = copy.deepcopy(self.put_by_sku[sku])
+                product = item.get('product')
+                if not isinstance(product, dict):
+                    product = {}
+                    item['product'] = product
+                product['imageUrls'] = list(self.readback[sku])
+                return item
             return self.put_by_sku[sku]
         item = self.items[sku]
         if isinstance(item, Exception):
@@ -375,3 +384,90 @@ def test_live_get_failure_skips_without_writing_local_fields(monkeypatch):
     assert list(client.put_by_sku) == ['SKU-OK']
     assert client.partial_writes == []
     assert marked == [(['SKU-OK'], 'image_refresh', 'done')]
+
+
+def test_readback_image_count_must_match_or_stay_queued(monkeypatch):
+    """2 张写出、读回 1 张不算 done; 3 张写出、读回 3 张才 done."""
+    marked = []
+    two = ['https://img/a.jpg', 'https://img/b.jpg']
+    three = [
+        'https://img/1.jpg?x-cc=10&x-cu=1&x-ct=2&x-cs=sig/part=a%20b',
+        'https://img/2.jpg?x-cc=10&x-cu=1&x-ct=2&x-cs=sig/part=a%20b',
+        'https://img/3.jpg?x-cc=10&x-cu=1&x-ct=2&x-cs=sig/part=a%20b',
+    ]
+    client = FakeClient(
+        {
+            'SKU-COLLAPSE': _live_item(quantity=5, sku='SKU-COLLAPSE'),
+            'SKU-EXACT': _live_item(quantity=5, sku='SKU-EXACT'),
+        },
+        readback={
+            'SKU-COLLAPSE': two[:1],
+            'SKU-EXACT': list(three),
+        },
+    )
+
+    def images(sku):
+        return list(two if sku == 'SKU-COLLAPSE' else three)
+
+    cir = _install(
+        monkeypatch,
+        client,
+        [{'sku': 'SKU-COLLAPSE'}, {'sku': 'SKU-EXACT'}],
+        images=images,
+        marked=marked,
+    )
+
+    rep = cir.run(apply_changes=True, limit=10)
+
+    assert rep['failed'] == ['SKU-COLLAPSE']
+    assert rep['done'] == ['SKU-EXACT']
+    assert rep['rows'][0]['reason'] == 'verification image count mismatch'
+    assert rep['rows'][0]['expected_count'] == 2
+    assert rep['rows'][0]['live_n'] == 1
+    assert rep['rows'][1]['live_n'] == 3
+    assert marked == [(['SKU-EXACT'], 'image_refresh', 'done')]
+    sent = client.put_by_sku['SKU-EXACT']['product']['imageUrls']
+    assert [url.encode('utf-8') for url in sent] == [url.encode('utf-8') for url in three]
+    assert client.partial_writes == []
+
+
+def test_nonpositive_package_weight_dropped_from_put_body(monkeypatch):
+    marked = []
+    zero_only = _live_item(quantity=5, sku='SKU-W0')
+    zero_only['packageWeightAndSize'] = {'weight': {'value': 0, 'unit': 'POUND'}}
+    zero_with_dims = _live_item(quantity=5, sku='SKU-WD')
+    zero_with_dims['packageWeightAndSize'] = {
+        'weight': {'value': 0, 'unit': 'POUND'},
+        'dimensions': {
+            'height': 10.0, 'length': 40.0, 'width': 20.0, 'unit': 'INCH',
+        },
+    }
+    client = FakeClient({
+        'SKU-W0': zero_only,
+        'SKU-WD': zero_with_dims,
+    })
+    cir = _install(
+        monkeypatch,
+        client,
+        [{'sku': 'SKU-W0'}, {'sku': 'SKU-WD'}],
+        marked=marked,
+    )
+
+    rep = cir.run(apply_changes=True, limit=10)
+
+    assert rep['done'] == ['SKU-W0', 'SKU-WD']
+    assert rep['failed'] == []
+    body_zero = client.put_by_sku['SKU-W0']
+    body_dims = client.put_by_sku['SKU-WD']
+    assert 'packageWeightAndSize' not in body_zero
+    assert 'weight' not in body_dims['packageWeightAndSize']
+    assert body_dims['packageWeightAndSize']['dimensions'] == {
+        'height': 10.0, 'length': 40.0, 'width': 20.0, 'unit': 'INCH',
+    }
+    assert body_zero['availability']['shipToLocationAvailability']['quantity'] == 5
+    assert body_dims['availability']['shipToLocationAvailability']['quantity'] == 5
+    assert zero_only['packageWeightAndSize']['weight']['value'] == 0
+    assert marked == [
+        (['SKU-W0'], 'image_refresh', 'done'),
+        (['SKU-WD'], 'image_refresh', 'done'),
+    ]
