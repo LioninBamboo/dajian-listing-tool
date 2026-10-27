@@ -1192,3 +1192,376 @@ def test_store_root_uses_gp_config_not_preloaded_main_env(tmp_path, monkeypatch,
     assert rc == m.EXIT_USAGE
     assert os.environ.get("EBAY_ENVIRONMENT") == "PRODUCTION"
     assert os.environ.get("EBAY_APP_ID") == "MAIN_APP"
+
+
+class _OAuth:
+    def get_valid_token(self):
+        return "tok"
+
+
+class _RecordingClient:
+    def __init__(self, prices=None, items=None):
+        self.oauth = _OAuth()
+        self.base_url = "https://api.ebay.com"
+        self.writes = []
+        self.gets = []
+        self.prices = prices or {}
+        self.items = items or {}
+        self.session = self
+
+    def get_inventory_item(self, sku):
+        self.gets.append(("inventory", sku))
+        return self.items.get(sku) or _item(["https://live/old.jpg"], qty=3)
+
+    def get_offers_by_sku(self, sku, marketplace_id=None):
+        self.gets.append(("offers", sku))
+        price = self.prices.get(sku, 120)
+        return [{
+            "offerId": f"off-{sku}",
+            "listing": {"listingId": "188111", "listingStatus": "ACTIVE"},
+            "status": "PUBLISHED",
+            "marketplaceId": "EBAY_US",
+            "pricingSummary": {"price": {"value": str(price), "currency": "USD"}},
+        }]
+
+    def put(self, url, headers=None, json=None, timeout=None):
+        self.writes.append(("offer_put", url, json))
+        return type("Resp", (), {"status_code": 204})()
+
+    def create_or_replace_inventory_item(self, sku, payload):
+        self.writes.append(("inventory_put", sku, payload))
+        urls = list((payload or {}).get("image_urls") or [])
+        qty = (payload or {}).get("quantity", 3)
+        self.items[sku] = _item(urls or [GIGA_URL], qty=qty)
+        return {"ok": True}
+
+    def update_ad_bid(self, *a, **k):
+        self.writes.append(("update_ad_bid", a, k))
+        raise AssertionError("ad write")
+
+    def delete_ad(self, *a, **k):
+        self.writes.append(("delete_ad", a, k))
+        raise AssertionError("ad write")
+
+
+def test_production_context_wires_readonly_gets(tmp_path, monkeypatch, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    main_root = tmp_path / "main_checkout"
+    _write_store_yaml(main_root / "config" / "store_profile.yaml", "AquaVerve", "full")
+    db = main_root / "ebay_collection.db"
+    _init_db(db, [{
+        "sku": "W5230P450590",
+        "suggested_price": 120,
+        "stock": 4,
+        "listing_id": "188111",
+        "images": [GIGA_URL, GIGA_URL_2],
+    }])
+    main_root.joinpath(".env").write_text(
+        "\n".join([
+            "EBAY_ENVIRONMENT=SANDBOX",
+            "EBAY_APP_ID=STORE_APP",
+            "EBAY_CERT_ID=STORE_CERT",
+            "EBAY_DEV_ID=STORE_DEV",
+            f"DAJIAN_COLLECTION_DB={db}",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    cache = main_root / "logs" / "runtime_cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    cache.joinpath("performance_cache.json").write_text(
+        json.dumps({"traffic_meta": {"api_ok": True, "record_count": 1}, "traffic": {}, "sales": {}}),
+        encoding="utf-8",
+    )
+    queue = main_root / "logs" / "cro_action_queue.jsonl"
+    queue.write_text(json.dumps({
+        "sku": "W5230P450590",
+        "action": "image_refresh",
+        "status": "pending",
+        "listing_id": "188111",
+        "enqueued_at": datetime.now(CST).isoformat(),
+    }) + "\n", encoding="utf-8")
+    main_root.joinpath("logs", "_scheduler_health.json").write_text(json.dumps({
+        "tasks": {"daily_tasks": {"status": "success", "at": datetime.now(CST).isoformat()}}
+    }), encoding="utf-8")
+
+    monkeypatch.setenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    monkeypatch.setenv("EBAY_APP_ID", "MAIN_APP")
+    recorded = {"apps": []}
+    client = _RecordingClient(
+        items={"W5230P450590": _item(["https://live/old.jpg"], qty=3)},
+        prices={"W5230P450590": 120},
+    )
+
+    def production_client(ctx):
+        recorded["apps"].append(os.environ.get("EBAY_APP_ID"))
+        recorded["readonly"] = ctx.readonly_db
+        if ctx.readonly_db:
+            return m.ReadOnlyEbayClient(client)
+        return client
+
+    monkeypatch.setattr(m, "create_production_client", production_client)
+
+    args = m.parse_args([
+        "--store", "main",
+        "--store-root", str(main_root),
+        "--out-dir", str(tmp_path / "wired"),
+    ])
+    ctx = m.build_context(args)
+    assert ctx.ebay_client_factory is not None
+    assert ctx.read_live_price_fn is not None
+    assert ctx.write_price_fn is not None
+    assert ctx.verify_price_fn is not None
+    assert ctx.readonly_db is True
+    assert ctx.isolate_store_root is True
+
+    wrapped = m.get_ebay_client(ctx)
+    assert isinstance(wrapped, m.ReadOnlyEbayClient)
+    with pytest.raises(RuntimeError, match="dry-run write blocked"):
+        wrapped.create_or_replace_inventory_item("W5230P450590", {})
+    with pytest.raises(RuntimeError, match="dry-run write blocked"):
+        wrapped.update_ad_bid("x")
+    assert m.read_live_price(ctx, "W5230P450590", "188111") == 120.0
+    assert recorded["apps"] == ["STORE_APP"]
+    assert os.environ.get("EBAY_APP_ID") == "MAIN_APP"
+    assert os.environ.get("EBAY_ENVIRONMENT") == "PRODUCTION"
+    assert client.writes == []
+
+    rc = m.main([
+        "--store", "main",
+        "--store-root", str(main_root),
+        "--out-dir", str(tmp_path / "wired-run"),
+    ])
+    assert rc == 0
+    assert client.writes == []
+    assert any(kind == "inventory" for kind, _sku in client.gets)
+    dry = json.loads(next((tmp_path / "wired-run").glob("*_dry.json")).read_text(encoding="utf-8"))
+    assert dry["writes"] == {"db": 0, "queue": 0, "ebay": 0}
+    assert dry["mode"] == "dry"
+    imgs = [c for c in dry["candidates"] if c["action"] == "image_refresh"]
+    assert imgs
+    assert os.environ.get("EBAY_APP_ID") == "MAIN_APP"
+
+
+def test_live_price_drop_never_calls_ad_apis(tmp_path, monkeypatch, no_promote_module):
+    from scripts import cro_daily_improve as m
+    import scripts.batch_smart_reprice as reprice
+    import src.services.repricing_guard as guard
+    import src.services.ebay_ad_service as ads
+
+    ad_calls = []
+    monkeypatch.setattr(reprice, "update_ebay_price", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("update_ebay_price must not be used")
+    ))
+    monkeypatch.setattr(guard, "_try_disable_ad", lambda *a, **k: ad_calls.append("disable") or (False, "failed"))
+    monkeypatch.setattr(ads.EbayAdService, "delete_ad", lambda *a, **k: ad_calls.append("delete_ad"))
+    monkeypatch.setattr(ads.EbayAdService, "update_ad_bid", lambda *a, **k: ad_calls.append("update_ad_bid"))
+    monkeypatch.setattr(ads.EbayAdService, "create_ad_safe", lambda *a, **k: ad_calls.append("create_ad_safe"))
+
+    client = _RecordingClient(prices={"W5230P450590": 110})
+    marked = []
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        ebay_environment="PRODUCTION",
+        ebay_client_factory=lambda: client,
+        read_live_price_fn=lambda sku, lid: 120 if not client.writes else 110,
+        precheck_price_fn=None,
+        write_price_fn=None,
+        write_price_db_fn=lambda *a, **k: True,
+        mark_done_fn=lambda skus, action, queue_path=None: marked.append((list(skus), action)) or len(list(skus)),
+        recent_terminal_fn=lambda **k: set(),
+    )
+    cand = {
+        "schema": "cro_daily_improve/v1",
+        "store": "main",
+        "created_at": _now().isoformat(),
+        "expires_at": (_now() + timedelta(hours=2)).isoformat(),
+        "candidates": [{
+            "action": "price_drop",
+            "sku": "W5230P450590",
+            "listing_id": "188111",
+            "live_price": 120,
+            "new_price": 110,
+        }],
+    }
+    path = tmp_path / "price.json"
+    path.write_text(json.dumps(cand), encoding="utf-8")
+    rc = m.main(
+        [
+            "--store", "main", "--live",
+            "--candidates", str(path),
+            "--approve-sha256", _sha(path),
+            "--out-dir", str(ctx.out_dir),
+        ],
+        ctx=ctx,
+    )
+    assert rc == 0
+    assert ad_calls == []
+    live = json.loads(next(ctx.out_dir.glob("*_live.json")).read_text(encoding="utf-8"))
+    assert live["results"][0]["status"] == "done"
+    assert any(kind == "offer_put" for kind, *_ in client.writes)
+    assert not any(kind in {"update_ad_bid", "delete_ad"} for kind, *_rest in client.writes)
+    assert marked
+
+
+def test_live_price_fail_closed_missing_cost_and_exception(tmp_path, monkeypatch, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    db = tmp_path / "main" / "ebay_collection.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    _init_db(db, [{
+        "sku": "NOCOST",
+        "suggested_price": 80,
+        "stock": 3,
+        "listing_id": "L-NO",
+        "cost_breakdown": {"total_dajian_cost": 0},
+    }])
+    writes = []
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        ebay_environment="PRODUCTION",
+        ebay_client_factory=lambda: (_ for _ in ()).throw(AssertionError("client")),
+        read_live_price_fn=lambda sku, lid: 80,
+        write_price_fn=lambda *a, **k: writes.append("price") or True,
+        write_price_db_fn=lambda *a, **k: writes.append("db") or True,
+        recent_terminal_fn=lambda **k: set(),
+        mark_done_fn=lambda *a, **k: 0,
+    )
+    cand = {
+        "schema": "cro_daily_improve/v1",
+        "store": "main",
+        "created_at": _now().isoformat(),
+        "expires_at": (_now() + timedelta(hours=2)).isoformat(),
+        "candidates": [{
+            "action": "price_drop",
+            "sku": "NOCOST",
+            "listing_id": "L-NO",
+            "live_price": 80,
+            "new_price": 70,
+        }],
+    }
+    path = tmp_path / "nocost.json"
+    path.write_text(json.dumps(cand), encoding="utf-8")
+    rc = m.main(
+        [
+            "--store", "main", "--live",
+            "--candidates", str(path),
+            "--approve-sha256", _sha(path),
+            "--out-dir", str(ctx.out_dir),
+        ],
+        ctx=ctx,
+    )
+    assert rc == 0
+    live = json.loads(next(ctx.out_dir.glob("*_live.json")).read_text(encoding="utf-8"))
+    assert live["results"][0]["status"] == "skipped"
+    assert str(live["results"][0]["reason"]).startswith("guard_error")
+    assert writes == []
+
+    boom_ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        ebay_environment="PRODUCTION",
+        precheck_price_fn=lambda **k: (_ for _ in ()).throw(RuntimeError("db locked")),
+        read_live_price_fn=lambda sku, lid: 120,
+        write_price_fn=lambda *a, **k: writes.append("price") or True,
+        recent_terminal_fn=lambda **k: set(),
+        mark_done_fn=lambda *a, **k: 0,
+    )
+    cand2 = dict(cand)
+    cand2["candidates"] = [{
+        "action": "price_drop",
+        "sku": "W5230P450590",
+        "listing_id": "188111",
+        "live_price": 120,
+        "new_price": 110,
+    }]
+    path2 = tmp_path / "boom.json"
+    path2.write_text(json.dumps(cand2), encoding="utf-8")
+    rc = m.main(
+        [
+            "--store", "main", "--live",
+            "--candidates", str(path2),
+            "--approve-sha256", _sha(path2),
+            "--out-dir", str(boom_ctx.out_dir),
+        ],
+        ctx=boom_ctx,
+    )
+    assert rc == 0
+    live2 = json.loads(next(boom_ctx.out_dir.glob("*_live.json")).read_text(encoding="utf-8"))
+    assert live2["results"][0]["status"] == "skipped"
+    assert "guard_error" in str(live2["results"][0]["reason"])
+    assert writes == []
+
+
+def test_live_image_put_error_continues_batch(tmp_path, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    skus = ["SKU1", "SKU2", "SKU3"]
+
+    class BatchClient:
+        def __init__(self):
+            self.puts = []
+            self.items = {sku: _item(["https://live/old.jpg"], qty=3) for sku in skus}
+
+        def get_inventory_item(self, sku):
+            return self.items[sku]
+
+        def create_or_replace_inventory_item(self, sku, payload):
+            if sku == "SKU2":
+                raise RuntimeError("put exploded")
+            self.puts.append(sku)
+            urls = list((payload or {}).get("image_urls") or [GIGA_URL])
+            self.items[sku] = _item(urls, qty=int((payload or {}).get("quantity") or 3))
+
+    client = BatchClient()
+    marked = []
+    ctx = _ctx(
+        tmp_path, "main", _main_profile(),
+        ebay_environment="PRODUCTION",
+        ebay_client_factory=lambda: client,
+        load_local_product_fn=lambda sku: {
+            "images": [GIGA_URL, GIGA_URL_2], "title": "t", "description": "d",
+        },
+        recent_terminal_fn=lambda **k: set(),
+        mark_done_fn=lambda skus_, action, queue_path=None: marked.append((list(skus_), action)) or len(list(skus_)),
+    )
+    cand = {
+        "schema": "cro_daily_improve/v1",
+        "store": "main",
+        "created_at": _now().isoformat(),
+        "expires_at": (_now() + timedelta(hours=2)).isoformat(),
+        "candidates": [
+            {
+                "action": "image_refresh",
+                "sku": sku,
+                "listing_id": f"L{sku}",
+                "live_n": 1,
+                "live_lead": "https://live/old.jpg",
+                "reason": "local lead image differs from live",
+            }
+            for sku in skus
+        ],
+    }
+    path = tmp_path / "batch.json"
+    path.write_text(json.dumps(cand), encoding="utf-8")
+    rc = m.main(
+        [
+            "--store", "main", "--live",
+            "--candidates", str(path),
+            "--approve-sha256", _sha(path),
+            "--out-dir", str(ctx.out_dir),
+        ],
+        ctx=ctx,
+    )
+    assert rc == 0
+    assert client.puts == ["SKU1", "SKU3"]
+    live = json.loads(next(ctx.out_dir.glob("*_live.json")).read_text(encoding="utf-8"))
+    by_sku = {row["sku"]: row for row in live["results"]}
+    assert by_sku["SKU1"]["status"] == "done"
+    assert by_sku["SKU2"]["status"] == "failed"
+    assert "put exploded" in str(by_sku["SKU2"]["reason"])
+    assert by_sku["SKU3"]["status"] == "done"
+    assert marked
+    done_skus = [sku for skus_, _action in marked for sku in skus_]
+    assert "SKU1" in done_skus and "SKU3" in done_skus
+    assert "SKU2" not in done_skus
+    assert not ctx.lock_path.exists()

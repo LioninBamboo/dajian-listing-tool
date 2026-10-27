@@ -672,9 +672,13 @@ def guard_price_fail_closed(
         )
     except Exception as exc:
         return False, f"guard_error:{exc}"
+    reason_s = str(reason or "")
+    # precheck_price fail-opens on missing cost; this CLI must fail closed (#44).
+    if reason_s in {"no_cost_data", "pricing_engine_unavailable"} or reason_s.startswith("no_cost"):
+        return False, f"guard_error:{reason_s or 'no_cost_data'}"
     if not ok:
-        return False, str(reason or "guard_denied")
-    return True, str(reason or "ok")
+        return False, reason_s or "guard_denied"
+    return True, reason_s or "ok"
 
 
 def stock_exclude_reason(sku: str, stock_map: Dict[str, Optional[int]]) -> Optional[str]:
@@ -734,10 +738,126 @@ def compute_new_price(
     }
 
 
+class ReadOnlyEbayClient:
+    """Dry-run wrapper: live price + inventory GET only. Write APIs raise."""
+
+    def __init__(self, inner: Any) -> None:
+        object.__setattr__(self, "_inner", inner)
+
+    def get_inventory_item(self, sku: str) -> Any:
+        return self._inner.get_inventory_item(sku)
+
+    def get_offers_by_sku(self, sku: str, marketplace_id: Optional[str] = None) -> Any:
+        return self._inner.get_offers_by_sku(sku, marketplace_id=marketplace_id)
+
+    def get_offer(self, offer_id: str) -> Any:
+        return self._inner.get_offer(offer_id)
+
+    @property
+    def oauth(self) -> Any:
+        return getattr(self._inner, "oauth", None)
+
+    def __getattr__(self, name: str) -> Any:
+        def _blocked(*_a: Any, **_k: Any) -> Any:
+            raise RuntimeError(f"dry-run write blocked: {name}")
+
+        return _blocked
+
+
+def create_production_client(ctx: ImproveContext) -> Any:
+    """Build the store-scoped eBay client. Caller holds store_root_runtime()."""
+    from src.clients.real_ebay_client import create_real_ebay_client
+
+    client = create_real_ebay_client(environment=ctx.ebay_environment or "SANDBOX")
+    if ctx.readonly_db:
+        return ReadOnlyEbayClient(client)
+    return client
+
+
+def fetch_live_price_readonly(ctx: ImproveContext, sku: str, listing_id: str) -> Optional[float]:
+    """GET-only live price. Uses store-root credentials when isolated."""
+    try:
+        from scripts.batch_smart_reprice import read_current_listing_price
+
+        with store_root_runtime(ctx):
+            client = get_ebay_client(ctx)
+            if client is None:
+                return None
+            oauth = getattr(client, "oauth", None)
+            inner = getattr(client, "_inner", client)
+            oauth = oauth or getattr(inner, "oauth", None)
+            return read_current_listing_price(
+                oauth, sku, listing_id or "", client=client,
+            )
+    except Exception:
+        return None
+
+
+def verify_live_price(
+    ctx: ImproveContext, sku: str, new_price: float, listing_id: str,
+) -> tuple[bool, Optional[float]]:
+    live = fetch_live_price_readonly(ctx, sku, listing_id)
+    if live is None:
+        return False, None
+    try:
+        value = float(live)
+    except (TypeError, ValueError):
+        return False, None
+    return abs(value - float(new_price)) <= 0.05, value
+
+
+def write_price_ebay_only(
+    ctx: ImproveContext, sku: str, new_price: float, listing_id: str,
+) -> bool:
+    """Price-only eBay write. Never calls ad APIs or update_ebay_price."""
+    from scripts.batch_smart_reprice import _select_best_offer, update_trading_price
+    from src.services.repricing_guard import reprice_write_channel
+
+    with store_root_runtime(ctx):
+        client = get_ebay_client(ctx)
+        if client is None:
+            return False
+        inner = getattr(client, "_inner", client)
+        oauth = getattr(client, "oauth", None) or getattr(inner, "oauth", None)
+        if oauth is None:
+            return False
+        if reprice_write_channel(listing_id, profile=ctx.profile) == "trading":
+            return bool(update_trading_price(oauth, sku, new_price, listing_id))
+        getter = getattr(inner, "get_offers_by_sku", None) or getattr(client, "get_offers_by_sku", None)
+        if getter is None:
+            return False
+        offers = getter(sku) or []
+        offer = _select_best_offer(offers, expected_listing_id=listing_id)
+        if not offer or not offer.get("offerId"):
+            return False
+        payload = dict(offer)
+        pricing = dict(payload.get("pricingSummary") or {})
+        price = dict(pricing.get("price") or {})
+        price["value"] = str(round(float(new_price), 2))
+        pricing["price"] = price
+        payload["pricingSummary"] = pricing
+        session = getattr(inner, "session", None)
+        base = getattr(inner, "base_url", None) or "https://api.ebay.com"
+        token = oauth.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Content-Language": "en-US",
+        }
+        url = f"{base.rstrip('/')}/sell/inventory/v1/offer/{offer['offerId']}"
+        if session is not None:
+            resp = session.put(url, headers=headers, json=payload, timeout=60)
+        else:
+            import requests
+
+            resp = requests.put(url, headers=headers, json=payload, timeout=60, verify=False)
+        return int(getattr(resp, "status_code", 0) or 0) in (200, 204)
+
+
 def read_live_price(ctx: ImproveContext, sku: str, listing_id: str) -> Optional[float]:
     if ctx.read_live_price_fn is not None:
         return ctx.read_live_price_fn(sku, listing_id)
-    return None
+    return fetch_live_price_readonly(ctx, sku, listing_id)
 
 
 def get_ebay_client(ctx: ImproveContext) -> Any:
@@ -745,15 +865,8 @@ def get_ebay_client(ctx: ImproveContext) -> Any:
         return ctx.ebay_client
     factory = ctx.ebay_client_factory
     if factory is None:
-        if not ctx.isolate_store_root:
-            return None
-
         def factory() -> Any:
-            from src.clients.real_ebay_client import create_real_ebay_client
-
-            with store_root_runtime(ctx):
-                return create_real_ebay_client(environment=ctx.ebay_environment or "SANDBOX")
-
+            return create_production_client(ctx)
     with store_root_runtime(ctx):
         ctx.ebay_client = factory()
     return ctx.ebay_client
@@ -799,10 +912,11 @@ def inspect_image(
         urls_keep_giga_sigs,
     )
 
-    client = get_ebay_client(ctx)
-    if client is None:
-        return {"sku": sku, "status": "excluded", "reason": "image_get_unavailable"}
-    item = client.get_inventory_item(sku)
+    with store_root_runtime(ctx):
+        client = get_ebay_client(ctx)
+        if client is None:
+            return {"sku": sku, "status": "excluded", "reason": "image_get_unavailable"}
+        item = client.get_inventory_item(sku)
     if not item:
         return {"sku": sku, "status": "excluded", "reason": "no inventory item"}
     product = item.get("product") or {}
@@ -1195,61 +1309,61 @@ def validate_candidates_file(path: Path, approve: str, now: datetime, store: str
 
 
 def apply_price_live(ctx: ImproveContext, cand: Dict[str, Any]) -> Dict[str, Any]:
-    sku = cand["sku"]
-    listing_id = str(cand.get("listing_id") or "")
-    expected_live = float(cand["live_price"])
-    new_price = float(cand["new_price"])
-    live = read_live_price(ctx, sku, listing_id)
-    if live is None or abs(float(live) - expected_live) > 0.009:
-        return {
-            "sku": sku, "action": "price_drop", "status": "skipped",
-            "reason": "price_moved", "before": live, "after": None,
-        }
-    ok, reason = guard_price_fail_closed(ctx, sku, new_price, listing_id)
-    if not ok:
-        return {
-            "sku": sku, "action": "price_drop", "status": "skipped",
-            "reason": reason, "before": live, "after": None,
-        }
-    writer = ctx.write_price_fn
-    if writer is None:
-        from scripts.batch_smart_reprice import update_ebay_price
+    sku = str((cand or {}).get("sku") or "")
+    try:
+        listing_id = str(cand.get("listing_id") or "")
+        expected_live = float(cand["live_price"])
+        new_price = float(cand["new_price"])
+        live = read_live_price(ctx, sku, listing_id)
+        if live is None or abs(float(live) - expected_live) > 0.009:
+            return {
+                "sku": sku, "action": "price_drop", "status": "skipped",
+                "reason": "price_moved", "before": live, "after": None,
+            }
+        ok, reason = guard_price_fail_closed(ctx, sku, new_price, listing_id)
+        if not ok:
+            return {
+                "sku": sku, "action": "price_drop", "status": "skipped",
+                "reason": reason, "before": live, "after": None,
+            }
+        writer = ctx.write_price_fn
+        if writer is None:
+            def writer(sku_: str, price_: float, listing_id_: str) -> bool:
+                return write_price_ebay_only(ctx, sku_, price_, listing_id_)
 
-        def writer(sku_, price_, listing_id_):
-            client = get_ebay_client(ctx)
-            oauth = getattr(client, "oauth", None) or getattr(ctx, "oauth", None)
-            if oauth is None:
-                return False
-            return update_ebay_price(oauth, sku_, price_, expected_listing_id=listing_id_)
-
-    wrote = bool(writer(sku, new_price, listing_id))
-    if wrote:
-        ctx.writes["ebay"] += 1
-    verifier = ctx.verify_price_fn
-    verified = False
-    readback = None
-    if wrote and verifier is not None:
-        verified, readback = verifier(sku, new_price, listing_id)
-    elif wrote:
-        readback = read_live_price(ctx, sku, listing_id)
-        verified = readback is not None and abs(float(readback) - new_price) <= 0.05
-    if wrote and verified:
-        db_writer = ctx.write_price_db_fn
-        if db_writer is not None:
-            if db_writer(sku, new_price, cand):
-                ctx.writes["db"] += 1
-        else:
-            if _write_price_db(ctx, sku, new_price):
-                ctx.writes["db"] += 1
+        wrote = bool(writer(sku, new_price, listing_id))
+        if wrote:
+            ctx.writes["ebay"] += 1
+        verifier = ctx.verify_price_fn
+        verified = False
+        readback = None
+        if wrote and verifier is not None:
+            verified, readback = verifier(sku, new_price, listing_id)
+        elif wrote:
+            readback = read_live_price(ctx, sku, listing_id)
+            verified = readback is not None and abs(float(readback) - new_price) <= 0.05
+        if wrote and verified:
+            db_writer = ctx.write_price_db_fn
+            if db_writer is not None:
+                if db_writer(sku, new_price, cand):
+                    ctx.writes["db"] += 1
+            else:
+                if _write_price_db(ctx, sku, new_price):
+                    ctx.writes["db"] += 1
+            return {
+                "sku": sku, "action": "price_drop", "status": "done",
+                "before": expected_live, "after": readback if readback is not None else new_price,
+                "readback": readback, "reason": "ok",
+            }
         return {
-            "sku": sku, "action": "price_drop", "status": "done",
-            "before": expected_live, "after": readback if readback is not None else new_price,
-            "readback": readback, "reason": "ok",
+            "sku": sku, "action": "price_drop", "status": "failed",
+            "before": expected_live, "after": readback, "reason": "write_or_verify_failed",
         }
-    return {
-        "sku": sku, "action": "price_drop", "status": "failed",
-        "before": expected_live, "after": readback, "reason": "write_or_verify_failed",
-    }
+    except Exception as exc:
+        return {
+            "sku": sku, "action": "price_drop", "status": "failed",
+            "reason": f"error:{exc}",
+        }
 
 
 def _write_price_db(ctx: ImproveContext, sku: str, new_price: float) -> bool:
@@ -1283,47 +1397,54 @@ def apply_image_live(ctx: ImproveContext, cand: Dict[str, Any]) -> Dict[str, Any
         urls_keep_giga_sigs,
     )
 
-    sku = cand["sku"]
-    client = get_ebay_client(ctx)
-    if client is None:
-        return {"sku": sku, "action": "image_refresh", "status": "failed", "reason": "no_client"}
-    item = client.get_inventory_item(sku)
-    if not item:
-        return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": "no inventory item"}
-    product = item.get("product") or {}
-    live_urls = list(product.get("imageUrls") or [])
-    live_n = len(live_urls)
-    live_lead = live_urls[0] if live_urls else ""
-    if live_n != cand.get("live_n") or live_lead != (cand.get("live_lead") or ""):
-        return {
-            "sku": sku, "action": "image_refresh", "status": "skipped",
-            "reason": "live_changed", "before": live_n, "after": None,
-        }
-    local = load_local_product(ctx, sku)
-    local_images = list(local.get("images") or [])
-    need = _should_refresh(local_images, live_urls)
-    payload, reason = build_strict_refresh_payload(item, local)
-    if reason:
-        return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": reason}
-    if payload is None or not urls_keep_giga_sigs(local_images, payload.get("image_urls") or []):
-        return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": "image_sig_stripped"}
-    if not need:
-        return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": "live already healthy"}
-    client.create_or_replace_inventory_item(sku, payload)
-    ctx.writes["ebay"] += 1
-    item2 = client.get_inventory_item(sku) or {}
-    live2 = list(((item2.get("product") or {}).get("imageUrls")) or [])
-    expected = min(len(local_images), 24)
-    if not live2 or len(live2) < max(1, expected - 1):
+    sku = str((cand or {}).get("sku") or "")
+    try:
+        with store_root_runtime(ctx):
+            client = get_ebay_client(ctx)
+            if client is None:
+                return {"sku": sku, "action": "image_refresh", "status": "failed", "reason": "no_client"}
+            item = client.get_inventory_item(sku)
+            if not item:
+                return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": "no inventory item"}
+            product = item.get("product") or {}
+            live_urls = list(product.get("imageUrls") or [])
+            live_n = len(live_urls)
+            live_lead = live_urls[0] if live_urls else ""
+            if live_n != cand.get("live_n") or live_lead != (cand.get("live_lead") or ""):
+                return {
+                    "sku": sku, "action": "image_refresh", "status": "skipped",
+                    "reason": "live_changed", "before": live_n, "after": None,
+                }
+            local = load_local_product(ctx, sku)
+            local_images = list(local.get("images") or [])
+            need = _should_refresh(local_images, live_urls)
+            payload, reason = build_strict_refresh_payload(item, local)
+            if reason:
+                return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": reason}
+            if payload is None or not urls_keep_giga_sigs(local_images, payload.get("image_urls") or []):
+                return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": "image_sig_stripped"}
+            if not need:
+                return {"sku": sku, "action": "image_refresh", "status": "skipped", "reason": "live already healthy"}
+            client.create_or_replace_inventory_item(sku, payload)
+            ctx.writes["ebay"] += 1
+            item2 = client.get_inventory_item(sku) or {}
+            live2 = list(((item2.get("product") or {}).get("imageUrls")) or [])
+            expected = min(len(local_images), 24)
+            if not live2 or len(live2) < max(1, expected - 1):
+                return {
+                    "sku": sku, "action": "image_refresh", "status": "failed",
+                    "reason": "verification mismatch",
+                    "before": live_n, "after": len(live2),
+                }
+            return {
+                "sku": sku, "action": "image_refresh", "status": "done",
+                "reason": need, "before": live_n, "after": len(live2),
+            }
+    except Exception as exc:
         return {
             "sku": sku, "action": "image_refresh", "status": "failed",
-            "reason": "verification mismatch",
-            "before": live_n, "after": len(live2),
+            "reason": f"error:{exc}",
         }
-    return {
-        "sku": sku, "action": "image_refresh", "status": "done",
-        "reason": need, "before": live_n, "after": len(live2),
-    }
 
 
 def mark_done_skus(ctx: ImproveContext, rows: List[Dict[str, Any]]) -> None:
@@ -1369,7 +1490,7 @@ def build_context(args: argparse.Namespace, profile: Any = None) -> ImproveConte
             )
     match_store_profile(args.store, profile)
     now = _now_cst()
-    return ImproveContext(
+    ctx = ImproveContext(
         store=args.store,
         profile=profile,
         project_root=project_root,
@@ -1387,6 +1508,11 @@ def build_context(args: argparse.Namespace, profile: Any = None) -> ImproveConte
         store_env=store_env,
         isolate_store_root=isolate,
     )
+    ctx.ebay_client_factory = lambda: create_production_client(ctx)
+    ctx.read_live_price_fn = lambda sku, lid: fetch_live_price_readonly(ctx, sku, lid)
+    ctx.write_price_fn = lambda sku, price, lid: write_price_ebay_only(ctx, sku, price, lid)
+    ctx.verify_price_fn = lambda sku, price, lid: verify_live_price(ctx, sku, price, lid)
+    return ctx
 
 
 def run_improve(args: argparse.Namespace, ctx: ImproveContext) -> int:
@@ -1423,46 +1549,59 @@ def run_improve(args: argparse.Namespace, ctx: ImproveContext) -> int:
             if err is not None:
                 return err
             assert data is not None
-            recent24 = recent_terminal(ctx, 24)
-            consume_ok = scheduler_task_succeeded_today(ctx, "cro_consume")
-            image_ok = scheduler_task_succeeded_today(ctx, "cro_image_refresh")
             results: List[Dict[str, Any]] = []
-            for cand in data.get("candidates") or []:
-                sku = str(cand.get("sku") or "")
-                action = str(cand.get("action") or "")
-                if (sku, action) in recent24:
-                    results.append({
-                        "sku": sku, "action": action, "status": "skipped",
-                        "reason": "recent_terminal_24h",
-                    })
-                    continue
-                if action == "price_drop":
-                    results.append(apply_price_live(ctx, cand))
-                elif action == "image_refresh":
-                    results.append(apply_image_live(ctx, cand))
-            mark_done_skus(ctx, results)
-            report = {
-                "schema": SCHEMA,
-                "run_id": run_id,
-                "store": ctx.store,
-                "mode": "live",
-                "git_sha": preflight["git_sha"],
-                "created_at": ctx.now.isoformat(),
-                "expires_at": (ctx.now + CANDIDATES_TTL).isoformat(),
-                "preflight": preflight,
-                "promote_disabled": True,
-                "allowed_actions": sorted(effective_allowed_actions()),
-                "candidates": data.get("candidates") or [],
-                "excluded": data.get("excluded") or empty_excluded(),
-                "read_only_context": data.get("read_only_context") or {},
-                "results": results,
-                "scheduler": {
-                    "cro_consume_succeeded_today": consume_ok,
-                    "cro_image_refresh_succeeded_today": image_ok,
-                },
-                "writes": dict(ctx.writes),
-            }
-            write_reports(report, ctx.out_dir, f"{ctx.store}_{stamp}_live")
+            consume_ok = False
+            image_ok = False
+            try:
+                recent24 = recent_terminal(ctx, 24)
+                consume_ok = scheduler_task_succeeded_today(ctx, "cro_consume")
+                image_ok = scheduler_task_succeeded_today(ctx, "cro_image_refresh")
+                for cand in data.get("candidates") or []:
+                    sku = str(cand.get("sku") or "")
+                    action = str(cand.get("action") or "")
+                    try:
+                        if (sku, action) in recent24:
+                            results.append({
+                                "sku": sku, "action": action, "status": "skipped",
+                                "reason": "recent_terminal_24h",
+                            })
+                            continue
+                        if action == "price_drop":
+                            results.append(apply_price_live(ctx, cand))
+                        elif action == "image_refresh":
+                            results.append(apply_image_live(ctx, cand))
+                    except Exception as exc:
+                        results.append({
+                            "sku": sku, "action": action, "status": "failed",
+                            "reason": f"error:{exc}",
+                        })
+            finally:
+                try:
+                    mark_done_skus(ctx, results)
+                except Exception:
+                    pass
+                report = {
+                    "schema": SCHEMA,
+                    "run_id": run_id,
+                    "store": ctx.store,
+                    "mode": "live",
+                    "git_sha": preflight["git_sha"],
+                    "created_at": ctx.now.isoformat(),
+                    "expires_at": (ctx.now + CANDIDATES_TTL).isoformat(),
+                    "preflight": preflight,
+                    "promote_disabled": True,
+                    "allowed_actions": sorted(effective_allowed_actions()),
+                    "candidates": data.get("candidates") or [],
+                    "excluded": data.get("excluded") or empty_excluded(),
+                    "read_only_context": data.get("read_only_context") or {},
+                    "results": results,
+                    "scheduler": {
+                        "cro_consume_succeeded_today": consume_ok,
+                        "cro_image_refresh_succeeded_today": image_ok,
+                    },
+                    "writes": dict(ctx.writes),
+                }
+                write_reports(report, ctx.out_dir, f"{ctx.store}_{stamp}_live")
         else:
             products = load_published_products(ctx)
             perf = load_performance_readonly(ctx)
