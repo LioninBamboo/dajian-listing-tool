@@ -140,6 +140,12 @@ class StoreProfile:
     # store (scheduler_profile=full) ignores these flags.
     scheduler_enable_qc_autofix: bool = False
     scheduler_enable_ads: bool = False
+    # Opt-in automatic Promoted Listings bid *raises*. Default / absent = False:
+    # - task_cro_promote skips entirely
+    # - task_smart_bid runs with --no-raises (lowers / no-ops still apply)
+    # Flip in store_profile.local.yaml only. Manual CLI of cro_promote.py /
+    # batch_smart_bid.py (without --no-raises) remains available.
+    scheduler_enable_cro_promote: bool = False
     # Explicit ops allowlist. Empty on an ops profile => {ops_daily, order_recheck}.
     # The main full/daily profile ignores this field (unrestricted).
     scheduler_allowed_jobs: tuple = ()
@@ -203,6 +209,17 @@ class StoreProfile:
     def ops_ads_enabled(self) -> bool:
         """True only on an ops instance that opted into the ads/marketing slice."""
         return self.is_ops_scheduler and bool(self.scheduler_enable_ads)
+
+    @property
+    def cro_promote_scheduler_enabled(self) -> bool:
+        """True when this instance opted into scheduled automatic bid raises.
+
+        Gates ``task_cro_promote`` (full skip when false) and the *raise*
+        direction of ``task_smart_bid`` (``--no-raises`` when false).
+        Unlike ops ads/QC slices, applies on any scheduler_profile
+        (including main ``full``). Absent or false = fail-closed.
+        """
+        return bool(self.scheduler_enable_cro_promote)
 
     @property
     def resolved_scheduler_allowed_jobs(self) -> frozenset[str] | None:
@@ -303,6 +320,7 @@ _SECTION_FIELD_MAP = {
         "scheduler_mutex_name",
         "scheduler_enable_qc_autofix",
         "scheduler_enable_ads",
+        "scheduler_enable_cro_promote",
         "scheduler_allowed_jobs",
     },
 }
@@ -330,6 +348,7 @@ _BOOL_FIELDS = {
     "force_house_brand",
     "scheduler_enable_qc_autofix",
     "scheduler_enable_ads",
+    "scheduler_enable_cro_promote",
 }
 _TUPLE_FIELDS = {"banned_terms", "scheduler_allowed_jobs"}
 

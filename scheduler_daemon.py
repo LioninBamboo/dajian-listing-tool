@@ -258,6 +258,14 @@ def _ops_ads_enabled() -> bool:
         return False
 
 
+def _cro_promote_scheduler_enabled() -> bool:
+    """Fail-closed: missing/unreadable profile => do not auto-raise ad bids."""
+    try:
+        return bool(get_store_profile().cro_promote_scheduler_enabled)
+    except Exception:
+        return False
+
+
 _UNREADABLE_OPS_WARNED = False
 
 
@@ -1548,9 +1556,25 @@ def task_cro_monthly_report():
 
 
 def task_cro_promote():
-    """S23 — 每日执行 CRO promote 队列: 已推广则提 bid, 未推广则安全开广告."""
+    """S23 — 每日执行 CRO promote 队列: 已推广则提 bid, 未推广则安全开广告.
+
+    Owner rule (2026-10-26/27): bots must not automatically raise Promoted
+    Listings ad rates. Gated by store-profile ``scheduler_enable_cro_promote``
+    (default / absent = false). Manual ``scripts/cro_promote.py`` CLI remains.
+    """
     if _task_succeeded_today('cro_promote'):
         return True, 'Skipped (already succeeded today)'
+    if not _cro_promote_scheduler_enabled():
+        logger.info(
+            "↪ 跳过 CRO 推广执行: scheduler_enable_cro_promote 未开启 "
+            "(默认关闭, 避免自动提 ad rate/bid)"
+        )
+        update_health(
+            'cro_promote',
+            'success',
+            'Skipped (scheduler_enable_cro_promote off)',
+        )
+        return True, 'Skipped (scheduler_enable_cro_promote off)'
     if not _daily_tasks_ready_for_cro('CRO 推广执行'):
         return True, 'Skipped (waiting for daily_tasks)'
     run_task(
@@ -1617,14 +1641,32 @@ def task_smart_bid():
 
     每条调整都被 PricingEngine 守门员复核 — 现价不支持则取可支持的最大 bid.
     每周二 10:00 运行, 给性能数据足够一周的样本量.
+
+    Owner rule (2026-10-26/27): automatic bid *raises* require
+    ``scheduler_enable_cro_promote``. When the flag is off (default), the
+    scheduled run passes ``--no-raises`` so only lowers / no-ops apply.
+    Manual ``scripts/batch_smart_bid.py --apply`` without ``--no-raises``
+    may still raise.
     """
     if _task_succeeded_today('smart_bid'):
         logger.info("↪ 跳过智能 Bid: 今日已成功执行")
         return True, 'Skipped (already succeeded today)'
 
+    cmd = [
+        str(PROJECT_ROOT / 'scripts' / 'batch_smart_bid.py'),
+        '--apply', '--email',
+    ]
+    if _cro_promote_scheduler_enabled():
+        logger.info("smart_bid: scheduler_enable_cro_promote on → raises allowed")
+    else:
+        cmd.append('--no-raises')
+        logger.info(
+            "smart_bid: scheduler_enable_cro_promote off → "
+            "--no-raises (只允许降 bid / 不变)"
+        )
     run_task(
         'smart_bid',
-        [str(PROJECT_ROOT / 'scripts' / 'batch_smart_bid.py'), '--apply', '--email'],
+        cmd,
         timeout_sec=TASK_TIMEOUT['smart_bid'],
     )
 
@@ -2197,8 +2239,11 @@ def _setup_schedule_full():
     logger.info("  09:30  每日全量任务 (daily_tasks.py — 含库存同步+报告；智能调价仅周一/周四)")
     logger.info("  10:05  MI 流水线自检 (F32 — 异常发邮件)")
     logger.info("  09:40  广告恢复审计 (ad_restore_audit --apply --email)")
-    logger.info("  周二 10:00  分级 Bid 优化 (batch_smart_bid --apply --email)")
-    logger.info("  周二 11:00  Bid 7 天回溯 (bid_rollback_audit --apply --email)")
+    logger.info(
+        "  周二 10:00  分级 Bid 优化 (batch_smart_bid --apply --email"
+        "[; --no-raises unless scheduler_enable_cro_promote])"
+    )
+    logger.info("  周二 11:00  Bid 7 天回溯 (bid_rollback_audit --apply --email; 只降不升)")
     logger.info("  周日 03:00  CRO ops 快照 + DB DR 演练 (cro_ops_snapshot)")
     logger.info("  09:45  广告黑名单自动清理 (P7 — ad_blacklist_cleanup)")
     logger.info("  09:50  守门员异常告警 (P8 — guard_anomaly_alert)")

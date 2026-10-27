@@ -13,6 +13,15 @@ def tmp_queue(tmp_path, monkeypatch):
     return queue_path
 
 
+def test_safe_auto_actions_excludes_promote_by_default():
+    from src.services.cro_auto_executor import SAFE_AUTO_ACTIONS
+
+    assert 'promote' not in SAFE_AUTO_ACTIONS
+    assert set(SAFE_AUTO_ACTIONS) == {
+        'price_drop', 'image_refresh', 'fill_specifics',
+    }
+
+
 def test_auto_enqueue_and_execute_only_handles_safe_actions(tmp_queue, monkeypatch):
     import src.services.cro_auto_executor as auto_mod
     monkeypatch.setattr(auto_mod, 'queue_stats', lambda: {'pending': 0})
@@ -31,25 +40,27 @@ def test_auto_enqueue_and_execute_only_handles_safe_actions(tmp_queue, monkeypat
 
     rep = auto_mod.auto_enqueue_and_execute(
         [
-            {'sku': 'A', 'action': 'promote', 'priority': 1},
+            {'sku': 'A', 'action': 'price_drop', 'priority': 1},
             {'sku': 'B', 'action': 'delist', 'priority': 1},
-            {'sku': 'C', 'action': 'title_refresh', 'priority': 1},
+            {'sku': 'C', 'action': 'promote', 'priority': 1},
             {'sku': 'D', 'action': 'price_drop', 'priority': 2},
         ],
-        action_types=('promote', 'delist', 'title_refresh'),
-        executor_map={'promote': fake_executor},
+        action_types=('price_drop', 'delist', 'promote'),
+        executor_map={'price_drop': fake_executor},
         send_email=False,
     )
     assert rep['selected_count'] == 1
     assert rep['enqueue']['added'] == 1
-    assert rep['execution']['unsupported'] == ['delist', 'title_refresh']
+    assert rep['execution']['unsupported'] == ['delist', 'promote']
     assert calls == [(True, 200, False)]
 
 
 def test_auto_enqueue_and_execute_skips_recently_handled(tmp_queue, monkeypatch):
     import src.services.cro_auto_executor as auto_mod
     monkeypatch.setattr(auto_mod, 'queue_stats', lambda: {'pending': 0})
-    monkeypatch.setattr(auto_mod, 'recent_terminal_keys', lambda hours=24: {('A', 'promote')})
+    monkeypatch.setattr(
+        auto_mod, 'recent_terminal_keys', lambda hours=24: {('A', 'price_drop')}
+    )
 
     calls = []
 
@@ -58,9 +69,9 @@ def test_auto_enqueue_and_execute_skips_recently_handled(tmp_queue, monkeypatch)
         return {'pending_total': 0, 'done': [], 'failed': [], 'skipped': []}
 
     rep = auto_mod.auto_enqueue_and_execute(
-        [{'sku': 'A', 'action': 'promote', 'priority': 1}],
-        action_types=('promote',),
-        executor_map={'promote': fake_executor},
+        [{'sku': 'A', 'action': 'price_drop', 'priority': 1}],
+        action_types=('price_drop',),
+        executor_map={'price_drop': fake_executor},
     )
     assert rep['selected_count'] == 0
     assert rep['enqueue']['added'] == 0

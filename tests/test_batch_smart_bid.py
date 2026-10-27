@@ -143,6 +143,64 @@ class BuildPlanTests(unittest.TestCase):
         self.assertGreaterEqual(plan[0]['new_bid'], 4.5)
 
 
+class AllowRaisesGateTests(unittest.TestCase):
+    """Owner rule: allow_raises=False blocks bid increases, keeps lowers."""
+
+    def _fake_client(self, price: str = '200.00'):
+        class FakeClient:
+            def get_offer_by_sku(self, sku):
+                return {'pricingSummary': {'price': {'value': price}}}
+        return FakeClient()
+
+    def test_raise_becomes_skip_raise_disabled_when_disallowed(self):
+        products = [{'sku': 'A', 'listing_id': 'L1',
+                     'impressions': 1000, 'ctr': 0.05, 'sold_qty': 2}]
+        ads = {'L1': {'campaign_id': 'C1', 'bid_percentage': 5.0}}
+        cost_map = {'A': {'total_cost': 50.0, 'listing_id': 'L1'}}
+        plan = bsb.build_plan(
+            products, ads, cost_map, real_client=self._fake_client(),
+            allow_raises=False,
+        )
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]['decision'], 'skip_raise_disabled')
+        self.assertEqual(plan[0]['new_bid'], 5.0)
+        self.assertIn('raise blocked', plan[0]['reason'])
+
+    def test_lower_still_allowed_when_raises_disallowed(self):
+        # Current 7% HIGH bid, but low-tier signals → desired 3% (a lower).
+        products = [{'sku': 'B', 'listing_id': 'L2',
+                     'impressions': 400, 'ctr': 0.005, 'sold_qty': 0}]
+        ads = {'L2': {'campaign_id': 'C1', 'bid_percentage': 7.0}}
+        cost_map = {'B': {'total_cost': 50.0, 'listing_id': 'L2'}}
+        plan = bsb.build_plan(
+            products, ads, cost_map, real_client=self._fake_client(),
+            allow_raises=False,
+        )
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]['tier'], 'low')
+        self.assertEqual(plan[0]['decision'], 'adjust')
+        self.assertEqual(plan[0]['new_bid'], bsb.LOW_BID)
+        self.assertLess(plan[0]['new_bid'], plan[0]['current_bid'])
+
+    def test_apply_plan_refuses_raise_when_disallowed(self):
+        calls = []
+
+        class FakeAds:
+            def update_ad_bid(self, campaign_id, listing_id, bid):
+                calls.append((campaign_id, listing_id, bid))
+                return {'success': True}
+
+        plan = [{
+            'sku': 'X', 'listing_id': 'L9', 'campaign_id': 'C9',
+            'decision': 'adjust', 'current_bid': 5.0, 'new_bid': 7.0,
+        }]
+        result = bsb.apply_plan(plan, FakeAds(), allow_raises=False)
+        self.assertEqual(calls, [])
+        self.assertEqual(result['applied_ok'], 0)
+        self.assertEqual(plan[0]['decision'], 'skip_raise_disabled')
+        self.assertFalse(plan[0]['applied'])
+
+
 class SummarizeTests(unittest.TestCase):
 
     def test_summary_counts(self):

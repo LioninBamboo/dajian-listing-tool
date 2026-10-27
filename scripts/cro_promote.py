@@ -10,7 +10,9 @@
       c. update_ad_bid/create_ad_safe 成功后 mark_done
 
 不绕过现有规则: 复用 EbayAdService.update_ad_bid / create_ad_safe.
-调度: 每日 10:25 (在 CRO 队列消费窗口内).
+调度: 每日 10:25 仅当 store profile ``scheduler_enable_cro_promote: true``
+(默认 / 缺省 = false; owner rule 2026-10-26/27 禁止自动提 ad rate).
+手动 CLI 始终可用.
 """
 from __future__ import annotations
 

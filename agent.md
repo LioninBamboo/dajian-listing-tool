@@ -10,6 +10,7 @@ This file is for future coding agents working in this repository. It is intentio
 - Generated listing correctness is centralized in `src/utils/listing_quality_gate.py`; do not fork product-family, item-specific, image, or measurement blockers in one-off scripts.
 - `StoreProfile.qc_profile` defaults to `furniture`. AquaRides sets `motors`, which skips furniture quality-gate rules (measurements, category, banner) and the EN-store LLM FactSheet extractor. Motors still blocks incomplete vehicle-specific fitment, and it runs deterministic material / color / capacity invent checks plus claim-invent gates and `package_includes_set_qty_mismatch`, including universal-fit parts. Fitment Type Universal / Universal Fit / Universal Fitment Type with no Year/Make/Model table is not a fitment hard block. Do not invent Year/Make/Model to satisfy that check.
 - Substore `scheduler_profile: ops` stays inventory-only unless `scheduler_enable_qc_autofix` / `scheduler_enable_ads` are flipped in that instance's local yaml. Do not switch substores onto `scheduler_profile: full` to get QC or ads.
+- `scheduler_enable_cro_promote` (default / absent = false) gates automatic bid *raises*: `task_cro_promote` skips; `task_smart_bid` gets `--no-raises` (lowers stay). Do not auto-enqueue or auto-execute `promote`. Manual `scripts/cro_promote.py` / `batch_smart_bid.py --apply` remain. Do not flip this flag in tracked yaml — operators set it in local profile if needed.
 - Do not publish READY drafts before running `scripts/audit_fix_ready_drafts.py` and checking `logs/ready_draft_audit_*.json`.
 - Treat any `quality_gate` unresolved entry in `logs/ready_draft_audit_*.json` as a publish blocker.
 - The scheduled `11:30` live listing audit is detect-only: `scripts/audit_fix_active_listings.py --live --email` reports and emails, but does not auto-fix the full live corpus.
@@ -33,7 +34,7 @@ This file is for future coding agents working in this repository. It is intentio
 
 ## CRO-Specific Rules
 
-- `scheduler_daemon.py` owns the CRO cadence around `09:45-10:30`; `cro_promote` runs daily at `10:25`, while Sunday threshold jobs and Monday delist confirmations stay weekly/manual. Do not document an older shortened schedule.
+- `scheduler_daemon.py` owns the CRO cadence around `09:45-10:30`; `cro_promote` is scheduled at `10:25` but no-ops unless `scheduler_enable_cro_promote` is true. Sunday threshold jobs and Monday delist confirmations stay weekly/manual. Do not document an older shortened schedule.
 - Keep CRO diagnose, queueing, execution, and ops/governance modules conceptually separate; do not fold them into one script without a clear reason.
 - S131-S140 production observation flows through `src/services/cro_ops_control_plane.py`, `scripts/cro_ops_snapshot.py`, `scheduler_daemon.py --task cro_ops`, and the Streamlit `🚦 CRO 状态` page.
 - `src/services/cro_disaster_recovery.py` public DR interface is `backup_database` / `verify_backup` / `restore_to_temp` / `run_dr_drill`; compatibility helpers may exist but should not replace that contract in docs.

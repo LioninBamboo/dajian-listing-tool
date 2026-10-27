@@ -348,7 +348,7 @@ def test_run_cro_daily_respects_per_action_activity_quotas(
     assert stats['pending_by_action'] == rep['queued_by_action']
 
 
-def test_daily_tasks_passes_50_slot_activity_quota(monkeypatch):
+def test_daily_tasks_does_not_enqueue_promote_by_default(monkeypatch):
     import daily_tasks
 
     captured = {}
@@ -402,14 +402,18 @@ def test_daily_tasks_passes_50_slot_activity_quota(monkeypatch):
     rep = daily_tasks.run_cro_diagnose(enqueue_p1=True)
 
     assert rep['summary']['total'] == 1
+    assert 'promote' not in captured['enqueue_action_types']
+    assert 'promote' not in captured['action_quotas']
+    assert captured['enqueue_action_types'] == (
+        'price_drop', 'image_refresh', 'fill_specifics', 'send_offer',
+    )
     assert captured['action_quotas'] == {
         'price_drop': 10,
         'image_refresh': 5,
         'fill_specifics': 15,
-        'promote': 10,
         'send_offer': 10,
     }
-    assert sum(captured['action_quotas'].values()) == 50
+    assert sum(captured['action_quotas'].values()) == 40
 
 
 def test_run_cro_daily_never_queues_p3_or_p4(tmp_db, tmp_queue, tmp_path):
