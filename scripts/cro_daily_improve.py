@@ -17,10 +17,11 @@ import sqlite3
 import subprocess
 import sys
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -69,6 +70,17 @@ STORE_EXPECTATIONS: Dict[str, Dict[str, Any]] = {
 }
 
 STORE_LABEL = {"main": "Main", "gp": "GrovePop", "aqua": "AquaRides"}
+
+# Credentials / identity that belong to a store checkout. Overlay only inside
+# store_root_runtime() and always restore. EBAY_ENVIRONMENT is never written.
+STORE_SCOPED_CREDENTIAL_KEYS: tuple[str, ...] = (
+    "EBAY_APP_ID",
+    "EBAY_CERT_ID",
+    "EBAY_DEV_ID",
+    "EBAY_REDIRECT_URI",
+    "EBAY_CLIENT_ID",
+    "EBAY_CLIENT_SECRET",
+)
 
 
 def effective_allowed_actions() -> frozenset[str]:
@@ -155,6 +167,13 @@ class ImproveContext:
     send_email_fn: Optional[Callable[..., Any]] = None
     authorizer: Optional[Callable] = None
     writes: Dict[str, int] = field(default_factory=lambda: {"db": 0, "queue": 0, "ebay": 0})
+    token_db_path: Optional[Path] = None
+    store_env: Dict[str, str] = field(default_factory=dict)
+    isolate_store_root: bool = False
+
+    def __post_init__(self) -> None:
+        if self.token_db_path is None:
+            self.token_db_path = Path(self.store_root) / "ebay_tokens.db"
 
 
 class StoreMismatch(Exception):
@@ -228,6 +247,74 @@ def force_skip_skus(profile: Any) -> set[str]:
     return {str(s).strip() for s in DEFAULT_FORCE_SKIP_SKUS} | {
         str(s).strip() for s in extra if str(s).strip()
     }
+
+
+def read_dotenv_map(path: Path) -> Dict[str, str]:
+    """Read a .env file into a dict. Does not touch os.environ."""
+    if not path.is_file():
+        return {}
+    from dotenv import dotenv_values
+
+    raw = dotenv_values(path)
+    return {str(k): str(v) for k, v in raw.items() if k and v is not None}
+
+
+def resolve_store_root_paths(store_root: Path, store_env: Dict[str, str]) -> tuple[Path, Path]:
+    """DB + token store for a --store-root checkout (explicit, not Main's cwd)."""
+    root = Path(store_root).resolve()
+    db_raw = store_env.get("DAJIAN_COLLECTION_DB") or ""
+    token_raw = (
+        store_env.get("EBAY_TOKEN_DB")
+        or store_env.get("EBAY_TOKENS_DB")
+        or ""
+    )
+    db_path = Path(db_raw) if db_raw else (root / "ebay_collection.db")
+    token_path = Path(token_raw) if token_raw else (root / "ebay_tokens.db")
+    if not db_path.is_absolute():
+        db_path = root / db_path
+    if not token_path.is_absolute():
+        token_path = root / token_path
+    return db_path.resolve(), token_path.resolve()
+
+
+def load_store_root_profile(store_root: Path) -> tuple[Any, str]:
+    """Load profile from the target checkout. Ignores STORE_PROFILE_PATH / Main yaml."""
+    from src.utils.store_profile import load_store_profile
+
+    root = Path(store_root)
+    local = root / "config" / "store_profile.local.yaml"
+    tracked = root / "config" / "store_profile.yaml"
+    chosen = local if local.is_file() else tracked
+    return load_store_profile(chosen), str(chosen.resolve() if chosen.exists() else chosen)
+
+
+@contextmanager
+def store_root_runtime(ctx: ImproveContext) -> Iterator[None]:
+    """Temporarily use store-root credentials. Never assigns EBAY_ENVIRONMENT."""
+    if not ctx.isolate_store_root:
+        yield
+        return
+    import src.services.ebay_auth as ebay_auth
+
+    saved_env = {key: os.environ.get(key) for key in STORE_SCOPED_CREDENTIAL_KEYS}
+    saved_token = ebay_auth._TOKEN_DB_PATH
+    try:
+        for key in STORE_SCOPED_CREDENTIAL_KEYS:
+            value = ctx.store_env.get(key)
+            if value:
+                os.environ[key] = value
+            else:
+                # Do not inherit Main credentials when the target .env omits a key.
+                os.environ.pop(key, None)
+        ebay_auth._TOKEN_DB_PATH = str(ctx.token_db_path)
+        yield
+    finally:
+        for key, old in saved_env.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+        ebay_auth._TOKEN_DB_PATH = saved_token
 
 
 def abort_if_promote_loaded() -> Optional[int]:
@@ -395,13 +482,18 @@ def load_stock_map(ctx: ImproveContext, products: List[Dict[str, Any]]) -> Dict[
 def load_performance_readonly(ctx: ImproveContext) -> Optional[Dict[str, Any]]:
     if ctx.load_perf_fn is not None:
         return ctx.load_perf_fn(ctx)
-    candidates = [
-        ctx.store_root / "logs" / "runtime_cache" / "performance_cache.json",
-        ctx.store_root / "logs" / "_performance_cache.json",
-        ctx.store_root / "_performance_cache.json",
-        ctx.project_root / "logs" / "runtime_cache" / "performance_cache.json",
-        ctx.project_root / "logs" / "_performance_cache.json",
-    ]
+    roots = [ctx.store_root]
+    if not ctx.isolate_store_root and ctx.store_root != ctx.project_root:
+        roots.append(ctx.project_root)
+    elif not ctx.isolate_store_root:
+        roots = [ctx.project_root]
+    candidates = []
+    for root in roots:
+        candidates.extend((
+            root / "logs" / "runtime_cache" / "performance_cache.json",
+            root / "logs" / "_performance_cache.json",
+            root / "_performance_cache.json",
+        ))
     for path in candidates:
         if not path.is_file():
             continue
@@ -445,7 +537,11 @@ def merge_performance(products: List[Dict[str, Any]], perf: Optional[Dict[str, A
 
 
 def load_market_data(ctx: ImproveContext) -> Dict[str, Any]:
-    roots = [ctx.store_root / "reports", ctx.project_root / "reports"]
+    roots = [ctx.store_root / "reports"]
+    if not ctx.isolate_store_root and ctx.project_root != ctx.store_root:
+        roots.append(ctx.project_root / "reports")
+    elif not ctx.isolate_store_root:
+        roots = [ctx.project_root / "reports"]
     reports: List[Path] = []
     for root in roots:
         if root.is_dir():
@@ -649,14 +745,44 @@ def get_ebay_client(ctx: ImproveContext) -> Any:
         return ctx.ebay_client
     factory = ctx.ebay_client_factory
     if factory is None:
-        return None
-    ctx.ebay_client = factory()
+        if not ctx.isolate_store_root:
+            return None
+
+        def factory() -> Any:
+            from src.clients.real_ebay_client import create_real_ebay_client
+
+            with store_root_runtime(ctx):
+                return create_real_ebay_client(environment=ctx.ebay_environment or "SANDBOX")
+
+    with store_root_runtime(ctx):
+        ctx.ebay_client = factory()
     return ctx.ebay_client
 
 
 def load_local_product(ctx: ImproveContext, sku: str) -> Dict[str, Any]:
     if ctx.load_local_product_fn is not None:
         return ctx.load_local_product_fn(sku)
+    if ctx.isolate_store_root:
+        if not ctx.db_path.exists():
+            return {"images": [], "title": "", "description": ""}
+        conn = open_db(ctx.db_path, readonly=True, authorizer=ctx.authorizer)
+        try:
+            row = conn.execute(
+                "SELECT images, title, description FROM collected_products WHERE sku = ?",
+                (sku,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return {"images": [], "title": "", "description": ""}
+        images = _parse_json_field(row["images"], [])
+        if not isinstance(images, list):
+            images = []
+        return {
+            "images": images,
+            "title": row["title"] or "",
+            "description": row["description"] or "",
+        }
     from scripts.cro_image_refresh import _load_local_product
 
     return _load_local_product(sku)
@@ -978,6 +1104,7 @@ def preflight_block(ctx: ImproveContext) -> Dict[str, Any]:
     profile = ctx.profile
     return {
         "store": ctx.store,
+        "brand_name": str(getattr(profile, "brand_name", "") or ""),
         "is_motors": bool(getattr(profile, "is_motors", False)),
         "site_id": str(getattr(profile, "ebay_site_id", "0") or "0"),
         "marketplace": str(getattr(profile, "ebay_marketplace_id", "EBAY_US") or "EBAY_US"),
@@ -985,6 +1112,9 @@ def preflight_block(ctx: ImproveContext) -> Dict[str, Any]:
         "git_sha": git_sha(ctx.project_root),
         "profile_path": ctx.profile_path,
         "is_ops_scheduler": is_ops_store(profile),
+        "store_root": str(Path(ctx.store_root).resolve()),
+        "db_path": str(Path(ctx.db_path).resolve()),
+        "token_db_path": str(Path(ctx.token_db_path or (Path(ctx.store_root) / "ebay_tokens.db")).resolve()),
     }
 
 
@@ -1214,45 +1344,37 @@ def mark_done_skus(ctx: ImproveContext, rows: List[Dict[str, Any]]) -> None:
 
 def build_context(args: argparse.Namespace, profile: Any = None) -> ImproveContext:
     project_root = PROJECT_ROOT
-    store_root = Path(args.store_root).resolve() if getattr(args, "store_root", None) else project_root
+    isolate = bool(getattr(args, "store_root", None))
+    store_root = Path(args.store_root).resolve() if isolate else project_root
+    store_env: Dict[str, str] = {}
     profile_path = ""
-    if profile is None:
-        from src.utils.store_profile import load_store_profile, get_store_profile
+    if isolate:
+        store_env = read_dotenv_map(store_root / ".env")
+        # Preflight READ of the target store's value. Never copy it into os.environ.
+        ebay_env = store_env.get("EBAY_ENVIRONMENT") or ""
+        db_path, token_db_path = resolve_store_root_paths(store_root, store_env)
+        if profile is None:
+            profile, profile_path = load_store_root_profile(store_root)
+    else:
+        ebay_env = os.getenv("EBAY_ENVIRONMENT") or ""
+        db_path = (store_root / "ebay_collection.db").resolve()
+        token_db_path = (store_root / "ebay_tokens.db").resolve()
+        if profile is None:
+            from src.utils.store_profile import get_store_profile
 
-        if getattr(args, "store_root", None):
-            local = store_root / "config" / "store_profile.local.yaml"
-            tracked = store_root / "config" / "store_profile.yaml"
-            chosen = local if local.is_file() else tracked
-            profile = load_store_profile(chosen)
-            profile_path = str(chosen)
-        else:
             profile = get_store_profile()
             profile_path = str(
                 os.getenv("STORE_PROFILE_PATH")
                 or (project_root / "config" / "store_profile.local.yaml")
             )
     match_store_profile(args.store, profile)
-    ebay_env = os.getenv("EBAY_ENVIRONMENT") or ""
-    if getattr(args, "store_root", None):
-        env_file = store_root / ".env"
-        if env_file.is_file():
-            from dotenv import dotenv_values
-
-            values = dotenv_values(env_file)
-            if values.get("EBAY_ENVIRONMENT"):
-                ebay_env = str(values.get("EBAY_ENVIRONMENT") or ebay_env)
-            for key, value in values.items():
-                if not key or value is None or key == "EBAY_ENVIRONMENT":
-                    continue
-                if key not in os.environ:
-                    os.environ[key] = value
     now = _now_cst()
     return ImproveContext(
         store=args.store,
         profile=profile,
         project_root=project_root,
         store_root=store_root,
-        db_path=store_root / "ebay_collection.db",
+        db_path=db_path,
         queue_path=store_root / "logs" / "cro_action_queue.jsonl",
         out_dir=Path(args.out_dir),
         lock_path=store_root / "logs" / "locks" / LOCK_NAME,
@@ -1261,6 +1383,9 @@ def build_context(args: argparse.Namespace, profile: Any = None) -> ImproveConte
         profile_path=profile_path,
         now=now,
         readonly_db=not bool(getattr(args, "live", False)),
+        token_db_path=token_db_path,
+        store_env=store_env,
+        isolate_store_root=isolate,
     )
 
 

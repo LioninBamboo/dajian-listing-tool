@@ -1024,3 +1024,171 @@ def test_store_root_live_rejected_by_parser():
             "--approve-sha256", "deadbeefdead",
         ])
     assert exc.value.code == 2
+
+
+def _write_store_yaml(path: Path, brand: str, scheduler: str, tree_id: str = "0") -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        textwrap.dedent(
+            f"""
+            server:
+              scheduler_profile: {scheduler}
+            store:
+              brand_name: {brand}
+            ebay:
+              category_tree_id: "{tree_id}"
+            """
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_store_root_runtime_restores_main_env(tmp_path, monkeypatch):
+    from scripts import cro_daily_improve as m
+    import src.services.ebay_auth as ebay_auth
+
+    monkeypatch.setenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    monkeypatch.setenv("EBAY_APP_ID", "MAIN_APP")
+    monkeypatch.setenv("EBAY_CERT_ID", "MAIN_CERT")
+    monkeypatch.setenv("EBAY_DEV_ID", "MAIN_DEV")
+    monkeypatch.delenv("EBAY_REDIRECT_URI", raising=False)
+    main_token = tmp_path / "main_tokens.db"
+    monkeypatch.setattr(ebay_auth, "_TOKEN_DB_PATH", str(main_token))
+
+    gp = tmp_path / "gp"
+    ctx = _ctx(
+        tmp_path, "gp", _gp_profile(),
+        isolate_store_root=True,
+        store_env={
+            "EBAY_ENVIRONMENT": "SANDBOX",
+            "EBAY_APP_ID": "GP_APP",
+            "EBAY_CERT_ID": "GP_CERT",
+            # EBAY_DEV_ID omitted on purpose — must not inherit Main.
+        },
+        token_db_path=gp / "ebay_tokens.db",
+    )
+    seen = {}
+    with m.store_root_runtime(ctx):
+        seen["app"] = os.environ.get("EBAY_APP_ID")
+        seen["cert"] = os.environ.get("EBAY_CERT_ID")
+        seen["dev"] = os.environ.get("EBAY_DEV_ID")
+        seen["env"] = os.environ.get("EBAY_ENVIRONMENT")
+        seen["token"] = ebay_auth._TOKEN_DB_PATH
+    assert seen == {
+        "app": "GP_APP",
+        "cert": "GP_CERT",
+        "dev": None,
+        "env": "PRODUCTION",
+        "token": str(gp / "ebay_tokens.db"),
+    }
+    assert os.environ.get("EBAY_APP_ID") == "MAIN_APP"
+    assert os.environ.get("EBAY_CERT_ID") == "MAIN_CERT"
+    assert os.environ.get("EBAY_DEV_ID") == "MAIN_DEV"
+    assert os.environ.get("EBAY_ENVIRONMENT") == "PRODUCTION"
+    assert ebay_auth._TOKEN_DB_PATH == str(main_token)
+
+
+def test_store_root_uses_gp_config_not_preloaded_main_env(tmp_path, monkeypatch, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    main_root = tmp_path / "main_checkout"
+    gp_root = tmp_path / "GrovePop_Listing_Tool"
+    main_db = main_root / "ebay_collection.db"
+    gp_db = gp_root / "ebay_collection.db"
+    gp_tokens = gp_root / "ebay_tokens.db"
+    main_yaml = _write_store_yaml(
+        main_root / "config" / "store_profile.yaml", "AquaVerve", "full",
+    )
+    _write_store_yaml(gp_root / "config" / "store_profile.yaml", "GrovePop", "ops")
+    _init_db(main_db, [
+        {"sku": "W465P451141", "suggested_price": 55, "stock": 1, "listing_id": "MAIN-LID"},
+        {"sku": "MAIN-ONLY-SKU", "suggested_price": 90, "stock": 4, "listing_id": "MAIN-ONLY"},
+    ])
+    _init_db(gp_db, [
+        {"sku": "GP-ONLY-SKU", "suggested_price": 80, "stock": 3, "listing_id": "GP-LID"},
+    ])
+    gp_tokens.write_bytes(b"")
+    gp_root.joinpath(".env").write_text(
+        "\n".join([
+            "EBAY_ENVIRONMENT=SANDBOX",
+            "EBAY_APP_ID=GP_APP",
+            "EBAY_CERT_ID=GP_CERT",
+            "EBAY_DEV_ID=GP_DEV",
+            "EBAY_REDIRECT_URI=https://gp.example/callback",
+            "EBAY_CLIENT_ID=GP_CLIENT",
+            "EBAY_CLIENT_SECRET=GP_SECRET",
+            f"DAJIAN_COLLECTION_DB={gp_db}",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    cache_dir = main_root / "logs" / "runtime_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.joinpath("performance_cache.json").write_text(
+        json.dumps({"traffic_meta": {"api_ok": True, "record_count": 99}}),
+        encoding="utf-8",
+    )
+    reports = main_root / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    reports.joinpath("reprice_report_20990101.json").write_text(
+        json.dumps({"market_research": {"MAIN": {"median": 1}}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(m, "PROJECT_ROOT", main_root)
+    monkeypatch.setenv("EBAY_ENVIRONMENT", "PRODUCTION")
+    monkeypatch.setenv("EBAY_APP_ID", "MAIN_APP")
+    monkeypatch.setenv("EBAY_CERT_ID", "MAIN_CERT")
+    monkeypatch.setenv("EBAY_DEV_ID", "MAIN_DEV")
+    monkeypatch.setenv("EBAY_REDIRECT_URI", "https://main.example/callback")
+    monkeypatch.setenv("EBAY_CLIENT_ID", "MAIN_CLIENT")
+    monkeypatch.setenv("EBAY_CLIENT_SECRET", "MAIN_SECRET")
+    monkeypatch.setenv("DAJIAN_COLLECTION_DB", str(main_db))
+    monkeypatch.setenv("STORE_PROFILE_PATH", str(main_yaml))
+
+    client_calls = []
+
+    def boom_client(*_a, **_k):
+        client_calls.append("create")
+        raise AssertionError("store-root ops dry-run must not build an eBay client")
+
+    monkeypatch.setattr(m, "get_ebay_client", boom_client)
+    import src.clients.real_ebay_client as rec
+    monkeypatch.setattr(rec, "create_real_ebay_client", boom_client)
+
+    out_dir = tmp_path / "reports" / "cro_daily_improve"
+    rc = m.main([
+        "--store", "gp",
+        "--store-root", str(gp_root),
+        "--out-dir", str(out_dir),
+    ])
+    assert rc == 0
+    assert client_calls == []
+    assert os.environ.get("EBAY_ENVIRONMENT") == "PRODUCTION"
+    assert os.environ.get("EBAY_APP_ID") == "MAIN_APP"
+    assert os.environ.get("DAJIAN_COLLECTION_DB") == str(main_db)
+
+    dry = json.loads(next(out_dir.glob("*_dry.json")).read_text(encoding="utf-8"))
+    pre = dry["preflight"]
+    assert pre["brand_name"] == "GrovePop"
+    assert pre["is_ops_scheduler"] is True
+    assert pre["ebay_environment"] == "SANDBOX"
+    assert pre["ebay_environment"] != os.environ.get("EBAY_ENVIRONMENT")
+    assert Path(pre["store_root"]) == gp_root.resolve()
+    assert Path(pre["db_path"]) == gp_db.resolve()
+    assert Path(pre["token_db_path"]) == gp_tokens.resolve()
+    assert dry["degraded"] is True
+    assert dry["candidates"] == []
+    force_skus = {row.get("sku") for row in dry["excluded"].get("force_skip") or []}
+    assert "W465P451141" not in force_skus
+    assert "MAIN-ONLY-SKU" not in json.dumps(dry)
+
+    mismatch_out = tmp_path / "mismatch"
+    rc = m.main([
+        "--store", "gp",
+        "--store-root", str(main_root),
+        "--out-dir", str(mismatch_out),
+    ])
+    assert rc == m.EXIT_USAGE
+    assert os.environ.get("EBAY_ENVIRONMENT") == "PRODUCTION"
+    assert os.environ.get("EBAY_APP_ID") == "MAIN_APP"
