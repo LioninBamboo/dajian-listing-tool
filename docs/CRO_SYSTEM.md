@@ -31,7 +31,7 @@ logs/cro_action_queue.jsonl
     +--> 10:00 scripts/batch_smart_reprice.py --from-cro-queue
     +--> 10:15 scripts/cro_image_refresh.py
     +--> 10:20 scripts/cro_fill_specifics.py
-    +--> 10:25 scripts/cro_promote.py
+    +--> 10:25 scripts/cro_promote.py   # gated: scheduler_enable_cro_promote (default off)
     +--> Mon 11:00 scripts/cro_delist.py (magic-link confirm path)
     |
     v
@@ -65,7 +65,7 @@ The current CRO-relevant schedule in scheduler_daemon.py is:
 | `10:00` | `task_cro_consume()` | Executes queued `price_drop` work through repricing |
 | `10:15` | `task_cro_image_refresh()` | Executes queued image refresh work |
 | `10:20` | `task_cro_fill_specifics()` | Executes queued specifics fixes |
-| `10:25` | `task_cro_promote()` | Executes queued promote work; existing ads get bid uplift, missing ads use `create_ad_safe` |
+| `10:25` | `task_cro_promote()` | **Default skip.** Runs only when `scheduler_enable_cro_promote: true`. Then executes queued promote work (bid uplift / `create_ad_safe`). Manual CLI remains available. |
 | `10:30` | `task_cro_sentinel()` | Sends CRO alert signal and worsened-SKU output |
 | `10:35` | `task_cro_send_offer()` | Sends margin-floored seller-initiated offers to interested buyers of low-CVR listings |
 | `10:40` | `task_cro_lifecycle_detect()` | Relist-lifecycle candidate detection (local candidate rows only; no eBay mutation) |
@@ -120,21 +120,23 @@ The diagnosis rules live in `src/services/conversion_diagnoser.py`. In operator 
 
 `run_cro_daily()` only auto-queues a diagnosis action when both hold:
 
-1. The action type is whitelisted by the caller (`daily_tasks.run_cro_diagnose` passes `price_drop`, `image_refresh`, `fill_specifics`, `promote`).
+1. The action type is whitelisted by the caller (`daily_tasks.run_cro_diagnose` passes `price_drop`, `image_refresh`, `fill_specifics`, `send_offer` — **not** `promote`).
 2. The action priority is within `enqueue_max_priority` (the daily run passes `2`).
 
 Priority semantics from `conversion_diagnoser.py`:
 
-| Priority | Actions | Auto-queued? |
+| Priority | Actions | Auto-queued by daily_tasks? |
 |----------|---------|--------------|
-| P1 | `price_drop` (drop), `promote` (zero-impression) | Yes |
-| P2 | `image_refresh`, `fill_specifics`, `send_offer`, `title_refresh`, `promote` (30d no-sale) | Yes, if the type is whitelisted |
+| P1 | `price_drop` (drop) | Yes |
+| P1 | `promote` (zero-impression) | **No** (owner rule 2026-10-26/27 — use manual CLI) |
+| P2 | `image_refresh`, `fill_specifics`, `send_offer`, `title_refresh` | Yes, if the type is whitelisted |
+| P2 | `promote` (30d no-sale) | **No** |
 | P3 | `delist` | Never — human-confirmed only |
 | P4 | `price_drop` reverse increase | Never |
 
 The runner hard-caps `enqueue_max_priority` at 2, so P3/P4 can never be auto-queued regardless of caller arguments. Before 2026-07, only P1 was queued, which meant the 10:15 `image_refresh` and 10:20 `fill_specifics` executors always consumed an empty queue (the diagnoser emits both only at P2). The daily report field `queued_by_action` shows what actually entered the queue per action type.
 
-`daily_tasks.run_cro_diagnose()` now passes a 50-slot daily activity quota so listing activity is spread across safer levers instead of title churn: `price_drop=10`, `image_refresh=5`, `fill_specifics=15`, `promote=10`, and `send_offer=10`. These caps limit how many recommendations per action type can enter `cro_action_queue` in one daily run; duplicate pending rows, recent terminal rows, inventory safety filters, and promote at-cap cooldown can reduce the actual count. Title keyword enrichment remains outside this quota because it is an operator-only dry-run/apply path.
+`daily_tasks.run_cro_diagnose()` passes a daily activity quota without promote: `price_drop=10`, `image_refresh=5`, `fill_specifics=15`, and `send_offer=10`. These caps limit how many recommendations per action type can enter `cro_action_queue` in one daily run; duplicate pending rows, recent terminal rows, and inventory safety filters can reduce the actual count. Title keyword enrichment remains outside this quota because it is an operator-only dry-run/apply path. `SAFE_AUTO_ACTIONS` in `cro_auto_executor` likewise excludes `promote`.
 
 ### Why A Run May Show Only `promote`
 
@@ -145,7 +147,7 @@ If the daily diagnosis says most or all listings are in `no_impression`, CRO has
 
 It will not emit `price_drop`, `image_refresh`, or `fill_specifics` until a listing has enough exposure to prove where the funnel is leaking.
 
-Example: in `reports/cro_daily_2026-05-10.json`, all `676` diagnosed listings fell into `no_impression`, and the action summary only contained `promote` and `delist`. That is why the later queue and email showed no pending `price_drop`, `image_refresh`, or `fill_specifics` work.
+Example: in `reports/cro_daily_2026-05-10.json`, all `676` diagnosed listings fell into `no_impression`, and the action summary only contained `promote` and `delist`. Historically that meant the later queue/email showed only promote work. After 2026-10-26/27, `run_cro_diagnose` no longer whitelists `promote`, so the same diagnosis day leaves the promote queue empty unless an operator enqueues or runs `scripts/cro_promote.py` manually.
 
 ### Why Queue Stats Can Show Pending But Nothing Executable
 

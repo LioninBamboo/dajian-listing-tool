@@ -13,7 +13,11 @@ from src.services.cro_action_queue import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-SAFE_AUTO_ACTIONS = ('price_drop', 'image_refresh', 'fill_specifics', 'promote')
+# Owner rule (2026-10-26/27): never auto-raise Promoted Listings ad rates.
+# `promote` stays executable via explicit CLI (`scripts/cro_promote.py`) or a
+# custom action_types pass that an operator opts into after re-adding it here;
+# it is intentionally absent from the default auto-execute set.
+SAFE_AUTO_ACTIONS = ('price_drop', 'image_refresh', 'fill_specifics')
 DEFAULT_LIMITS = {
     'price_drop': 200,
     'image_refresh': 80,

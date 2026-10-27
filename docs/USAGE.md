@@ -114,7 +114,7 @@ PUBLISHED
 | `10:00` | `cro_consume` | 执行 CRO 队列中的 `price_drop` |
 | `10:15` | `cro_image_refresh` | 执行 CRO 队列中的主图刷新 |
 | `10:20` | `cro_fill_specifics` | 执行 CRO 队列中的 specifics 修复 |
-| `10:25` | `cro_promote` | 执行 CRO 队列中的 promote；已推广提 bid，未推广走安全开广告 |
+| `10:25` | `cro_promote` | **默认跳过**。仅当 `scheduler_enable_cro_promote: true` 时执行队列中的 promote（已推广提 bid / 未推广安全开广告）。手动 `python scripts/cro_promote.py` 不受影响 |
 | `10:30` | `cro_sentinel` | 输出 CRO 告警与恶化 SKU |
 | 每 `2h` | `auto_analyze` | `daily_tasks.py --analyze-only` |
 | `20:00` | `health_check` | `scripts/sales_health_check.py --auto-fix --email` |
@@ -131,7 +131,8 @@ PUBLISHED
 - 标题优化定时任务已停用；只有显式设置 `ENABLE_SCHEDULED_TITLE_OPTIMIZATION=1` 时才会重新启用 `daily_optimize.py`。
 - MI 自检失败时会把结果写入 `logs/_scheduler_health.json`，必要时发高优先级提醒邮件。
 - CRO 的执行链路不是全部在 `09:30` 一次跑完，而是先诊断入队，再由 `10:00-10:30` 的消费窗口逐步落地。
-- Streamlit CRO 页的优先动作清单会展示完整动作分布；“自动执行安全 P1”会去重入队并立即消费 `price_drop` / `image_refresh` / `fill_specifics` / `promote`，`delist` 仍只走人工确认。
+- Streamlit CRO 页的优先动作清单会展示完整动作分布；“自动执行安全 P1”会去重入队并立即消费 `price_drop` / `image_refresh` / `fill_specifics`（**不含** `promote`），`delist` 仍只走人工确认。`daily_tasks.run_cro_diagnose` 默认也不再入队 `promote`，避免自动提高 Promoted Listings ad rate。
+- 如需重新打开调度器 10:25 promote 消费，在该店 `config/store_profile.local.yaml` 的 `server:` 下设 `scheduler_enable_cro_promote: true`（缺省 / 缺字段 = false）。此开关**不会**改回 diagnose 入队；需要提 bid 时用手动 CLI。
 
 ## 4. 当前推荐操作路径
 
@@ -246,6 +247,7 @@ python daily_tasks.py --audit-only
 |------|------|----------|
 | `scheduler_enable_qc_autofix` | GrovePop（户外家具，`qc_profile: furniture`） | 与主店相同的 11:30 只读审计 → 12:10 白名单修复 → 12:30 语义改写（仍需 env）→ 13:00 缺视频 |
 | `scheduler_enable_ads` | GrovePop + AquaRides | 周一/周四智能调价 / 广告恢复 / 黑名单 / 守门员告警 / `ads_enroll`（`create_ad_safe`，Trading 现价回退）/ 周二 bid / 促销轮转 |
+| `scheduler_enable_cro_promote` | 主店可选（默认 false） | 打开后才跑 10:25 `task_cro_promote`（提 bid / 安全开广告）。**不会**让 `run_cro_diagnose` 重新入队 `promote`；缺省关闭以遵守「禁止自动提高 ad rate」 |
 
 AquaRides 的 Motors 内容 QC / Fitment 仍走专用 Windows 任务，不要给汽配打开 `scheduler_enable_qc_autofix`（那是家具白名单）。
 

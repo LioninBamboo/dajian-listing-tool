@@ -1791,19 +1791,23 @@ def run_cro_diagnose(enqueue_p1: bool = True) -> dict:
 
         market_data = get_market_data_from_report(None)
 
+        # Owner rule (2026-10-26/27): do not enqueue `promote` by default.
+        # Automatic bid raises are off unless an operator runs
+        # scripts/cro_promote.py explicitly, or flips
+        # scheduler_enable_cro_promote (scheduler consumer only; this diagnose
+        # path still omits promote so the queue cannot refill itself).
         rep = run_cro_daily(
             products,
             market_data=market_data,
             enqueue_p1=enqueue_p1,
             enqueue_action_types=('price_drop', 'image_refresh',
-                                  'fill_specifics', 'promote', 'send_offer'),
-            # 每日 listing 活跃维护总量 50: 避免把"活跃"等同于频繁改标题.
+                                  'fill_specifics', 'send_offer'),
+            # 每日 listing 活跃维护配额 (不含 promote): 避免把"活跃"等同于频繁改标题.
             # 标题关键词增强保留在 scripts/cro_title_rewrite.py 的手动 dry-run/apply 通道.
             action_quotas={
                 'price_drop': 10,
                 'image_refresh': 5,
                 'fill_specifics': 15,
-                'promote': 10,
                 'send_offer': 10,
             },
             # image_refresh / fill_specifics 诊断恒为 P2; 不放宽到 2 时

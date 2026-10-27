@@ -258,6 +258,14 @@ def _ops_ads_enabled() -> bool:
         return False
 
 
+def _cro_promote_scheduler_enabled() -> bool:
+    """Fail-closed: missing/unreadable profile => do not auto-raise ad bids."""
+    try:
+        return bool(get_store_profile().cro_promote_scheduler_enabled)
+    except Exception:
+        return False
+
+
 _UNREADABLE_OPS_WARNED = False
 
 
@@ -1548,9 +1556,25 @@ def task_cro_monthly_report():
 
 
 def task_cro_promote():
-    """S23 — 每日执行 CRO promote 队列: 已推广则提 bid, 未推广则安全开广告."""
+    """S23 — 每日执行 CRO promote 队列: 已推广则提 bid, 未推广则安全开广告.
+
+    Owner rule (2026-10-26/27): bots must not automatically raise Promoted
+    Listings ad rates. Gated by store-profile ``scheduler_enable_cro_promote``
+    (default / absent = false). Manual ``scripts/cro_promote.py`` CLI remains.
+    """
     if _task_succeeded_today('cro_promote'):
         return True, 'Skipped (already succeeded today)'
+    if not _cro_promote_scheduler_enabled():
+        logger.info(
+            "↪ 跳过 CRO 推广执行: scheduler_enable_cro_promote 未开启 "
+            "(默认关闭, 避免自动提 ad rate/bid)"
+        )
+        update_health(
+            'cro_promote',
+            'success',
+            'Skipped (scheduler_enable_cro_promote off)',
+        )
+        return True, 'Skipped (scheduler_enable_cro_promote off)'
     if not _daily_tasks_ready_for_cro('CRO 推广执行'):
         return True, 'Skipped (waiting for daily_tasks)'
     run_task(

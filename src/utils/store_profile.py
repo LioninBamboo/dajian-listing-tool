@@ -140,6 +140,11 @@ class StoreProfile:
     # store (scheduler_profile=full) ignores these flags.
     scheduler_enable_qc_autofix: bool = False
     scheduler_enable_ads: bool = False
+    # Opt-in CRO Promoted Listings bid raises. Default / absent = False so
+    # scheduler_daemon task_cro_promote never auto-raises ad rates unless an
+    # operator explicitly flips this in store_profile.local.yaml.
+    # Does not affect manual `python scripts/cro_promote.py` CLI use.
+    scheduler_enable_cro_promote: bool = False
     # Explicit ops allowlist. Empty on an ops profile => {ops_daily, order_recheck}.
     # The main full/daily profile ignores this field (unrestricted).
     scheduler_allowed_jobs: tuple = ()
@@ -203,6 +208,15 @@ class StoreProfile:
     def ops_ads_enabled(self) -> bool:
         """True only on an ops instance that opted into the ads/marketing slice."""
         return self.is_ops_scheduler and bool(self.scheduler_enable_ads)
+
+    @property
+    def cro_promote_scheduler_enabled(self) -> bool:
+        """True when this instance opted into scheduled CRO promote (bid raises).
+
+        Unlike ops ads/QC slices, this flag applies on any scheduler_profile
+        (including main ``full``). Absent or false keeps task_cro_promote inert.
+        """
+        return bool(self.scheduler_enable_cro_promote)
 
     @property
     def resolved_scheduler_allowed_jobs(self) -> frozenset[str] | None:
@@ -303,6 +317,7 @@ _SECTION_FIELD_MAP = {
         "scheduler_mutex_name",
         "scheduler_enable_qc_autofix",
         "scheduler_enable_ads",
+        "scheduler_enable_cro_promote",
         "scheduler_allowed_jobs",
     },
 }
@@ -330,6 +345,7 @@ _BOOL_FIELDS = {
     "force_house_brand",
     "scheduler_enable_qc_autofix",
     "scheduler_enable_ads",
+    "scheduler_enable_cro_promote",
 }
 _TUPLE_FIELDS = {"banned_terms", "scheduler_allowed_jobs"}
 

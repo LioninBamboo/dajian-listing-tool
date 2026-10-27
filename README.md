@@ -51,11 +51,14 @@ Additional CRO cadence:
 - `10:00` CRO queue price-drop consume
 - `10:15` CRO image refresh
 - `10:20` CRO specifics fill
+- `10:25` CRO promote (bid raise) — **off by default**; requires `scheduler_enable_cro_promote: true` in store profile
 - `10:30` CRO sentinel alert
 - Sun `02:00` threshold learning, Sun `02:30` threshold promotion
 - Sun `03:00` CRO ops snapshot, capacity sample, and DB DR drill
-- Tue `10:00` smart bid, Tue `10:30` CRO promote, Tue `11:00` bid rollback
+- Tue `10:00` smart bid, Tue `11:00` bid rollback
 - Mon `11:00` CRO delist email
+
+Automatic Promoted Listings ad-rate increases are disabled by default (owner rule 2026-10-26/27): diagnose no longer enqueues `promote`, `SAFE_AUTO_ACTIONS` excludes it, and the 10:25 scheduler job skips unless `scheduler_enable_cro_promote` is explicitly set. Manual `python scripts/cro_promote.py` remains available.
 
 ## Safe Publish Workflow
 
