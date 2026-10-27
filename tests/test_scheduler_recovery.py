@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 import types
 from datetime import datetime
 from pathlib import Path
@@ -1616,6 +1617,151 @@ def test_resume_non75_claim_miss_keeps_unclaimed_marker_and_alerts(tmp_path, mon
     assert marker['handshake_claimed'] is False
     assert marker['outcome'] == 'exit75'
     assert any('handshake failed' in a.lower() for a in alerts)
+
+
+def test_inflight_empty_marker_blocks_concurrent_never_claimed_retry(tmp_path, monkeypatch):
+    """Empty marker with fresh mtime is in-flight — loser must not overwrite/retry."""
+    import threading
+
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir(parents=True)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    scheduler_daemon._RESUME_MARKER_MEMORY.clear()
+    scheduler_daemon._RESUME_WRITE_SEQ.clear()
+    path = scheduler_daemon._inventory_resume_marker_path('daily_tasks')
+    # Simulate winner's O_CREAT before payload write completes.
+    path.write_text('', encoding='utf-8')
+    assert scheduler_daemon._marker_file_within_handshake_window(path) is True
+    assert scheduler_daemon._inventory_resume_already_consumed('daily_tasks') is True
+
+    results = []
+
+    def _claim(token):
+        results.append(
+            scheduler_daemon._try_claim_inventory_resume_marker(
+                'daily_tasks', token, prior_status='interrupted'
+            )
+        )
+
+    t1 = threading.Thread(target=_claim, args=('loser-a',))
+    t2 = threading.Thread(target=_claim, args=('loser-b',))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert all(not claimed for claimed, _ in results)
+    # File must remain the empty in-flight marker (not overwritten).
+    assert path.read_text(encoding='utf-8') == ''
+    assert not path.with_name(path.name + '.never_claimed_retry').exists()
+
+
+def test_stale_unreadable_marker_allows_never_claimed_retry(tmp_path, monkeypatch):
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir(parents=True)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    scheduler_daemon._RESUME_MARKER_MEMORY.clear()
+    scheduler_daemon._RESUME_WRITE_SEQ.clear()
+    path = scheduler_daemon._inventory_resume_marker_path('daily_tasks')
+    path.write_text('{not-json', encoding='utf-8')
+    old = time.time() - scheduler_daemon._RESUME_HANDSHAKE_TIMEOUT_SEC - 5
+    os.utime(path, (old, old))
+    assert scheduler_daemon._marker_file_within_handshake_window(path) is False
+    assert scheduler_daemon._inventory_resume_already_consumed('daily_tasks') is False
+    claimed, marker = scheduler_daemon._try_claim_inventory_resume_marker(
+        'daily_tasks', 'retry-token', prior_status='interrupted'
+    )
+    assert claimed is True
+    assert marker['never_claimed_retry_used'] is True
+
+
+def test_read_prefers_newer_write_seq_memory_over_stale_disk(tmp_path, monkeypatch):
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir(parents=True)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    scheduler_daemon._RESUME_MARKER_MEMORY.clear()
+    scheduler_daemon._RESUME_WRITE_SEQ.clear()
+    # Durable pending (seq 1).
+    assert scheduler_daemon._write_inventory_resume_marker(
+        'daily_tasks',
+        {
+            'date': '20260511',
+            'outcome': 'pending',
+            'handshake_claimed': False,
+            'exit75_retries': 0,
+        },
+    ) is True
+    # Later exit75 update fails on disk but lands in memory with higher seq.
+    monkeypatch.setattr(
+        scheduler_daemon.os,
+        'replace',
+        lambda *a, **k: (_ for _ in ()).throw(PermissionError('locked')),
+    )
+    monkeypatch.setattr(scheduler_daemon.time, 'sleep', lambda *_: None)
+    assert scheduler_daemon._write_inventory_resume_marker(
+        'daily_tasks',
+        {
+            'date': '20260511',
+            'outcome': 'exit75',
+            'handshake_claimed': False,
+            'exit75_retries': 2,
+            'last_exit75_at': '2026-05-11T11:00:00',
+        },
+    ) is False
+    marker = scheduler_daemon._read_inventory_resume_marker('daily_tasks')
+    assert marker['outcome'] == 'exit75'
+    assert marker['exit75_retries'] == 2
+    assert marker['write_seq'] >= 2
+
+
+def test_initial_claim_write_failure_emits_once_alert(tmp_path, monkeypatch):
+    lock_dir = tmp_path / '_task_locks'
+    lock_dir.mkdir(parents=True)
+    monkeypatch.setattr(scheduler_daemon, 'TASK_LOCK_DIR', lock_dir)
+    monkeypatch.setattr(scheduler_daemon, 'datetime', FixedNoonDateTime)
+    scheduler_daemon._RESUME_MARKER_MEMORY.clear()
+    scheduler_daemon._RESUME_WRITE_SEQ.clear()
+    alerts = []
+    monkeypatch.setattr(
+        scheduler_daemon,
+        '_alert_inventory_resume',
+        lambda msg, **kwargs: alerts.append(msg),
+    )
+
+    real_write = os.write
+    writes = {'n': 0}
+
+    def _fail_first_payload_write(fd, data):
+        # Fail only the initial marker payload write; allow alert-gate writes.
+        writes['n'] += 1
+        if writes['n'] == 1:
+            raise OSError('disk full')
+        return real_write(fd, data)
+
+    monkeypatch.setattr(scheduler_daemon.os, 'write', _fail_first_payload_write)
+    claimed, marker = scheduler_daemon._try_claim_inventory_resume_marker(
+        'daily_tasks', 'tok1', prior_status='interrupted'
+    )
+    assert claimed is False
+    assert marker is None
+    assert any('initial claim write failed' in a.lower() for a in alerts)
+    # Second failure same day must not double-alert (own gate).
+    n = len(alerts)
+    # Reset counter so the next claim's payload write fails again (nth==1 style
+    # would not apply; force every marker-path write that looks like JSON to fail).
+    def _fail_json_payload_write(fd, data):
+        if isinstance(data, (bytes, bytearray)) and data[:1] == b'{':
+            raise OSError('disk full')
+        return real_write(fd, data)
+
+    monkeypatch.setattr(scheduler_daemon.os, 'write', _fail_json_payload_write)
+    claimed2, _ = scheduler_daemon._try_claim_inventory_resume_marker(
+        'daily_tasks', 'tok2', prior_status='interrupted'
+    )
+    assert claimed2 is False
+    assert len(alerts) == n
 
 
 def test_resume_handshake_timeout_exhaust_alerts_no_full_daily(tmp_path, monkeypatch):

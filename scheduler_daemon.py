@@ -577,6 +577,8 @@ _RESUME_EXIT75_BACKOFF_SEC = (30, 120, 300)  # after 1st/2nd/3rd exit-75
 _RESUME_HANDSHAKE_TIMEOUT_SEC = 15
 # Process-local fallback when durable marker I/O fails (same calendar day only).
 _RESUME_MARKER_MEMORY: dict[str, dict] = {}
+# Monotonic write sequence per day/task (also stamped into marker payloads).
+_RESUME_WRITE_SEQ: dict[str, int] = {}
 
 
 def _inventory_resume_marker_path(task_name='daily_tasks', now=None):
@@ -592,24 +594,90 @@ def _resume_marker_memory_key(task_name='daily_tasks', now=None):
     return f"{TASK_LOCK_DIR}:{now.strftime('%Y%m%d')}:{task_name}"
 
 
+def _resume_write_seq_value(payload) -> int:
+    try:
+        return int((payload or {}).get('write_seq') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _next_resume_write_seq(task_name='daily_tasks', now=None, *, at_least=0) -> int:
+    key = _resume_marker_memory_key(task_name, now=now)
+    current = max(int(_RESUME_WRITE_SEQ.get(key) or 0), int(at_least or 0))
+    nxt = current + 1
+    _RESUME_WRITE_SEQ[key] = nxt
+    return nxt
+
+
+def _stamp_resume_write_seq(task_name, payload, now=None) -> dict:
+    data = dict(payload or {})
+    data['write_seq'] = _next_resume_write_seq(
+        task_name,
+        now=now,
+        at_least=_resume_write_seq_value(data),
+    )
+    return data
+
+
 def _remember_resume_marker(task_name, payload, now=None):
     if not isinstance(payload, dict):
         return
-    _RESUME_MARKER_MEMORY[_resume_marker_memory_key(task_name, now=now)] = dict(payload)
+    key = _resume_marker_memory_key(task_name, now=now)
+    existing = _RESUME_MARKER_MEMORY.get(key)
+    if existing and _resume_write_seq_value(existing) > _resume_write_seq_value(payload):
+        return
+    _RESUME_MARKER_MEMORY[key] = dict(payload)
+    seq = _resume_write_seq_value(payload)
+    if seq > int(_RESUME_WRITE_SEQ.get(key) or 0):
+        _RESUME_WRITE_SEQ[key] = seq
+
+
+def _marker_file_within_handshake_window(path, now=None) -> bool:
+    """True when marker file mtime is still inside the handshake wait window.
+
+    Uses wall-clock ``time.time()`` (not the injectible ``datetime.now``) so a
+    concurrent claimer reading a just-created empty file still sees it as
+    in-flight under test clocks that freeze ``datetime.now``.
+    """
+    del now  # mtime age is wall-clock; kept for call-site symmetry
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    return age < _RESUME_HANDSHAKE_TIMEOUT_SEC
+
+
+def _load_resume_marker_from_disk(path):
+    """Return parsed dict, or None when missing/empty/unparseable."""
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding='utf-8').strip()
+        if not raw:
+            return None
+        data = json.loads(raw)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _read_inventory_resume_marker(task_name='daily_tasks', now=None):
+    """Prefer the newer of durable file vs in-memory fallback (by write_seq)."""
     path = _inventory_resume_marker_path(task_name, now=now)
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding='utf-8'))
-            if isinstance(data, dict):
-                _remember_resume_marker(task_name, data, now=now)
-                return data
-        except Exception:
-            pass
+    disk = _load_resume_marker_from_disk(path)
     mem = _RESUME_MARKER_MEMORY.get(_resume_marker_memory_key(task_name, now=now))
-    return dict(mem) if isinstance(mem, dict) else None
+    mem = dict(mem) if isinstance(mem, dict) else None
+    if disk and mem:
+        if _resume_write_seq_value(mem) > _resume_write_seq_value(disk):
+            return mem
+        _remember_resume_marker(task_name, disk, now=now)
+        return disk
+    if disk:
+        _remember_resume_marker(task_name, disk, now=now)
+        return disk
+    if mem:
+        return mem
+    return None
 
 
 def _write_inventory_resume_marker(task_name, payload, now=None) -> bool:
@@ -619,9 +687,12 @@ def _write_inventory_resume_marker(task_name, payload, now=None) -> bool:
     On Windows, ``os.replace`` can raise ``PermissionError`` if another handle
     briefly holds the target; retry a few times and never crash the daemon.
     Callers must not treat a False return as success (do not launch resume).
+    Always stamps a monotonic ``write_seq`` so memory can beat a stale on-disk
+    copy after a failed later write.
     """
     path = _inventory_resume_marker_path(task_name, now=now)
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _stamp_resume_write_seq(task_name, payload, now=now)
     tmp = path.with_name(f'{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp')
     try:
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -704,10 +775,20 @@ def _inventory_resume_already_consumed(task_name='daily_tasks', now=None):
     Exception: a ``pending`` marker with no handshake/claim (worker never started,
     e.g. reboot right after launch) may allow exactly one more attempt when
     ``never_claimed_retry_used`` is still false and the original launcher is dead.
+
+    Empty/unparseable marker files whose mtime is still inside the handshake
+    window are treated as in-flight (consumed) — never as a free retry slot.
     """
     now = now or datetime.now()
+    path = _inventory_resume_marker_path(task_name, now=now)
     marker = _read_inventory_resume_marker(task_name, now=now)
     if not marker:
+        if path.exists() and _marker_file_within_handshake_window(path, now=now):
+            return True
+        if path.exists() and not _marker_file_within_handshake_window(path, now=now):
+            # Stale unreadable: allow the one never-claimed retry unless gate used.
+            gate = path.with_name(path.name + '.never_claimed_retry')
+            return gate.exists()
         return False
     day = str(marker.get('date') or '')
     if day and day != now.strftime('%Y%m%d'):
@@ -737,11 +818,29 @@ def _inventory_resume_already_consumed(task_name='daily_tasks', now=None):
     return True
 
 
+def _emit_claim_write_failed_alert(task_name, now=None, *, detail=''):
+    text = (
+        f"{task_name}: inventory resume marker initial claim write failed"
+        + (f" ({detail})" if detail else '')
+        + "; not launching --sync-only"
+    )
+    return _emit_resume_alert_once(
+        task_name,
+        _RESUME_ALERT_KIND_CLAIM_WRITE,
+        text,
+        now=now,
+        marker_flag='claim_write_failed_alert_emitted',
+    )
+
+
 def _try_claim_inventory_resume_marker(task_name, launch_token, *, prior_status='', now=None):
     """Atomically claim today's resume slot (O_CREAT|O_EXCL) or take the one never-claimed retry.
 
     Returns (claimed: bool, marker: dict|None). Only one winner across watchdog/daemon.
     Durable marker write failures return claimed=False (do not launch resume).
+
+    Empty/unparseable marker files inside the handshake window are in-flight:
+    do not never-claimed-retry and do not overwrite.
     """
     now = now or datetime.now()
     path = _inventory_resume_marker_path(task_name, now=now)
@@ -749,18 +848,22 @@ def _try_claim_inventory_resume_marker(task_name, launch_token, *, prior_status=
     day = now.strftime('%Y%m%d')
     launcher_pid = os.getpid()
     launcher_marker = get_process_creation_marker(launcher_pid) or ''
-    fresh = {
-        'date': day,
-        'launch_token': launch_token,
-        'launched_at': now.isoformat(),
-        'prior_status': prior_status,
-        'outcome': 'pending',
-        'handshake_claimed': False,
-        'never_claimed_retry_used': False,
-        'exit75_retries': 0,
-        'launcher_pid': launcher_pid,
-        'launcher_creation_marker': launcher_marker,
-    }
+    fresh = _stamp_resume_write_seq(
+        task_name,
+        {
+            'date': day,
+            'launch_token': launch_token,
+            'launched_at': now.isoformat(),
+            'prior_status': prior_status,
+            'outcome': 'pending',
+            'handshake_claimed': False,
+            'never_claimed_retry_used': False,
+            'exit75_retries': 0,
+            'launcher_pid': launcher_pid,
+            'launcher_creation_marker': launcher_marker,
+        },
+        now=now,
+    )
 
     try:
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -779,6 +882,7 @@ def _try_claim_inventory_resume_marker(task_name, launch_token, *, prior_status=
             except OSError:
                 pass
             _remember_resume_marker(task_name, fresh, now=now)
+            _emit_claim_write_failed_alert(task_name, now=now, detail=str(exc))
             return False, None
         else:
             os.close(fd)
@@ -788,9 +892,27 @@ def _try_claim_inventory_resume_marker(task_name, launch_token, *, prior_status=
         pass
     except OSError as exc:
         logger.warning("inventory resume marker create failed: %s", exc)
+        _emit_claim_write_failed_alert(task_name, now=now, detail=str(exc))
         return False, None
 
-    existing = _read_inventory_resume_marker(task_name, now=now) or {}
+    # File exists: parse carefully — empty/partial create is not a free retry slot.
+    disk = _load_resume_marker_from_disk(path)
+    if disk is None and path.exists():
+        if _marker_file_within_handshake_window(path, now=now):
+            # Winner is still writing / fsyncing — treat as in-flight.
+            return False, None
+        # Stale unreadable: one never-claimed retry may reclaim the slot.
+        existing = {
+            'date': day,
+            'outcome': 'pending',
+            'handshake_claimed': False,
+            'never_claimed_retry_used': False,
+            'exit75_retries': 0,
+            'launched_at': None,
+        }
+    else:
+        existing = _read_inventory_resume_marker(task_name, now=now) or disk or {}
+
     outcome = str(existing.get('outcome') or '').lower()
     handshake_claimed = bool(existing.get('handshake_claimed'))
     stale_pending = _pending_resume_launch_is_stale(existing, now=now)
@@ -1001,6 +1123,7 @@ _RESUME_ALERT_KIND_BLOCKED = 'blocked'
 _RESUME_ALERT_KIND_BACKOFF = 'backoff'
 _RESUME_ALERT_KIND_EXHAUSTED = 'retries_exhausted'
 _RESUME_ALERT_KIND_CLAIM_MISS = 'claim_miss'
+_RESUME_ALERT_KIND_CLAIM_WRITE = 'claim_write_failed'
 
 
 def _emit_resume_alert_once(task_name, kind, message, *, now=None, marker_flag=None):
@@ -1013,8 +1136,12 @@ def _emit_resume_alert_once(task_name, kind, message, *, now=None, marker_flag=N
     try:
         gate_fd = os.open(str(gate), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         try:
-            os.write(gate_fd, str(kind).encode('utf-8'))
-            os.fsync(gate_fd)
+            try:
+                os.write(gate_fd, str(kind).encode('utf-8'))
+                os.fsync(gate_fd)
+            except OSError:
+                # Exclusive create already owns the once-slot; still emit.
+                pass
         finally:
             os.close(gate_fd)
     except FileExistsError:
@@ -1027,7 +1154,9 @@ def _emit_resume_alert_once(task_name, kind, message, *, now=None, marker_flag=N
             'date': now.strftime('%Y%m%d'),
         }
         if marker.get(marker_flag):
-            return False
+            # Gate won but flag already set (rare); still count as emitted.
+            _alert_inventory_resume(message)
+            return True
         marker[marker_flag] = True
         try:
             _write_inventory_resume_marker(task_name, marker, now=now)
