@@ -25,7 +25,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -257,17 +257,134 @@ def _skip_is_terminal(row: Dict[str, Any]) -> bool:
     return reason not in _RETRYABLE_SKIP_REASONS
 
 
+def _normalize_urls_for_compare(urls: List[str]) -> List[str]:
+    """Strip only x-oss-process on both sides so a refreshed lead stays healthy."""
+    return [
+        _image_url_drop_oss_process(url)
+        for url in urls
+        if isinstance(url, str) and url
+    ]
+
+
 def _should_refresh(local: List[str], live_urls: List[str]) -> Optional[str]:
     """返回 None 表示无需刷新; 否则返回原因."""
-    if len(local) < 2:
+    local_n = _normalize_urls_for_compare(local)
+    live_n = _normalize_urls_for_compare(live_urls)
+    if len(local_n) < 2:
         return None  # 本地都没多图, 没的换
-    if not live_urls:
+    if not live_n:
         return 'live has no images'
-    if len(live_urls) <= 1 and len(local) >= 2:
-        return f'live only {len(live_urls)} img vs local {len(local)}'
-    if local[0] != live_urls[0]:
+    if len(live_n) <= 1 and len(local_n) >= 2:
+        return f'live only {len(live_n)} img vs local {len(local_n)}'
+    if local_n[0] != live_n[0]:
         return 'local lead image differs from live'
     return None
+
+
+GIGA_SIG_KEYS: tuple[str, ...] = ("x-cc", "x-cu", "x-ct", "x-cs")
+
+
+def live_quantity(item: Dict[str, Any]) -> Optional[int]:
+    """Read ship-to qty. Missing/unparseable → None (never default to 1)."""
+    raw = ((item.get("availability") or {}).get(
+        "shipToLocationAvailability") or {}).get("quantity")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def giga_sig_params(url: str) -> Dict[str, str]:
+    """Raw query values (not decoded) so x-c* bytes stay comparable."""
+    if not url or not isinstance(url, str) or "?" not in url:
+        return {}
+    query = url.split("?", 1)[1].split("#", 1)[0]
+    out: Dict[str, str] = {}
+    for part in query.split("&"):
+        if "=" not in part:
+            continue
+        key, val = part.split("=", 1)
+        if key in GIGA_SIG_KEYS and key not in out:
+            out[key] = val
+    return out
+
+
+def strip_oss_keep_giga_sig(url: str) -> str:
+    """Drop only the raw x-oss-process &-segment; never re-encode the query."""
+    if not url or not isinstance(url, str):
+        return url or ""
+    return _image_url_drop_oss_process(url)
+
+
+def urls_keep_giga_sigs(source_urls: List[str], dest_urls: List[str]) -> bool:
+    """False when a kept URL's x-c* bytes are missing or changed.
+
+    Truncation is allowed: only the dest/kept prefix is compared pairwise.
+    """
+    n = min(len(source_urls), len(dest_urls))
+    for i in range(n):
+        src_sig = giga_sig_params(source_urls[i])
+        if not src_sig:
+            continue
+        dest_sig = giga_sig_params(dest_urls[i])
+        for key, value in src_sig.items():
+            if dest_sig.get(key) != value:
+                return False
+    return True
+
+
+def prepare_refresh_image_urls(local_images: List[Any]) -> Tuple[List[str], Optional[str]]:
+    """Strip OSS, cap at LIMIT, then check sigs on the kept URLs only."""
+    kept = [u for u in local_images if isinstance(u, str) and u][:_INVENTORY_IMAGE_LIMIT]
+    prepared = [strip_oss_keep_giga_sig(u) for u in kept]
+    if not urls_keep_giga_sigs(kept, prepared):
+        return [], "image_sig_stripped"
+    return prepared, None
+
+
+def payload_image_urls(payload: Optional[Dict[str, Any]]) -> List[str]:
+    if not payload:
+        return []
+    aliases = payload.get("image_urls")
+    if aliases:
+        return list(aliases)
+    return list(((payload.get("product") or {}).get("imageUrls")) or [])
+
+
+def _qty_skip_reason_for_inspect(item: Dict[str, Any]) -> Optional[str]:
+    reason = _quantity_skip_reason(item)
+    if not reason:
+        return None
+    if reason in {"live quantity missing", "live quantity unknown"}:
+        return "qty_unknown"
+    return "qty_zero"
+
+
+def build_strict_refresh_payload(
+    item: Dict[str, Any],
+    local: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Dry-run inspect wrapper over #48 PUT-body helpers.
+
+    Never default qty to 1. Keep GigaB2B x-c* params. Weight<=0 is omitted.
+    """
+    qty_reason = _qty_skip_reason_for_inspect(item)
+    if qty_reason:
+        return None, qty_reason
+    local_images = list(local.get("images") or [])
+    prepared, sig_reason = prepare_refresh_image_urls(local_images)
+    if sig_reason:
+        return None, sig_reason
+    try:
+        body = _inventory_refresh_put_body(item, prepared)
+    except RuntimeError as exc:
+        return None, str(exc)
+    qty = live_quantity(item)
+    body["image_urls"] = prepared
+    body["quantity"] = qty
+    return body, None
 
 
 def _refresh_one(client, sku: str, local: Dict[str, Any]) -> Dict[str, Any]:
@@ -297,12 +414,9 @@ def _refresh_one(client, sku: str, local: Dict[str, Any]) -> Dict[str, Any]:
     if product is None:
         return _skip_row(sku, 'live product missing')
 
-    prepared: List[str] = []
-    for raw_url in local_images:
-        if not isinstance(raw_url, str) or not raw_url:
-            return _skip_row(sku, 'local image url invalid')
-        prepared.append(_image_url_drop_oss_process(raw_url))
-    prepared = prepared[:_INVENTORY_IMAGE_LIMIT]
+    prepared, sig_reason = prepare_refresh_image_urls(local_images)
+    if sig_reason:
+        return _skip_row(sku, sig_reason)
     if len(prepared) < 2:
         return _skip_row(sku, 'live already healthy', live_n=len(live_urls))
 

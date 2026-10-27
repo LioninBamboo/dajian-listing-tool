@@ -471,3 +471,61 @@ def test_nonpositive_package_weight_dropped_from_put_body(monkeypatch):
         (['SKU-W0'], 'image_refresh', 'done'),
         (['SKU-WD'], 'image_refresh', 'done'),
     ]
+
+
+def test_should_refresh_normalizes_oss_on_both_sides():
+    from scripts.cro_image_refresh import (
+        _normalize_urls_for_compare,
+        _should_refresh,
+        strip_oss_keep_giga_sig,
+    )
+
+    local = [_URL_OSS_MIDDLE, _URL_UNCHANGED]
+    live = [strip_oss_keep_giga_sig(u) for u in local]
+    assert 'x-oss-process' in local[0]
+    assert 'x-oss-process' not in live[0]
+    assert _normalize_urls_for_compare(local) == _normalize_urls_for_compare(live)
+    assert _should_refresh(local, live) is None
+    assert _should_refresh(local, ['https://img/other.jpg', live[1]]) == (
+        'local lead image differs from live'
+    )
+
+
+def test_refresh_one_second_run_healthy_after_oss_strip(monkeypatch):
+    local_images = [_URL_OSS_MIDDLE, _URL_UNCHANGED]
+    client = FakeClient({'SKU-OSS': _live_item(quantity=5, sku='SKU-OSS')})
+    cir = _install(monkeypatch, client, [{'sku': 'SKU-OSS'}], images=local_images)
+
+    first = cir._refresh_one(client, 'SKU-OSS', {'images': local_images})
+    assert first['status'] == 'done'
+    assert len(client.puts) == 1
+    written = client.puts[0]['json']['product']['imageUrls']
+    assert 'x-oss-process' not in written[0]
+    assert written[0] == _URL_OSS_MIDDLE_EXPECTED
+
+    second = cir._refresh_one(client, 'SKU-OSS', {'images': local_images})
+    assert second['status'] == 'skipped'
+    assert second['reason'] == 'live already healthy'
+    assert len(client.puts) == 1
+
+
+def test_prepare_refresh_truncates_without_failing_sigs():
+    from scripts.cro_image_refresh import (
+        _INVENTORY_IMAGE_LIMIT,
+        prepare_refresh_image_urls,
+        urls_keep_giga_sigs,
+    )
+
+    local = [
+        (
+            f'https://b2bfiles1.gigab2b.cn/img/{i:02d}.jpg'
+            f'?x-oss-process=image/resize,w_800&x-cc=c{i}&x-cu=u{i}&x-ct=t{i}&x-cs=s{i}'
+        )
+        for i in range(25)
+    ]
+    prepared, reason = prepare_refresh_image_urls(local)
+    assert reason is None
+    assert len(prepared) == _INVENTORY_IMAGE_LIMIT == 24
+    assert urls_keep_giga_sigs(local, prepared) is True
+    assert all('x-oss-process' not in url for url in prepared)
+    assert all(f'x-cs=s{i}' in prepared[i] for i in range(24))

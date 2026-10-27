@@ -691,10 +691,11 @@ def _select_best_offer(offers, expected_listing_id: str = None):
     return sorted(offers, key=_rank)[0]
 
 
-def _trading_site_id() -> str:
-    from src.utils.store_profile import get_store_profile
+def _trading_site_id(profile=None) -> str:
+    if profile is None:
+        from src.utils.store_profile import get_store_profile
 
-    profile = get_store_profile()
+        profile = get_store_profile()
     return str(getattr(profile, "ebay_site_id", "0") or "0")
 
 
@@ -708,7 +709,7 @@ def _trading_headers(token: str, call: str, site_id: str) -> dict:
     }
 
 
-def fetch_trading_item_price(oauth, listing_id: str):
+def fetch_trading_item_price(oauth, listing_id: str, profile=None):
     """Read live Trading price via GetItem."""
     from xml.sax.saxutils import escape as xml_escape
 
@@ -726,7 +727,7 @@ def fetch_trading_item_price(oauth, listing_id: str):
     try:
         response = requests.post(
             "https://api.ebay.com/ws/api.dll",
-            headers=_trading_headers(oauth.get_valid_token(), "GetItem", _trading_site_id()),
+            headers=_trading_headers(oauth.get_valid_token(), "GetItem", _trading_site_id(profile)),
             data=xml.encode("utf-8"),
             timeout=30,
             verify=False,
@@ -751,7 +752,7 @@ def fetch_trading_item_price(oauth, listing_id: str):
     return parse_trading_item_price(body)
 
 
-def update_trading_price(oauth, sku: str, new_price: float, listing_id: str) -> bool:
+def update_trading_price(oauth, sku: str, new_price: float, listing_id: str, profile=None) -> bool:
     """Write a Trading/Motors listing price via ReviseFixedPriceItem.
 
     Price-only revise: do not send ItemSpecifics, or the live fitment/aspects
@@ -771,7 +772,7 @@ def update_trading_price(oauth, sku: str, new_price: float, listing_id: str) -> 
         response = requests.post(
             "https://api.ebay.com/ws/api.dll",
             headers=_trading_headers(
-                oauth.get_valid_token(), "ReviseFixedPriceItem", _trading_site_id()
+                oauth.get_valid_token(), "ReviseFixedPriceItem", _trading_site_id(profile)
             ),
             data=xml.encode("utf-8"),
             timeout=40,
@@ -798,13 +799,13 @@ def update_trading_price(oauth, sku: str, new_price: float, listing_id: str) -> 
     return False
 
 
-def read_current_listing_price(oauth, sku: str, listing_id: str = None, client=None):
+def read_current_listing_price(oauth, sku: str, listing_id: str = None, client=None, profile=None):
     """Read the live listing price from the listing's write channel."""
     from src.services.repricing_guard import reprice_write_channel
 
-    if reprice_write_channel(listing_id) == "trading":
+    if reprice_write_channel(listing_id, profile=profile) == "trading":
         try:
-            return fetch_trading_item_price(oauth, listing_id)
+            return fetch_trading_item_price(oauth, listing_id, profile=profile)
         except Exception:
             return None
     if client is None:
@@ -1050,7 +1051,8 @@ def generate_search_keyword(product: dict) -> str:
 
 
 def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
-                      market_mode: str = None, from_cro_queue: bool = False):
+                      market_mode: str = None, from_cro_queue: bool = False,
+                      only_skus: set | None = None):
     """主函数"""
     log.info("=" * 70)
     log.info("BATCH SMART REPRICE — Terapeak 市场调研 + 智能定价")
@@ -1059,6 +1061,10 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
 
     products = get_published_products()
     log.info(f"Loaded {len(products)} PUBLISHED products with cost data")
+    if only_skus is not None:
+        wanted = {str(sku) for sku in only_skus}
+        products = [p for p in products if str(p.get("sku") or "") in wanted]
+        log.info(f"Filtered to {len(products)} products by only_skus ({len(wanted)} requested)")
 
     cro_queue_skus: set = set()
     if from_cro_queue:
