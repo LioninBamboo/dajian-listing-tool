@@ -102,7 +102,7 @@ PUBLISHED
 | 时间 | 任务标签 | 说明 |
 |------|----------|------|
 | `09:30` | `daily_tasks` | 全量工作负载，含分析、增量库存同步、全量缺货审核、审计、日报、MI 快照；智能调价仅周一/周四执行 |
-| `09:40` | `ad_restore` | 广告恢复审计与修复 |
+| `09:40` | `ad_restore` | **主店 AquaVerve 默认跳过**（健康状态 `skipped`）。其他店仍跑。主店仅当 `scheduler_enable_cro_promote: true` 时跑 `ad_restore_audit --apply`。手动 CLI 不受影响 |
 | `10:05` | `mi_check` | MI 自检，检查快照 / digest / 长周期 trend / 状态文件 |
 | `11:30` | `listing_audit` | `scripts/audit_fix_active_listings.py --live --email`，detect-only；对 live eBay listing 与 GIGA 原文做内容核对并发邮件 |
 | `12:10` | `source_aspect_autofix` | 白名单 `--fix-key` + `--email --fix`（禁止裸 `--fix`）；见 `docs/QC_PIPELINE_RED_LINES.md` |
@@ -111,10 +111,10 @@ PUBLISHED
 | `09:45` | `bl_cleanup` | 广告黑名单自动清理 |
 | `09:50` | `guard_alert` | 守门员异常率告警 |
 | `09:55` | `cro_monthly_report` | CRO 效果验证 / 阈值反馈门控 |
-| `10:00` | `cro_consume` | 执行 CRO 队列中的 `price_drop` |
+| `10:00` | `cro_consume` | 只执行 CRO 队列中的 `price_drop`。队列里的 `promote` 不会进广告 API |
 | `10:15` | `cro_image_refresh` | 执行 CRO 队列中的主图刷新 |
 | `10:20` | `cro_fill_specifics` | 执行 CRO 队列中的 specifics 修复 |
-| `10:25` | `cro_promote` | **默认跳过**。仅当 `scheduler_enable_cro_promote: true` 时执行队列中的 promote（已推广提 bid / 未推广安全开广告）。手动 `python scripts/cro_promote.py` 不受影响 |
+| `10:25` | `cro_promote` | **所有店默认跳过**（健康状态 `skipped`）。仅当 `scheduler_enable_cro_promote: true` 时执行。手动 `python scripts/cro_promote.py` 不受影响 |
 | `10:30` | `cro_sentinel` | 输出 CRO 告警与恶化 SKU |
 | 每 `2h` | `auto_analyze` | `daily_tasks.py --analyze-only` |
 | `20:00` | `health_check` | `scripts/sales_health_check.py --auto-fix --email` |
@@ -132,7 +132,7 @@ PUBLISHED
 - MI 自检失败时会把结果写入 `logs/_scheduler_health.json`，必要时发高优先级提醒邮件。
 - CRO 的执行链路不是全部在 `09:30` 一次跑完，而是先诊断入队，再由 `10:00-10:30` 的消费窗口逐步落地。
 - Streamlit CRO 页的优先动作清单会展示完整动作分布；“自动执行安全 P1”会去重入队并立即消费 `price_drop` / `image_refresh` / `fill_specifics`（**不含** `promote`），`delist` 仍只走人工确认。`daily_tasks.run_cro_diagnose` 默认也不再入队 `promote`，避免自动提高 Promoted Listings ad rate。
-- 如需重新打开调度器 10:25 promote 消费，在该店 `config/store_profile.local.yaml` 的 `server:` 下设 `scheduler_enable_cro_promote: true`（缺省 / 缺字段 = false）。此开关**不会**改回 diagnose 入队；需要提 bid 时用手动 CLI。
+- 所有店的 10:25 `cro_promote` 与 bid 上调看 `scheduler_enable_cro_promote`（缺省 / 缺字段 = false，健康状态记 `skipped` 而不是 success）。主店 AquaVerve（`brand_name: AquaVerve`，与历史 mutex 同一身份）在该开关为 false 时还会跳过 09:40 `ad_restore`、`ads_enroll` 和队列 `promote`。AquaRides / GrovePop 不设这个键时广告路径保持原样。要给主店重新打开这三项，在该店 `config/store_profile.local.yaml` 的 `server:` 下设 `scheduler_enable_cro_promote: true`。此开关**不会**改回 diagnose 入队。Relist 的 `--execute` 另需 `scheduler_enable_cro_relist: true`。
 
 ## 4. 当前推荐操作路径
 
@@ -246,8 +246,9 @@ python daily_tasks.py --audit-only
 | 开关 | 谁开 | 叠加任务 |
 |------|------|----------|
 | `scheduler_enable_qc_autofix` | GrovePop（户外家具，`qc_profile: furniture`） | 与主店相同的 11:30 只读审计 → 12:10 白名单修复 → 12:30 语义改写（仍需 env）→ 13:00 缺视频 |
-| `scheduler_enable_ads` | GrovePop + AquaRides | 周一/周四智能调价 / 广告恢复 / 黑名单 / 守门员告警 / `ads_enroll`（`create_ad_safe`，Trading 现价回退）/ 周二 bid / 促销轮转 |
-| `scheduler_enable_cro_promote` | 主店可选（默认 false） | 打开后：(1) 跑 10:25 `task_cro_promote`；(2) 周二 `smart_bid` 允许**上调** bid。缺省关闭时 promote 跳过、smart_bid 只降不升。**不会**让 `run_cro_diagnose` 重新入队 `promote`。`ad_restore` / `bid_rollback` 不受此开关影响 |
+| `scheduler_enable_ads` | GrovePop + AquaRides | 周一/周四智能调价 / 广告恢复 / 黑名单 / 守门员告警 / `ads_enroll` / 周二 bid / 促销轮转。这两店的 `ad_restore` 与 `ads_enroll` **不**再被 `scheduler_enable_cro_promote` 拦住；bid 上调仍要那个开关，降档和 `bid_rollback` 仍执行 |
+| `scheduler_enable_cro_promote` | 所有店默认 false；主店还用它拦开广告 | 所有店：打开后才跑 10:25 `task_cro_promote`，周二 `smart_bid` 才允许**上调**。主店 AquaVerve 额外：打开后才跑 09:40 `ad_restore`、`ads_enroll` 和队列 `promote`。缺键时主店这三项记健康状态 `skipped`；AquaRides / GrovePop 缺键仍跑广告。**不会**让 `run_cro_diagnose` 重新入队 `promote`。`bid_rollback` 与关广告不受此开关影响 |
+| `scheduler_enable_cro_relist` | 主店可选（默认 false） | 打开后 `scripts/cro_relist_lifecycle.py --execute` 才允许 End/Relist/revive。执行前读 eBay ActiveList：仍在卖的 SKU 记 `still_live` 并跳过；ActiveList 失败，或返回 0 且 DB 仍有在售，则整批中止、不写。`--detect` / `--evaluate` 始终只动本地 |
 
 AquaRides 的 Motors 内容 QC / Fitment 仍走专用 Windows 任务，不要给汽配打开 `scheduler_enable_qc_autofix`（那是家具白名单）。
 
@@ -255,7 +256,7 @@ AquaRides 的 Motors 内容 QC / Fitment 仍走专用 Windows 任务，不要给
 |------|------|------|
 | 每天 09:30 | 库存运营包 | `daily_tasks.py --ops-only`（增量同步 + 幽灵缺货恢复 + 精简邮件） |
 | 每 6 小时 | 出单源复核 | `scripts/order_source_recheck.py --hours-back 48 --email` |
-| 每天 10:25（ads 开） | 安全开广告 | `scripts/store_marketing.py --levers promoted --apply` |
+| 每天 10:25（ads 开；主店还要 `scheduler_enable_cro_promote`） | 安全开广告 | `scripts/store_marketing.py --levers promoted --apply` |
 | 每天 11:30–13:00（QC 开） | 内容审计 + 白名单修复 | 与主店同一组 `audit_fix_active_listings` / `semantic_rewrite` 任务 |
 
 金丝雀验收（子店目录内）：

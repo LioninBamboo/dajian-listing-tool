@@ -58,7 +58,9 @@ Additional CRO cadence:
 - Tue `10:00` smart bid, Tue `11:00` bid rollback
 - Mon `11:00` CRO delist email
 
-Automatic Promoted Listings ad-rate **increases** are disabled by default (owner rule 2026-10-26/27): diagnose no longer enqueues `promote`, `SAFE_AUTO_ACTIONS` excludes it, the 10:25 `cro_promote` job skips unless `scheduler_enable_cro_promote` is set, and Tuesday `smart_bid` runs with `--no-raises` under the same flag (lowers still apply). `ad_restore` re-opens ads at a target bid (does not raise existing bids); `bid_rollback` only lowers. Manual `python scripts/cro_promote.py` / `batch_smart_bid.py --apply` remain available.
+Automatic Promoted Listings ad-rate **increases** are disabled by default on every store (owner rule 2026-10-26/27): diagnose no longer enqueues `promote`, `SAFE_AUTO_ACTIONS` excludes it, `10:25` `cro_promote` skips, and Tuesday `smart_bid` runs with `--no-raises` (lowers still apply) while `scheduler_enable_cro_promote` is absent or false. **Main AquaVerve only** (brand `AquaVerve`, the same identity as the historical scheduler mutex) also skips `09:40` `ad_restore`, ops `ads_enroll`, and a queued `promote` when that flag is off. Tracked `config/store_profile.yaml` does not set the key, so Main is gated with no yaml edit. AquaRides and GrovePop keep the previous ad path when `scheduler_enable_ads` is on. `bid_rollback` only lowers and stays on. Manual CLI remains available.
+
+`scheduler_enable_cro_relist` (default false) blocks `scripts/cro_relist_lifecycle.py --execute` (End / Relist / revive). `--detect` and `--evaluate` stay local-only. When the flag is on, a live ActiveList SKU is refused with `still_live`. The whole execute aborts with no eBay writes when any ActiveList page Ack is not Success/Warning, when fewer rows come back than `api_total`, when pagination ends early, or when the fetch returns 0 rows while the DB still has live listings.
 
 ## Safe Publish Workflow
 

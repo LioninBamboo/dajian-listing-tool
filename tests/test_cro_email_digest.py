@@ -82,3 +82,13 @@ def test_render_auto_execution_email_surfaces_product_rows():
     assert 'Alpha Chair' in html
     assert 'already at cap' in html
     assert 'promote' in html
+
+
+def test_render_auto_execution_email_shows_main_promote_skip():
+    html = render_auto_execution_email({
+        'actions': [],
+        'blocked_by_flag': ['promote'],
+    })
+    assert '跳过' in html
+    assert 'scheduler_enable_cro_promote' in html
+    assert 'promote' in html

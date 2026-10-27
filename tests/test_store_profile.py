@@ -148,9 +148,12 @@ class TestOverrides:
         assert profile.scheduler_enable_qc_autofix is False
         assert profile.scheduler_enable_ads is False
         assert profile.scheduler_enable_cro_promote is False
+        assert profile.scheduler_enable_cro_relist is False
         assert profile.ops_qc_autofix_enabled is False
         assert profile.ops_ads_enabled is False
         assert profile.cro_promote_scheduler_enabled is False
+        assert profile.scheduled_ad_create_blocked is False
+        assert profile.cro_relist_scheduler_enabled is False
         assert profile.resolved_scheduler_allowed_jobs == frozenset({"ops_daily", "order_recheck"})
         assert profile.job_is_allowed("ops_daily") is True
         assert profile.job_is_allowed("smart_reprice") is False
