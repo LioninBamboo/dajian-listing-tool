@@ -352,7 +352,7 @@ def urls_keep_giga_sigs(source_urls: List[str], dest_urls: List[str]) -> bool:
     return True
 
 
-_INVENTORY_GET_ONLY_KEYS = frozenset({"sku", "href"})
+_INVENTORY_GET_ONLY_KEYS = frozenset({"sku", "href", "inventoryItemGroupKeys"})
 _PAYLOAD_ALIAS_KEYS = frozenset({"image_urls", "quantity"})
 
 
@@ -375,26 +375,26 @@ def inventory_put_body(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def put_strict_inventory_item(client: Any, sku: str, payload: Dict[str, Any]) -> Any:
-    """PUT the inventory item as a whole. Prefer raw session PUT (no rebuild)."""
+    """PUT the inventory item as a whole. No live session → refuse (no rebuild)."""
     body = inventory_put_body(payload)
     session = getattr(client, "session", None)
     oauth = getattr(client, "oauth", None)
     base = getattr(client, "base_url", None)
-    if session is not None and oauth is not None and base:
-        token = oauth.get_valid_token()
-        url = f"{str(base).rstrip('/')}/sell/inventory/v1/inventory_item/{sku}"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Content-Language": "en-US",
-        }
-        resp = session.put(url, headers=headers, json=body, timeout=60)
-        code = int(getattr(resp, "status_code", 0) or 0)
-        if code not in (200, 204):
-            text = getattr(resp, "text", "") or ""
-            raise RuntimeError(f"inventory PUT {code}: {text[:200]}")
-        return resp
-    return client.create_or_replace_inventory_item(sku, payload)
+    if session is None or oauth is None or not base:
+        raise RuntimeError("inventory PUT refused: no live session")
+    token = oauth.get_valid_token()
+    url = f"{str(base).rstrip('/')}/sell/inventory/v1/inventory_item/{sku}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Content-Language": "en-US",
+    }
+    resp = session.put(url, headers=headers, json=body, timeout=60)
+    code = int(getattr(resp, "status_code", 0) or 0)
+    if code not in (200, 204):
+        text = getattr(resp, "text", "") or ""
+        raise RuntimeError(f"inventory PUT {code}: {text[:200]}")
+    return resp
 
 
 def build_strict_refresh_payload(

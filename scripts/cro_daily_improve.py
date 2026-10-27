@@ -16,6 +16,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -55,6 +56,8 @@ EXIT_OPS_LIVE = 4
 EXIT_NOT_PRODUCTION = 5
 EXIT_LOCK = 6
 EXIT_EXPIRED = 7
+EXIT_DEGRADED = 8
+LOCK_UNREADABLE_HOLD_SEC = 60.0
 
 STORE_EXPECTATIONS: Dict[str, Dict[str, Any]] = {
     "main": {
@@ -619,6 +622,54 @@ def queue_is_fresh(ctx: ImproveContext, rows: Iterable[Dict[str, Any]]) -> bool:
     return False
 
 
+def _lock_snapshot(lock_path: Path) -> Optional[tuple[bytes, int, float]]:
+    """Read lock bytes together with inode/mtime. None if the file raced."""
+    try:
+        st = lock_path.stat()
+        raw = lock_path.read_bytes()
+        st2 = lock_path.stat()
+    except OSError:
+        return None
+    inode = int(getattr(st, "st_ino", 0) or 0)
+    inode2 = int(getattr(st2, "st_ino", 0) or 0)
+    if inode != inode2 or float(st.st_mtime) != float(st2.st_mtime):
+        return None
+    return raw, inode, float(st.st_mtime)
+
+
+def _lock_unchanged(lock_path: Path, observed: bytes, inode: int, mtime: float) -> bool:
+    try:
+        st = lock_path.stat()
+        if int(getattr(st, "st_ino", 0) or 0) != int(inode):
+            return False
+        if float(st.st_mtime) != float(mtime):
+            return False
+        return lock_path.read_bytes() == observed
+    except OSError:
+        return False
+
+
+def _try_reap_observed_lock(lock_path: Path, observed: bytes, inode: int, mtime: float) -> bool:
+    """Unlink only the exact stale file we observed; a replacement stays held."""
+    if not _lock_unchanged(lock_path, observed, inode, mtime):
+        return False
+    try:
+        lock_path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _parse_lock_payload(raw: bytes) -> Optional[Dict[str, Any]]:
+    if not raw or not raw.strip():
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def acquire_lock(lock_path: Path, now: datetime) -> Optional[int]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -632,22 +683,26 @@ def acquire_lock(lock_path: Path, now: datetime) -> Optional[int]:
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            try:
-                data = json.loads(lock_path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-            try:
-                holder = int(data.get("pid"))
-            except (TypeError, ValueError):
-                holder = None
-            marker = data.get("creation_marker")
-            if holder is not None and pid_alive(holder, marker):
+            snap = _lock_snapshot(lock_path)
+            if snap is None:
                 return EXIT_LOCK
-            try:
-                lock_path.unlink()
-            except OSError:
-                return EXIT_LOCK
-            continue
+            observed, inode, mtime = snap
+            data = _parse_lock_payload(observed)
+            if data is None:
+                age_sec = max(0.0, time.time() - mtime)
+                if age_sec < LOCK_UNREADABLE_HOLD_SEC:
+                    return EXIT_LOCK
+            else:
+                try:
+                    holder = int(data.get("pid"))
+                except (TypeError, ValueError):
+                    holder = None
+                marker = data.get("creation_marker")
+                if holder is not None and pid_alive(holder, marker):
+                    return EXIT_LOCK
+            if _try_reap_observed_lock(lock_path, observed, inode, mtime):
+                continue
+            return EXIT_LOCK
         try:
             os.write(fd, encoded)
             os.fsync(fd)
@@ -1748,6 +1803,8 @@ def run_improve(args: argparse.Namespace, ctx: ImproveContext) -> int:
             if error:
                 report["error"] = error
             write_reports(report, ctx.out_dir, f"{ctx.store}_{stamp}_dry")
+            if error:
+                return EXIT_DEGRADED
         loaded = abort_if_promote_loaded()
         if loaded is not None:
             return loaded

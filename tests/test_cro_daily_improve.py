@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -169,6 +170,41 @@ class GetOnlyClient:
                 raise AssertionError(f"write called: {name}")
             return boom
         raise AttributeError(name)
+
+
+class _FakeHttpResp:
+    status_code = 204
+    text = ""
+
+
+def _attach_live_session(client):
+    """put_strict_inventory_item requires session/oauth/base_url (no rebuild fallback)."""
+
+    class _OAuth:
+        def get_valid_token(self):
+            return "tok"
+
+    class _Session:
+        def put(self, url, headers=None, json=None, timeout=None):
+            sku = str(url).rstrip("/").split("/")[-1]
+            client.create_or_replace_inventory_item(sku, json)
+            return _FakeHttpResp()
+
+    client.session = _Session()
+    client.oauth = _OAuth()
+    client.base_url = "https://api.ebay.com"
+    return client
+
+
+def _payload_urls_and_qty(payload):
+    urls = list((payload or {}).get("image_urls") or [])
+    if not urls:
+        urls = list(((payload or {}).get("product") or {}).get("imageUrls") or [])
+    qty = (payload or {}).get("quantity")
+    if qty is None:
+        qty = (((payload or {}).get("availability") or {}).get(
+            "shipToLocationAvailability") or {}).get("quantity")
+    return urls, int(qty if qty is not None else 3)
 
 
 def _item(urls, qty=2):
@@ -362,9 +398,11 @@ def test_promote_cannot_be_enabled(tmp_path, monkeypatch, no_promote_module):
 
     def put(sku, payload):
         live_puts.append((sku, payload))
-        live_client.items[sku] = _item(payload["image_urls"], qty=payload["quantity"])
+        urls, qty = _payload_urls_and_qty(payload)
+        live_client.items[sku] = _item(urls, qty=qty)
 
     live_client.create_or_replace_inventory_item = put
+    _attach_live_session(live_client)
     live_ctx = _ctx(
         tmp_path, "main", _main_profile(),
         ebay_environment="PRODUCTION",
@@ -687,6 +725,7 @@ def test_image_qty_and_giga_sig(tmp_path, no_promote_module):
     item_ok["locale"] = "en_US"
     item_ok["sku"] = "W5230P450590"
     item_ok["href"] = "https://api.ebay.com/sell/inventory/v1/inventory_item/W5230P450590"
+    item_ok["inventoryItemGroupKeys"] = ["grp-1"]
     item_ok["availability"]["shipToLocationAvailability"]["allocationByFormat"] = {"auction": 0}
     item_ok["packageWeightAndSize"] = {
         "weight": {"value": 12.5, "unit": "POUND"},
@@ -719,6 +758,7 @@ def test_image_qty_and_giga_sig(tmp_path, no_promote_module):
     assert "quantity" not in put_body
     assert "sku" not in put_body
     assert "href" not in put_body
+    assert "inventoryItemGroupKeys" not in put_body
     assert put_body["packageWeightAndSize"] == item_ok["packageWeightAndSize"]
     assert put_body["product"]["imageUrls"] == payload["image_urls"]
 
@@ -1576,10 +1616,10 @@ def test_live_image_put_error_continues_batch(tmp_path, no_promote_module):
             if sku == "SKU2":
                 raise RuntimeError("put exploded")
             self.puts.append(sku)
-            urls = list((payload or {}).get("image_urls") or [GIGA_URL])
-            self.items[sku] = _item(urls, qty=int((payload or {}).get("quantity") or 3))
+            urls, qty = _payload_urls_and_qty(payload)
+            self.items[sku] = _item(urls or [GIGA_URL], qty=qty)
 
-    client = BatchClient()
+    client = _attach_live_session(BatchClient())
     marked = []
     ctx = _ctx(
         tmp_path, "main", _main_profile(),
@@ -1844,6 +1884,50 @@ def test_lock_stores_creation_marker_and_rejects_reused_pid(tmp_path, no_promote
     assert not lock.exists()
 
 
+def test_empty_fresh_lock_is_held_and_concurrent_stale_has_one_winner(tmp_path, no_promote_module):
+    from scripts import cro_daily_improve as m
+
+    empty = tmp_path / "empty.lock"
+    empty.write_bytes(b"")
+    assert m.acquire_lock(empty, _now()) == m.EXIT_LOCK
+    assert empty.exists()
+    assert empty.read_bytes() == b""
+
+    garbage = tmp_path / "garbage.lock"
+    garbage.write_text("{not-json", encoding="utf-8")
+    assert m.acquire_lock(garbage, _now()) == m.EXIT_LOCK
+    assert garbage.read_text(encoding="utf-8") == "{not-json"
+
+    stale = tmp_path / "stale.lock"
+    stale.write_text(
+        json.dumps({
+            "pid": 999999999,
+            "creation_marker": "proc-start-ticks:1",
+            "at": _now().isoformat(),
+            "name": "cro_daily_improve",
+        }),
+        encoding="utf-8",
+    )
+    results: list[int | None] = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait(timeout=5)
+        results.append(m.acquire_lock(stale, _now()))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert results.count(None) == 1
+    assert results.count(m.EXIT_LOCK) == 7
+    holder = json.loads(stale.read_text(encoding="utf-8"))
+    assert holder["pid"] == os.getpid()
+    m.release_lock(stale)
+    assert not stale.exists()
+
+
 def test_acquire_lock_uses_atomic_excl(tmp_path, monkeypatch, no_promote_module):
     from scripts import cro_daily_improve as m
 
@@ -2044,7 +2128,7 @@ def test_dry_run_exception_writes_degraded_report_and_releases_lock(tmp_path, no
         ebay_client_factory=lambda: GetOnlyClient(),
     )
     rc = m.main(["--store", "main", "--out-dir", str(ctx.out_dir)], ctx=ctx)
-    assert rc == 0
+    assert rc == m.EXIT_DEGRADED
     reports = list(ctx.out_dir.glob("*_dry.json"))
     assert reports
     dry = json.loads(reports[0].read_text(encoding="utf-8"))
@@ -2053,3 +2137,37 @@ def test_dry_run_exception_writes_degraded_report_and_releases_lock(tmp_path, no
     assert dry["mode"] == "dry"
     assert dry["writes"] == {"db": 0, "queue": 0, "ebay": 0}
     assert not ctx.lock_path.exists()
+
+
+def test_put_strict_refuses_without_session_and_drops_get_only_keys():
+    from scripts.cro_image_refresh import inventory_put_body, put_strict_inventory_item
+
+    class NoSession:
+        def create_or_replace_inventory_item(self, sku, payload):
+            raise AssertionError("must not fall back to create_or_replace_inventory_item")
+
+    with pytest.raises(RuntimeError, match="no live session"):
+        put_strict_inventory_item(NoSession(), "SKU", {
+            "sku": "SKU",
+            "href": "https://api.ebay.com/sell/inventory/v1/inventory_item/SKU",
+            "inventoryItemGroupKeys": ["g1"],
+            "locale": "en_US",
+            "product": {"imageUrls": ["https://img/a.jpg"]},
+        })
+
+    body = inventory_put_body({
+        "sku": "SKU",
+        "href": "https://api.ebay.com/x",
+        "inventoryItemGroupKeys": ["g1"],
+        "image_urls": ["https://alias.jpg"],
+        "quantity": 1,
+        "locale": "en_US",
+        "product": {"imageUrls": ["https://img/a.jpg"]},
+    })
+    assert "sku" not in body
+    assert "href" not in body
+    assert "inventoryItemGroupKeys" not in body
+    assert "image_urls" not in body
+    assert "quantity" not in body
+    assert body["locale"] == "en_US"
+    assert body["product"]["imageUrls"] == ["https://img/a.jpg"]
