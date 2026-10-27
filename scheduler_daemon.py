@@ -401,13 +401,6 @@ _TASK_STARTED_TODAY_STATUSES = {
     'failed',
 }
 
-# Crash/shutdown mid-run: resume unfinished inventory sync only (never full re-apply).
-_DAILY_RESUME_INVENTORY_STATUSES = {
-    'recovering',
-    'interrupted',
-}
-
-
 def _newer_qualifying_audit_since(since_iso, now=None):
     """True when a same-day full live_audit appeared after a skipped run."""
     now = now or datetime.now()
@@ -482,6 +475,9 @@ def _task_already_started_today(task_name, now=None):
 
     daily_tasks may only open one round per calendar day. Timeout is not success
     (CRO still waits), but it must not trigger another apply.
+
+    Watchdog ``recovering`` without durable partial-run evidence is a late
+    first-launch marker only — it must not block the normal full daily path.
     """
     now = now or datetime.now()
     info = _get_task_health(task_name)
@@ -495,35 +491,56 @@ def _task_already_started_today(task_name, now=None):
         last_dt = datetime.fromisoformat(at)
     except (TypeError, ValueError):
         return False
-    return last_dt.date() == now.date()
+    if last_dt.date() != now.date():
+        return False
+    if status == 'recovering' and not _has_partial_daily_run_evidence_today(task_name, now=now):
+        return False
+    return True
+
+
+def _today_stale_daily_lock_info(task_name='daily_tasks', now=None):
+    """Return today's stale (dead-pid) task lock payload, else None.
+
+    Durable evidence that daily_tasks actually started today and the worker
+    died — independent of watchdog ``recovering`` health writes.
+    """
+    now = now or datetime.now()
+    lock_path = _task_lock_path(task_name)
+    if not lock_path.exists():
+        return None
+    timeout_sec = int(TASK_TIMEOUT.get(task_name, 3600))
+    try:
+        lock_info = json.loads(lock_path.read_text(encoding='utf-8'))
+        timeout_sec = int(lock_info.get('timeout_sec') or timeout_sec)
+    except Exception:
+        return None
+    started_at = _iso_at_or_none(lock_info.get('started_at'))
+    if started_at is None or started_at.date() != now.date():
+        return None
+    if not _task_lock_is_stale(lock_info, timeout_sec, now=now):
+        return None
+    return lock_info
+
+
+def _has_partial_daily_run_evidence_today(task_name='daily_tasks', now=None):
+    """True when durable markers show daily_tasks partially ran today."""
+    return _today_stale_daily_lock_info(task_name, now=now) is not None
 
 
 def _should_resume_daily_inventory(task_name='daily_tasks', now=None):
-    """True when a crash/shutdown left daily_tasks recovering/interrupted today.
+    """True when a mid-run crash left unfinished inventory work today.
 
     Resume is inventory-sync only (``daily_tasks.py --sync-only`` with
     skip_synced_today). Never a blind full re-apply of live steps.
-    A still-running worker (active lock) blocks resume.
+
+    Decision uses durable markers (today's dead-pid lock), NOT watchdog
+    ``recovering`` health alone — a late first launch after 09:50 also sets
+    recovering and must still take the normal full daily path.
     """
     now = now or datetime.now()
-    info = _get_task_health(task_name)
-    if not info:
-        return False
-    status = str(info.get('status', '')).lower()
-    if status not in _DAILY_RESUME_INVENTORY_STATUSES:
-        return False
-    at = info.get('at')
-    if not at:
-        return False
-    try:
-        last_dt = datetime.fromisoformat(at)
-    except (TypeError, ValueError):
-        return False
-    if last_dt.date() != now.date():
-        return False
     if _task_run_lock_is_active(task_name, now=now):
         return False
-    return True
+    return _has_partial_daily_run_evidence_today(task_name, now=now)
 
 
 def _iso_at_or_none(value):
@@ -1137,20 +1154,23 @@ def task_giga_dropship_sync():
     run_task('giga_dropship_sync', cmd, timeout_sec=TASK_TIMEOUT['giga_dropship_sync'])
 
 
+_RESUME_LOCK_SKIP_MESSAGE = 'Skipped (already running or recovering)'
+
+
 def task_daily_full():
     """每日全量任务 (分析 + 库存同步 + 报告；智能调价仅周一/周四执行)"""
     if _is_ops_scheduler():
         logger.info("↪ ops 档 --task daily 转去库存运营包，避免子店跑主店全量")
         return task_ops_daily()
 
-    # Crash/shutdown mid-run (watchdog recovering / daemon interrupted): finish
-    # remaining inventory sync only. skip_synced_today skips already-applied SKUs;
-    # do NOT re-run smart_reprice / health autofix / other live steps.
+    # Mid-run crash with durable evidence (today's dead-pid lock): finish
+    # remaining inventory only. Never use watchdog recovering alone — that
+    # marker is also written for a late first launch after 09:50.
     if _should_resume_daily_inventory('daily_tasks'):
         info = _get_task_health('daily_tasks')
         status = str(info.get('status', '')).lower() or 'unknown'
         logger.info(
-            "↪ daily_tasks status=%s：恢复未完成库存同步 (--sync-only)，禁止全量二次 apply",
+            "↪ daily_tasks 今日有未完成库存同步证据 (status=%s)：--sync-only，禁止全量二次 apply",
             status,
         )
         ok, message = run_task(
@@ -1158,16 +1178,25 @@ def task_daily_full():
             [str(PROJECT_ROOT / 'daily_tasks.py'), '--sync-only'],
             timeout_sec=TASK_TIMEOUT['daily_tasks'],
         )
-        # Mark as resumed_inventory so double-apply stays blocked, but CRO
-        # dependents (which require success/partial_success) do not unlock
-        # against a queue that was never rebuilt.
-        final_status = 'resumed_inventory' if ok else 'failed'
+        # Exit 75: lock not acquired, sync never ran — leave health unchanged
+        # so a later resume can still proceed.
+        if message == _RESUME_LOCK_SKIP_MESSAGE:
+            logger.info("↪ inventory resume 未拿到锁，保持原 status=%s", status)
+            return True, message
+        if ok:
+            # Block double-apply; do not unlock CRO (needs success/partial_success).
+            update_health(
+                'daily_tasks',
+                'resumed_inventory',
+                f'Inventory resume after {status}: {message}',
+            )
+            return True, f'Resumed inventory after {status}: {message}'
         update_health(
             'daily_tasks',
-            final_status,
+            'failed',
             f'Inventory resume after {status}: {message}',
         )
-        return ok, f'Resumed inventory after {status}: {message}'
+        return False, f'Resumed inventory after {status}: {message}'
 
     if _task_already_started_today('daily_tasks'):
         info = _get_task_health('daily_tasks')
