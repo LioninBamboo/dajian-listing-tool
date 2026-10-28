@@ -399,9 +399,13 @@ _HEAD_NOUN_SUGGESTED_LEAF: dict[str, tuple[str, str, str]] = {
     "sideboard": ("183322", "sideboard", "high"),
     "buffet": ("183322", "sideboard", "high"),
     "bar stool": ("103431", "stool", "med"),
+    "bathroom vanity": ("176991", "vanity", "high"),
     "vanity table": ("32878", "vanity", "high"),
     "makeup vanity": ("32878", "vanity", "high"),
     "kitchen cart": ("115753", "kitchen_cart", "high"),
+    "tv stand": ("20488", "tv_stand", "high"),
+    "media console": ("20488", "tv_stand", "high"),
+    "entertainment center": ("20488", "tv_stand", "high"),
     "kitchen island": ("260157", "kitchen_island", "high"),
     "kitchen island cart": ("260157", "kitchen_island", "high"),
     "medicine cabinet": ("176991", "medicine", "high"),
@@ -1172,6 +1176,21 @@ def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDe
             return CategoryDecision(None, "unknown", "mattress_not_accessory")
         if stored_id and stored_id in _HEAD_FITS_STORED.get(deny_noun, ()):
             return CategoryDecision(None, "keep", "stored_head_fit")
+        if deny_noun == "vanity":
+            # Bathroom vanity cabinets → Bathroom Cabinets; makeup tables → 32878.
+            if re.search(r"\bmakeup\b|\bvanity\s+table\b", hay, re.IGNORECASE):
+                if stored_id == "32878":
+                    return CategoryDecision(None, "keep", "vanity_lock")
+                return CategoryDecision(
+                    "32878", "vanity", "makeup_vanity_head", "Vanities & Makeup Tables"
+                )
+            if re.search(r"\bbathroom\b|\bsink\b|\bceramic\b", hay, re.IGNORECASE):
+                if stored_id in _HEAD_FITS_STORED["vanity"]:
+                    return CategoryDecision(None, "keep", "vanity_lock")
+                return CategoryDecision(
+                    "176991", "vanity", "bathroom_vanity_head", "Bathroom Cabinets"
+                )
+            return CategoryDecision(None, "unknown", "unknown_head_noun")
         if deny_noun in {"cushion", "pad", "cover", "slipcover"} or title_is_chair_accessory(hay):
             return CategoryDecision(None, "unknown", "accessory")
         return CategoryDecision(None, "unknown", "unknown_head_noun")
@@ -1186,10 +1205,19 @@ def _propose_from_title(title: str, stored: str, stored_name: str) -> CategoryDe
         return CategoryDecision(None, "unknown", "accessory")
     if head == "hutch desk":
         return CategoryDecision(DESK, "desk", "hutch_desk", "Desks & Tables")
+    if head == "bathroom vanity":
+        stored_id = as_safe_category_id(stored)
+        if stored_id in _HEAD_FITS_STORED["vanity"]:
+            return CategoryDecision(None, "keep", "vanity_lock")
+        return CategoryDecision(
+            "176991", "vanity", "bathroom_vanity_head", "Bathroom Cabinets"
+        )
     if head in _TV_STAND_HEADS:
         if as_safe_category_id(stored) == "20488":
             return CategoryDecision(None, "keep", "tv_stand_lock")
-        return CategoryDecision(None, "unknown", "unknown_head_noun")
+        return CategoryDecision(
+            "20488", "tv_stand", "tv_stand_head", "TV Stands & Entertainment Units"
+        )
     if head in _BAR_CABINET_HEADS:
         stored_id = as_safe_category_id(stored)
         if stored_id == "20487":

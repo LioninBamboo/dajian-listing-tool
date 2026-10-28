@@ -143,8 +143,8 @@ def test_synthetic_s1_to_s6_and_extra_edges():
         (
             "Bathroom Vanity Hutch with Mirror 30 Inch Buffet Style",
             "",
-            None,
-            "unknown_head_noun",
+            "176991",
+            "bathroom_vanity_head",
             {"183322"},
         ),
         (

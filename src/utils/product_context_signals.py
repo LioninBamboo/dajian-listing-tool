@@ -252,6 +252,7 @@ _FIRST_NOUN_PHRASES: tuple[str, ...] = (
     "accent chair",
     "dining chair",
     "bar stool",
+    "bathroom vanity",
     "vanity table",
     "makeup vanity",
     "kitchen island cart",
