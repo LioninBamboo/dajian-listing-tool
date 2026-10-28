@@ -1457,11 +1457,29 @@ class RealEbayClient:
                     }
                 return payload
 
-            from src.utils.ebay_quantity import default_ebay_listing_quantity
+            from src.utils.ebay_quantity import (
+                SupplierOutOfStockError,
+                default_ebay_listing_quantity,
+            )
 
             sku = str(offer_data.get("sku") or "").strip()
             if sku:
-                quantity = self._resolved_publish_quantity(sku)
+                try:
+                    quantity = self._resolved_publish_quantity(sku)
+                except SupplierOutOfStockError:
+                    # Content-only updates on already-published OOS listings must
+                    # keep the live offer quantity (often 0). Inventing stock here
+                    # would restock eBay against GIGA/Dajian OOS.
+                    quantity = self._positive_offer_quantity(
+                        offer_data.get("availableQuantity"),
+                        default=0,
+                    )
+                    logging.warning(
+                        "Offer %s: supplier OOS — keeping live availableQuantity=%s "
+                        "for category/description update",
+                        offer_id,
+                        quantity,
+                    )
             else:
                 quantity = self._positive_offer_quantity(
                     offer_data.get("availableQuantity"),
@@ -1479,7 +1497,8 @@ class RealEbayClient:
                 return True
 
             error_text = response.text[:500]
-            if quantity != 1 and any(
+            # Never raise OOS/live-zero stock to 1 on a selling-limit retry.
+            if quantity > 1 and any(
                 marker in error_text.lower()
                 for marker in ("selling limit", "amount you can list", "exceed the amount you can list")
             ):

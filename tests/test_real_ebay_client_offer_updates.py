@@ -210,27 +210,59 @@ def test_create_offer_propagates_zero_supplier_stock(monkeypatch):
     assert client.session.post_calls == []
 
 
-def test_update_offer_category_propagates_zero_supplier_stock(monkeypatch):
+def test_update_offer_category_keeps_live_qty_when_supplier_oos(monkeypatch):
     monkeypatch.setattr(
         "src.utils.ebay_quantity.resolve_publish_quantity",
         lambda sku, **kwargs: (_ for _ in ()).throw(SupplierOutOfStockError(f"{sku} has zero supplier inventory")),
     )
     initial = _make_offer()
     initial["sku"] = "SKU-OOS"
-    initial["availableQuantity"] = 2
+    initial["availableQuantity"] = 0
+    verified = dict(initial)
+    verified["listingDescription"] = _long_description("new desc")
     client = _make_client(
         initial_offer=initial,
         put_response=_Response(200, payload={}),
+        verified_offer=verified,
+    )
+
+    ok = client.update_offer_category(
+        "offer-1",
+        "183124",
+        listing_description=_long_description("new desc"),
+    )
+    assert ok is True
+    assert client.session.put_calls[0]["json"]["availableQuantity"] == 0
+
+
+def test_update_offer_category_oos_qty_zero_skips_selling_limit_restock(monkeypatch):
+    """Selling-limit fallback must not raise live qty 0 → 1 on OOS content updates."""
+    monkeypatch.setattr(
+        "src.utils.ebay_quantity.resolve_publish_quantity",
+        lambda sku, **kwargs: (_ for _ in ()).throw(SupplierOutOfStockError(f"{sku} has zero supplier inventory")),
+    )
+    initial = _make_offer()
+    initial["sku"] = "SKU-OOS"
+    initial["availableQuantity"] = 0
+    client = _make_client(
+        initial_offer=initial,
+        put_response=_Response(
+            400,
+            text='{"errors":[{"message":"You have exceeded the amount you can list"}]}',
+        ),
+        # Keep verified category mismatched so success cannot come from GET fallback.
         verified_offer=initial,
     )
 
-    with pytest.raises(SupplierOutOfStockError):
-        client.update_offer_category(
-            "offer-1",
-            "183124",
-            listing_description=_long_description("new desc"),
-        )
-    assert client.session.put_calls == []
+    ok = client.update_offer_category(
+        "offer-1",
+        "183124",
+        listing_description=_long_description("new desc"),
+    )
+
+    assert ok is False
+    assert len(client.session.put_calls) == 1
+    assert client.session.put_calls[0]["json"]["availableQuantity"] == 0
 
 
 def test_update_offer_category_keeps_resolved_quantity_of_one(monkeypatch):
