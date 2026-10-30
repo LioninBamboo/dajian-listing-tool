@@ -55,6 +55,17 @@ _AQUA_REAL_FURNITURE_TITLES = (
 )
 
 
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Work Desk with Drawers",
+        "Work From Home Storage Cabinet",
+    ],
+)
+def test_aqua_bare_work_furniture_is_wrong_store(title):
+    assert publish_wrong_store_reason(title=title, store_kind="auto") == "wrong_store:furniture"
+
+
 @pytest.mark.parametrize("title", _AQUA_REAL_FURNITURE_TITLES)
 def test_aqua_bare_cabinet_bench_stool_are_wrong_store(title):
     assert publish_wrong_store_reason(title=title, store_kind="auto") == "wrong_store:furniture"
@@ -168,6 +179,7 @@ _AUTO_LIFT_KIT_TITLES = (
     "Suspension Lift Kit for Jeep Wrangler JK",
     "2 Inch Body Lift Kit for Ford F150 Truck",
     "Leveling Kit for Chevy",
+    "Leveling Lift Kit for Silverado",
 )
 
 
@@ -194,6 +206,16 @@ def test_furniture_bed_lift_kit_is_not_held_on_main():
     assert (
         publish_wrong_store_reason(
             title="Hydraulic Bed Lift Kit for Storage Bed Frame",
+            store_kind="furniture",
+        )
+        is None
+    )
+
+
+def test_router_table_leveling_lift_kit_is_not_held_on_main():
+    assert (
+        publish_wrong_store_reason(
+            title="Router Table Leveling Lift Kit",
             store_kind="furniture",
         )
         is None

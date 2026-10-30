@@ -114,9 +114,10 @@ _PUBLISH_VEHICLE_CONTEXT = (
 
 # On the auto store, skip a furniture hit only when the title also has one of
 # these garage/shop context words. Bare cabinet/bench/stool stay furniture.
+# Bare "work" is not garage context (a work desk is furniture).
 _AQUA_GARAGE_CONTEXT = (
-    "garage", "tool", "shop", "work", "workshop", "mechanic", "tool-chest",
-    "vise", "grinder", "sander",
+    "garage", "tool", "shop", "workshop", "work bench", "workbench",
+    "mechanic", "tool-chest", "vise", "grinder", "sander",
 )
 
 # Motors leaves that must not publish on a non-auto store. The floor-jack
@@ -275,11 +276,12 @@ def _without_phrases(haystack: str, phrases) -> str:
 
 # A woodworking "router lift kit" is not a suspension kit. Keep the auto
 # term only with a vehicle word, or drop it next to these household words.
+# "leveling" is auto context only when no ignore-list word is present.
 _LIFT_KIT_NON_AUTO = (
     "router", "router table", "woodworking", "table saw", "bed", "desk", "tv", "cabinet",
 )
 _LIFT_KIT_AUTO_CONTEXT = (
-    "truck", "jeep", "suv", "car", "vehicle", "suspension", "leveling", "body lift",
+    "truck", "jeep", "suv", "car", "vehicle", "suspension", "body lift",
     "ford", "chevy", "silverado", "f150", "wrangler", "ram", "tacoma", "gmc",
     "toyota", "dodge",
 )
@@ -290,7 +292,7 @@ def _lift_kit_is_automotive(haystack: str) -> bool:
         return True
     if _has_term(haystack, _LIFT_KIT_NON_AUTO):
         return False
-    return False
+    return _has_term(haystack, ("leveling",)) is not None
 
 
 def _publish_auto_hit(haystack: str) -> Optional[str]:
