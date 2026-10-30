@@ -94,18 +94,29 @@ _FURNITURE_TERMS = (
 # Publish-only. These words flag household goods on Main (a clothes-rack
 # crossbar, a radiator cover, a hall-tree floor mat). Roof racks still match
 # "roof rack" / "cargo carrier". "radiator" is narrowed below, not dropped.
+# "seat cover" / "winch" / "air compressor" stay in the publish list and need
+# a vehicle word in the title.
 _PUBLISH_DROPPED_AUTO_TERMS = frozenset({
-    "cross bar", "crossbar", "seat cover", "floor mat", "air compressor", "winch",
+    "cross bar", "crossbar", "floor mat",
 })
 _PUBLISH_AUTO_TERMS = tuple(
     term for term in _AUTO_TERMS
     if term not in _PUBLISH_DROPPED_AUTO_TERMS and term != "radiator"
 )
+_PUBLISH_AUTO_NEEDS_VEHICLE = frozenset({
+    "seat cover", "winch", "air compressor",
+})
+_PUBLISH_VEHICLE_CONTEXT = (
+    "car", "truck", "auto", "suv", "vehicle", "jeep", "atv", "utv", "12v",
+    "ford", "chevy", "silverado", "f150", "wrangler", "ram", "tacoma", "gmc",
+    "toyota", "dodge", "honda", "nissan",
+)
 
-# On the auto store these are garage/shop words, not a furniture mismatch.
-_AQUA_GARAGE_FURNITURE_TERMS = (
-    "storage cabinet", "work bench", "bench", "stool", "cabinet",
-    "grinder", "vise", "mechanic",
+# On the auto store, skip a furniture hit only when the title also has one of
+# these garage/shop context words. Bare cabinet/bench/stool stay furniture.
+_AQUA_GARAGE_CONTEXT = (
+    "garage", "tool", "shop", "work", "workshop", "mechanic", "tool-chest",
+    "vise", "grinder", "sander",
 )
 
 # Motors leaves that must not publish on a non-auto store. The floor-jack
@@ -275,14 +286,18 @@ _LIFT_KIT_AUTO_CONTEXT = (
 
 
 def _lift_kit_is_automotive(haystack: str) -> bool:
+    if _has_term(haystack, _LIFT_KIT_AUTO_CONTEXT):
+        return True
     if _has_term(haystack, _LIFT_KIT_NON_AUTO):
         return False
-    return _has_term(haystack, _LIFT_KIT_AUTO_CONTEXT) is not None
+    return False
 
 
 def _publish_auto_hit(haystack: str) -> Optional[str]:
     hit = _has_term(haystack, _PUBLISH_AUTO_TERMS)
     if hit == "lift kit" and not _lift_kit_is_automotive(haystack):
+        hit = None
+    if hit in _PUBLISH_AUTO_NEEDS_VEHICLE and not _has_term(haystack, _PUBLISH_VEHICLE_CONTEXT):
         hit = None
     if hit:
         return hit
@@ -294,9 +309,10 @@ def _publish_auto_hit(haystack: str) -> Optional[str]:
 
 
 def _publish_furniture_hit(haystack: str, store_kind: str) -> Optional[str]:
-    if store_kind == AUTO:
-        haystack = _without_phrases(haystack, _AQUA_GARAGE_FURNITURE_TERMS)
-    return _has_term(haystack, _FURNITURE_TERMS)
+    hit = _has_term(haystack, _FURNITURE_TERMS)
+    if hit and store_kind == AUTO and _has_term(haystack, _AQUA_GARAGE_CONTEXT):
+        return None
+    return hit
 
 
 def _classify_for_publish(

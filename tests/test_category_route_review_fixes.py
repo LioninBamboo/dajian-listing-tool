@@ -26,6 +26,7 @@ _AQUA_GARAGE_TITLES = (
     "Rolling Shop Stool",
     "Steel Garage Storage Cabinet",
     "Heavy Duty Work Bench",
+    "1x30 Inch Bench Belt Sander with 5 Inch Disc with Wrench Storage",
 )
 
 
@@ -45,6 +46,18 @@ def test_aqua_still_holds_a_real_sofa():
         publish_wrong_store_reason(title="3-Seat Sectional Sofa", store_kind="auto")
         == "wrong_store:furniture"
     )
+
+
+_AQUA_REAL_FURNITURE_TITLES = (
+    "Kitchen Pantry Storage Cabinet",
+    "Dining Bench Upholstered",
+    "Counter Height Bar Stool Set of 2",
+)
+
+
+@pytest.mark.parametrize("title", _AQUA_REAL_FURNITURE_TITLES)
+def test_aqua_bare_cabinet_bench_stool_are_wrong_store(title):
+    assert publish_wrong_store_reason(title=title, store_kind="auto") == "wrong_store:furniture"
 
 
 @pytest.mark.parametrize(
@@ -67,6 +80,28 @@ def test_main_household_titles_are_not_wrong_store(title, description):
         store_kind="furniture",
     )
     assert reason is None
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Truck Winch 12000 lb",
+        "Car Seat Cover Set",
+    ],
+)
+def test_main_vehicle_winch_and_seat_cover_are_wrong_store(title):
+    assert publish_wrong_store_reason(title=title, store_kind="furniture") == "wrong_store:auto"
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Massage Chair Seat Cover",
+        "Portable Air Compressor for Airbrush",
+    ],
+)
+def test_main_household_seat_cover_and_compressor_are_not_held(title):
+    assert publish_wrong_store_reason(title=title, store_kind="furniture") is None
 
 
 def test_publish_check_ignores_description_and_attribute_auto_words():
@@ -145,6 +180,23 @@ def test_router_lift_kit_is_not_wrong_store_on_main_or_gp(store_kind):
 def test_auto_lift_kit_is_wrong_store_on_main(title):
     assert (
         publish_wrong_store_reason(title=title, store_kind="furniture") == "wrong_store:auto"
+    )
+
+
+def test_truck_bed_lift_kit_is_wrong_store_on_main():
+    assert (
+        publish_wrong_store_reason(title="Truck Bed Lift Kit", store_kind="furniture")
+        == "wrong_store:auto"
+    )
+
+
+def test_furniture_bed_lift_kit_is_not_held_on_main():
+    assert (
+        publish_wrong_store_reason(
+            title="Hydraulic Bed Lift Kit for Storage Bed Frame",
+            store_kind="furniture",
+        )
+        is None
     )
 
 
