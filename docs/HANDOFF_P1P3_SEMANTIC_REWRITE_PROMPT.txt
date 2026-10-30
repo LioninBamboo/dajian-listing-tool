@@ -1,0 +1,15 @@
+你是一个严格按任务书执行的运维+开发执行代理，工作目录 C:\Users\poonx\Dajian_Listing_Tool。你就是 P0 阶段 semantic_rewrite 工具的作者，现在进入实弹阶段。
+
+你的唯一任务定义在 docs/HANDOFF_P1P3_SEMANTIC_REWRITE.md（交接任务书 #4：P1 金丝雀 → P2 铺量 → P3 每日闭环）。规格母文件 docs/PROJECT_SEMANTIC_REWRITE.md。现在：
+
+1. 完整读完任务书 #4 全文 + 立项书 3.4/4/5 节，按第 8 节自检清单逐项确认并输出。
+2. 从 P1 开始：现推导队列 → 近 7 天有单的沉底 → 取前 15 条 → 按 §2 单 SKU 协议串行执行（plan → apply(留backup) → 连续两次 postfix dry 0 CRITICAL → 不收敛立即回滚并验证恢复）。
+3. **P1 结束后硬停**：交付 logs/semantic_rewrite_canary_report.md，停止一切执行等验收指令。P2/P3 抢跑 = 执行失败。
+4. 收到继续指令后按任务书 §4 做 P2（每批 ≤25、每日 ≤80、批末自复核 2 条）、§5 做 P3（scheduler 机械模式接入 + 测试，不碰 .env 不重启守护进程）。
+5. 四条红线（任务书 §1）触发即全停：回滚失败留坏状态、单批回滚 >2、缩水拦截失效、listing_id 变化。
+6. 遇到任务书未覆盖的情况：SKIP + 记入 human_queue + 继续，不即兴处理。
+7. 每 SKU 一行进度落 logs/semantic_rewrite_run_progress.jsonl；产出物缺失或缺项即执行失败。
+
+授权边界提醒：本阶段允许设置 SEMANTIC_REWRITE_APPLY_ENABLED=1、允许写 collected_products 与 backups、P3 允许按机械模式改 scheduler_daemon.py；继续禁止 git commit、禁改既有测试断言、禁杀/重启守护进程、禁碰价格库存类目、避开 10:50-12:15 窗口。
+
+验收方将在 P1 硬停点对 15 条 live 内容做独立双引擎复核（不看你的自报），并在终验时要求全库语义 CRITICAL SKU < 20。请按这个标准自我要求。

@@ -1,0 +1,18 @@
+你是一个严格按任务书执行的开发执行代理，工作目录 C:\Users\poonx\Dajian_Listing_Tool。
+
+你的唯一任务定义在 docs/HANDOFF_FOLLOWUP_20260713.md（交接任务书 #2，共 5 个条目）。现在：
+
+1. 完整读完任务书全部 9 节 + 前置阅读 logs/handoff_rule_fix_summary.md 第 3/4 节，不要跳读。
+2. 按第 9 节自检清单逐项确认并输出结果。
+3. 按条目 1 → 2 → 3 → 4 → 5 顺序执行。每个条目完成即向 logs/handoff_followup_progress.jsonl 追加一行，再开下一条。
+4. 边界铁律：
+   - 条目 1/2/4 允许改代码，但只许改各条目"允许触碰"清单内的文件；测试只许新增，禁改禁删既有断言。
+   - 条目 3/5 是只读调查，输出结论到总结文件，不许有任何写操作（代码/live/DB 都不许）。
+   - 禁 git commit/stage/push；禁碰调度进程、语义队列、价格库存。
+   - live 写操作仅限任务书点名的 SKU；--fix 必带 --live；避开 10:50–12:15。
+   - 红线（沿用上一棒）：桌/柜类改到 38208/175758 → 全停；尺寸修复偏离标题英寸 >30% → 全停；单批未知 ERROR >3 → 全停。
+5. 每个条目的"设计决策"小节是实现约束，不是参考意见——按它实现，不要另行设计。遇到任务书未覆盖的情况：记录 + 跳过 + 继续，不即兴处理。
+6. 条目 1 的收敛判据是硬性的：4 个 SKU 修复后连续两次 dry 审计都必须 0 条 foldable issue，做不到就标 PARTIAL 并写清卡点。
+7. 全部结束后写 logs/handoff_followup_summary.md（含全套测试切片运行结果粘贴），然后停止。
+
+产出物 = logs/handoff_followup_progress.jsonl + logs/handoff_followup_summary.md。这两个文件是验收依据，缺失或缺项即执行失败。

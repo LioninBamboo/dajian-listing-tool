@@ -1,11 +1,15 @@
 """数据库操作封装"""
 import os
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from .models import Base, Product, SyncLog, Config
+
+
+def _utcnow_naive() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class Database:
@@ -72,7 +76,7 @@ class Database:
                 for key, value in product_data.items():
                     if hasattr(existing, key):
                         setattr(existing, key, value)
-                existing.updated_at = datetime.utcnow()
+                existing.updated_at = _utcnow_naive()
                 session.commit()
                 return existing.id
             else:
@@ -180,7 +184,7 @@ class Database:
             product = session.query(Product).filter_by(sku=sku).first()
             if product:
                 product.sync_status = status
-                product.last_synced_at = datetime.utcnow()
+                product.last_synced_at = _utcnow_naive()
                 if error:
                     product.error_message = error
                 
@@ -232,7 +236,7 @@ class Database:
             config = session.query(Config).filter_by(key=key).first()
             if config:
                 config.value = value
-                config.updated_at = datetime.utcnow()
+                config.updated_at = _utcnow_naive()
             else:
                 config = Config(key=key, value=value)
                 session.add(config)

@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<GetItemResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+  <Ack>Success</Ack>
+  <Item>
+    <ItemID>366333333333</ItemID>
+    <Title>Motors Support Bracket Steel</Title>
+    <Description><![CDATA[<p>Steel bracket</p><ul><li>Plywood backing plate</li></ul>]]></Description>
+    <PrimaryCategory><CategoryID>33651</CategoryID></PrimaryCategory>
+    <StartPrice currencyID="USD">29.99</StartPrice>
+    <Quantity>4</Quantity>
+    <ItemSpecifics>
+      <NameValueList><Name>Brand</Name><Value>AquaRides</Value></NameValueList>
+      <NameValueList><Name>Features</Name><Value>Plywood backing plate</Value></NameValueList>
+      <NameValueList><Name>Features</Name><Value>Steel construction</Value></NameValueList>
+    </ItemSpecifics>
+    <ItemCompatibilityList>
+      <Compatibility>
+        <NameValueList><Name>Year</Name><Value>2018</Value></NameValueList>
+        <NameValueList><Name>Make</Name><Value>Ford</Value></NameValueList>
+        <NameValueList><Name>Model</Name><Value>F-150</Value></NameValueList>
+      </Compatibility>
+      <Compatibility>
+        <NameValueList><Name>Year</Name><Value>2019</Value></NameValueList>
+        <NameValueList><Name>Make</Name><Value>Ford</Value></NameValueList>
+        <NameValueList><Name>Model</Name><Value>F-150</Value></NameValueList>
+      </Compatibility>
+    </ItemCompatibilityList>
+  </Item>
+</GetItemResponse>

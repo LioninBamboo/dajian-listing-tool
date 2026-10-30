@@ -1,5 +1,30 @@
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import urllib3
 from .ebay_client import EbayClient
+
+# Suppress InsecureRequestWarning 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _create_trading_session():
+    """Create a requests session with retry + verify=False for Trading API."""
+    session = requests.Session()
+    session.verify = False
+    session.trust_env = False
+    retry_strategy = Retry(
+        total=5,
+        connect=5,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 class EbayTradingClient:
     """
@@ -16,6 +41,7 @@ class EbayTradingClient:
         self.ebay_client = ebay_client
         self.env = ebay_client.env
         self.endpoint = self.ENDPOINTS[self.env]
+        self.session = _create_trading_session()
         
     def _build_headers(self, call_name: str) -> dict:
         """Build headers for Trading API"""
@@ -30,7 +56,7 @@ class EbayTradingClient:
             "Content-Type": "text/xml"
         }
 
-    def call(self, call_name: str, payload_xml_body: str) -> str:
+    def call(self, call_name: str, payload_xml_body: str, site_id: str | None = None) -> str:
         """
         Make a Trading API call
         
@@ -38,6 +64,8 @@ class EbayTradingClient:
             call_name: e.g., 'AddFixedPriceItem'
             payload_xml_body: The XML body INSIDE the Request tag. 
                               (e.g. <Item>...</Item>)
+            site_id: Trading SiteID. None keeps the header default (0 = eBay US).
+                     eBay Motors parts listings use 100.
                               
         Returns:
             Response XML string
@@ -51,13 +79,14 @@ class EbayTradingClient:
 </{call_name}Request>"""
 
         headers = self._build_headers(call_name)
+        if site_id is not None and str(site_id).strip() != "":
+            headers["X-EBAY-API-SITEID"] = str(site_id).strip()
         
-        response = requests.post(
+        response = self.session.post(
             self.endpoint,
             headers=headers,
             data=xml_request.encode('utf-8'),
-            timeout=30,
-            verify=False  # 禁用 SSL 验证以应对代理
+            timeout=60,
         )
         
         # Simple error check (requests level)
@@ -65,7 +94,7 @@ class EbayTradingClient:
         
         return response.text
 
-    def get_item(self, item_id: str) -> str:
+    def get_item(self, item_id: str, site_id: str | None = None) -> str:
         """
         Get Item Details
         """
@@ -73,7 +102,7 @@ class EbayTradingClient:
             <ItemID>{item_id}</ItemID>
             <DetailLevel>ReturnAll</DetailLevel>
         """
-        return self.call("GetItem", xml_payload)
+        return self.call("GetItem", xml_payload, site_id=site_id)
 
     def revise_item(self, item_id: str, xml_body: str) -> str:
         """
@@ -106,7 +135,7 @@ class EbayTradingClient:
         """
         return self.call("EndFixedPriceItem", payload)
 
-    def get_active_listings(self, page: int = 1, limit: int = 20) -> str:
+    def get_active_listings(self, page: int = 1, limit: int = 20, site_id: str | None = None) -> str:
         """
         Get all active listings using GetMyeBaySelling.
         Returns XML response string.
@@ -121,4 +150,28 @@ class EbayTradingClient:
             </ActiveList>
             <DetailLevel>ReturnAll</DetailLevel>
         """
-        return self.call("GetMyeBaySelling", payload)
+        return self.call("GetMyeBaySelling", payload, site_id=site_id)
+
+    def get_sold_listings(
+        self,
+        page: int = 1,
+        limit: int = 200,
+        duration_days: int = 60,
+        site_id: str | None = None,
+    ) -> str:
+        """Recent sales via GetMyeBaySelling SoldList.
+
+        Completed sell-throughs leave ActiveList. DurationInDays max is 60.
+        """
+        payload = f"""
+            <SoldList>
+                <DurationInDays>{int(duration_days)}</DurationInDays>
+                <Include>true</Include>
+                <Pagination>
+                    <EntriesPerPage>{int(limit)}</EntriesPerPage>
+                    <PageNumber>{int(page)}</PageNumber>
+                </Pagination>
+            </SoldList>
+            <DetailLevel>ReturnAll</DetailLevel>
+        """
+        return self.call("GetMyeBaySelling", payload, site_id=site_id)
