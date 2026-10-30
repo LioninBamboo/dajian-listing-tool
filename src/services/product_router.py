@@ -91,6 +91,29 @@ _FURNITURE_TERMS = (
     "sectional", "recliner", "desk", "stool", "bench", "shelving unit",
 )
 
+# Publish-only. These words flag household goods on Main (a clothes-rack
+# crossbar, a radiator cover, a hall-tree floor mat). Roof racks still match
+# "roof rack" / "cargo carrier". "radiator" is narrowed below, not dropped.
+_PUBLISH_DROPPED_AUTO_TERMS = frozenset({
+    "cross bar", "crossbar", "seat cover", "floor mat", "air compressor", "winch",
+})
+_PUBLISH_AUTO_TERMS = tuple(
+    term for term in _AUTO_TERMS
+    if term not in _PUBLISH_DROPPED_AUTO_TERMS and term != "radiator"
+)
+
+# On the auto store these are garage/shop words, not a furniture mismatch.
+_AQUA_GARAGE_FURNITURE_TERMS = (
+    "storage cabinet", "work bench", "bench", "stool", "cabinet",
+    "grinder", "vise", "mechanic",
+)
+
+# Motors leaves that must not publish on a non-auto store. The floor-jack
+# adapter stays wrong_store through this set, not through the bare "cross bar".
+_MOTORS_PUBLISH_LEAF_IDS = frozenset({
+    "262216", "262210", "174020", "174021", "262093",
+})
+
 
 def _norm(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip().lower()
@@ -122,7 +145,6 @@ def classify_product(
     description: str = "",
     attributes: Optional[Mapping[str, Any]] = None,
     supplier_category: str = "",
-    tools_route_to_auto: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Classify a product for routing.
 
@@ -159,8 +181,8 @@ def classify_product(
             "matched": false_friend,
         }
 
-    # Tool phrases always beat furniture "cabinet". tools_route_to_auto does
-    # not change this label; publish_wrong_store_reason applies the flag.
+    # Tool phrases always beat furniture "cabinet". The hold flag does not
+    # change this label; publish_wrong_store_reason applies it.
     hit = _has_term(hay, _TOOL_TERMS)
     if hit and not false_friend:
         return {"target": AUTO, "reason": "garage tool term", "matched": hit}
@@ -192,7 +214,6 @@ def collection_route_note(
         description=description,
         attributes=attributes,
         supplier_category=supplier_category,
-        tools_route_to_auto=tools_route_to_auto,
     )
     this_store = str(store_kind or "").strip().lower()
     if routing["target"] not in (this_store, UNKNOWN):
@@ -223,11 +244,93 @@ def pilot_collect_logs(
         attributes=attributes,
         supplier_category=supplier_category,
         store_kind=store_kind,
-        tools_route_to_auto=tools_route_to_auto,
     )
     if note.startswith("ROUTING:") and note not in logs:
         logs.append(note)
     return logs
+
+
+def _phrase_pattern(phrase: str) -> str:
+    words = [re.escape(word) for word in str(phrase).split() if word]
+    return r"(?<!\w)" + r"\s+".join(words) + r"(?!\w)"
+
+
+def _without_phrases(haystack: str, phrases) -> str:
+    cleaned = haystack
+    for phrase in sorted(phrases, key=len, reverse=True):
+        cleaned = re.sub(_phrase_pattern(phrase), " ", cleaned)
+    return cleaned
+
+
+def _publish_auto_hit(haystack: str) -> Optional[str]:
+    hit = _has_term(haystack, _PUBLISH_AUTO_TERMS)
+    if hit:
+        return hit
+    # "radiator cover" is household. A standalone radiator still is not.
+    scrubbed = _without_phrases(haystack, ("radiator cover",))
+    if _has_term(scrubbed, ("radiator",)):
+        return "radiator"
+    return None
+
+
+def _publish_furniture_hit(haystack: str, store_kind: str) -> Optional[str]:
+    if store_kind == AUTO:
+        haystack = _without_phrases(haystack, _AQUA_GARAGE_FURNITURE_TERMS)
+    return _has_term(haystack, _FURNITURE_TERMS)
+
+
+def _classify_for_publish(
+    *,
+    title: str = "",
+    supplier_category: str = "",
+    store_kind: str = "",
+) -> Dict[str, Any]:
+    """Publish routing. Title and supplier category only, whole words.
+
+    Description and attribute blobs are not part of this haystack.
+    """
+    hay = _norm(title)
+    supplier = _norm(supplier_category)
+    this = str(store_kind or "").strip().lower()
+
+    hit = _has_term(hay, _ARTTOY_TERMS)
+    if hit:
+        return {"target": ARTTOY, "reason": "art-toy term", "matched": hit}
+
+    for frag in _SUPPLIER_AUTO:
+        token = frag.strip()
+        if token and re.search(_phrase_pattern(token), supplier):
+            return {"target": AUTO, "reason": "supplier category", "matched": token}
+
+    false_friend = _has_term(hay, _AUTO_FALSE_FRIENDS)
+    hit = _publish_auto_hit(hay)
+    if hit and not false_friend:
+        return {"target": AUTO, "reason": "auto term", "matched": hit}
+    if hit and false_friend:
+        furniture_hit = _publish_furniture_hit(hay, this)
+        return {
+            "target": FURNITURE if furniture_hit else UNKNOWN,
+            "reason": f"auto term '{hit}' overridden by '{false_friend}'",
+            "matched": false_friend,
+        }
+
+    hit = _has_term(hay, _TOOL_TERMS)
+    if hit and not false_friend:
+        return {"target": AUTO, "reason": "garage tool term", "matched": hit}
+
+    hit = _publish_furniture_hit(hay, this)
+    if hit:
+        return {"target": FURNITURE, "reason": "furniture term", "matched": hit}
+
+    return {"target": UNKNOWN, "reason": "no decisive signal", "matched": ""}
+
+
+def _has_motors_publish_leaf(category_ids) -> bool:
+    if not category_ids:
+        return False
+    if isinstance(category_ids, str):
+        category_ids = [category_ids]
+    return any(str(cid or "").strip() in _MOTORS_PUBLISH_LEAF_IDS for cid in category_ids)
 
 
 def publish_wrong_store_reason(
@@ -238,31 +341,37 @@ def publish_wrong_store_reason(
     supplier_category: str = "",
     store_kind: str = "",
     tools_route_to_auto: Optional[bool] = None,
+    category_ids=None,
 ) -> Optional[str]:
     """Publish preflight. ``None`` means do not block.
 
-    Main (furniture) accepts every non-Motors product. Auto parts on a
-    non-auto store block. Garage tools block only when ``TOOLS_ROUTE_TO_AUTO``
-    is on and this store is not furniture/auto (Aqua already matches ``auto``).
+    Uses the title and the supplier category only. ``description`` and
+    ``attributes`` are accepted and ignored so a seat cover or a floor mat
+    mentioned only there cannot hold the row. Main accepts every non-Motors
+    product. Garage tools block only when ``TOOLS_ROUTE_TO_AUTO`` is on and
+    this store is not furniture/auto. A known Motors leaf blocks a non-auto
+    store even when the title has no auto term.
     """
-    routing = classify_product(
+    del description, attributes
+    routing = _classify_for_publish(
         title=title,
-        description=description,
-        attributes=attributes,
         supplier_category=supplier_category,
-        tools_route_to_auto=tools_route_to_auto,
+        store_kind=store_kind,
     )
     target = routing["target"]
     this = str(store_kind or "").strip().lower()
-    if target in (UNKNOWN, this, ""):
-        return None
-    route_tools = TOOLS_ROUTE_TO_AUTO if tools_route_to_auto is None else bool(tools_route_to_auto)
-    if routing["reason"] == "garage tool term":
-        if not route_tools or this in {"furniture", "main", "garden", "auto", ""}:
-            return None
-        return f"wrong_store:{target}"
-    if target == AUTO and this != AUTO:
-        return f"wrong_store:{target}"
-    if this not in {"furniture", "main", ""}:
-        return f"wrong_store:{target}"
+    reason = None
+    if target not in (UNKNOWN, this, ""):
+        route_tools = TOOLS_ROUTE_TO_AUTO if tools_route_to_auto is None else bool(tools_route_to_auto)
+        if routing["reason"] == "garage tool term":
+            if route_tools and this not in {"furniture", "main", "garden", "auto", ""}:
+                reason = f"wrong_store:{target}"
+        elif target == AUTO and this != AUTO:
+            reason = f"wrong_store:{target}"
+        elif this not in {"furniture", "main", ""}:
+            reason = f"wrong_store:{target}"
+    if reason:
+        return reason
+    if this != AUTO and _has_motors_publish_leaf(category_ids):
+        return "wrong_store:auto"
     return None

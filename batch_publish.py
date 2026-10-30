@@ -396,8 +396,21 @@ def apply_motors_tool_category_restore(
     return gated or stored or current, action, restore_name
 
 
-def _is_sellable_leaf_category(oauth, category_id: str) -> bool:
-    """Validate category ID against the correct taxonomy tree and ensure it's a leaf."""
+def _leaf_flag_from_taxonomy_response(resp):
+    """True/False on HTTP 200, or None when the response is not definitive."""
+    if getattr(resp, "status_code", None) != 200:
+        return None
+    node = (resp.json() or {}).get("categorySubtreeNode", {}) or {}
+    return bool(node.get("leafCategoryTreeNode"))
+
+
+def _is_sellable_leaf_category(oauth, category_id: str):
+    """Return True/False for a definitive leaf answer, or None when unknown.
+
+    A non-200 response or an exception is a transient miss. It is not cached
+    and it is not a not-sellable hold. Only a 200 that says the node is or is
+    not a leaf is cached.
+    """
     cid = str(category_id or "").strip()
     if not cid:
         return False
@@ -427,27 +440,44 @@ def _is_sellable_leaf_category(oauth, category_id: str) -> bool:
             params={"category_id": cid},
             timeout=30,
         )
-        valid = False
-        if resp.status_code == 200:
-            node = (resp.json() or {}).get("categorySubtreeNode", {})
-            valid = bool(node.get("leafCategoryTreeNode"))
+        primary = _leaf_flag_from_taxonomy_response(resp)
+        if primary is True:
+            _CATEGORY_VALIDITY_CACHE[cid] = True
+            return True
         # Fall back: Motors-primary store may still carry a tree-0 leaf that
         # isn't in the force-inventory set yet.
-        if not valid and tree_id != "0":
+        fallback = None
+        if tree_id != "0":
             resp0 = requests.get(
                 f"{oauth.api_base}/commerce/taxonomy/v1/category_tree/0/get_category_subtree",
                 headers=headers,
                 params={"category_id": cid},
                 timeout=30,
             )
-            if resp0.status_code == 200:
-                node0 = (resp0.json() or {}).get("categorySubtreeNode", {})
-                valid = bool(node0.get("leafCategoryTreeNode"))
-        _CATEGORY_VALIDITY_CACHE[cid] = valid
-        return valid
+            fallback = _leaf_flag_from_taxonomy_response(resp0)
+            if fallback is True:
+                _CATEGORY_VALIDITY_CACHE[cid] = True
+                return True
+        definitive_false = primary is False and (tree_id == "0" or fallback is False)
+        if definitive_false:
+            _CATEGORY_VALIDITY_CACHE[cid] = False
+            return False
+        return None
     except Exception:
-        _CATEGORY_VALIDITY_CACHE[cid] = False
-        return False
+        return None
+
+
+def _publish_sellable_verdict(sellable_check, cid):
+    """True, False, or None (unknown). Unknown must not become a hold."""
+    if not callable(sellable_check) or not cid:
+        return True
+    try:
+        result = sellable_check(cid)
+    except Exception:
+        return None
+    if result is None:
+        return None
+    return bool(result)
 
 
 def _resolve_publish_store_kind(store_kind):
@@ -577,8 +607,7 @@ def select_batch_publish_category(
     if (
         candidate
         and not preserve_approved_category
-        and callable(sellable_check)
-        and not sellable_check(candidate)
+        and _publish_sellable_verdict(sellable_check, candidate) is False
     ):
         logger.warning(f"  [CAT] Stored category {candidate} is not a sellable leaf in EBAY_US; ignoring stored category")
         candidate = None
@@ -605,7 +634,7 @@ def select_batch_publish_category(
                 api_cat_name,
                 description,
             )
-            if callable(sellable_check) and not sellable_check(api_cat_id):
+            if _publish_sellable_verdict(sellable_check, api_cat_id) is False:
                 logger.warning(f"  [CAT] Auto category {api_cat_id} is not a sellable leaf in EBAY_US; ignoring auto category")
                 api_cat_id, api_cat_name = None, None
 
@@ -651,13 +680,23 @@ def select_batch_publish_category(
             and hasattr(category_matcher, "_complete_aspects")
         ):
             required_aspects, recommended_aspects = category_matcher._get_category_aspects(candidate)
-            completed_aspects = category_matcher._complete_aspects(
-                existing_aspects,
-                required_aspects,
-                recommended_aspects,
-                title_context,
-                selected_name,
-            )
+            try:
+                completed_aspects = category_matcher._complete_aspects(
+                    existing_aspects,
+                    required_aspects,
+                    recommended_aspects,
+                    title_context,
+                    selected_name,
+                    category_id=candidate,
+                )
+            except TypeError:
+                completed_aspects = category_matcher._complete_aspects(
+                    existing_aspects,
+                    required_aspects,
+                    recommended_aspects,
+                    title_context,
+                    selected_name,
+                )
     elif api_cat_id and auto_plausible:
         selected = api_cat_id
         selected_name = api_cat_name
@@ -668,6 +707,12 @@ def select_batch_publish_category(
         selected = api_cat_id
         selected_name = api_cat_name
 
+    def _sellable_for_gate(cid):
+        verdict = _publish_sellable_verdict(sellable_check, cid)
+        if verdict is None:
+            return True
+        return verdict
+
     gate_result = apply_category_write_gate(
         original_stored,
         selected,
@@ -675,7 +720,7 @@ def select_batch_publish_category(
         listing_status=listing_status,
         reason="publish_candidate",
         index=index,
-        sellable_check=sellable_check,
+        sellable_check=_sellable_for_gate if callable(sellable_check) else None,
     )
     gated_id, action = gate_result
     suggestion = getattr(gate_result, "suggestion", None)
@@ -699,12 +744,9 @@ def select_batch_publish_category(
     unpublished = unpublished_listing_status(listing_status)
 
     def _sellable(cid) -> bool:
-        if not callable(sellable_check) or not cid:
-            return True
-        try:
-            return bool(sellable_check(cid))
-        except Exception:
-            return False
+        # True for a sellable leaf and for an unknown/transient answer.
+        # Only a definitive False is not sellable.
+        return _publish_sellable_verdict(sellable_check, cid) is not False
 
     if unpublished and original_stored and callable(sellable_check) and not _sellable(original_stored):
         # An approved remap already replaced the unsellable stored id.
@@ -735,13 +777,19 @@ def select_batch_publish_category(
         supplier = str(opt.get("supplier_category") or "")
     from src.services.product_router import publish_wrong_store_reason
 
+    if action == "remap" and gated_id:
+        considered_ids = [gated_id]
+    else:
+        considered_ids = []
+        for cid in (original_stored, gated_id, selected):
+            if cid and cid not in considered_ids:
+                considered_ids.append(cid)
     wrong_store = publish_wrong_store_reason(
         title=title_context,
-        description=description or "",
-        attributes=attributes if isinstance(attributes, dict) else None,
         supplier_category=supplier,
         store_kind=_resolve_publish_store_kind(store_kind),
         tools_route_to_auto=tools_route_to_auto,
+        category_ids=considered_ids,
     )
     if wrong_store and unpublished:
         if wrong_store not in reasons:
@@ -1221,6 +1269,86 @@ def enrich_aspects(product: dict) -> dict:
 # Publishing
 # ═══════════════════════════════════════════════════════════════
 
+def category_hold_publish_result(
+    choice,
+    *,
+    stored_cat,
+    title,
+    opt=None,
+    attributes=None,
+    flags=None,
+) -> dict:
+    """Error payload for a held publish category.
+
+    not-sellable, wrong-store, and key-conflict keeps the reason code, the
+    conflicting ids, and the suggestion. They do not use the generic
+    "not plausible" sentence.
+    """
+    from src.utils.category_decision import conflicting_category_keys, tree_unavailable_publish_error
+
+    action = str((choice or {}).get("action") or "")
+    reasons = [str(item) for item in ((choice or {}).get("reasons") or [])]
+    suggestion = (choice or {}).get("suggestion")
+    conflict_map, key_suggestion = conflicting_category_keys(stored_cat, opt, attributes)
+    specific = [
+        item for item in reasons
+        if item in {"not_sellable_in_store_tree", "category_key_conflict"}
+        or item.startswith("wrong_store")
+    ]
+    if action == "hold_not_sellable" and "not_sellable_in_store_tree" not in specific:
+        specific.append("not_sellable_in_store_tree")
+    if action == "hold_category_key_conflict" and "category_key_conflict" not in specific:
+        specific.append("category_key_conflict")
+    if action == "hold_wrong_store" and not any(item.startswith("wrong_store") for item in specific):
+        specific.append("wrong_store")
+    key_conflict = "category_key_conflict" in specific or action == "hold_category_key_conflict"
+    if suggestion is None and key_conflict:
+        suggestion = key_suggestion
+
+    if action == "hold_tree_unavailable" and not specific:
+        message = tree_unavailable_publish_error()
+    elif action == "hold_empty" and not specific:
+        message = "Cannot determine eBay category"
+    elif action == "hold_implausible" and not specific:
+        message = (
+            f"Stored category {stored_cat} is not publishable for title "
+            f"'{str(title or '')[:120]}'"
+        )
+    elif specific or action in {
+        "hold_not_sellable",
+        "hold_wrong_store",
+        "hold_category_key_conflict",
+    }:
+        parts = [action] if action else []
+        if specific:
+            parts.append(", ".join(specific))
+        if key_conflict and conflict_map:
+            primary = conflict_map.get("categoryId") or (str(stored_cat) if stored_cat else "")
+            others = []
+            for label, cid in conflict_map.items():
+                if label == "categoryId" or cid == primary or cid in others:
+                    continue
+                others.append(cid)
+            if primary and others:
+                parts.append(f"{primary} vs {' / '.join(others)}")
+        parts.append(f"suggestion={suggestion}")
+        message = "; ".join(part for part in parts if part)
+    else:
+        message = (
+            f"Stored category {stored_cat} is not plausible for title "
+            f"'{str(title or '')[:120]}'"
+        )
+    return {
+        "status": "error",
+        "message": message,
+        "flags": list(flags or []),
+        "action": action,
+        "reasons": reasons,
+        "suggestion": suggestion,
+        "conflicts": conflict_map or None,
+    }
+
+
 def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     """
     Publish a single product to eBay with full pipeline:
@@ -1380,27 +1508,23 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     completed_aspects = choice.get("aspects") or existing_aspects
     category_flags = list(choice.get("flags") or [])
     if choice.get("held"):
-        if choice.get("action") == "hold_empty":
-            msg = "Cannot determine eBay category"
-        elif choice.get("action") == "hold_implausible":
-            msg = (
-                f"Stored category {stored_cat} is not publishable for title "
-                f"'{title_context[:120]}'"
-            )
-        elif choice.get("action") == "hold_tree_unavailable":
-            from src.utils.category_decision import tree_unavailable_publish_error
-
-            msg = tree_unavailable_publish_error()
+        held_result = category_hold_publish_result(
+            choice,
+            stored_cat=stored_cat,
+            title=title_context,
+            opt=opt,
+            attributes=product.get("attributes") if isinstance(product.get("attributes"), dict) else None,
+            flags=category_flags,
+        )
+        if held_result.get("action") == "hold_tree_unavailable":
             return {
                 "status": "error",
-                "message": msg,
+                "message": held_result["message"],
                 "action": "hold_tree_unavailable",
                 "flags": category_flags,
             }
-        else:
-            msg = f"Stored category {stored_cat} is not plausible for title '{title_context[:120]}'"
-        record_error(sku, msg)
-        return {"status": "error", "message": msg, "flags": category_flags}
+        record_error(sku, held_result["message"])
+        return held_result
     category_id = choice.get("category_id")
     category_name = choice.get("category_name")
     if not category_id:

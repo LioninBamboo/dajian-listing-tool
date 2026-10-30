@@ -33,6 +33,26 @@ from src.services.ebay_auth import EbayOAuthService
 from src.utils.category_tree_cache import build_category_path
 from src.utils.store_profile import get_store_profile
 
+# Parent ids for one category index. Keyed by object identity plus size so a
+# replaced or grown index is rebuilt, and a repeated leaf check does not scan
+# the whole tree again.
+_INDEX_PARENT_IDS = {}
+
+
+def _index_parent_ids(index) -> set:
+    if not isinstance(index, dict):
+        return set()
+    key = (id(index), len(index))
+    cached = _INDEX_PARENT_IDS.get(key)
+    if cached is not None and cached[0] is index:
+        return cached[1]
+    parents = set()
+    for meta in index.values():
+        if isinstance(meta, (list, tuple)) and len(meta) > 1 and meta[1]:
+            parents.add(str(meta[1]))
+    _INDEX_PARENT_IDS[key] = (index, parents)
+    return parents
+
 
 class EbayCategoryMatcher:
     """Automatic category and item specifics matching"""
@@ -1013,11 +1033,7 @@ class EbayCategoryMatcher:
         def _is_leaf(index, leaf_id: str) -> bool:
             if not isinstance(index, dict) or leaf_id not in index:
                 return False
-            parents = set()
-            for meta in index.values():
-                if isinstance(meta, (list, tuple)) and len(meta) > 1 and meta[1]:
-                    parents.add(str(meta[1]))
-            return leaf_id not in parents
+            return leaf_id not in _index_parent_ids(index)
 
         store_index = indexes.get(tree_id) if isinstance(indexes.get(tree_id), dict) else {}
         if tree_id != "100" and cid in motors_ids and not _is_leaf(store_index, cid):
