@@ -584,7 +584,7 @@ def choose_ready_category(
         # Flag set (including blank/mismatched pin): fail closed — do not rematch.
         return current_category_id, current_category_name, aspects
 
-    from src.utils.category_decision import apply_category_write_gate
+    from src.utils.category_decision import CATEGORY_HOLD_ACTIONS, apply_category_write_gate
 
     original_id = normalize_category_id(current_category_id)
     original_name = current_category_name
@@ -663,7 +663,7 @@ def choose_ready_category(
             listing_status=listing_status or "READY",
             reason="ready_draft_candidate",
         )
-        if action in {"hold_empty", "hold_implausible", "hold_tree_unavailable"}:
+        if action in CATEGORY_HOLD_ACTIONS:
             return original_id or None, original_name if original_id else None, aspects
         if gated == original_id:
             if not original_id:

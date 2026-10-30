@@ -5,6 +5,11 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
+import pytest
+
+if not (ROOT / "logs").is_dir():
+    pytest.skip("logs directory absent in this checkout", allow_module_level=True)
+
 SPEC = importlib.util.spec_from_file_location(
     "batch_smart_reprice",
     ROOT / "scripts" / "batch_smart_reprice.py",

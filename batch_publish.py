@@ -450,6 +450,60 @@ def _is_sellable_leaf_category(oauth, category_id: str) -> bool:
         return False
 
 
+def _resolve_publish_store_kind(store_kind):
+    """Explicit argument wins. A profile with no store_kind and is_motors is auto."""
+    if str(store_kind or "").strip():
+        return str(store_kind).strip().lower()
+    from src.utils.store_profile import get_store_profile
+
+    profile = get_store_profile()
+    if hasattr(profile, "store_kind"):
+        kind = str(getattr(profile, "store_kind") or "").strip().lower()
+        return kind or "furniture"
+    if getattr(profile, "is_motors", False):
+        return "auto"
+    return "furniture"
+
+
+def _aspects_for_final_leaf(
+    category_matcher,
+    leaf,
+    existing_aspects,
+    completed_aspects,
+    matcher_leaf,
+    title_context,
+    selected_name,
+):
+    """Aspects for the leaf that will publish. Recompute when it is not the matcher leaf."""
+    existing_aspects = dict(existing_aspects or {})
+    if not leaf:
+        return existing_aspects
+    if matcher_leaf and str(leaf) == str(matcher_leaf):
+        return dict(completed_aspects or existing_aspects)
+    if category_matcher is None or not hasattr(category_matcher, "_complete_aspects"):
+        return existing_aspects
+    required, recommended = [], []
+    if hasattr(category_matcher, "_get_category_aspects"):
+        required, recommended = category_matcher._get_category_aspects(leaf)
+    try:
+        return category_matcher._complete_aspects(
+            existing_aspects,
+            required,
+            recommended,
+            title_context,
+            selected_name or "",
+            category_id=str(leaf),
+        )
+    except TypeError:
+        return category_matcher._complete_aspects(
+            existing_aspects,
+            required,
+            recommended,
+            title_context,
+            selected_name or "",
+        )
+
+
 def select_batch_publish_category(
     *,
     stored_cat,
@@ -462,6 +516,10 @@ def select_batch_publish_category(
     category_matcher=None,
     preserve_approved_category=False,
     sellable_check=None,
+    store_kind=None,
+    attributes=None,
+    tools_route_to_auto=None,
+    index=None,
 ):
     """Pick a publish category, then run the shared write gate.
 
@@ -473,6 +531,8 @@ def select_batch_publish_category(
     from src.utils.category_decision import (
         apply_category_write_gate,
         category_gate_report_flags,
+        conflicting_category_keys,
+        unpublished_listing_status,
     )
 
     original_stored = str(stored_cat or "").strip() or None
@@ -497,6 +557,8 @@ def select_batch_publish_category(
                 "held": True,
                 "selected": None,
                 "flags": report_flags,
+                "reasons": ["hold_empty"],
+                "suggestion": None,
             }
 
     if original_stored in INVALID_CATEGORY_REMAP and not preserve_approved_category:
@@ -524,12 +586,15 @@ def select_batch_publish_category(
 
     api_cat_id = None
     api_cat_name = None
+    matcher_leaf = None
     if category_matcher is not None:
         api_cat_id, api_cat_name, completed_aspects = category_matcher.get_category_and_aspects(
             title_context, existing_aspects, description
         )
         if api_cat_id:
             api_cat_id = str(api_cat_id).strip()
+        matcher_leaf = api_cat_id
+        if api_cat_id:
             if api_cat_id in INVALID_CATEGORY_REMAP:
                 remapped = INVALID_CATEGORY_REMAP[api_cat_id]
                 logger.warning(f"  [CAT] Remapping legacy invalid auto category {api_cat_id} -> {remapped}")
@@ -603,49 +668,128 @@ def select_batch_publish_category(
         selected = api_cat_id
         selected_name = api_cat_name
 
-    gated_id, action = apply_category_write_gate(
+    gate_result = apply_category_write_gate(
         original_stored,
         selected,
         title_context,
         listing_status=listing_status,
         reason="publish_candidate",
+        index=index,
+        sellable_check=sellable_check,
     )
-    if action in {"hold_empty", "hold_implausible", "hold_tree_unavailable"}:
-        return {
-            "category_id": None,
-            "category_name": None,
-            "aspects": completed_aspects,
-            "action": action,
-            "original_stored": original_stored,
-            "held": True,
-            "selected": selected,
-            "flags": report_flags,
-        }
-    if gated_id and gated_id == original_stored:
-        selected_name = original_name or selected_name or f"Category {gated_id}"
-        if (
-            category_matcher is not None
-            and gated_id != selected
-            and hasattr(category_matcher, "_get_category_aspects")
-            and hasattr(category_matcher, "_complete_aspects")
-        ):
-            required_aspects, recommended_aspects = category_matcher._get_category_aspects(gated_id)
-            completed_aspects = category_matcher._complete_aspects(
-                existing_aspects,
-                required_aspects,
-                recommended_aspects,
-                title_context,
-                selected_name,
-            )
+    gated_id, action = gate_result
+    suggestion = getattr(gate_result, "suggestion", None)
+    reasons = []
+    if action == "hold_implausible":
+        reasons.append("implausible_category")
+    elif action == "hold_not_sellable":
+        reasons.append("not_sellable_in_store_tree")
+    elif action == "hold_empty":
+        reasons.append("hold_empty")
+    elif action == "hold_tree_unavailable":
+        reasons.append("hold_tree_unavailable")
+    held = action in {
+        "hold_empty",
+        "hold_implausible",
+        "hold_tree_unavailable",
+        "hold_not_sellable",
+        "hold_wrong_store",
+        "hold_category_key_conflict",
+    }
+    unpublished = unpublished_listing_status(listing_status)
+
+    def _sellable(cid) -> bool:
+        if not callable(sellable_check) or not cid:
+            return True
+        try:
+            return bool(sellable_check(cid))
+        except Exception:
+            return False
+
+    if unpublished and original_stored and callable(sellable_check) and not _sellable(original_stored):
+        # An approved remap already replaced the unsellable stored id.
+        approved_replacement = action == "remap" and gated_id and _sellable(gated_id)
+        if not approved_replacement:
+            if "not_sellable_in_store_tree" not in reasons:
+                reasons.append("not_sellable_in_store_tree")
+            held = True
+            if action in {"keep", "remap"}:
+                action = "hold_not_sellable"
+            gated_id = None
+
+    conflict_map, key_suggestion = conflicting_category_keys(
+        original_stored, opt, attributes
+    )
+    if conflict_map and unpublished:
+        reasons.append("category_key_conflict")
+        held = True
+        action = "hold_category_key_conflict"
+        gated_id = None
+        if key_suggestion:
+            suggestion = key_suggestion
+
+    supplier = ""
+    if isinstance(attributes, dict):
+        supplier = str(attributes.get("category") or attributes.get("supplier_category") or "")
+    if not supplier and isinstance(opt, dict):
+        supplier = str(opt.get("supplier_category") or "")
+    from src.services.product_router import publish_wrong_store_reason
+
+    wrong_store = publish_wrong_store_reason(
+        title=title_context,
+        description=description or "",
+        attributes=attributes if isinstance(attributes, dict) else None,
+        supplier_category=supplier,
+        store_kind=_resolve_publish_store_kind(store_kind),
+        tools_route_to_auto=tools_route_to_auto,
+    )
+    if wrong_store and unpublished:
+        if wrong_store not in reasons:
+            reasons.append(wrong_store)
+        held = True
+        if action in {"keep", "remap"}:
+            action = "hold_wrong_store"
+        gated_id = None
+
+    if suggestion and original_stored and str(suggestion) == str(original_stored):
+        suggestion = None
+    if (
+        suggestion
+        and callable(sellable_check)
+        and not _sellable(suggestion)
+        and "category_key_conflict" not in reasons
+    ):
+        suggestion = None
+
+    if held:
+        gated_id = None
+        aspects_out = dict(existing_aspects)
+        if "category_key_conflict" not in reasons and suggestion and not _sellable(suggestion):
+            suggestion = None
+    else:
+        suggestion = None
+        if gated_id and gated_id == original_stored:
+            selected_name = original_name or selected_name or f"Category {gated_id}"
+        aspects_out = _aspects_for_final_leaf(
+            category_matcher,
+            gated_id,
+            existing_aspects,
+            completed_aspects,
+            matcher_leaf,
+            title_context,
+            selected_name,
+        )
     return {
         "category_id": gated_id,
         "category_name": selected_name if gated_id else None,
-        "aspects": completed_aspects,
+        "aspects": aspects_out,
         "action": action,
         "original_stored": original_stored,
-        "held": False,
+        "held": held,
         "selected": selected,
         "flags": report_flags,
+        "reasons": reasons,
+        "suggestion": suggestion if held else None,
     }
 
 
@@ -1230,6 +1374,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             if preserve_approved_category
             else (lambda cid, _oauth=oauth: _is_sellable_leaf_category(_oauth, cid))
         ),
+        attributes=product.get("attributes") if isinstance(product.get("attributes"), dict) else None,
     )
     stored_cat = choice.get("original_stored") or stored_cat
     completed_aspects = choice.get("aspects") or existing_aspects
@@ -1918,6 +2063,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                             category_matcher=category_matcher,
                             preserve_approved_category=preserve_approved_category,
                             sellable_check=lambda cid, _oauth=oauth: _is_sellable_leaf_category(_oauth, cid),
+                            attributes=product.get("attributes") if isinstance(product.get("attributes"), dict) else None,
                         )
                         gated_retry = retry_choice.get("category_id")
                         if retry_choice.get("held") or not gated_retry:
@@ -1930,7 +2076,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                         if new_id and new_id != category_id:
                             logger.info(f"  [FIX] Category {category_id} invalid, switching to API-suggested: {new_id} ({new_name})")
                             category_id, category_name = new_id, new_name
-                            completed_aspects.update(new_aspects)
+                            completed_aspects.clear()
+                            completed_aspects.update(retry_choice.get("aspects") or {})
                             marketplace_id = _target_marketplace(category_id)
                             category_reselected = True
                     continue

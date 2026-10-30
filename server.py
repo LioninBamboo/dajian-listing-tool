@@ -1057,27 +1057,21 @@ async def collect_product(
         # nothing is moved automatically — tools/route_products.py acts on it.
         route_note = ""
         try:
-            from src.services.product_router import classify_product
+            from src.services.product_router import collection_route_note
             from src.utils.store_profile import get_store_profile as _gsp
 
-            routing = classify_product(
+            route_note = collection_route_note(
                 title=title,
                 description=description,
                 attributes=attributes,
                 supplier_category=str((specs or {}).get("category") or ""),
+                store_kind=_gsp().store_kind,
             )
-            this_store = _gsp().store_kind
-            if routing["target"] not in (this_store, "unknown"):
-                route_note = (
-                    f"ROUTING: looks like '{routing['target']}' "
-                    f"({routing['reason']}: {routing['matched']}) but this instance is "
-                    f"'{this_store}' — belongs in the {routing['target']} store."
-                )
+            if route_note.startswith("ROUTING:"):
                 logging.warning("[ROUTE] %s %s", payload.sku, route_note)
-            else:
-                route_note = f"Routing: {routing['target']} ({routing['reason']})"
         except Exception as route_err:  # routing must never block collection
             logging.warning("[ROUTE] %s classification failed: %s", payload.sku, route_err)
+            route_note = ""
 
         issue_flags = _collection_issue_flags(
             payload,

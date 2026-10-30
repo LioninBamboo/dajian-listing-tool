@@ -24,6 +24,13 @@ FURNITURE = "furniture"
 ARTTOY = "arttoy"
 UNKNOWN = "unknown"
 
+# Sergey 09-25: Main is a home store and may list everything except auto parts.
+# The flag only controls whether a garage-tool classification becomes a
+# wrong_store hold. Default off: tools never block a draft. Tool phrases still
+# beat "cabinet" so a tool chest is not classified as furniture. Tests cover
+# both values. Unknown never blocks.
+TOOLS_ROUTE_TO_AUTO = False
+
 # Supplier category fragments that are decisively automotive.
 _SUPPLIER_AUTO = (
     "auto", "car ", "truck", "vehicle", "motorcycle", "towing", "cargo carrier",
@@ -70,6 +77,14 @@ _ARTTOY_TERMS = (
     "mystery box", "trading figure", "figurine set",
 )
 
+# Checked before the furniture "cabinet" term. "tool drawer" and "tool gift"
+# are intentionally absent so they do not steal a kitchen cabinet or a gift.
+_TOOL_TERMS = (
+    "tool chest", "tool box", "tool cart", "tool storage", "tool cabinet",
+    "mechanic creeper", "creeper", "floor jack", "bolt cutter", "garage gift",
+    "mechanic",
+)
+
 _FURNITURE_TERMS = (
     "sofa", "couch", "armchair", "dining table", "coffee table", "bed frame",
     "nightstand", "dresser", "wardrobe", "bookshelf", "cabinet", "ottoman",
@@ -89,12 +104,25 @@ def _has_term(haystack: str, terms) -> Optional[str]:
     return None
 
 
+def _supplier_has(supplier: str, frag: str) -> bool:
+    """Supplier text match. Single token ``auto`` is a whole word.
+
+    ``automatic``, ``autoclave``, and ``automobile`` are not the auto store.
+    Multi-word fragments stay substring matches (``cargo carrier`` in
+    ``cargo carriers``).
+    """
+    if frag == "auto":
+        return re.search(r"(?<![a-z0-9])auto(?![a-z0-9])", supplier) is not None
+    return frag in supplier
+
+
 def classify_product(
     *,
     title: str = "",
     description: str = "",
     attributes: Optional[Mapping[str, Any]] = None,
     supplier_category: str = "",
+    tools_route_to_auto: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Classify a product for routing.
 
@@ -116,7 +144,7 @@ def classify_product(
 
     # 1) Supplier category is the most trustworthy signal.
     for frag in _SUPPLIER_AUTO:
-        if frag in supplier:
+        if _supplier_has(supplier, frag):
             return {"target": AUTO, "reason": "supplier category", "matched": frag}
 
     # 2) Title/description terms, unless a known false friend explains the hit.
@@ -131,6 +159,12 @@ def classify_product(
             "matched": false_friend,
         }
 
+    # Tool phrases always beat furniture "cabinet". tools_route_to_auto does
+    # not change this label; publish_wrong_store_reason applies the flag.
+    hit = _has_term(hay, _TOOL_TERMS)
+    if hit and not false_friend:
+        return {"target": AUTO, "reason": "garage tool term", "matched": hit}
+
     hit = _has_term(hay, _FURNITURE_TERMS)
     if hit:
         return {"target": FURNITURE, "reason": "furniture term", "matched": hit}
@@ -141,3 +175,94 @@ def classify_product(
 def route_for_product(**kwargs) -> str:
     """Convenience wrapper returning just the routing target."""
     return classify_product(**kwargs)["target"]
+
+
+def collection_route_note(
+    *,
+    title: str = "",
+    description: str = "",
+    attributes: Optional[Mapping[str, Any]] = None,
+    supplier_category: str = "",
+    store_kind: str = "",
+    tools_route_to_auto: Optional[bool] = None,
+) -> str:
+    """Same note the extension collect path logs. Does not move the row."""
+    routing = classify_product(
+        title=title,
+        description=description,
+        attributes=attributes,
+        supplier_category=supplier_category,
+        tools_route_to_auto=tools_route_to_auto,
+    )
+    this_store = str(store_kind or "").strip().lower()
+    if routing["target"] not in (this_store, UNKNOWN):
+        return (
+            f"ROUTING: looks like '{routing['target']}' "
+            f"({routing['reason']}: {routing['matched']}) but this instance is "
+            f"'{this_store}' — belongs in the {routing['target']} store."
+        )
+    return f"Routing: {routing['target']} ({routing['reason']})"
+
+
+def pilot_collect_logs(
+    title: str = "",
+    description: str = "",
+    attributes: Optional[Mapping[str, Any]] = None,
+    supplier_category: str = "",
+    store_kind: str = "furniture",
+    tools_route_to_auto: Optional[bool] = None,
+    existing_logs: Optional[list] = None,
+) -> list:
+    """Collection logs for pilot_collect_garden. Never a store move."""
+    logs = list(existing_logs or ["pilot_collect_garden"])
+    if "pilot_collect_garden" not in logs:
+        logs.append("pilot_collect_garden")
+    note = collection_route_note(
+        title=title,
+        description=description,
+        attributes=attributes,
+        supplier_category=supplier_category,
+        store_kind=store_kind,
+        tools_route_to_auto=tools_route_to_auto,
+    )
+    if note.startswith("ROUTING:") and note not in logs:
+        logs.append(note)
+    return logs
+
+
+def publish_wrong_store_reason(
+    *,
+    title: str = "",
+    description: str = "",
+    attributes: Optional[Mapping[str, Any]] = None,
+    supplier_category: str = "",
+    store_kind: str = "",
+    tools_route_to_auto: Optional[bool] = None,
+) -> Optional[str]:
+    """Publish preflight. ``None`` means do not block.
+
+    Main (furniture) accepts every non-Motors product. Auto parts on a
+    non-auto store block. Garage tools block only when ``TOOLS_ROUTE_TO_AUTO``
+    is on and this store is not furniture/auto (Aqua already matches ``auto``).
+    """
+    routing = classify_product(
+        title=title,
+        description=description,
+        attributes=attributes,
+        supplier_category=supplier_category,
+        tools_route_to_auto=tools_route_to_auto,
+    )
+    target = routing["target"]
+    this = str(store_kind or "").strip().lower()
+    if target in (UNKNOWN, this, ""):
+        return None
+    route_tools = TOOLS_ROUTE_TO_AUTO if tools_route_to_auto is None else bool(tools_route_to_auto)
+    if routing["reason"] == "garage tool term":
+        if not route_tools or this in {"furniture", "main", "garden", "auto", ""}:
+            return None
+        return f"wrong_store:{target}"
+    if target == AUTO and this != AUTO:
+        return f"wrong_store:{target}"
+    if this not in {"furniture", "main", ""}:
+        return f"wrong_store:{target}"
+    return None
