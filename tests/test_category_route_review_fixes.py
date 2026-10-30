@@ -125,6 +125,29 @@ def test_real_brake_pad_still_blocks_main():
     )
 
 
+_ROUTER_LIFT_TITLE = (
+    "Router Lift Kit, Aluminum Alloy Router Table Insert Plate with Lifting ..."
+)
+_AUTO_LIFT_KIT_TITLES = (
+    "3 Inch Front Leveling Lift Kit for Silverado",
+    "Suspension Lift Kit for Jeep Wrangler JK",
+    "2 Inch Body Lift Kit for Ford F150 Truck",
+    "Leveling Kit for Chevy",
+)
+
+
+@pytest.mark.parametrize("store_kind", ["furniture", "garden"])
+def test_router_lift_kit_is_not_wrong_store_on_main_or_gp(store_kind):
+    assert publish_wrong_store_reason(title=_ROUTER_LIFT_TITLE, store_kind=store_kind) is None
+
+
+@pytest.mark.parametrize("title", _AUTO_LIFT_KIT_TITLES)
+def test_auto_lift_kit_is_wrong_store_on_main(title):
+    assert (
+        publish_wrong_store_reason(title=title, store_kind="furniture") == "wrong_store:auto"
+    )
+
+
 def test_gp_key_conflict_message_keeps_ids_and_suggestion():
     row = BY_SKU["W808P391606"]
     result, opt, attributes, _opt_before, _attr_before = _run(row)

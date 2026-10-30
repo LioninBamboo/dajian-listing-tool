@@ -262,8 +262,28 @@ def _without_phrases(haystack: str, phrases) -> str:
     return cleaned
 
 
+# A woodworking "router lift kit" is not a suspension kit. Keep the auto
+# term only with a vehicle word, or drop it next to these household words.
+_LIFT_KIT_NON_AUTO = (
+    "router", "router table", "woodworking", "table saw", "bed", "desk", "tv", "cabinet",
+)
+_LIFT_KIT_AUTO_CONTEXT = (
+    "truck", "jeep", "suv", "car", "vehicle", "suspension", "leveling", "body lift",
+    "ford", "chevy", "silverado", "f150", "wrangler", "ram", "tacoma", "gmc",
+    "toyota", "dodge",
+)
+
+
+def _lift_kit_is_automotive(haystack: str) -> bool:
+    if _has_term(haystack, _LIFT_KIT_NON_AUTO):
+        return False
+    return _has_term(haystack, _LIFT_KIT_AUTO_CONTEXT) is not None
+
+
 def _publish_auto_hit(haystack: str) -> Optional[str]:
     hit = _has_term(haystack, _PUBLISH_AUTO_TERMS)
+    if hit == "lift kit" and not _lift_kit_is_automotive(haystack):
+        hit = None
     if hit:
         return hit
     # "radiator cover" is household. A standalone radiator still is not.
