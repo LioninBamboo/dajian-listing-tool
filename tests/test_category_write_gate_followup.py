@@ -738,22 +738,31 @@ def test_item5_aqua_refreshes_tree_100_and_0(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "sku,stored,title",
+    "sku,stored,title,expect_keep",
     [
-        ("aqua:W110243192", "20487", "Rolling Tool Chest Cabinet with Drawers"),
-        ("aqua:W110243144", "20487", "Rolling Tool Chest Cabinet with Drawers"),
-        ("aqua:W2660P287608", "20487", "Rolling Tool Chest Cabinet with Drawers"),
-        ("aqua:W46559181", "88057", "Adjustable Grinder Stand Workstation"),
-        ("aqua:W465P210780", "262980", "Heavy Duty Bench Vise Stand"),
-        ("aqua:W46563694", "260150", "Manual Citrus Juicer Press"),
+        # Tool-chest titles in furniture 20487 are implausible (report-only; no remap).
+        ("aqua:W110243192", "20487", "Rolling Tool Chest Cabinet with Drawers", False),
+        ("aqua:W110243144", "20487", "Rolling Tool Chest Cabinet with Drawers", False),
+        ("aqua:W2660P287608", "20487", "Rolling Tool Chest Cabinet with Drawers", False),
+        ("aqua:W46559181", "88057", "Adjustable Grinder Stand Workstation", True),
+        ("aqua:W465P210780", "262980", "Heavy Duty Bench Vise Stand", True),
+        ("aqua:W46563694", "260150", "Manual Citrus Juicer Press", True),
     ],
 )
-def test_item5_aqua_tree0_leaves_are_not_invalid(sku, stored, title):
+def test_item5_aqua_tree0_leaves_are_not_invalid(sku, stored, title, expect_keep):
     ok, reason = validate_target_category(stored, "", title, index=INDEX)
-    assert ok is True, (sku, stored, reason)
     gated, action, err = _gate(stored, title, "READY")
-    assert action == "keep", (sku, action, err)
-    assert gated == stored
+    if expect_keep:
+        assert ok is True, (sku, stored, reason)
+        assert action == "keep", (sku, action, err)
+        assert gated == stored
+        assert err == ""
+    else:
+        assert ok is False, (sku, stored, reason)
+        assert reason == "implausible_target_path"
+        assert action == "hold_implausible", (sku, action, err)
+        assert gated is None
+        assert err
 
 
 @pytest.mark.real_category_tree

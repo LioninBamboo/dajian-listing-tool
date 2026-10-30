@@ -139,14 +139,25 @@ def main():
         pinfo = prices.get(sku) or {}
         ship = float(pinfo.get("ship") or 0.0)
         m = map_detail(det, pinfo.get("price"))
+        from src.services.product_router import pilot_collect_logs
+
         row = db.query(CollectedProduct).filter_by(sku=sku).first()
+        route_logs = pilot_collect_logs(
+            title=m["title"],
+            description=m["description"],
+            attributes=m["attributes"],
+            supplier_category=str(det.get("category") or ""),
+            store_kind="furniture",
+            existing_logs=list(row.logs or []) if row is not None else None,
+        )
         if row:
             row.title, row.description = m["title"], m["description"]
             row.attributes, row.specs = m["attributes"], m["specs"]
             row.images, row.videos = m["images"], m["videos"]
             row.price, row.shipping, row.stock = m["price"], ship, 10
             row.status = "COLLECTED"
-            for f in ("attributes", "specs", "images", "videos"):
+            row.logs = route_logs
+            for f in ("attributes", "specs", "images", "videos", "logs"):
                 from sqlalchemy.orm.attributes import flag_modified
                 flag_modified(row, f)
         else:
@@ -154,7 +165,7 @@ def main():
                 sku=sku, title=m["title"], price=m["price"], shipping=ship, stock=10,
                 description=m["description"], images=m["images"], videos=m["videos"],
                 attributes=m["attributes"], specs=m["specs"], url="",
-                status="COLLECTED", logs=["pilot_collect_garden"],
+                status="COLLECTED", logs=route_logs,
             ))
         db.commit()
         done += 1

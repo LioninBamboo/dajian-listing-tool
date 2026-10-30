@@ -356,6 +356,20 @@ _KIND_ALLOWED_STORED = {
 HOLD_EMPTY_PUBLISH_ERROR = (
     "Stored category is empty or invalid; holding publish. No category write."
 )
+HOLD_NOT_SELLABLE_PUBLISH_ERROR = (
+    "Stored category is not a sellable leaf in this store's publish tree; "
+    "holding publish. No category write."
+)
+CATEGORY_HOLD_ACTIONS = frozenset(
+    {
+        "hold_empty",
+        "hold_implausible",
+        "hold_tree_unavailable",
+        "hold_not_sellable",
+        "hold_wrong_store",
+        "hold_category_key_conflict",
+    }
+)
 HOLD_TREE_UNAVAILABLE_ERROR = (
     "category tree unavailable; refresh failed; no publish"
 )
@@ -368,9 +382,11 @@ class CategoryGateResult(tuple):
     Unpacks like the historical 3-tuple so existing callers stay intact.
     """
 
-    def __new__(cls, category_id, action, error, flags=None):
+    def __new__(cls, category_id, action, error, flags=None, suggestion=None, reasons=None):
         inst = super().__new__(cls, (category_id, action, error))
         inst.flags = list(flags or [])
+        inst.suggestion = suggestion
+        inst.reasons = list(reasons or [])
         return inst
 
 
@@ -1025,6 +1041,142 @@ def pet_species_mismatch_reason(title: str, path: str) -> str | None:
     return None
 
 
+_TOOL_GARAGE_PRODUCT_RE = re.compile(
+    r"\b(?:tool\s+chests?|tool\s+box(?:es)?|tool\s+carts?|tool\s+storages?|"
+    r"tool\s+cabinets?|floor\s+jacks?|bolt\s+cutters?|creepers?|mechanics?)\b",
+    re.IGNORECASE,
+)
+_CREEPER_RE = re.compile(r"\bcreepers?\b", re.IGNORECASE)
+_FLOOR_JACK_RE = re.compile(
+    r"\b(?:floor\s+jacks?|cross\s+beams?(?:\s+adapters?)?)\b",
+    re.IGNORECASE,
+)
+_DOG_CRATE_PRODUCT_RE = re.compile(
+    r"\b(?:dog\s+crates?|dog\s+kennels?|dog\s+cages?|pet\s+cages?)\b",
+    re.IGNORECASE,
+)
+_COLLECTIBLE_SIGNAL_RE = re.compile(
+    r"\b(?:vintage|antique|collectibles?|signed|graded)\b",
+    re.IGNORECASE,
+)
+_FLOORING_STRIP_RE = re.compile(
+    r"\b(?:sealing\s+strips?|edge\s+sealing)\b",
+    re.IGNORECASE,
+)
+_FLOOR_WORD_RE = re.compile(r"\b(?:floors?|flooring)\b", re.IGNORECASE)
+_FURNITURE_CABINET_IDS = frozenset({"38221", "20487"})
+_CREEPER_REJECT_IDS = frozenset({"39731", "33088"})
+_ROOF_RACK_IDS = frozenset({"262216", "33651"})
+_CAULK_IDS = frozenset({"184315"})
+_COLLECTIBLE_LEAF_IDS = frozenset({"975", "3489"})
+_TABLE_WORD_RE = re.compile(r"\btables?\b", re.IGNORECASE)
+_TOOL_BOX_NAME_RE = re.compile(r"\btool\s+box(?:es)?\b", re.IGNORECASE)
+_WORK_BENCH_NAME_RE = re.compile(r"\bwork\s+benches?\b", re.IGNORECASE)
+
+
+def title_vs_category_implausible(
+    title: str,
+    category_id: str | None,
+    *,
+    path: str = "",
+    category_name: str = "",
+) -> str | None:
+    """Title-family mismatch. Word boundaries only. None means this check passed.
+
+    Does not invent a replacement leaf. Callers hold and may attach a
+    report-only suggestion from a separate plausible candidate.
+    """
+    hay = as_safe_text(title)
+    cid = as_safe_category_id(category_id) or ""
+    if not hay or not cid:
+        return None
+    name = as_safe_text(category_name).lower()
+    path_text = as_safe_text(path)
+    path_low = path_text.lower()
+    furniture_leaf = cid in _FURNITURE_CABINET_IDS or any(
+        path_text.startswith(prefix) for prefix in FURNITURE_PATH_PREFIXES
+    )
+    if _TOOL_GARAGE_PRODUCT_RE.search(hay) and furniture_leaf:
+        return "implausible_category"
+    if _CREEPER_RE.search(hay) and (
+        cid in _CREEPER_REJECT_IDS
+        or _TOOL_BOX_NAME_RE.search(name)
+        or _WORK_BENCH_NAME_RE.search(name)
+    ):
+        return "implausible_category"
+    if _FLOOR_JACK_RE.search(hay) and (
+        cid in _ROOF_RACK_IDS or "roof rack" in name or "roof rack" in path_low
+    ):
+        return "implausible_category"
+    if _DOG_CRATE_PRODUCT_RE.search(hay) and (
+        "end table" in name
+        or "end table" in path_low
+        or cid in {"54235", "38204"}
+        or _TABLE_WORD_RE.search(name)
+    ):
+        return "implausible_category"
+    collectible_leaf = (
+        cid in _COLLECTIBLE_LEAF_IDS
+        or path_text.startswith("Collectibles")
+        or path_text.startswith("Stamps")
+        or path_text.startswith(ANTIQUES_PREFIX)
+        or "collectible" in name
+        or "stamps" in path_low
+        or name in {"stamps", "germany & colonies"}
+    )
+    if collectible_leaf and not _COLLECTIBLE_SIGNAL_RE.search(hay):
+        return "implausible_category"
+    if (
+        _FLOORING_STRIP_RE.search(hay)
+        and _FLOOR_WORD_RE.search(hay)
+        and (
+            cid in _CAULK_IDS
+            or "caulk" in name
+            or "sealant" in name
+            or "caulks & sealants" in path_low
+        )
+    ):
+        return "implausible_category"
+    return None
+
+
+def conflicting_category_keys(
+    stored: Any = None,
+    optimization: Any = None,
+    attributes: Any = None,
+) -> tuple[dict[str, str], str | None]:
+    """Return ``(present, suggestion)``. Empty ``present`` means the keys agree.
+
+    Suggestion is report-only: the non-``categoryId`` value when the other
+    keys agree with each other. Nothing is written back onto the row.
+    """
+    opt = optimization if isinstance(optimization, dict) else {}
+    attrs = attributes if isinstance(attributes, dict) else {}
+    present: dict[str, str] = {}
+
+    def _add(label: str, raw: Any) -> None:
+        cid = as_safe_category_id(raw)
+        if cid:
+            present[label] = cid
+
+    _add("categoryId", stored if stored not in (None, "") else opt.get("categoryId"))
+    if stored not in (None, "") and "categoryId" not in present:
+        _add("categoryId", opt.get("categoryId"))
+    _add("category_id", opt.get("category_id"))
+    _add("ebay_category_id", opt.get("ebay_category_id"))
+    _add("attributes.forced_category_id", attrs.get("forced_category_id"))
+    _add("attributes.category_id", attrs.get("category_id"))
+    _add("attributes.ebay_category_id", attrs.get("ebay_category_id"))
+    _add("attributes.categoryId", attrs.get("categoryId"))
+    unique = set(present.values())
+    if len(unique) <= 1:
+        return {}, None
+    primary = present.get("categoryId")
+    others = {cid for label, cid in present.items() if label != "categoryId"}
+    suggestion = next(iter(others)) if len(others) == 1 and primary not in others else None
+    return present, suggestion
+
+
 def validate_target_category(
     cid: str | None,
     kind: str = "",
@@ -1088,6 +1240,10 @@ def validate_target_category(
             return False, "implausible_target_path"
     allowed = _KIND_ALLOWED_STORED.get(effective_kind)
     if allowed is not None and target not in allowed:
+        return False, "implausible_target_path"
+    meta = flat.get(target)
+    cat_name = meta[0] if isinstance(meta, (list, tuple)) and meta else ""
+    if title_vs_category_implausible(title, target, path=path, category_name=cat_name):
         return False, "implausible_target_path"
     return True, ""
 
@@ -1609,6 +1765,24 @@ def category_gate_report_flags(
     return flags
 
 
+class CategoryWriteAction(tuple):
+    """``(category_id, action)`` plus a report-only ``.suggestion``."""
+
+    def __new__(cls, category_id, action, suggestion=None):
+        inst = super().__new__(cls, (category_id, action))
+        inst.suggestion = suggestion
+        return inst
+
+
+def _sellable_in_store(sellable_check, category_id: str | None) -> bool:
+    if sellable_check is None or not category_id:
+        return True
+    try:
+        return bool(sellable_check(category_id))
+    except Exception:
+        return False
+
+
 def explicit_override_target_allowed(
     target_id: Any,
     title: str = "",
@@ -1655,6 +1829,7 @@ def apply_category_write_gate(
     reason: str = "publish_candidate",
     kind: str = "classified",
     index=None,
+    sellable_check=None,
 ) -> tuple[str | None, str]:
     """Gate every publish/draft category choice.
 
@@ -1700,6 +1875,14 @@ def apply_category_write_gate(
     if unpublished and stored and is_legacy_remap_stored(stored):
         return None, "hold_implausible"
 
+    report_suggestion = None
+    if candidate and candidate != stored and _sellable_in_store(sellable_check, candidate):
+        candidate_ok, _candidate_reason = validate_target_category(
+            candidate, kind, title, index=index
+        )
+        if candidate_ok:
+            report_suggestion = candidate
+
     if chosen == stored and stored:
         stored_ok, stored_reason = validate_target_category(stored, "", title, index=index)
         if stored_reason == "tree_unavailable":
@@ -1709,7 +1892,9 @@ def apply_category_write_gate(
                 return None, "hold_tree_unavailable"
             return stored, "keep"
         if not stored_ok and unpublished:
-            return None, "hold_implausible"
+            return CategoryWriteAction(None, "hold_implausible", report_suggestion)
+        if unpublished and not _sellable_in_store(sellable_check, stored):
+            return CategoryWriteAction(None, "hold_not_sellable", report_suggestion)
     return chosen or None, action
 
 
@@ -1725,6 +1910,7 @@ def gate_publish_category_choice(
     optimization: Any = None,
     is_motors: bool | None = None,
     indexes=None,
+    sellable_check=None,
 ) -> CategoryGateResult:
     """Shared choke point for every manual/API publish category write.
 
@@ -1732,7 +1918,7 @@ def gate_publish_category_choice(
     ``error`` is set on hold; callers must not publish or write a category
     when it is non-empty. Unapproved remaps keep the stored id (report-only).
     """
-    gated, action = apply_category_write_gate(
+    result = apply_category_write_gate(
         original_stored,
         candidate_id,
         title,
@@ -1740,7 +1926,10 @@ def gate_publish_category_choice(
         reason=reason,
         kind=kind,
         index=index,
+        sellable_check=sellable_check,
     )
+    gated, action = result
+    write_suggestion = getattr(result, "suggestion", None)
     flags = category_gate_report_flags(
         original_stored,
         optimization=optimization,
@@ -1748,11 +1937,29 @@ def gate_publish_category_choice(
         indexes=indexes,
     )
     if action == "hold_empty":
-        return CategoryGateResult(None, action, HOLD_EMPTY_PUBLISH_ERROR, flags)
+        return CategoryGateResult(
+            None, action, HOLD_EMPTY_PUBLISH_ERROR, flags, reasons=["hold_empty"]
+        )
     if action == "hold_implausible":
         return CategoryGateResult(
-            None, action, hold_implausible_publish_error(original_stored, title), flags
+            None,
+            action,
+            hold_implausible_publish_error(original_stored, title),
+            flags,
+            suggestion=write_suggestion,
+            reasons=["implausible_category"],
+        )
+    if action == "hold_not_sellable":
+        return CategoryGateResult(
+            None,
+            action,
+            HOLD_NOT_SELLABLE_PUBLISH_ERROR,
+            flags,
+            suggestion=write_suggestion,
+            reasons=["not_sellable_in_store_tree"],
         )
     if action == "hold_tree_unavailable":
-        return CategoryGateResult(None, action, tree_unavailable_publish_error(), flags)
+        return CategoryGateResult(
+            None, action, tree_unavailable_publish_error(), flags, reasons=["hold_tree_unavailable"]
+        )
     return CategoryGateResult(gated, action, "", flags)

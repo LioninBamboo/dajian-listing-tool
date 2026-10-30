@@ -33,6 +33,26 @@ from src.services.ebay_auth import EbayOAuthService
 from src.utils.category_tree_cache import build_category_path
 from src.utils.store_profile import get_store_profile
 
+# Parent ids for one category index. Keyed by object identity plus size so a
+# replaced or grown index is rebuilt, and a repeated leaf check does not scan
+# the whole tree again.
+_INDEX_PARENT_IDS = {}
+
+
+def _index_parent_ids(index) -> set:
+    if not isinstance(index, dict):
+        return set()
+    key = (id(index), len(index))
+    cached = _INDEX_PARENT_IDS.get(key)
+    if cached is not None and cached[0] is index:
+        return cached[1]
+    parents = set()
+    for meta in index.values():
+        if isinstance(meta, (list, tuple)) and len(meta) > 1 and meta[1]:
+            parents.add(str(meta[1]))
+    _INDEX_PARENT_IDS[key] = (index, parents)
+    return parents
+
 
 class EbayCategoryMatcher:
     """Automatic category and item specifics matching"""
@@ -856,7 +876,8 @@ class EbayCategoryMatcher:
             required_aspects, 
             recommended_aspects,
             title,
-            category_name
+            category_name,
+            category_id=category_id,
         )
         
         return category_id, category_name, completed_aspects
@@ -952,21 +973,77 @@ class EbayCategoryMatcher:
             )
             return None, None
 
-        if kw_cat_id and kw_cat_id != "38208":  # Not the generic fallback default
-            # Strong keyword match — trust it over API
-            if api_cat_id and api_cat_id != kw_cat_id:
-                logging.info(f"[CAT] Keyword={kw_cat_id} ({kw_cat_name}), API={api_cat_id} ({api_cat_name}) — using keyword match")
+        def _usable(cid, name) -> bool:
+            if not cid:
+                return False
+            if not self.is_category_plausible_for_text(title, str(cid), name):
+                return False
+            if not self._keyword_allowed_on_store_tree(str(cid)):
+                return False
+            return True
+
+        generic = bool(getattr(self, "_last_keyword_was_generic", False))
+        kw_ok = _usable(kw_cat_id, kw_cat_name)
+        api_ok = False
+        if api_cat_id and self._is_api_category_plausible(title, api_cat_id, api_cat_name):
+            api_ok = _usable(api_cat_id, api_cat_name)
+        elif api_cat_id:
+            logging.warning(
+                f"[CAT] API suggested {api_cat_id} ({api_cat_name}) rejected as implausible for: {title[:60]}"
+            )
+        # A specific plausible keyword may win. Catch-alls (table/chair/cabinet)
+        # and the 38208 default must not override a plausible API answer.
+        strong_kw = kw_ok and not generic and str(kw_cat_id) != "38208"
+        if strong_kw:
+            if api_cat_id and str(api_cat_id) != str(kw_cat_id):
+                logging.info(
+                    f"[CAT] Keyword={kw_cat_id} ({kw_cat_name}), API={api_cat_id} ({api_cat_name}) — using keyword match"
+                )
             return kw_cat_id, kw_cat_name
-        
-        if api_cat_id:
-            # Verify API result isn't a known bad mapping
-            if self._is_api_category_plausible(title, api_cat_id, api_cat_name):
-                return api_cat_id, api_cat_name
-            else:
-                logging.warning(f"[CAT] API suggested {api_cat_id} ({api_cat_name}) rejected as implausible for: {title[:60]}")
-                return kw_cat_id, kw_cat_name
-        
-        return kw_cat_id, kw_cat_name
+        if api_ok:
+            return api_cat_id, api_cat_name
+        if kw_ok and (str(kw_cat_id) == "38208" or generic):
+            return kw_cat_id, kw_cat_name
+        # A rejected keyword must not fall through to 38208.
+        return None, None
+
+    def _keyword_allowed_on_store_tree(self, category_id: str) -> bool:
+        """Conservative publish-tree check for a keyword id.
+
+        Unknown ids missing from a partial offline index are allowed. Reject a
+        known leaf of the other tree, and the known Motors ids when this store
+        is not tree 100 and that id is not a leaf of the store tree.
+        """
+        cid = str(category_id or "").strip()
+        if not cid:
+            return False
+        motors_ids = {"262216", "262210", "174020", "174021", "262093"}
+        try:
+            from src.utils.category_tree_cache import load_category_indexes
+            from src.utils.store_profile import get_store_profile
+
+            profile = get_store_profile()
+            tree_id = str(getattr(profile, "category_tree_id", "0") or "0")
+            indexes = load_category_indexes() or {}
+        except Exception:
+            return True
+        if not isinstance(indexes, dict) or not indexes:
+            return True
+
+        def _is_leaf(index, leaf_id: str) -> bool:
+            if not isinstance(index, dict) or leaf_id not in index:
+                return False
+            return leaf_id not in _index_parent_ids(index)
+
+        store_index = indexes.get(tree_id) if isinstance(indexes.get(tree_id), dict) else {}
+        if tree_id != "100" and cid in motors_ids and not _is_leaf(store_index, cid):
+            return False
+        for other_id, other in indexes.items():
+            if str(other_id) == tree_id or not isinstance(other, dict):
+                continue
+            if _is_leaf(other, cid) and cid not in store_index:
+                return False
+        return True
 
     def is_category_plausible_for_text(
         self,
@@ -1721,6 +1798,21 @@ class EbayCategoryMatcher:
             if has_indoor_bench_context:
                 return False
 
+        try:
+            from src.utils.category_decision import title_vs_category_implausible
+
+            path = ""
+            try:
+                path = self.get_category_path(cid, category_name or "")
+            except Exception:
+                path = ""
+            if title_vs_category_implausible(
+                title, cid, path=path, category_name=category_name or ""
+            ):
+                return False
+        except Exception:
+            logging.debug("[CAT] title/category plausibility check skipped", exc_info=True)
+
         return True
     
     def _is_api_category_plausible(self, title: str, api_cat_id: str, api_cat_name: str) -> bool:
@@ -1744,6 +1836,7 @@ class EbayCategoryMatcher:
     
     def _fallback_category(self, title: str, description: str = None) -> Tuple[Optional[str], Optional[str]]:
         """Fallback category mapping based on keywords - comprehensive for GigaCloud products"""
+        self._last_keyword_was_generic = False
         # Combine title and description for better matching
         title_lower = self._normalize_keyword_text(title)
         desc_lower = self._normalize_keyword_text((description or "")[:3000])
@@ -1809,7 +1902,7 @@ class EbayCategoryMatcher:
 
             # ==================== PET SUPPLIES ====================
             # Dog Products
-            (["dog crate", "dog kennel", "dog cage"], "121851", "Dog Cages & Crates"),
+            (["dog crate", "dog kennel", "dog cage", "pet cage"], "121851", "Dog Cages & Crates"),
             (["dog bed"], "20744", "Beds"),
             (["dog house"], "108884", "Dog Houses"),
             (["dog ramp", "dog stairs", "pet stairs"], "116389", "Ramps & Stairs"),
@@ -2076,6 +2169,21 @@ class EbayCategoryMatcher:
 
         generic_mappings = mappings[-3:]
         specific_mappings = mappings[:-3]
+        self._last_keyword_was_generic = False
+        _crossbar_kws = {"cross bar", "cross bars", "crossbar"}
+        _roof_ctx = re.compile(
+            r"\b(?:roofs?|rooftops?|cargo\s+baskets?|cargo\s+carriers?|truck\s+beds?|roof\s+racks?)\b",
+            re.IGNORECASE,
+        )
+        _jack_ctx = re.compile(
+            r"\b(?:floor\s+jacks?|cross\s+beams?|engine\s+hoists?|shop\s+cranes?|(?:for|under)\s+jacks?)\b",
+            re.IGNORECASE,
+        )
+        _specific_head = re.compile(
+            r"\b(?:tool\s+chests?|tool\s+box(?:es)?|tool\s+carts?|tool\s+storages?|"
+            r"tool\s+cabinets?|dog\s+crates?|dog\s+kennels?|pet\s+cages?|dog\s+cages?)\b",
+            re.IGNORECASE,
+        )
 
         def _keyword_in_text(text: str, keyword: str) -> bool:
             keyword = (keyword or "").strip().lower()
@@ -2083,29 +2191,42 @@ class EbayCategoryMatcher:
                 return False
             return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text) is not None
 
+        def _keyword_allowed(text: str, keyword: str) -> bool:
+            keyword = (keyword or "").strip().lower()
+            if keyword in _crossbar_kws:
+                if _jack_ctx.search(text or ""):
+                    return False
+                if not _roof_ctx.search(text or ""):
+                    return False
+            return _keyword_in_text(text, keyword)
+
         # The camping-kitchen leaf has no exclude list of its own. "Camping Cook
         # Station with Griddle Plate" contains the phrase and must keep the
         # upstream hint. Gate on the title only — a description must not exclude.
         title_is_camping_kitchen = is_camping_kitchen_title(title_lower)
 
-        def match(text: str, rules) -> Tuple[Optional[str], Optional[str]]:
+        def match(text: str, rules, *, generic: bool = False) -> Tuple[Optional[str], Optional[str]]:
+            if generic and _specific_head.search(text or ""):
+                return None, None
             for keywords, cat_id, cat_name in rules:
-                if any(_keyword_in_text(text, kw) for kw in keywords):
+                if any(_keyword_allowed(text, kw) for kw in keywords):
                     if "camping kitchen" in keywords and not title_is_camping_kitchen:
                         continue
                     return cat_id, cat_name
             return None, None
 
-        for text, rules in (
-            (title_lower, specific_mappings),
-            (title_lower, generic_mappings),
-            (f"{title_lower} {desc_lower}".strip(), specific_mappings),
+        for text, rules, generic in (
+            (title_lower, specific_mappings, False),
+            (title_lower, generic_mappings, True),
+            (f"{title_lower} {desc_lower}".strip(), specific_mappings, False),
         ):
-            cat_id, cat_name = match(text, rules)
+            cat_id, cat_name = match(text, rules, generic=generic)
             if cat_id:
+                self._last_keyword_was_generic = generic
                 return cat_id, cat_name
-        
-        # Default to generic Home & Garden
+
+        # Default to generic Home & Garden. Not a catch-all noun hit.
+        self._last_keyword_was_generic = False
         return "38208", "Furniture"
     
     def _get_category_aspects(self, category_id: str) -> Tuple[List[Dict], List[Dict]]:
@@ -2239,45 +2360,80 @@ class EbayCategoryMatcher:
                 recommended.append(aspect)
         
         return required, recommended
-    
+
+    # Collectibles aspects are never invented. The allowlist is empty on
+    # purpose: detectors may fill a value, allowed_values[0] may not.
+    _COLLECTIBLE_ASPECT_NAMES = {
+        "certification",
+        "grade",
+        "quality",
+        "professional grader",
+        "certification number",
+        "era",
+        "vintage",
+    }
+    _STAMP_FABRICATIONS = {"apex", "gem", "mint hinged"}
+    _FAMILY_ASPECT_DEFAULTS: Dict[str, Dict[str, str]] = {}
+
+    def _aspect_family(self, category_id: str, category_name: str) -> str:
+        cid = str(category_id or "").strip()
+        name = (category_name or "").lower()
+        if cid in {"3489", "975"} or "collectible" in name or "stamp" in name:
+            return "collectibles"
+        try:
+            path = self.get_category_path(cid, category_name or "")
+        except Exception:
+            path = ""
+        plow = (path or "").lower()
+        if plow.startswith("collectibles") or plow.startswith("stamps") or plow.startswith("antiques"):
+            return "collectibles"
+        if "stamps" in plow:
+            return "collectibles"
+        return ""
+
     def _complete_aspects(
-        self, 
-        existing: Dict[str, List[str]], 
-        required: List[Dict], 
+        self,
+        existing: Dict[str, List[str]],
+        required: List[Dict],
         recommended: List[Dict],
         title: str,
-        category_name: str
+        category_name: str,
+        category_id: str = None,
     ) -> Dict[str, List[str]]:
-        """
-        Complete missing aspects based on existing data and smart defaults
-        """
+        """Complete missing aspects from source data. Never invent a value."""
         completed = dict(existing)
-        title_lower = title.lower()
-        
-        # Process required aspects first
+        title_lower = (title or "").lower()
+
         for aspect in required:
             name = aspect.get("name", "")
             is_measurement_aspect = name in {"Item Length", "Item Width", "Item Height", "Item Weight"}
-            
-            # Skip if already present
             if name in completed and completed[name]:
                 continue
-            
-            # Try to auto-detect value
             value = self._detect_aspect_value(name, aspect, existing, title_lower, category_name)
-            
             if value:
+                if str(value).strip().lower() in self._STAMP_FABRICATIONS:
+                    continue
+                if (
+                    str(name).strip().lower() in self._COLLECTIBLE_ASPECT_NAMES
+                    and self._aspect_family(category_id, category_name) != "collectibles"
+                ):
+                    continue
                 completed[name] = [value] if isinstance(value, str) else value
                 logging.info(f"[AUTO] Added required aspect: {name} = {value}")
             else:
                 if is_measurement_aspect:
                     continue
-                # Use default value from allowed values
-                allowed = aspect.get("allowed_values", [])
-                if allowed:
-                    completed[name] = [allowed[0]]
-                    logging.warning(f"[DEFAULT] Added default for {name}: {allowed[0]}")
-        
+                family = self._aspect_family(category_id, category_name)
+                if str(name).strip().lower() in self._COLLECTIBLE_ASPECT_NAMES and family != "collectibles":
+                    continue
+                allowed_default = (self._FAMILY_ASPECT_DEFAULTS.get(family) or {}).get(name)
+                if not allowed_default:
+                    continue
+                if str(allowed_default).strip().lower() in self._STAMP_FABRICATIONS:
+                    continue
+                completed[name] = [allowed_default]
+                logging.info(f"[FAMILY] Added family default for {name}: {allowed_default}")
+
         return completed
     
     def _detect_aspect_value(
