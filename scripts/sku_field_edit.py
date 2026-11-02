@@ -95,8 +95,10 @@ def build_parser() -> argparse.ArgumentParser:
         action=_OpAction,
         help=(
             "Set/replace one draft item specific as NAME=VALUE. VALUE must "
-            "appear in the GIGA source (or match a numeric dimension with "
-            "unit conversion). Repeatable. Local drafts only."
+            "match the same or equivalent source attribute/spec NAME "
+            "(Material/Frame Material/Main Material, Color/Colour), or a "
+            "matching dimension. Free text is not enough for material/color/"
+            "type. Brand/MPN/UPC/EAN/ISBN are refused. Repeatable. Local drafts only."
         ),
     )
     parser.add_argument("--set-category", action=_OpAction)
@@ -104,6 +106,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--push-live", action="store_true")
     parser.add_argument("--allow-category", action="store_true")
+    parser.add_argument(
+        "--allow-factsheet-unavailable",
+        action="store_true",
+        help=(
+            "Required with --apply when FactSheet status is unavailable. "
+            "Dry-run still reports gate reason fact_sheet_unavailable."
+        ),
+    )
     parser.add_argument(
         "--allow-multi-unit",
         action="store_true",

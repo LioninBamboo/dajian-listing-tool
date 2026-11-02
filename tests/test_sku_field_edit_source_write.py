@@ -380,8 +380,8 @@ def test_unit_equivalents_and_cm_conversion():
 
     cm_row = draft_row("U2", source_title="30.48 cm Bathroom Cabinet")
     assert scd.validate_draft_title('12" Bathroom Cabinet', cm_row).ok is True
-    assert scd.validate_aspect_value("12 in", cm_row).ok is True
-    assert scd.validate_aspect_value("13 in", cm_row).ok is False
+    assert scd.validate_aspect_value("Length", "12 in", cm_row).ok is True
+    assert scd.validate_aspect_value("Length", "13 in", cm_row).ok is False
 
 
 def test_armchair_does_not_match_chair_and_plural_stem():
@@ -461,6 +461,7 @@ def test_help_mentions_source_checked_mode():
     text = build_parser().format_help()
     assert "--set-title" in text
     assert "--set-aspect" in text
+    assert "--allow-factsheet-unavailable" in text
     assert "local" in text.casefold()
     assert "GIGA" in text or "source" in text.casefold()
 
@@ -510,3 +511,213 @@ def test_compound_top_from_countertop_and_ampersand():
     )
     assert scd.validate_draft_title("Bathroom Cabinet Stone Top", row).ok is True
     assert scd.validate_draft_title("Bathroom Cabinet oak & pine", row).ok is True
+
+
+@pytest.mark.parametrize(
+    "source_title,draft_title,token",
+    [
+        ("Adjustable height desk", "Adjustable Table", "table"),
+        ("Comfortable lounge", "Comfortable Table", "table"),
+        ("Vegetable storage bin", "Vegetable Table", "table"),
+        ("Fully assembled lamp", "Assembled LED", "led"),
+        ("Covered patio", "Covered Red", "red"),
+        ("Featured collection", "Featured Red", "red"),
+        ("Lumbar support chair", "Support Port", "port"),
+        ("Hardwood cabinet", "Wood Cabinet", "wood"),
+        ("Wheelchair ramp", "Chair Ramp", "chair"),
+        ("Fiberglass panel", "Glass Panel", "glass"),
+        ("Easy to understand", "Understand Stand", "stand"),
+        ("Consistent quality", "Consistent Tent", "tent"),
+        ("Desktop organizer", "Desktop Top", "top"),
+        ("Moonlight lamp", "Moonlight Light", "light"),
+    ],
+)
+def test_compound_suffix_false_friends_refused(source_title, draft_title, token):
+    row = draft_row("CF1", source_title=source_title)
+    result = scd.validate_draft_title(draft_title, row)
+    assert result.ok is False
+    assert result.reason == "title_unsourced_tokens"
+    assert any(item.casefold() == token for item in result.unsourced)
+
+
+def test_wood_standalone_is_sourced_but_hardwood_is_not():
+    wood = draft_row("W1", source_title="Solid wood cabinet")
+    assert scd.validate_draft_title("Wood Cabinet", wood).ok is True
+    hard = draft_row("W2", source_title="Hardwood cabinet")
+    refused = scd.validate_draft_title("Wood Cabinet", hard)
+    assert refused.ok is False
+    assert any(item.casefold() == "wood" for item in refused.unsourced)
+
+
+def test_bookshelf_allowlist_still_sources_shelf():
+    row = draft_row("B1", source_title="Oak bookshelf")
+    assert scd.validate_draft_title("Oak Shelf", row).ok is True
+
+
+def test_in_is_not_inches_for_n_in_1_or_color_words():
+    combo = draft_row("M1", source_title="2 in 1 folding table")
+    quote_from_combo = scd.validate_draft_title('2" folding table', combo)
+    assert quote_from_combo.ok is False
+    assert any('2"' in item or item.endswith('"') for item in quote_from_combo.unsourced)
+
+    hyphen = draft_row("M2", source_title="2-in-1 folding table")
+    assert scd.validate_draft_title('2" folding table', hyphen).ok is False
+
+    quoted = draft_row("M3", source_title='2" folding table')
+    combo_from_quote = scd.validate_draft_title("2 in 1 folding table", quoted)
+    assert combo_from_quote.ok is False
+    assert any(item == "1" for item in combo_from_quote.unsourced)
+
+    color = draft_row("M4", source_title="12 in White cabinet")
+    assert scd.validate_draft_title('12" White cabinet', color).ok is False
+
+    real = draft_row("M5", source_title='TIA 12" Bathroom Cabinet')
+    assert scd.validate_draft_title("Bathroom Cabinet 12 in", real).ok is True
+    assert scd.validate_draft_title("Bathroom Cabinet 12 in x 8 in", real).ok is False
+    sized = draft_row("M6", source_title="12 in W x 8 in D cabinet")
+    assert scd.validate_draft_title('12" cabinet', sized).ok is True
+
+
+def test_named_aspect_rejects_free_text_material_and_accepts_spec():
+    pvc = draft_row(
+        "A1",
+        source_title="Storage cabinet",
+        source_desc="wood grain finish",
+        attributes={"Material": "PVC"},
+    )
+    wood = scd.validate_aspect_value("Material", "Wood", pvc)
+    assert wood.ok is False
+    assert wood.reason == "aspect_unsourced"
+
+    epp = draft_row(
+        "A2",
+        source_title="Ergonomic chair",
+        specs={"Frame Material": "EPP Foam"},
+    )
+    assert scd.validate_aspect_value("Frame Material", "EPP Foam", epp).ok is True
+    assert scd.validate_aspect_value("Main Material", "EPP Foam", epp).ok is True
+
+    color_free = draft_row("A3", source_title="12 in White cabinet")
+    assert scd.validate_aspect_value("Color", "White", color_free).ok is False
+    color_named = draft_row("A4", source_title="cabinet", attributes={"Colour": "White"})
+    assert scd.validate_aspect_value("Color", "White", color_named).ok is True
+
+
+def test_set_aspect_material_wood_grain_refused_and_frame_material_accepted(tmp_path):
+    pvc_row = draft_row(
+        "CLI-A1",
+        source_title="Storage cabinet",
+        source_desc="wood grain finish",
+        attributes={"Material": "PVC"},
+    )
+    code, out, report, ctx = run_edit(tmp_path / "wood", pvc_row, ["--set-aspect", "Material=Wood"])
+    assert code == 2
+    assert "aspect_unsourced" in (out + json.dumps(report))
+
+    epp_row = draft_row(
+        "CLI-A2",
+        source_title="Ergonomic chair",
+        specs={"Frame Material": "EPP Foam"},
+    )
+    code, out, report, ctx = run_edit(tmp_path / "epp", epp_row, ["--set-aspect", "Frame Material=EPP Foam"])
+    assert code == 0
+    assert report["skus"][0]["diff"]["aspects"]["after"]["Frame Material"] == ["EPP Foam"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["Brand", "MPN", "UPC", "EAN", "ISBN", "Manufacturer Part Number"],
+)
+def test_protected_aspects_refused(name):
+    row = draft_row(
+        "P1",
+        source_title="AquaVerve cabinet",
+        attributes={"Brand": "AquaVerve", "MPN": "X1", "UPC": "1", "EAN": "2", "ISBN": "3"},
+    )
+    result = scd.validate_aspect_value(name, "AquaVerve", row)
+    assert result.ok is False
+    assert result.reason == "aspect_protected"
+
+
+def test_negative_attribute_values_are_not_title_evidence():
+    water = draft_row(
+        "N1",
+        source_title="Outdoor cabinet",
+        attributes={"Waterproof": "No"},
+    )
+    result = scd.validate_draft_title("Waterproof Cabinet", water)
+    assert result.ok is False
+    assert any(item.casefold() == "waterproof" for item in result.unsourced)
+
+    tools = draft_row(
+        "N2",
+        source_title="Storage cabinet",
+        specs={"Tool-free Assembly": "No"},
+    )
+    tool_free = scd.validate_draft_title("Tool Free Cabinet", tools)
+    assert tool_free.ok is False
+    assert any(item.casefold() == "tool" for item in tool_free.unsourced)
+    assert any(item.casefold() == "free" for item in tool_free.unsourced)
+
+
+def test_set_of_n_requires_matching_count_phrase():
+    drawers = draft_row("C2", source_title="Cabinet with 2 drawers")
+    result = scd.validate_draft_title("Set of 2 Chairs", drawers)
+    assert result.ok is False
+    assert result.reason == "title_count_phrase_unsourced"
+
+    pieces = draft_row("C3", source_title="2-piece dining chairs")
+    assert scd.validate_draft_title("Set of 2 Chairs", pieces).ok is True
+    assert scd.validate_draft_title("2 Pack Chairs", pieces).ok is True
+
+    bare = draft_row("C4", source_title="Cabinet with shelves")
+    set_only = scd.validate_draft_title("Set Cabinet", bare)
+    assert set_only.ok is False
+    assert any(item.casefold() == "set" for item in set_only.unsourced)
+
+    offset = draft_row("C5", source_title="Cabinet offset of 2 drawers")
+    assert scd.extract_count_phrase_numbers(offset["title"]) == set()
+    assert scd.validate_draft_title("Set of 2 Chairs", offset).reason == "title_count_phrase_unsourced"
+
+
+def test_fact_sheet_unavailable_blocks_apply_unless_flagged(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        scd,
+        "check_fact_sheet_violations",
+        lambda *_args, **_kwargs: {"status": "unavailable", "violations": []},
+    )
+    code, out, report, ctx = run_edit(tmp_path / "dry", cabinet_row(), ["--set-title", CABINET_ACCEPT_TITLE])
+    assert code == 0
+    blob = out + json.dumps(report)
+    assert "fact_sheet_unavailable" in blob
+    assert "pass" not in {
+        gate.get("reason")
+        for sku in report["skus"]
+        for gate in sku.get("gates", [])
+        if gate.get("name") == "claim_guard"
+    }
+    assert load_row(ctx, "W2615P429613")["optimization"]["title"] != CABINET_ACCEPT_TITLE
+
+    code, out, report, ctx = run_edit(
+        tmp_path / "apply",
+        cabinet_row(),
+        ["--set-title", CABINET_ACCEPT_TITLE, "--apply", "--note", "need factsheet"],
+    )
+    assert code == 2
+    assert "fact_sheet_unavailable" in (out + json.dumps(report))
+    assert load_row(ctx, "W2615P429613")["optimization"]["title"] != CABINET_ACCEPT_TITLE
+
+    code, out, report, ctx = run_edit(
+        tmp_path / "allow",
+        cabinet_row(),
+        [
+            "--set-title",
+            CABINET_ACCEPT_TITLE,
+            "--apply",
+            "--allow-factsheet-unavailable",
+            "--note",
+            "explicit unavailable override",
+        ],
+    )
+    assert code == 0
+    assert load_row(ctx, "W2615P429613")["optimization"]["title"] == CABINET_ACCEPT_TITLE

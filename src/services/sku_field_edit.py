@@ -830,7 +830,7 @@ def apply_source_write_ops(
             value = str(op.aspect_value or "").replace("\r", "").strip()
             if not name:
                 return refuse(plan, "field_not_editable", "field_not_editable")
-            checked = validate_aspect_value(value, plan.row)
+            checked = validate_aspect_value(name, value, plan.row)
             add_gate(plan, f"aspect_source:{name}", checked.ok, checked.reason or value)
             if checked.evidence:
                 aspect_evidence[name] = checked.evidence[0].as_dict()
@@ -894,6 +894,12 @@ def apply_source_write_ops(
             claim.reason,
             claim.reason + (f":{','.join(claim.unsourced)}" if claim.unsourced else ""),
         )
+    if (
+        claim.reason == "fact_sheet_unavailable"
+        and getattr(args, "apply", False)
+        and not getattr(args, "allow_factsheet_unavailable", False)
+    ):
+        return refuse(plan, "fact_sheet_unavailable", "fact_sheet_unavailable")
 
     plan.optimization_after = opt
     if not changed:
