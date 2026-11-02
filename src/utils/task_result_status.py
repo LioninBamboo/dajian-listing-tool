@@ -120,15 +120,39 @@ _ITEM_LEVEL_FAILURE_RECOGNIZERS = {
 }
 
 
+def _int_field(payload: Mapping[str, Any], key: str) -> int:
+    try:
+        return int(payload.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_analyze_soft_degradation(payload: Any) -> bool:
+    """True when analyze only skipped corrupt rows or failed to load some SKUs."""
+    if not isinstance(payload, Mapping):
+        return False
+    if payload.get("error"):
+        return False
+    if _int_field(payload, "failed") > 0:
+        return False
+    return _int_field(payload, "skipped_corrupt") > 0 or _int_field(payload, "load_errors") > 0
+
+
 def classify_daily_task_outcome(results: Any) -> str:
     """Classify a daily run without turning per-SKU reprice errors into reruns.
 
     ``partial_success`` is terminal for the scheduler: work was completed and
     external writes occurred, but a targeted retry queue is still required.
     Any other nested failure remains a normal ``failed`` result.
+
+    ``results['analyze']`` with ``skipped_corrupt > 0`` or ``load_errors > 0``
+    (and no analyze ``error``) is at least ``partial_success``. An analyze
+    ``error`` remains ``failed``.
     """
 
     if not has_task_failure(results):
+        if isinstance(results, Mapping) and is_analyze_soft_degradation(results.get("analyze")):
+            return "partial_success"
         return "success"
     if not isinstance(results, Mapping):
         return "failed"
@@ -139,9 +163,22 @@ def classify_daily_task_outcome(results: Any) -> str:
     for task_name, payload in results.items():
         if not has_task_failure(payload):
             continue
+        if task_name == "analyze" and is_analyze_soft_degradation(payload):
+            saw_item_level = True
+            continue
         recognizer = _ITEM_LEVEL_FAILURE_RECOGNIZERS.get(task_name)
         if recognizer is not None and recognizer(payload):
             saw_item_level = True
             continue
         return "failed"
     return "partial_success" if saw_item_level else "failed"
+
+
+def exit_code_for_task_results(results: Any) -> int:
+    """Map classify_daily_task_outcome to the process exit code (0 / 1 / 2)."""
+    outcome = classify_daily_task_outcome(results)
+    if outcome == "partial_success":
+        return 2
+    if outcome == "failed":
+        return 1
+    return 0

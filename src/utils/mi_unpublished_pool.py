@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from src.utils.logs_codec import append_log
 from src.utils.mi_opportunity_flow import _store_kind_allows
 
 _COST_KEYS = (
@@ -118,20 +119,17 @@ def recycle_ended_for_mi(
                 if quantity is not None and int(quantity) <= 0:
                     skipped["zero_stock"] += 1
                     continue
-            try:
-                logs = json.loads(row["logs"]) if row["logs"] else []
-                if not isinstance(logs, list):
-                    logs = [str(logs)]
-            except (TypeError, ValueError, json.JSONDecodeError):
-                logs = []
-            logs.append(f"[MI_ENDED_RECYCLE] Restored ENDED SKU to PENDING at {now}")
+            logs_json = append_log(
+                row["logs"],
+                f"[MI_ENDED_RECYCLE] Restored ENDED SKU to PENDING at {now}",
+            )
             conn.execute(
                 """
                 UPDATE collected_products
                 SET status = 'PENDING', listing_id = NULL, logs = ?, updated_at = ?
                 WHERE sku = ? AND status = 'ENDED'
                 """,
-                (json.dumps(logs, ensure_ascii=False), now, sku),
+                (logs_json, now, sku),
             )
             reactivated.append(sku)
         conn.commit()

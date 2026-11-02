@@ -5,6 +5,7 @@ import json
 import sqlite3
 
 from src.utils.mi_unpublished_pool import recycle_ended_for_mi
+from tests.test_logs_codec import TRAILING_XML
 
 
 def _make_db(tmp_path, rows):
@@ -113,6 +114,23 @@ def test_skips_auto_titles_blacklist_and_oos(tmp_path):
     assert report["skipped"]["auto_family"] == 1
     assert report["skipped"]["blacklist"] == 1
     assert report["skipped"]["zero_stock"] == 1
+
+
+def test_recycle_keeps_trailing_xml_history(tmp_path):
+    db = _make_db(tmp_path, [_ended(sku="XML-1", logs=TRAILING_XML)])
+    report = recycle_ended_for_mi(db, limit=10, store_kind="furniture")
+    assert report["reactivated"] == ["XML-1"]
+    conn = sqlite3.connect(db)
+    try:
+        raw = conn.execute("SELECT logs FROM collected_products WHERE sku='XML-1'").fetchone()[0]
+    finally:
+        conn.close()
+    loaded = json.loads(raw)
+    assert loaded[0] == "Category ID: 38208"
+    assert loaded[1].startswith("[2026-10-10 08:35:14] CRO_END_LIVE_20261010")
+    assert "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" in loaded[1]
+    assert loaded[1].split("?>", 1)[1].startswith("\n<EndFixedPriceItemResponse")
+    assert loaded[-1].startswith("[MI_ENDED_RECYCLE]")
 
 
 def test_respects_daily_limit(tmp_path):

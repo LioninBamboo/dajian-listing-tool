@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.db.collection_db import SessionLocal
-from src.db.collection_models import CollectedProduct
+from src.db.collection_models import CollectedProduct, CorruptLogs
 from src.services.ebay_category_matcher import create_category_matcher
 from src.services.pricing_engine import PricingEngine
 from sqlalchemy.orm.attributes import flag_modified
@@ -45,22 +45,36 @@ def main():
 
     qwen = QwenOptimizer(api_key=QWEN_KEY)
 
-    # 获取所有 COLLECTED 状态的产品
-    products = db.query(CollectedProduct).filter_by(status='COLLECTED').all()
+    # 获取所有 COLLECTED 状态的产品（先只取 id/sku，避免一行损坏拖垮整批）
+    candidates = (
+        db.query(CollectedProduct.id, CollectedProduct.sku)
+        .filter_by(status='COLLECTED')
+        .all()
+    )
 
-    if not products:
+    if not candidates:
         print("✅ 没有需要处理的 COLLECTED 状态产品")
         sys.exit(0)
 
-    print(f"📦 发现 {len(products)} 个待处理产品\n")
+    print(f"📦 发现 {len(candidates)} 个待处理产品\n")
 
     success = 0
     failed = 0
 
-    for i, product in enumerate(products, 1):
-        print(f"[{i}/{len(products)}] 处理 {product.sku}...")
+    for i, candidate in enumerate(candidates, 1):
+        product_id, sku = candidate[0], candidate[1]
+        product = None
+        print(f"[{i}/{len(candidates)}] 处理 {sku}...")
         
         try:
+            product = (
+                db.query(CollectedProduct)
+                .filter(CollectedProduct.id == product_id)
+                .one()
+            )
+            if isinstance(product.logs, CorruptLogs):
+                print(f"  ⏭ corrupt_logs:{product.logs.parse_status} (no write)\n")
+                continue
             # 1. 计算价格
             specs = product.specs or {}
             attributes = product.attributes or {}
@@ -192,8 +206,10 @@ def main():
             
         except Exception as e:
             print(f"  ❌ 失败: {e}\n")
-            failed += 1
             db.rollback()
+            if product is None:
+                continue
+            failed += 1
             product = db.merge(product)
             product.status = "ERROR"
             product.logs = (product.logs or []) + [

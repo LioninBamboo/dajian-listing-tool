@@ -242,6 +242,36 @@ def test_has_mojibake():
     assert not has_mojibake("Boucle fabric")
 
 
+def test_apply_snapshot_keeps_trailing_xml_history(db_conn):
+    from tests.test_logs_codec import TRAILING_XML
+
+    db_conn.execute(
+        "UPDATE collected_products SET logs = ? WHERE sku = ?",
+        (TRAILING_XML, "W3636P456662"),
+    )
+    db_conn.commit()
+    detail = dict(W3636_DETAIL, videoUrls=["https://cdn.example.com/tent.mp4"])
+    snapshot = build_source_snapshot(detail)
+    row = dict(
+        zip(
+            ("title", "description", "attributes", "specs", "videos"),
+            db_conn.execute(
+                "SELECT title, description, attributes, specs, videos FROM collected_products WHERE sku=?",
+                ("W3636P456662",),
+            ).fetchone(),
+        )
+    )
+    drifts = diff_source_row(row, snapshot)
+    assert apply_snapshot(db_conn, "W3636P456662", snapshot, drifts) is True
+    raw = db_conn.execute(
+        "SELECT logs FROM collected_products WHERE sku=?", ("W3636P456662",)
+    ).fetchone()[0]
+    loaded = json.loads(raw)
+    assert loaded[0] == "Category ID: 38208"
+    assert "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" in loaded[1]
+    assert loaded[-1].startswith("Source refresh at")
+
+
 def test_apply_snapshot_writes_only_drifted_fields(db_conn):
     detail = dict(W3636_DETAIL, videoUrls=["https://cdn.example.com/tent.mp4"])
     snapshot = build_source_snapshot(detail)

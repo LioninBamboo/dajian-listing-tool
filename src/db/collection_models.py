@@ -1,9 +1,70 @@
 """数据库模型定义 - 采集系统专用"""
+from __future__ import annotations
+
+import logging
 from datetime import UTC, datetime
-from sqlalchemy import Column, Integer, String, Text, Float, DateTime, JSON
+from typing import Any
+
+from sqlalchemy import Column, Integer, String, Text, Float, DateTime, JSON, event
 from sqlalchemy.orm import declarative_base
+from sqlalchemy.types import TypeDecorator
+
+from src.utils.logs_codec import dump_logs, parse_logs
 
 Base = declarative_base()
+logger = logging.getLogger(__name__)
+
+
+class CorruptLogs(list):
+    """List subclass returned when collected_products.logs is not valid JSON."""
+
+    parse_status: str
+    trailing: str
+    error: str | None
+    leading_entries: list[Any]
+
+    def __init__(
+        self,
+        items: list[Any],
+        *,
+        parse_status: str,
+        trailing: str = "",
+        error: str | None = None,
+        leading_entries: list[Any] | None = None,
+    ) -> None:
+        super().__init__(items)
+        self.parse_status = parse_status
+        self.trailing = trailing
+        self.error = error
+        self.leading_entries = list(leading_entries if leading_entries is not None else items)
+
+
+class TolerantJSONList(TypeDecorator):
+    """TEXT-backed JSON list that never raises on a corrupt collected_products.logs cell."""
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: Any, dialect: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise TypeError(
+                f"CollectedProduct.logs must be a list or None, got {type(value).__name__}"
+            )
+        return dump_logs(list(value))
+
+    def process_result_value(self, value: Any, dialect: Any) -> list[Any] | None:
+        parsed = parse_logs(value)
+        if parsed.status in {"ok", "empty", "non_list"}:
+            return parsed.entries
+        return CorruptLogs(
+            parsed.entries_with_trailing(),
+            parse_status=parsed.status,
+            trailing=parsed.trailing,
+            error=parsed.error,
+            leading_entries=parsed.entries,
+        )
 
 
 def _utcnow_naive() -> datetime:
@@ -57,8 +118,8 @@ class CollectedProduct(Base):
     status = Column(String(20), default='PENDING', index=True)  # PENDING, READY, PUBLISHED, ERROR
     listing_id = Column(String(50))  # eBay listing ID
     
-    # 日志
-    logs = Column(JSON)  # ["Received from extension", "AI optimization complete", ...]
+    # 日志 — tolerant reader; still TEXT in SQLite, no schema migration
+    logs = Column(TolerantJSONList)
     
     # 时间戳
     created_at = Column(DateTime, default=_utcnow_naive)
@@ -90,3 +151,17 @@ class CollectedProduct(Base):
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'published_at': self.published_at.isoformat() if self.published_at else None
         }
+
+
+@event.listens_for(CollectedProduct, "load")
+def _warn_corrupt_collected_logs(target: CollectedProduct, _context: Any) -> None:
+    logs = target.logs
+    if not isinstance(logs, CorruptLogs):
+        return
+    logger.warning(
+        "corrupt logs sku=%s status=%s leading_items=%s trailing_len=%s",
+        target.sku or "?",
+        logs.parse_status,
+        len(logs.leading_entries),
+        len(logs.trailing or ""),
+    )

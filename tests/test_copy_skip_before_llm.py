@@ -271,6 +271,7 @@ def test_analyze_callers_gate_before_llm_copy():
 
 class _Product:
     def __init__(self, **kwargs):
+        self.id = kwargs.get("id", 1)
         self.sku = kwargs.get("sku", "N710P100001")
         self.status = "COLLECTED"
         self.title = kwargs.get("title", "Oak Side Table")
@@ -287,14 +288,21 @@ class _Product:
 
 
 class _Query:
-    def __init__(self, product):
+    def __init__(self, product, entities=()):
         self._product = product
+        self._entities = entities
 
     def filter(self, *args, **kwargs):
         return self
 
     def all(self):
+        keys = [getattr(entity, "key", None) for entity in self._entities]
+        if keys == ["id", "sku"]:
+            return [(getattr(self._product, "id", 1), self._product.sku)]
         return [self._product]
+
+    def one(self):
+        return self._product
 
 
 class _Session:
@@ -302,7 +310,7 @@ class _Session:
         self._product = product
 
     def query(self, *args, **kwargs):
-        return _Query(self._product)
+        return _Query(self._product, args)
 
     def merge(self, product):
         return product

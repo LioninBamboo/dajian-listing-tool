@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
 from src.db.collection_db import DATABASE_PATH, MAINTENANCE_PATH
+from src.utils.logs_codec import parse_logs
 from src.db.collection_models import _utcnow_naive
 from src.db.database_safety import (
     DatabaseSafetyError,
@@ -306,16 +307,7 @@ def _as_opt(raw: Any) -> dict[str, Any]:
 
 
 def _as_logs(raw: Any) -> list[Any]:
-    if raw is None or raw == "":
-        return []
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except json.JSONDecodeError:
-            return [raw]
-    if isinstance(raw, list):
-        return list(raw)
-    return [raw]
+    return parse_logs(raw).entries_with_trailing()
 
 
 def _row_dict(row: sqlite3.Row | Mapping[str, Any]) -> dict[str, Any]:

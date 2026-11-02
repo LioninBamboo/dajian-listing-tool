@@ -28,6 +28,7 @@ from src.services.semantic_rewrite import (  # noqa: E402
     dual_gate_allows_apply,
     dual_gate_block_reason,
 )
+from src.utils.logs_codec import append_log  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,14 +117,10 @@ def rollback_sku(
         opt["aspects"] = aspects
         if category_id:
             opt["categoryId"] = str(category_id)
-        try:
-            logs = json.loads(logs_raw) if isinstance(logs_raw, str) else list(logs_raw or [])
-        except Exception:
-            logs = []
-        logs.append({"event": "semantic_rewrite_rollback", "sku": sku})
+        logs_json = append_log(logs_raw, {"event": "semantic_rewrite_rollback", "sku": sku})
         conn.execute(
             "UPDATE collected_products SET optimization = ?, logs = ? WHERE sku = ?",
-            (json.dumps(opt, ensure_ascii=False), json.dumps(logs, ensure_ascii=False), sku),
+            (json.dumps(opt, ensure_ascii=False), logs_json, sku),
         )
         conn.commit()
 
