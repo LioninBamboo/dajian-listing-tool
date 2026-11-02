@@ -12,8 +12,8 @@ Operator-only CLI that edits **one SKU** (or an explicit `--skus` list, max 50) 
 - `--apply` 只写本地库。要推 eBay 必须同时给 `--push-live`，且发生在库写成功并回读通过之后。
 - Automatic online SQLite backup before the first write. On Main this is a full copy of `ebay_collection.db` (about 200 MB). Keep a short retention window under `deploy_backup/sku_edit_*`.
 - 第一次写入前做在线 SQLite 备份。Main 库整库约 200 MB；`deploy_backup/sku_edit_*` 请做短期留存。
-- Text edits are **deletion-only**. There is no `--allow-add` in v1.
-- 文本编辑只允许删除。v1 没有 `--allow-add`。
+- Text edits are **deletion-only**, except the local-draft source-checked write mode below.
+- 文本编辑只允许删除。唯一例外是下面的本地草稿来源校验写入（`--set-title` / `--set-aspect`）。
 - Category edits require `--allow-category` plus the high-fee / leaf / lock / required-aspect gates.
 - 改类目必须 `--allow-category`，并经过高费、叶子、锁定、目标必填项门禁。
 - Quantity, price, status, listing_id, images, source GIGA fields are never editable.
@@ -37,7 +37,33 @@ python scripts/sku_field_edit.py --store main --sku W465140910 \
 python scripts/sku_field_edit.py --store main --sku W465P341531 \
   --strip-claim plywood --location features \
   --apply --push-live --note "claim scrub"
+
+# Local-draft source-checked title rewrite (dry-run default)
+python scripts/sku_field_edit.py --store main --sku W2615P429613 \
+  --set-title 'Wall Mounted Narrow Bathroom Cabinet 12" with 2 Open Shelves, Sintered Stone Top'
+
+# Same write, plus a sourced item specific
+python scripts/sku_field_edit.py --store main --sku W2615P429613 \
+  --set-title 'Wall Mounted Narrow Bathroom Cabinet 12" with 2 Open Shelves, Sintered Stone Top' \
+  --set-aspect "Mounting=Wall Mounted" --apply --note "source-checked draft title"
 ```
+
+### Local-draft source-checked writes / 本地草稿来源校验写入
+
+`--set-title` and `--set-aspect` replace draft `optimization` fields when the new text is grounded in the stored GIGA source (row `title`, HTML description, attributes, specs). This is the only add/replace path.
+
+`--set-title` / `--set-aspect` 用 GIGA 源文本校验后改草稿 `optimization`。这是唯一允许新增/替换标题或 item specific 的路径。
+
+- **Local drafts only.** Statuses such as READY / COLLECTED / DRAFT are allowed. PUBLISHED, ENDED, or any row with a `listing_id` is refused (`published_not_editable` / `listing_id_present`).
+- **仅本地草稿。** READY / COLLECTED / DRAFT 等可写。PUBLISHED、ENDED、或带 `listing_id` 的行一律拒绝。
+- **One SKU per invocation.** `--push-live` is refused (`source_write_live_forbidden`); no eBay API calls.
+- **每次只改一个 SKU。** 禁止 `--push-live`，不调 eBay。
+- Title rules: length ≤ 80, non-empty, no HTML, existing banned-term QC, every content token must appear in source (word boundary, simple plural/stem, unit-aware `12"` / `12 in` / `12-inch`). Neutral connectors (`with`, `and`, `for`, `set`, `of`, `the`, `a`, `in`, `&`, `-`, `,`) are configurable via `SKU_FIELD_EDIT_TITLE_CONNECTORS`. Then FactSheet / claim-guard runs on the resulting draft; any flagged unsourced claim blocks.
+- 标题：≤80、非空、无 HTML、走已有违禁词；每个内容词必须在源里（词边界、简单复数/词干、单位等价）。连接词可通过环境变量配置。然后再跑 FactSheet / claim-guard，有未溯源声明就拒绝。
+- Aspect `NAME=VALUE` is set only when VALUE (normalized) is in source, or matches a numeric dimension with unit conversion.
+- item specific 仅在 VALUE 能在源里找到（或单位换算后的尺寸匹配）时写入。
+- Same safety as the rest of the tool: dry-run default, explicit `--apply`, maintenance / DB lock, online backup + `field_edit_report` JSON, readback, non-zero exit on refusal. Never touches image URLs (GigaB2B `x-cc` / `x-cu` / `x-ct` / `x-cs` stay intact).
+- 安全约定与现有模式相同：默认 dry-run、`--apply` 才写、维护锁、备份+JSON 报告、回读、拒绝非 0 退出。绝不改图片 URL。
 
 `--store` must match the loaded profile (`main` = AquaVerve inventory, `gp` = GrovePop inventory, `aqua` = AquaRides trading site 100). The tool never writes `.env` or `config/store_profile*.yaml`.
 
