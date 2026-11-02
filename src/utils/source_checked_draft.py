@@ -14,7 +14,7 @@ from typing import Any, Iterable, Mapping
 
 from src.utils.banned_terms_guard import scan_listing
 from src.utils.claim_diff_engine import build_source_constraints, detect_claim_violations
-from src.utils.claim_strip import claim_matches_text, strip_html_to_text
+from src.utils.claim_strip import strip_html_to_text
 from src.utils.listing_fact_sheet import check_fact_sheet_violations
 from src.utils.listing_quality_gate import _iter_source_entries
 
@@ -37,13 +37,14 @@ ASPECT_NAME_FAMILIES = {
     "material": "material",
     "frame material": "material",
     "main material": "material",
+    "upholstery material": "material",
+    "upholstery": "material",
     "color": "color",
     "colour": "color",
     "type": "type",
     "product type": "type",
     "item type": "type",
 }
-NAMED_ONLY_FAMILIES = frozenset({"material", "color", "type"})
 DIMENSION_ASPECT_FAMILIES = {
     "length": "length",
     "item length": "length",
@@ -60,6 +61,9 @@ DIMENSION_ASPECT_FAMILIES = {
     "depth": "depth",
     "item depth": "depth",
     "assembled depth": "depth",
+    "seat height": "seat_height",
+    "seat width": "seat_width",
+    "seat depth": "seat_depth",
 }
 _COMPOUND_ALLOWLIST: dict[str, frozenset[str]] = {
     "countertop": frozenset({"top"}),
@@ -126,6 +130,35 @@ _COUNT_PHRASE_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+_BARE_COUNT_NOUN_RE = re.compile(
+    r"""
+    \b(?P<n>\d+)\s+
+    (?:(?P<adj>[A-Za-z]+)\s+){0,3}
+    (?P<noun>[A-Za-z]+(?:ies|ves|ches|shes|sses|xes|s))\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_COUNT_NOUN_SKIP = frozenset(
+    {
+        "inches",
+        "inch",
+        "cms",
+        "mms",
+        "feet",
+        "pcs",
+        "pieces",
+        "piece",
+        "packs",
+        "pack",
+        "this",
+        "its",
+        "as",
+        "is",
+        "has",
+        "was",
+    }
+)
+_LIST_SPLIT_RE = re.compile(r"\s*(?:,|/|&|\band\b)\s*", re.IGNORECASE)
 _WORD_RE = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z]+)?")
 _INCH_FACTORS = {
     '"': 1.0,
@@ -345,6 +378,31 @@ def extract_count_phrase_numbers(text: str) -> set[int]:
     return numbers
 
 
+def extract_noun_count_claims(text: str) -> list[tuple[int, str]]:
+    """Bare ``N <adj>* <plural-noun>`` claims, e.g. ``4 Dining Chairs``."""
+    claims: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for match in _BARE_COUNT_NOUN_RE.finditer(str(text or "")):
+        noun = str(match.group("noun") or "").casefold()
+        if noun in _COUNT_NOUN_SKIP or noun in title_connectors():
+            continue
+        if not _looks_plural_noun(noun):
+            continue
+        item = (int(match.group("n")), simple_stem(noun))
+        if item in seen:
+            continue
+        seen.add(item)
+        claims.append(item)
+    return claims
+
+
+def _looks_plural_noun(word: str) -> bool:
+    folded = str(word or "").casefold()
+    if len(folded) <= 3 or folded.endswith("ss"):
+        return False
+    return folded.endswith(("ies", "ves", "ches", "shes", "sses", "xes", "s"))
+
+
 def locate_token_evidence(
     token: str,
     kind: str,
@@ -385,6 +443,18 @@ def check_title_tokens(title: str, row: Mapping[str, Any]) -> SourceCheckResult:
             ok=False,
             reason="title_count_phrase_unsourced",
             unsourced=[f"set/piece/pack {n}" for n in missing_counts],
+        )
+    source_nouns = set(extract_noun_count_claims(source_blob))
+    missing_nouns = [
+        f"{number} {noun}"
+        for number, noun in extract_noun_count_claims(title)
+        if (number, noun) not in source_nouns and number not in source_counts
+    ]
+    if missing_nouns:
+        return SourceCheckResult(
+            ok=False,
+            reason="title_count_phrase_unsourced",
+            unsourced=missing_nouns,
         )
     count_phrase_ok = bool(title_counts) and not missing_counts
     evidence: list[TokenEvidence] = []
@@ -454,18 +524,34 @@ def _dimension_family(name: str) -> str:
     return DIMENSION_ASPECT_FAMILIES.get(_normalize_aspect_name(name), "")
 
 
-def _aspect_value_in_source(value: str, source_text: str) -> bool:
-    if not str(value or "").strip():
+def _normalize_aspect_value(value: str) -> str:
+    text = strip_html_to_text(str(value or "")).casefold()
+    text = re.sub(r"[\s_\-]+", " ", text)
+    return text.strip(" .:")
+
+
+def _value_as_text(raw: Any) -> str:
+    if isinstance(raw, (list, tuple)):
+        return ", ".join(str(item).strip() for item in raw if str(item).strip())
+    return str(raw if raw is not None else "")
+
+
+def _named_value_items(source_value: str) -> list[str]:
+    text = strip_html_to_text(source_value).strip()
+    if not text:
+        return []
+    items = [part.strip() for part in _LIST_SPLIT_RE.split(text) if part.strip()]
+    return items or [text]
+
+
+def named_values_equal(wanted: str, source_value: str) -> bool:
+    """Exact value match after case/whitespace/hyphen normalize, or one whole list item."""
+    want = _normalize_aspect_value(wanted)
+    if not want:
         return False
-    if claim_matches_text(value, source_text):
+    if want == _normalize_aspect_value(source_value):
         return True
-    if extract_measurements(value) and _measurement_in_source(value, source_text):
-        return True
-    folded = strip_html_to_text(value).casefold()
-    source_folded = strip_html_to_text(source_text).casefold()
-    if folded and re.search(rf"(?<![A-Za-z0-9]){re.escape(folded)}(?![A-Za-z0-9])", source_folded):
-        return True
-    return False
+    return any(want == _normalize_aspect_value(item) for item in _named_value_items(source_value))
 
 
 def _named_source_fields(row: Mapping[str, Any], name: str) -> list[tuple[str, str]]:
@@ -476,16 +562,24 @@ def _named_source_fields(row: Mapping[str, Any], name: str) -> list[tuple[str, s
     hits: list[tuple[str, str]] = []
     for source_name, mapping in (("attribute", fields["attributes"]), ("spec", fields["specs"])):
         for key, raw in mapping.items():
-            if _attr_value_is_negative(raw):
-                continue
+            text = _value_as_text(raw)
             key_n = _normalize_aspect_name(str(key))
             if family and _aspect_family(key_n) == family:
-                hits.append((f"{source_name}:{key}", str(raw)))
+                hits.append((f"{source_name}:{key}", text))
             elif dimension and _dimension_family(key_n) == dimension:
-                hits.append((f"{source_name}:{key}", str(raw)))
+                hits.append((f"{source_name}:{key}", text))
             elif not family and not dimension and key_n == wanted:
-                hits.append((f"{source_name}:{key}", str(raw)))
+                hits.append((f"{source_name}:{key}", text))
     return hits
+
+
+def _aspect_fail(reason: str, value: str) -> SourceCheckResult:
+    return SourceCheckResult(
+        ok=False,
+        reason=reason,
+        unsourced=[value],
+        evidence=[TokenEvidence(token=value, sourced=False, evidence="", kind="aspect")],
+    )
 
 
 def validate_aspect_value(name: str, value: str, row: Mapping[str, Any]) -> SourceCheckResult:
@@ -499,23 +593,21 @@ def validate_aspect_value(name: str, value: str, row: Mapping[str, Any]) -> Sour
     if not cleaned:
         return SourceCheckResult(ok=False, reason="aspect_value_empty")
 
-    family = _aspect_family(cleaned_name)
     dimension = _dimension_family(cleaned_name)
     named = _named_source_fields(row, cleaned_name)
-    for label, raw in named:
-        if _aspect_value_in_source(cleaned, raw):
-            return SourceCheckResult(
-                ok=True,
-                evidence=[TokenEvidence(token=cleaned, sourced=True, evidence=f"{label}={raw[:80]}", kind="aspect")],
-            )
-
-    if family in NAMED_ONLY_FAMILIES:
-        return SourceCheckResult(
-            ok=False,
-            reason="aspect_unsourced",
-            unsourced=[cleaned],
-            evidence=[TokenEvidence(token=cleaned, sourced=False, evidence="", kind="aspect")],
-        )
+    if named:
+        for label, raw in named:
+            if named_values_equal(cleaned, raw):
+                return SourceCheckResult(
+                    ok=True,
+                    evidence=[TokenEvidence(token=cleaned, sourced=True, evidence=f"{label}={raw[:80]}", kind="aspect")],
+                )
+            if dimension and extract_measurements(cleaned) and _measurement_in_source(cleaned, raw):
+                return SourceCheckResult(
+                    ok=True,
+                    evidence=[TokenEvidence(token=cleaned, sourced=True, evidence=f"{label}={raw[:80]}", kind="aspect")],
+                )
+        return _aspect_fail("aspect_unsourced", cleaned)
 
     if dimension:
         source_blob = source_text_from_row(row)
@@ -524,26 +616,9 @@ def validate_aspect_value(name: str, value: str, row: Mapping[str, Any]) -> Sour
                 ok=True,
                 evidence=[TokenEvidence(token=cleaned, sourced=True, evidence="dimension", kind="aspect")],
             )
-        return SourceCheckResult(
-            ok=False,
-            reason="aspect_unsourced",
-            unsourced=[cleaned],
-            evidence=[TokenEvidence(token=cleaned, sourced=False, evidence="", kind="aspect")],
-        )
+        return _aspect_fail("aspect_unsourced", cleaned)
 
-    for label, raw in source_entries_from_row(row):
-        text = strip_html_to_text(raw)
-        if _aspect_value_in_source(cleaned, text):
-            return SourceCheckResult(
-                ok=True,
-                evidence=[TokenEvidence(token=cleaned, sourced=True, evidence=f"{label}={text[:80]}", kind="aspect")],
-            )
-    return SourceCheckResult(
-        ok=False,
-        reason="aspect_unsourced",
-        unsourced=[cleaned],
-        evidence=[TokenEvidence(token=cleaned, sourced=False, evidence="", kind="aspect")],
-    )
+    return _aspect_fail("aspect_no_named_source", cleaned)
 
 
 def local_draft_refusal(row: Mapping[str, Any]) -> str:

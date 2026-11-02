@@ -95,10 +95,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=_OpAction,
         help=(
             "Set/replace one draft item specific as NAME=VALUE. VALUE must "
-            "match the same or equivalent source attribute/spec NAME "
-            "(Material/Frame Material/Main Material, Color/Colour), or a "
-            "matching dimension. Free text is not enough for material/color/"
-            "type. Brand/MPN/UPC/EAN/ISBN are refused. Repeatable. Local drafts only."
+            "exactly equal the same or equivalent source attribute/spec "
+            "(Material/Frame Material/Main Material/Upholstery Material, "
+            "Color/Colour), or one whole comma/slash/and list item. "
+            "Substrings do not count. No named source field → "
+            "aspect_no_named_source. Dimensions still unit-convert. "
+            "Brand/MPN/UPC/EAN/ISBN refused. Repeatable. Local drafts only."
         ),
     )
     parser.add_argument("--set-category", action=_OpAction)

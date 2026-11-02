@@ -155,9 +155,10 @@ def test_cabinet_title_accept_and_floor_standing_refuse(tmp_path):
 
 
 def test_cabinet_mounting_aspect_accept_and_freestanding_refuse(tmp_path):
+    mounted = cabinet_row(attributes={"Mounting": "Wall Mounted"})
     code, out, report, ctx = run_edit(
         tmp_path,
-        cabinet_row(),
+        mounted,
         ["--set-aspect", "Mounting=Wall Mounted"],
     )
     assert code == 0
@@ -165,12 +166,20 @@ def test_cabinet_mounting_aspect_accept_and_freestanding_refuse(tmp_path):
 
     code, out, report, ctx = run_edit(
         tmp_path / "free",
-        cabinet_row(),
+        mounted,
         ["--set-aspect", "Mounting=Freestanding"],
     )
     assert code == 2
     assert "aspect_unsourced" in (out + json.dumps(report))
     assert "Mounting" not in load_row(ctx, "W2615P429613")["optimization"]["aspects"]
+
+    code, out, report, ctx = run_edit(
+        tmp_path / "unnamed",
+        cabinet_row(),
+        ["--set-aspect", "Mounting=Wall Mounted"],
+    )
+    assert code == 2
+    assert "aspect_no_named_source" in (out + json.dumps(report))
 
 
 def test_chair_title_and_frame_material(tmp_path):
@@ -236,7 +245,7 @@ def test_published_row_refused(tmp_path):
 
 
 def test_apply_writes_backup_readback_and_preserves_images(tmp_path):
-    row = cabinet_row()
+    row = cabinet_row(attributes={"Mounting": "Wall Mounted"})
     code, out, report, ctx = run_edit(
         tmp_path,
         row,
@@ -443,7 +452,10 @@ def test_maintenance_lock_and_already_absent(tmp_path):
 
 
 def test_aspect_replaces_existing_and_hyphen_matches(tmp_path):
-    row = cabinet_row(aspects={"Brand": ["AquaVerve"], "Mounting": ["Freestanding"]})
+    row = cabinet_row(
+        attributes={"Mounting": "Wall Mounted"},
+        aspects={"Brand": ["AquaVerve"], "Mounting": ["Freestanding"]},
+    )
     code, out, report, ctx = run_edit(
         tmp_path,
         row,
@@ -578,6 +590,56 @@ def test_in_is_not_inches_for_n_in_1_or_color_words():
     assert scd.validate_draft_title('12" cabinet', sized).ok is True
 
 
+def test_named_aspect_value_must_equal_whole_field_or_list_item():
+    pu = draft_row("A1", source_title="Sofa", attributes={"Material": "PU Leather"})
+    assert scd.validate_aspect_value("Material", "Leather", pu).ok is False
+    assert scd.validate_aspect_value("Material", "Leather", pu).reason == "aspect_unsourced"
+    assert scd.validate_aspect_value("Material", "PU Leather", pu).ok is True
+
+    faux = draft_row("A2", source_title="Sofa", attributes={"Material": "Faux Leather"})
+    assert scd.validate_aspect_value("Material", "Leather", faux).reason == "aspect_unsourced"
+
+    upholstery = draft_row(
+        "A3",
+        source_title="Sofa",
+        source_desc="faux leather",
+    )
+    leather_desc = scd.validate_aspect_value("Upholstery Material", "Leather", upholstery)
+    assert leather_desc.ok is False
+    assert leather_desc.reason == "aspect_no_named_source"
+
+    off_white = draft_row("A4", source_title="Cabinet", attributes={"Color": "Off-White"})
+    assert scd.validate_aspect_value("Color", "White", off_white).reason == "aspect_unsourced"
+
+    listed = draft_row("A5", source_title="Cabinet", attributes={"Color": "Black/White"})
+    assert scd.validate_aspect_value("Color", "Black", listed).ok is True
+    assert scd.validate_aspect_value("Color", "White", listed).ok is True
+    assert scd.validate_aspect_value("Color", "Off-White", listed).ok is False
+
+    epp = draft_row(
+        "A6",
+        source_title="Ergonomic chair",
+        specs={"Frame Material": "EPP Foam"},
+    )
+    assert scd.validate_aspect_value("Frame Material", "EPP Foam", epp).ok is True
+    assert scd.validate_aspect_value("Main Material", "EPP Foam", epp).ok is True
+    assert scd.validate_aspect_value("Frame Material", "Foam", epp).reason == "aspect_unsourced"
+
+    color_free = draft_row("A7", source_title="12 in White cabinet")
+    assert scd.validate_aspect_value("Color", "White", color_free).reason == "aspect_no_named_source"
+    color_named = draft_row("A8", source_title="cabinet", attributes={"Colour": "White"})
+    assert scd.validate_aspect_value("Color", "White", color_named).ok is True
+
+    style = draft_row(
+        "A9",
+        source_title="Storage cabinet",
+        source_desc="wood grain finish",
+    )
+    style_wood = scd.validate_aspect_value("Style", "Wood", style)
+    assert style_wood.ok is False
+    assert style_wood.reason == "aspect_no_named_source"
+
+
 def test_named_aspect_rejects_free_text_material_and_accepts_spec():
     pvc = draft_row(
         "A1",
@@ -596,11 +658,6 @@ def test_named_aspect_rejects_free_text_material_and_accepts_spec():
     )
     assert scd.validate_aspect_value("Frame Material", "EPP Foam", epp).ok is True
     assert scd.validate_aspect_value("Main Material", "EPP Foam", epp).ok is True
-
-    color_free = draft_row("A3", source_title="12 in White cabinet")
-    assert scd.validate_aspect_value("Color", "White", color_free).ok is False
-    color_named = draft_row("A4", source_title="cabinet", attributes={"Colour": "White"})
-    assert scd.validate_aspect_value("Color", "White", color_named).ok is True
 
 
 def test_set_aspect_material_wood_grain_refused_and_frame_material_accepted(tmp_path):
@@ -660,6 +717,26 @@ def test_negative_attribute_values_are_not_title_evidence():
     assert any(item.casefold() == "free" for item in tool_free.unsourced)
 
 
+def test_exact_negative_named_spec_can_be_copied():
+    assembly = draft_row(
+        "N3",
+        source_title="Cabinet",
+        specs={"Assembly Required": "No"},
+    )
+    assert scd.validate_aspect_value("Assembly Required", "No", assembly).ok is True
+    assert scd.validate_aspect_value("Assembly Required", "Yes", assembly).reason == "aspect_unsourced"
+
+    water = draft_row(
+        "N4",
+        source_title="Outdoor cabinet",
+        attributes={"Waterproof": "No"},
+    )
+    assert scd.validate_aspect_value("Waterproof", "No", water).ok is True
+    title = scd.validate_draft_title("Waterproof Cabinet", water)
+    assert title.ok is False
+    assert any(item.casefold() == "waterproof" for item in title.unsourced)
+
+
 def test_set_of_n_requires_matching_count_phrase():
     drawers = draft_row("C2", source_title="Cabinet with 2 drawers")
     result = scd.validate_draft_title("Set of 2 Chairs", drawers)
@@ -678,6 +755,20 @@ def test_set_of_n_requires_matching_count_phrase():
     offset = draft_row("C5", source_title="Cabinet offset of 2 drawers")
     assert scd.extract_count_phrase_numbers(offset["title"]) == set()
     assert scd.validate_draft_title("Set of 2 Chairs", offset).reason == "title_count_phrase_unsourced"
+
+
+def test_bare_number_plural_noun_is_count_claim():
+    legs = draft_row("D1", source_title="Chair frame with 4 legs")
+    result = scd.validate_draft_title("4 Dining Chairs", legs)
+    assert result.ok is False
+    assert result.reason == "title_count_phrase_unsourced"
+    assert any("4" in item and "chair" in item for item in result.unsourced)
+
+    chairs = draft_row("D2", source_title="Walnut 4 dining chairs")
+    assert scd.validate_draft_title("4 Dining Chairs", chairs).ok is True
+
+    phrase = draft_row("D3", source_title="Set of 4 dining chairs")
+    assert scd.validate_draft_title("4 Dining Chairs", phrase).ok is True
 
 
 def test_fact_sheet_unavailable_blocks_apply_unless_flagged(tmp_path, monkeypatch):
