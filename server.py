@@ -1891,9 +1891,26 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
             try:
                 # Upload images (once — reuse on retries)
                 if eps_images is None and raw_images:
-                    print(f" Uploading {min(len(raw_images), 24)} images to eBay EPS...")
-                    eps_images = ebay_client.upload_images_to_eps(raw_images, max_images=24)
-                    print(f"[EPS] {len(eps_images)} images hosted on eBay")
+                    from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
+
+                    print(f" Uploading {min(len(raw_images), 24)} images via eBay Media API...")
+                    try:
+                        eps_images = ebay_client.upload_images_to_eps(raw_images, max_images=24)
+                    except MediaApiScopeError as scope_err:
+                        product.logs = (product.logs or []) + [str(scope_err)]
+                        flag_modified(product, "logs")
+                        db.commit()
+                        return {"status": "error", "message": str(scope_err)}
+                    except MediaImageUploadError as upload_err:
+                        msg = (
+                            f"image upload failed: {upload_err.uploaded_count} of "
+                            f"{len(raw_images)} images: {upload_err.reasons_text()}"
+                        )
+                        product.logs = (product.logs or []) + [msg]
+                        flag_modified(product, "logs")
+                        db.commit()
+                        return {"status": "error", "message": msg}
+                    print(f"[MEDIA] {len(eps_images)} images hosted on eBay")
                 
                 if not eps_images:
                     raise Exception("No images after EPS upload")
@@ -1992,6 +2009,22 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                     raise Exception("Failed to create eBay offer.")
                     
             except Exception as e:
+                from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
+
+                if isinstance(e, MediaApiScopeError):
+                    product.logs = (product.logs or []) + [str(e)]
+                    flag_modified(product, "logs")
+                    db.commit()
+                    return {"status": "error", "message": str(e)}
+                if isinstance(e, MediaImageUploadError):
+                    msg = (
+                        f"image upload failed: {e.uploaded_count} of "
+                        f"{len(raw_images)} images: {e.reasons_text()}"
+                    )
+                    product.logs = (product.logs or []) + [msg]
+                    flag_modified(product, "logs")
+                    db.commit()
+                    return {"status": "error", "message": msg}
                 last_error = str(e) if str(e) else "Unknown error"
                 print(f"[ATTEMPT {attempt+1}] Error: {last_error[:200]}")
                 
@@ -2197,6 +2230,19 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
     except HTTPException:
         raise
     except Exception as e:
+        from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
+
+        if isinstance(e, MediaApiScopeError):
+            product.logs = (product.logs or []) + [str(e)]
+            flag_modified(product, "logs")
+            db.commit()
+            return {"status": "error", "message": str(e)}
+        if isinstance(e, MediaImageUploadError):
+            msg = f"image upload failed: {e.uploaded_count} of {len((product.images or []))} images: {e.reasons_text()}"
+            product.logs = (product.logs or []) + [msg]
+            flag_modified(product, "logs")
+            db.commit()
+            return {"status": "error", "message": msg}
         error_msg = str(e) if str(e) else "Unknown error occurred"
         product.logs = (product.logs or []) + [f"Publish failed: {error_msg}"]
         flag_modified(product, 'logs')

@@ -44,6 +44,7 @@ for _stream_name in ("stdout", "stderr"):
         )
 
 from src.clients.dajian_client import DaJianClient
+from src.clients.ebay_media_images import MediaApiScopeError
 from src.clients.real_ebay_client import create_real_ebay_client
 from scripts.audit_fix_active_listings import _fill_missing_required_aspects
 from src.utils.dimension_helpers import (
@@ -513,7 +514,14 @@ def main():
             if live_image_urls and len(live_image_urls) >= max(1, expected_count - 1):
                 image_urls_for_put = list(live_image_urls)
             elif db_images:
-                image_urls_for_put = ebay.upload_images_to_eps(db_images, max_images=24) or list(live_image_urls)
+                from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
+
+                try:
+                    image_urls_for_put = ebay.upload_images_to_eps(db_images, max_images=24) or list(live_image_urls)
+                except MediaApiScopeError:
+                    raise
+                except MediaImageUploadError:
+                    image_urls_for_put = list(live_image_urls)
             else:
                 image_urls_for_put = list(live_image_urls)
             live_quantity = (
@@ -599,6 +607,8 @@ def main():
                 }
             )
             print(f"[{idx}/{len(issue_rows)}] Fixed {sku}")
+        except MediaApiScopeError:
+            raise
         except Exception as exc:
             conn.rollback()
             summary["errors"].append({"sku": sku, "error": str(exc)})

@@ -57,10 +57,19 @@ def fix_product_images(sku: str, oauth: EbayOAuthService, ebay_client) -> bool:
         print(f'  [OK] Images already present for {sku} ({len(current_images)} live, {expected_count} expected)')
         return True
 
-    # Upload to EPS so eBay hosts permanent copies; never PUT raw GigaB2B URLs.
-    eps_urls = ebay_client.upload_images_to_eps(images, max_images=24)
+    # Upload via Media API so eBay hosts permanent copies; never PUT raw GigaB2B URLs.
+    from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
+
+    try:
+        eps_urls = ebay_client.upload_images_to_eps(images, max_images=24)
+    except MediaApiScopeError as scope_err:
+        print(f'  [ERROR] {scope_err}')
+        return False
+    except MediaImageUploadError as upload_err:
+        print(f'  [ERROR] image upload failed for {sku}: {upload_err}')
+        return False
     if not eps_urls:
-        print(f'  [ERROR] EPS upload returned 0 images for {sku}')
+        print(f'  [ERROR] Media API upload returned 0 images for {sku}')
         return False
     
     item.setdefault('product', {})

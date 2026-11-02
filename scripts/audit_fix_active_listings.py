@@ -3216,6 +3216,8 @@ def fix_listing_on_ebay(
     override_category_lock: bool = False,
 ):
     """Apply fixes to a published eBay listing."""
+    from src.clients.ebay_media_images import MediaApiScopeError
+
     results = []
     stored_opt = parse_json(product_row["optimization"])
     opt = parse_json(base_opt_raw if base_opt_raw is not None else product_row["optimization"])
@@ -4239,7 +4241,17 @@ def fix_listing_on_ebay(
                     logging.warning(
                         f"[AUDIT] {sku}: live images degraded ({len(live_image_urls)} vs {expected_count}) — re-uploading to EPS"
                     )
-                    image_urls_for_put = ebay_client.upload_images_to_eps(db_images, max_images=24)
+                    from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
+
+                    try:
+                        image_urls_for_put = ebay_client.upload_images_to_eps(db_images, max_images=24)
+                    except MediaApiScopeError:
+                        raise
+                    except MediaImageUploadError:
+                        logging.warning(
+                            f"[AUDIT] {sku}: Media API upload failed; keeping {len(live_image_urls)} live image URL(s)"
+                        )
+                        image_urls_for_put = []
                     if not image_urls_for_put:
                         image_urls_for_put = list(live_image_urls)  # last-resort fallback
                 else:
@@ -4410,6 +4422,8 @@ def fix_listing_on_ebay(
         db_conn.commit()
         results.append("Local DB updated")
 
+    except MediaApiScopeError:
+        raise
     except Exception as e:
         results.append(f"ERROR [{sku}]: {e}")
 
