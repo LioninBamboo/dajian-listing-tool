@@ -5,7 +5,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import Column, Integer, String, Text, Float, DateTime, JSON
+from sqlalchemy import Column, Integer, String, Text, Float, DateTime, JSON, event
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.types import TypeDecorator
 
@@ -58,12 +58,6 @@ class TolerantJSONList(TypeDecorator):
         parsed = parse_logs(value)
         if parsed.status in {"ok", "empty", "non_list"}:
             return parsed.entries
-        logger.warning(
-            "corrupt logs sku=? status=%s leading_items=%s trailing_len=%s",
-            parsed.status,
-            len(parsed.entries),
-            len(parsed.trailing or ""),
-        )
         return CorruptLogs(
             parsed.entries_with_trailing(),
             parse_status=parsed.status,
@@ -157,3 +151,17 @@ class CollectedProduct(Base):
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
             'published_at': self.published_at.isoformat() if self.published_at else None
         }
+
+
+@event.listens_for(CollectedProduct, "load")
+def _warn_corrupt_collected_logs(target: CollectedProduct, _context: Any) -> None:
+    logs = target.logs
+    if not isinstance(logs, CorruptLogs):
+        return
+    logger.warning(
+        "corrupt logs sku=%s status=%s leading_items=%s trailing_len=%s",
+        target.sku or "?",
+        logs.parse_status,
+        len(logs.leading_entries),
+        len(logs.trailing or ""),
+    )

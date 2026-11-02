@@ -82,7 +82,7 @@ def test_repair_empty_help_does_not_touch_db(tmp_path):
     assert _statuses(db)["N710P1"][0] == "READY"
 
 
-def test_repair_claim_dry_run_and_confirm_gate(tmp_path):
+def test_repair_claim_dry_run_and_confirm_gate(tmp_path, capsys):
     from scripts.repair_claim_hallucinations import main
 
     db = _make_products_db(
@@ -100,11 +100,12 @@ def test_repair_claim_dry_run_and_confirm_gate(tmp_path):
     before = _statuses(db)
     assert main(["--db", str(db), "--log-file", str(log_file)]) == 0
     assert _statuses(db) == before
+    assert "counts: matched=2 refused_live=1 writable=1" in capsys.readouterr().out
 
-    assert main(["--db", str(db), "--log-file", str(log_file), "--apply", "--confirm-skus", "99"]) == 2
+    assert main(["--db", str(db), "--log-file", str(log_file), "--apply", "--confirm-skus", "2"]) == 2
     assert _statuses(db) == before
 
-    assert main(["--db", str(db), "--log-file", str(log_file), "--apply", "--confirm-skus", "2"]) == 0
+    assert main(["--db", str(db), "--log-file", str(log_file), "--apply", "--confirm-skus", "1"]) == 0
     after = _statuses(db)
     assert after["SAFE1"][0] == "COLLECTED"
     assert after["SAFE1"][2] != before["SAFE1"][2]
@@ -113,8 +114,12 @@ def test_repair_claim_dry_run_and_confirm_gate(tmp_path):
     assert after["LIVE1"][1] == before["LIVE1"][1]
 
 
-def test_repair_empty_skips_null_or_non_string_description(tmp_path):
-    from scripts.repair_empty_descriptions import main
+def test_repair_empty_skips_null_or_non_string_description(tmp_path, capsys):
+    from scripts.repair_empty_descriptions import _missing_description, main
+
+    assert _missing_description(json.dumps({"description": None})) is True
+    assert _missing_description(json.dumps({"description": {"html": "<p>x</p>"}})) is True
+    assert _missing_description(json.dumps({"description": "KEY FEATURES <li>ok</li>"})) is False
 
     db = _make_products_db(
         tmp_path / "ebay_collection.db",
@@ -132,9 +137,87 @@ def test_repair_empty_skips_null_or_non_string_description(tmp_path):
     before = db.read_bytes()
     assert main(["--db", str(db)]) == 0
     assert db.read_bytes() == before
+    assert "counts: matched=3 refused_live=3 writable=0" in capsys.readouterr().out
     after = _statuses(db)
     assert after["NULL-DESC"][0] == "READY"
     assert after["DICT-DESC"][0] == "READY"
+
+
+def test_repair_empty_confirm_skus_is_writable_not_matched(tmp_path):
+    from scripts.repair_empty_descriptions import main
+
+    db = _make_products_db(
+        tmp_path / "ebay_collection.db",
+        [
+            _row(
+                "LIVE-BAD",
+                status="READY",
+                listing_id="111",
+                optimization=json.dumps({"description": "<p>no list</p>"}),
+            ),
+        ],
+    )
+    before = _statuses(db)
+    assert main(["--db", str(db), "--apply", "--confirm-skus", "1"]) == 2
+    assert _statuses(db) == before
+    assert main(["--db", str(db), "--apply", "--include-live", "--confirm-skus", "1"]) == 0
+    assert _statuses(db)["LIVE-BAD"][0] == "COLLECTED"
+
+
+def test_repair_scripts_refuse_apply_when_maintenance_lock_held(tmp_path):
+    from scripts.repair_claim_hallucinations import main as claim_main
+    from scripts.repair_empty_descriptions import main as empty_main
+
+    db = _make_products_db(
+        tmp_path / "ebay_collection.db",
+        [
+            _row("SAFE1", status="ERROR", logs="[]"),
+            _row(
+                "LIVE-BAD",
+                status="READY",
+                listing_id=None,
+                optimization=json.dumps({"description": "<p>no list</p>"}),
+            ),
+        ],
+    )
+    lock = tmp_path / "_maintenance.lock"
+    lock.write_text("held\n", encoding="utf-8")
+    log_file = tmp_path / "issues.json"
+    log_file.write_text(json.dumps({"issues": [{"sku": "SAFE1"}]}), encoding="utf-8")
+    before = _statuses(db)
+
+    assert (
+        claim_main(
+            [
+                "--db",
+                str(db),
+                "--log-file",
+                str(log_file),
+                "--maintenance-lock",
+                str(lock),
+                "--apply",
+                "--confirm-skus",
+                "1",
+            ]
+        )
+        == 2
+    )
+    assert (
+        empty_main(
+            [
+                "--db",
+                str(db),
+                "--maintenance-lock",
+                str(lock),
+                "--apply",
+                "--include-live",
+                "--confirm-skus",
+                "1",
+            ]
+        )
+        == 2
+    )
+    assert _statuses(db) == before
 
 
 def test_normalize_dry_run_and_apply_only_logs(tmp_path):

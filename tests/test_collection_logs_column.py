@@ -116,7 +116,8 @@ def test_corrupt_warning_omits_trailing_text(tmp_path, caplog):
     finally:
         session.close()
         engine.dispose()
-    assert "corrupt logs sku=?" in caplog.text
+    assert "corrupt logs sku=XML1" in caplog.text
+    assert "sku=?" not in caplog.text
     assert "status=trailing_text" in caplog.text
     assert "<?xml" not in caplog.text
     assert "EndFixedPriceItemResponse" not in caplog.text

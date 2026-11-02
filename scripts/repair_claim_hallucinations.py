@@ -14,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.db.collection_db import DATABASE_PATH
+from src.db.database_safety import DatabaseSafetyError, assert_runtime_not_in_maintenance
 from src.utils.logs_codec import append_log
 
 DEFAULT_LOG_FILE = PROJECT_ROOT / "logs" / "listing_audit_fix_20260620_113024.json"
@@ -31,12 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Write changes. Also requires --confirm-skus matching the matched SKU count.",
+        help="Write changes. Also requires --confirm-skus matching the writable SKU count.",
     )
     parser.add_argument(
         "--confirm-skus",
         type=int,
-        help="Must equal the number of matched SKUs before any write happens.",
+        help="Must equal the number of rows that will actually be written (excludes refused live rows).",
     )
     parser.add_argument(
         "--include-live",
@@ -44,6 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Allow resetting PUBLISHED/READY rows or rows that still have a listing_id.",
     )
     parser.add_argument("--db", type=Path, default=None, help="SQLite path (defaults to DATABASE_PATH).")
+    parser.add_argument(
+        "--maintenance-lock",
+        type=Path,
+        default=None,
+        help="Path of logs/_maintenance.lock. --apply refuses if this file exists.",
+    )
     parser.add_argument(
         "--log-file",
         type=Path,
@@ -115,13 +122,24 @@ def main(argv: list[str] | None = None) -> int:
             for row in refused:
                 print(f"  refuse {row['sku']} status={row['status']} listing_id={row['listing_id'] or ''}")
 
+        print(
+            f"counts: matched={len(matched)} refused_live={len(refused)} writable={len(eligible)}"
+        )
+
         if not args.apply:
             print("Dry-run: no writes. Pass --apply --confirm-skus <n> to write.")
             return 0
 
-        if args.confirm_skus != len(matched):
+        lock = Path(args.maintenance_lock) if args.maintenance_lock is not None else PROJECT_ROOT / "logs" / "_maintenance.lock"
+        try:
+            assert_runtime_not_in_maintenance(lock)
+        except DatabaseSafetyError as exc:
+            print(f"{exc}; writing nothing.")
+            return 2
+
+        if args.confirm_skus != len(eligible):
             print(
-                f"--confirm-skus {args.confirm_skus!r} does not match matched SKU count {len(matched)}; writing nothing."
+                f"--confirm-skus {args.confirm_skus!r} does not match writable SKU count {len(eligible)}; writing nothing."
             )
             return 2
 
