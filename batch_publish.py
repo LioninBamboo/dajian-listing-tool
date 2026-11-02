@@ -2597,7 +2597,11 @@ def main():
         for r in results:
             if r['status'] == 'error':
                 logger.info(f"  {r['sku']}: {r['message'][:120]}")
-        return 1
+        # Scheduler treats exit 2 as partial_success (per-SKU QC/category/price
+        # or image-upload blocks). Only a Media API scope abort is exit 1.
+        if any(is_media_scope_abort(r) for r in results):
+            return 1
+        return 2
     return 0
 
 

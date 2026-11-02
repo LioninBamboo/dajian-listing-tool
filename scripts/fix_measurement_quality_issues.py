@@ -44,6 +44,7 @@ for _stream_name in ("stdout", "stderr"):
         )
 
 from src.clients.dajian_client import DaJianClient
+from src.clients.ebay_media_images import MediaApiScopeError
 from src.clients.real_ebay_client import create_real_ebay_client
 from scripts.audit_fix_active_listings import _fill_missing_required_aspects
 from src.utils.dimension_helpers import (
@@ -606,6 +607,8 @@ def main():
                 }
             )
             print(f"[{idx}/{len(issue_rows)}] Fixed {sku}")
+        except MediaApiScopeError:
+            raise
         except Exception as exc:
             conn.rollback()
             summary["errors"].append({"sku": sku, "error": str(exc)})

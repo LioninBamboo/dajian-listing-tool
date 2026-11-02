@@ -3216,6 +3216,8 @@ def fix_listing_on_ebay(
     override_category_lock: bool = False,
 ):
     """Apply fixes to a published eBay listing."""
+    from src.clients.ebay_media_images import MediaApiScopeError
+
     results = []
     stored_opt = parse_json(product_row["optimization"])
     opt = parse_json(base_opt_raw if base_opt_raw is not None else product_row["optimization"])
@@ -4420,6 +4422,8 @@ def fix_listing_on_ebay(
         db_conn.commit()
         results.append("Local DB updated")
 
+    except MediaApiScopeError:
+        raise
     except Exception as e:
         results.append(f"ERROR [{sku}]: {e}")
 

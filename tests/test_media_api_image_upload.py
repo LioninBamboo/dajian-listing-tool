@@ -8,6 +8,7 @@ import sys
 import time
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from xml.sax.saxutils import escape as xml_escape
 
 import pytest
@@ -245,13 +246,19 @@ def test_prepare_inventory_preserves_giga_signature_params():
 
     assert prepared == [HOSTED_A, HOSTED_B]
     sent = [call["json"]["imageUrl"] for call in session.calls]
-    for body_url in sent:
-        assert "x-cc=AAA" in body_url
-        assert "x-cu=BBB" in body_url
-        assert "x-ct=CCC" in body_url
-        assert "x-cs=" in body_url
-        assert "x-oss-process" not in body_url
-    assert "DD%2BEE%3D" in sent[0] or "DD+EE=" in sent[0]
+    assert len(sent) == 2
+    first = parse_qs(urlparse(sent[0]).query, keep_blank_values=True)
+    second = parse_qs(urlparse(sent[1]).query, keep_blank_values=True)
+    assert first.get("x-cc") == ["AAA"]
+    assert first.get("x-cu") == ["BBB"]
+    assert first.get("x-ct") == ["CCC"]
+    assert first.get("x-cs") == ["DD+EE="]
+    assert "x-oss-process" not in first
+    assert second.get("x-cc") == ["AAA"]
+    assert second.get("x-cu") == ["BBB"]
+    assert second.get("x-ct") == ["CCC"]
+    assert second.get("x-cs") == ["FF+GG="]
+    assert "x-oss-process" not in second
 
 
 def test_retry_503_then_success(monkeypatch):
@@ -627,45 +634,65 @@ def test_batch_publish_partial_image_failure_blocks_sku_and_writes(monkeypatch):
     assert recorded and recorded[0][0] == "SKU-IMG-FAIL"
 
 
-def test_batch_publish_exit_code_nonzero_on_image_error(monkeypatch, tmp_path):
+def _run_batch_main(monkeypatch, tmp_path, products, publish):
     monkeypatch.setattr(batch_publish, "LOG_DIR", tmp_path)
-    monkeypatch.setattr(
-        batch_publish,
-        "get_ready_products",
-        lambda *a, **k: [{"sku": "S1", "title": "Table", "suggested_price": 10}],
-    )
-    monkeypatch.setattr(
-        batch_publish,
-        "publish_single_product",
+    monkeypatch.setattr(batch_publish, "get_ready_products", lambda *a, **k: products)
+    monkeypatch.setattr(batch_publish, "publish_single_product", publish)
+    monkeypatch.setattr(sys, "argv", ["batch_publish.py"])
+    return batch_publish.main()
+
+
+def test_batch_publish_exit_code_2_on_image_error(monkeypatch, tmp_path):
+    rc = _run_batch_main(
+        monkeypatch,
+        tmp_path,
+        [{"sku": "S1", "title": "Table", "suggested_price": 10}],
         lambda *a, **k: {"status": "error", "message": "image upload failed: 1 of 3 images: boom"},
     )
-    monkeypatch.setattr(sys, "argv", ["batch_publish.py"])
-    assert batch_publish.main() == 1
+    assert rc == 2
 
 
-def test_batch_publish_exit_code_nonzero_on_scope_error(monkeypatch, tmp_path):
+def test_batch_publish_exit_code_2_on_ordinary_sku_failure(monkeypatch, tmp_path):
+    rc = _run_batch_main(
+        monkeypatch,
+        tmp_path,
+        [{"sku": "S1", "title": "Table", "suggested_price": 10}],
+        lambda *a, **k: {"status": "error", "message": "Validation failed: price below floor"},
+    )
+    assert rc == 2
+
+
+def test_batch_publish_exit_code_0_on_all_success(monkeypatch, tmp_path):
+    rc = _run_batch_main(
+        monkeypatch,
+        tmp_path,
+        [{"sku": "S1", "title": "Table", "suggested_price": 10}],
+        lambda *a, **k: {"status": "success", "message": "Published"},
+    )
+    assert rc == 0
+
+
+def test_batch_publish_exit_code_1_on_scope_error(monkeypatch, tmp_path):
     seen = []
 
     def fake_publish(product, dry_run=False):
         seen.append(product["sku"])
         raise MediaApiScopeError(format_media_scope_error(403, 190013))
 
-    monkeypatch.setattr(batch_publish, "LOG_DIR", tmp_path)
-    monkeypatch.setattr(
-        batch_publish,
-        "get_ready_products",
-        lambda *a, **k: [
-            {"sku": "S1", "title": "A", "suggested_price": 10},
-            {"sku": "S2", "title": "B", "suggested_price": 10},
-        ],
-    )
-    monkeypatch.setattr(batch_publish, "publish_single_product", fake_publish)
     monkeypatch.setattr(
         "src.clients.ebay_media_images.get_store_profile",
         lambda: StoreProfile(brand_name="GrovePop"),
     )
-    monkeypatch.setattr(sys, "argv", ["batch_publish.py"])
-    assert batch_publish.main() == 1
+    rc = _run_batch_main(
+        monkeypatch,
+        tmp_path,
+        [
+            {"sku": "S1", "title": "A", "suggested_price": 10},
+            {"sku": "S2", "title": "B", "suggested_price": 10},
+        ],
+        fake_publish,
+    )
+    assert rc == 1
     assert seen == ["S1"]
 
 
@@ -722,3 +749,201 @@ def test_scope_error_message_omits_token():
     text = format_media_scope_error(403, 190013)
     assert SECRET_TOKEN not in text
     assert "sell.inventory" in text
+
+
+def _audit_product_row(*, sku="SKU-AUDIT", images=None, title="Coffee Table"):
+    return {
+        "sku": sku,
+        "title": title,
+        "description": "<div>Assembly Required Yes</div>",
+        "attributes": "{}",
+        "specs": "{}",
+        "optimization": json.dumps(
+            {
+                "title": title,
+                "description": "<div>old desc</div>",
+                "categoryId": "38204",
+                "aspects": {"Brand": ["OldBrand"]},
+            }
+        ),
+        "images": json.dumps(
+            images
+            or [
+                "https://cdn.example/a.jpg",
+                "https://cdn.example/b.jpg",
+                "https://cdn.example/c.jpg",
+            ]
+        ),
+        "listing_id": "188000000001",
+        "price": 50,
+        "suggested_price": 99,
+    }
+
+
+def _audit_matcher():
+    class _Matcher:
+        def _get_category_aspects(self, category_id):
+            return [], []
+
+    return _Matcher()
+
+
+def test_audit_fix_scope_error_propagates_and_stops(monkeypatch, tmp_path):
+    import scripts.audit_fix_active_listings as audit
+
+    monkeypatch.setattr(audit, "get_category_matcher", _audit_matcher)
+    puts = []
+
+    class _Client:
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "OFFER-1", "categoryId": "38204"}]
+
+        def get_inventory_item(self, sku):
+            # 1 live vs 3 local sources is degraded, so the script re-uploads.
+            return {"product": {"imageUrls": [HOSTED_A]}}
+
+        def upload_images_to_eps(self, images, max_images=24):
+            raise MediaApiScopeError(format_media_scope_error(403, 190013))
+
+        def create_or_replace_inventory_item(self, sku, product):
+            puts.append(product)
+            raise AssertionError("must not PUT after scope error")
+
+        def publish_offer(self, offer_id):
+            raise AssertionError("must not publish after scope error")
+
+    conn = __import__("sqlite3").connect(tmp_path / "audit.db")
+    conn.execute(
+        "CREATE TABLE collected_products (sku TEXT, optimization TEXT, listing_id TEXT, status TEXT, updated_at TEXT)"
+    )
+    conn.commit()
+
+    with pytest.raises(MediaApiScopeError):
+        audit.fix_listing_on_ebay(
+            "SKU-AUDIT",
+            _audit_product_row(),
+            {"__restore_images__": True, "Brand": ["AquaVerve"]},
+            _Client(),
+            conn,
+        )
+    assert puts == []
+
+
+def test_audit_fix_image_error_keeps_live_urls_and_continues_other_fixes(monkeypatch, tmp_path):
+    import scripts.audit_fix_active_listings as audit
+
+    monkeypatch.setattr(audit, "get_category_matcher", _audit_matcher)
+    puts = []
+
+    class _Client:
+        def get_offers_by_sku(self, sku):
+            return [{"offerId": "OFFER-1", "categoryId": "38204"}]
+
+        def get_inventory_item(self, sku):
+            # Degraded live set (1 of 3). Upload would return a partial EPS
+            # list; the script must keep this live set instead.
+            return {"product": {"imageUrls": [HOSTED_A]}}
+
+        def upload_images_to_eps(self, images, max_images=24):
+            raise MediaImageUploadError(
+                failed=[(1, "https://cdn.example/b.jpg", "HTTP 400")],
+                uploaded_count=1,
+            )
+
+        def create_or_replace_inventory_item(self, sku, product):
+            puts.append(product)
+            return {"status": "success"}
+
+        def publish_offer(self, offer_id):
+            return {"listingId": "188000000001"}
+
+        def update_offer_category(self, offer_id, category_id, listing_description=None):
+            return True
+
+    conn = __import__("sqlite3").connect(tmp_path / "audit.db")
+    conn.execute(
+        "CREATE TABLE collected_products (sku TEXT, optimization TEXT, listing_id TEXT, status TEXT, updated_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO collected_products (sku, optimization, listing_id, status) VALUES (?, ?, ?, ?)",
+        ("SKU-AUDIT", "{}", "188000000001", "PUBLISHED"),
+    )
+    conn.commit()
+
+    results = audit.fix_listing_on_ebay(
+        "SKU-AUDIT",
+        _audit_product_row(),
+        {"__restore_images__": True, "Brand": ["AquaVerve"]},
+        _Client(),
+        conn,
+    )
+
+    assert puts, results
+    assert puts[0]["image_urls"] == [HOSTED_A]
+    assert puts[0]["aspects"]["Brand"] == ["AquaVerve"]
+    assert not any(str(item).startswith("ERROR [SKU-AUDIT]:") for item in results)
+    assert any("Brand" in str(item) for item in results)
+
+
+def test_measurement_fix_scope_error_stops_batch(monkeypatch, tmp_path):
+    import scripts.fix_measurement_quality_issues as measurement
+
+    db_path = tmp_path / "measure.db"
+    conn = __import__("sqlite3").connect(db_path)
+    conn.execute(
+        "CREATE TABLE collected_products ("
+        "sku TEXT, title TEXT, description TEXT, attributes TEXT, specs TEXT, "
+        "optimization TEXT, images TEXT, price REAL, suggested_price REAL, "
+        "listing_id TEXT, status TEXT, updated_at TEXT)"
+    )
+    images = json.dumps(["https://cdn.example/a.jpg", "https://cdn.example/b.jpg"])
+    for sku in ("SKU-1", "SKU-2"):
+        conn.execute(
+            "INSERT INTO collected_products VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                sku,
+                "Table",
+                "<div>desc</div>",
+                "{}",
+                "{}",
+                json.dumps({"title": "Table", "description": "<div>Overall Dimensions NOT AVAILABLE</div>", "aspects": {}}),
+                images,
+                10,
+                20,
+                "1",
+                "PUBLISHED",
+                "2026-01-01",
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+    seen = []
+
+    class _Oauth:
+        def is_authorized(self):
+            return True
+
+    class _Ebay:
+        oauth = _Oauth()
+
+        def get_inventory_item(self, sku):
+            return {"product": {"imageUrls": []}}
+
+        def upload_images_to_eps(self, images, max_images=24):
+            seen.append(images)
+            raise MediaApiScopeError("scope denied for test")
+
+        def create_or_replace_inventory_item(self, *a, **k):
+            raise AssertionError("must not PUT after scope error")
+
+    monkeypatch.setattr(measurement, "DB_PATH", db_path)
+    monkeypatch.setattr(measurement, "LOG_DIR", tmp_path)
+    monkeypatch.setattr(measurement, "fetch_dajian_details", lambda *a, **k: {})
+    monkeypatch.setattr(measurement, "create_real_ebay_client", lambda *a, **k: _Ebay())
+    monkeypatch.setattr(measurement, "DaJianClient", lambda *a, **k: object())
+    monkeypatch.setattr(sys, "argv", ["fix_measurement_quality_issues.py", "--sku", "SKU-1,SKU-2"])
+
+    with pytest.raises(MediaApiScopeError):
+        measurement.main()
+    assert len(seen) == 1
