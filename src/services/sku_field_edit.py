@@ -1350,6 +1350,94 @@ def build_diff(
     return diff
 
 
+def _listing_id_text(value: Any) -> str | None:
+    """Strip a listing id to comparable text, or None when it is absent.
+
+    Integers use decimal text so ``366778621648`` equals ``"366778621648"``.
+    Only leading and trailing whitespace is removed. A shorter digit string is
+    not a match. Bools are not listing ids (``True`` must not become ``"1"``).
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        text = str(value).strip()
+    elif isinstance(value, str):
+        text = value.strip()
+    else:
+        return None
+    return text or None
+
+
+def _offer_listing_id(offer: Any) -> str | None:
+    """Listing id carried by one Sell Inventory ``getOffers`` offer.
+
+    Precedence: nested ``offer["listing"]["listingId"]`` when present and
+    non-empty, otherwise top-level ``offer["listingId"]``, otherwise None.
+    When both are set and they differ, the nested id wins — even if the
+    top-level id is the one equal to the DB item id. ``listing`` of None,
+    ``{}``, or a non-mapping, and ``listingId`` of ``""`` or whitespace, are
+    absent and fall through.
+    """
+    if not isinstance(offer, Mapping):
+        return None
+    listing = offer.get("listing")
+    if isinstance(listing, Mapping):
+        nested = _listing_id_text(listing.get("listingId"))
+        if nested:
+            return nested
+    return _listing_id_text(offer.get("listingId"))
+
+
+def _offer_marketplace(offer: Mapping[str, Any]) -> str:
+    raw = offer.get("marketplaceId")
+    if not isinstance(raw, str):
+        return ""
+    return raw.strip().upper()
+
+
+def _offer_sequence(offers: Any) -> list[Any]:
+    if isinstance(offers, (list, tuple)):
+        return list(offers)
+    return []
+
+
+def _select_offer_for_push(
+    offers: Any, expected_listing_id: Any
+) -> tuple[Mapping[str, Any] | None, str]:
+    """Choose the Inventory offer ``--push-live`` may update.
+
+    Returns ``(offer, "")`` or ``(None, reason)``.
+
+    When any offer's ``marketplaceId`` is EBAY_US, only those offers are
+    eligible — a matching id on another marketplace is not a substitute.
+    More than one EBAY_US offer that has a listing id refuses
+    ``multiple_offers`` instead of guessing, even when one id equals the DB.
+    No listing id on the eligible offer(s) refuses ``offer_not_published``.
+    A present id that is not exactly the DB id (stripped string equality)
+    refuses ``listing_id_mismatch``. Offers with no ``marketplaceId`` keep
+    match-by-id behavior so a single untagged offer still pushes.
+    """
+    items = [item for item in _offer_sequence(offers) if isinstance(item, Mapping)]
+    expected = _listing_id_text(expected_listing_id) or ""
+    us_offers = [item for item in items if _offer_marketplace(item) == "EBAY_US"]
+    pool = us_offers if us_offers else items
+    published = [item for item in pool if _offer_listing_id(item)]
+    if us_offers and len(published) > 1:
+        return None, "multiple_offers"
+    if not us_offers and len(published) > 1:
+        matches = [item for item in published if _offer_listing_id(item) == expected]
+        if len(matches) == 1:
+            return matches[0], ""
+        if len(matches) > 1:
+            return None, "multiple_offers"
+        return None, "listing_id_mismatch"
+    if len(published) == 1:
+        if _offer_listing_id(published[0]) != expected:
+            return None, "listing_id_mismatch"
+        return published[0], ""
+    return None, "offer_not_published"
+
+
 def fetch_live(plan: SkuPlan, ctx: SkuFieldEditContext, args: Any) -> SkuPlan:
     listing_id = str(plan.listing_id or "")
     try:
@@ -1378,13 +1466,9 @@ def fetch_live(plan: SkuPlan, ctx: SkuFieldEditContext, args: Any) -> SkuPlan:
                 return refuse(plan, "fetch_failed", "fetch_failed")
             inventory = ebay.get_inventory_item(plan.sku) or {}
             offers = ebay.get_offers_by_sku(plan.sku) or []
-            offer = None
-            for item in offers:
-                if str((item or {}).get("listingId") or "") == listing_id:
-                    offer = item
-                    break
+            offer, mismatch = _select_offer_for_push(offers, listing_id)
             if offer is None:
-                return refuse(plan, "listing_id_mismatch", "listing_id_mismatch")
+                return refuse(plan, mismatch, mismatch)
             plan.live = {"inventory": inventory, "offer": offer}
             qty = live_quantity(inventory, offer)
             if qty == 0 or str(qty) == "0":
@@ -2266,13 +2350,15 @@ def live_readback_ok(plan: SkuPlan, ctx: SkuFieldEditContext) -> tuple[bool, lis
     ebay = ctx.ebay_client
     inventory = ebay.get_inventory_item(plan.sku) or {}
     offers = ebay.get_offers_by_sku(plan.sku) or []
+    sequence = _offer_sequence(offers)
+    expected_listing_id = _listing_id_text(plan.listing_id) or ""
     offer = None
-    for item in offers:
-        if str((item or {}).get("listingId") or "") == str(plan.listing_id):
+    for item in sequence:
+        if isinstance(item, Mapping) and (_offer_listing_id(item) or "") == expected_listing_id:
             offer = item
             break
-    if offer is None and offers:
-        offer = offers[0]
+    if offer is None and sequence:
+        offer = sequence[0]
     if fetches_price_or_qty_changed(plan.live.get("inventory"), plan.live.get("offer"), inventory, offer):
         mismatches.append("price_qty")
     product = inventory.get("product") or {}

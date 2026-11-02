@@ -41,6 +41,10 @@ ASPECT_NAME_FAMILIES = {
     "upholstery": "material",
     "color": "color",
     "colour": "color",
+    # GIGA attributes use "Main Color" (e.g. "Beige,Natural Wood"), not "Color".
+    # _named_source_fields still requires the whitespace-only key to be exactly
+    # "main color", so "Main-Color" / "Main_Color" / "Main Color Family" do not match.
+    "main color": "color",
     "type": "type",
     "product type": "type",
     "item type": "type",
@@ -516,6 +520,11 @@ def _normalize_aspect_name(name: str) -> str:
     return re.sub(r"[\s_\-]+", " ", str(name or "").casefold()).strip()
 
 
+def _whitespace_key(name: str) -> str:
+    """Casefold and trim/collapse whitespace only. Hyphens and underscores stay."""
+    return re.sub(r"\s+", " ", str(name or "").casefold()).strip()
+
+
 def _aspect_family(name: str) -> str:
     return ASPECT_NAME_FAMILIES.get(_normalize_aspect_name(name), "")
 
@@ -554,6 +563,13 @@ def named_values_equal(wanted: str, source_value: str) -> bool:
     return any(want == _normalize_aspect_value(item) for item in _named_value_items(source_value))
 
 
+def _blank_main_color(raw: Any) -> bool:
+    """None, ``""``, and whitespace-only ``Main Color`` are not a color source."""
+    if raw is None:
+        return True
+    return not _value_as_text(raw).strip()
+
+
 def _named_source_fields(row: Mapping[str, Any], name: str) -> list[tuple[str, str]]:
     fields = source_fields_from_row(row)
     family = _aspect_family(name)
@@ -564,6 +580,12 @@ def _named_source_fields(row: Mapping[str, Any], name: str) -> list[tuple[str, s
         for key, raw in mapping.items():
             text = _value_as_text(raw)
             key_n = _normalize_aspect_name(str(key))
+            # Family lookup folds "_" and "-". Main Color does not: only case and
+            # whitespace on the key, so Main-Color / Main_Color are different keys.
+            if key_n == "main color" and _whitespace_key(key) != "main color":
+                continue
+            if key_n == "main color" and _blank_main_color(raw):
+                continue
             if family and _aspect_family(key_n) == family:
                 hits.append((f"{source_name}:{key}", text))
             elif dimension and _dimension_family(key_n) == dimension:
