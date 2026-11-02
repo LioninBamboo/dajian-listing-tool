@@ -1,0 +1,167 @@
+"""Guarded repair / normalize tools: dry-run default, confirm gates, no live writes."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from src.utils.logs_codec import parse_logs
+from tests.test_logs_codec import TRAILING_SHORT, TRAILING_XML, VALID
+
+
+def _make_products_db(path: Path, rows):
+    conn = sqlite3.connect(str(path), timeout=30)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE collected_products (
+                sku TEXT PRIMARY KEY,
+                title TEXT,
+                price REAL,
+                status TEXT,
+                listing_id TEXT,
+                optimization TEXT,
+                logs TEXT,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO collected_products "
+            "(sku, title, price, status, listing_id, optimization, logs, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+def _row(sku, *, status="COLLECTED", listing_id=None, logs=VALID, optimization=None, updated_at="2026-10-01"):
+    return (sku, f"Title {sku}", 10.0, status, listing_id, optimization, logs, updated_at)
+
+
+def _statuses(db_path):
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    try:
+        return {
+            sku: (status, logs, updated_at, listing_id)
+            for sku, status, logs, updated_at, listing_id in conn.execute(
+                "SELECT sku, status, logs, updated_at, listing_id FROM collected_products"
+            )
+        }
+    finally:
+        conn.close()
+
+
+def test_repair_claim_help_does_not_touch_db(tmp_path):
+    from scripts.repair_claim_hallucinations import main
+
+    db = _make_products_db(tmp_path / "ebay_collection.db", [_row("N710P1")])
+    before = db.read_bytes()
+    with pytest.raises(SystemExit) as exited:
+        main(["--help"])
+    assert exited.value.code == 0
+    assert db.read_bytes() == before
+    assert _statuses(db)["N710P1"][0] == "COLLECTED"
+
+
+def test_repair_empty_help_does_not_touch_db(tmp_path):
+    from scripts.repair_empty_descriptions import main
+
+    db = _make_products_db(tmp_path / "ebay_collection.db", [_row("N710P1", status="READY")])
+    before = db.read_bytes()
+    with pytest.raises(SystemExit) as exited:
+        main(["--help"])
+    assert exited.value.code == 0
+    assert db.read_bytes() == before
+    assert _statuses(db)["N710P1"][0] == "READY"
+
+
+def test_repair_claim_dry_run_and_confirm_gate(tmp_path):
+    from scripts.repair_claim_hallucinations import main
+
+    db = _make_products_db(
+        tmp_path / "ebay_collection.db",
+        [
+            _row("SAFE1", status="ERROR", logs="[]"),
+            _row("LIVE1", status="PUBLISHED", listing_id="111", logs="[]"),
+        ],
+    )
+    log_file = tmp_path / "issues.json"
+    log_file.write_text(
+        json.dumps({"issues": [{"sku": "SAFE1"}, {"sku": "LIVE1"}]}),
+        encoding="utf-8",
+    )
+    before = _statuses(db)
+    assert main(["--db", str(db), "--log-file", str(log_file)]) == 0
+    assert _statuses(db) == before
+
+    assert main(["--db", str(db), "--log-file", str(log_file), "--apply", "--confirm-skus", "99"]) == 2
+    assert _statuses(db) == before
+
+    assert main(["--db", str(db), "--log-file", str(log_file), "--apply", "--confirm-skus", "2"]) == 0
+    after = _statuses(db)
+    assert after["SAFE1"][0] == "COLLECTED"
+    assert after["SAFE1"][2] != before["SAFE1"][2]
+    assert "repair_claim_hallucinations reset at" in json.loads(after["SAFE1"][1])[-1]
+    assert after["LIVE1"][0] == "PUBLISHED"
+    assert after["LIVE1"][1] == before["LIVE1"][1]
+
+
+def test_normalize_dry_run_and_apply_only_logs(tmp_path):
+    from scripts.normalize_corrupt_logs import main
+
+    db = _make_products_db(
+        tmp_path / "ebay_collection.db",
+        [
+            _row("OK1", status="DELISTED", logs=VALID, updated_at="2026-09-01"),
+            _row("BAD1", status="DELISTED", logs=TRAILING_SHORT, updated_at="2026-09-02"),
+            _row("BAD2", status="COLLECTED", logs=TRAILING_XML, updated_at="2026-09-03"),
+        ],
+    )
+    lock = tmp_path / "_no_maintenance.lock"
+    backups = tmp_path / "backups"
+    reports = tmp_path / "logs"
+    common = [
+        "--db",
+        str(db),
+        "--maintenance-lock",
+        str(lock),
+        "--backup-dir",
+        str(backups),
+        "--report-dir",
+        str(reports),
+        "--timestamp",
+        "20261102_120000",
+    ]
+    before = _statuses(db)
+    assert main(common) == 0
+    assert _statuses(db) == before
+
+    assert main(common + ["--apply", "--store", "main", "--confirm-count", "99"]) == 2
+    assert _statuses(db) == before
+
+    assert main(common + ["--apply", "--store", "main", "--confirm-count", "2"]) == 0
+    after = _statuses(db)
+    assert after["OK1"] == before["OK1"]
+    assert after["BAD1"][0] == "DELISTED"
+    assert after["BAD1"][2] == "2026-09-02"
+    assert after["BAD2"][0] == "COLLECTED"
+    assert after["BAD2"][2] == "2026-09-03"
+    parsed = parse_logs(after["BAD1"][1])
+    assert parsed.status == "ok"
+    assert parsed.entries[0] == "Listing: 366407614496, Offer: 108006576011, Cat: 38204"
+    assert parsed.entries[1].startswith("[2026-10-08 11:26:48] LONG_OOS_END_LIVE")
+    xml = parse_logs(after["BAD2"][1])
+    assert xml.status == "ok"
+    assert xml.entries[-1].startswith("[2026-10-10 08:35:14] CRO_END_LIVE_20261010")
+    assert "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" in xml.entries[-1]
+    assert list(backups.glob("normalize_logs_*/ebay_collection.db"))
+    report = json.loads(next(reports.glob("normalize_corrupt_logs_main_*.json")).read_text(encoding="utf-8"))
+    assert report["count"] == 2
+    assert {row["sku"] for row in report["written"]} == {"BAD1", "BAD2"}

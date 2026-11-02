@@ -49,6 +49,7 @@ def _utcnow_naive() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 from src.services.pricing_engine import PricingEngine
+from src.utils.logs_codec import append_log
 
 logger = logging.getLogger(__name__)
 
@@ -410,20 +411,13 @@ def ingest_external_opportunity_as_pending(
             existing_status = (row[0] or "").upper()
             if existing_status in _LIVE_STATUSES:
                 return "skipped_live"
-            try:
-                logs = json.loads(row[1]) if row[1] else []
-                if not isinstance(logs, list):
-                    logs = [str(logs)]
-            except (TypeError, ValueError):
-                logs = []
-            logs.append(log_marker)
             conn.execute(
                 "UPDATE collected_products SET status = ?, logs = ?, "
                 "suggested_price = COALESCE(?, suggested_price), updated_at = ? "
                 "WHERE sku = ?",
                 (
                     "PENDING",
-                    json.dumps(logs),
+                    append_log(row[1], log_marker),
                     float(opp.get("suggested_price") or 0) or None,
                     now,
                     sku,

@@ -19,6 +19,7 @@ These tests pin three contracts of
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Dict, List
 from unittest.mock import MagicMock
@@ -228,6 +229,57 @@ def test_external_discovery_filters_zero_market_and_low_margin(fake_db):
         db_path=fake_db,
     )
     assert opps == []
+
+
+def test_ingest_keeps_trailing_xml_history(tmp_path):
+    from src.plugins.terapeak_research.external_discovery import (
+        ingest_external_opportunity_as_pending,
+    )
+    from tests.test_logs_codec import TRAILING_XML
+
+    db_path = tmp_path / "ebay_collection.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE collected_products (
+                sku TEXT PRIMARY KEY,
+                status TEXT,
+                logs TEXT,
+                suggested_price REAL,
+                updated_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO collected_products (sku, status, logs) VALUES (?, ?, ?)",
+            ("XML-ENDED", "ENDED", TRAILING_XML),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert (
+        ingest_external_opportunity_as_pending(
+            {
+                "sku": "XML-ENDED",
+                "suggested_price": 99.0,
+                "opportunity_score": 70,
+                "margin_rate": 20,
+            },
+            db_path=str(db_path),
+        )
+        == "reactivated"
+    )
+    conn = sqlite3.connect(db_path)
+    try:
+        raw = conn.execute("SELECT logs FROM collected_products WHERE sku='XML-ENDED'").fetchone()[0]
+    finally:
+        conn.close()
+    loaded = json.loads(raw)
+    assert loaded[0] == "Category ID: 38208"
+    assert "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" in loaded[1]
+    assert loaded[-1].startswith("[MI_EXTERNAL_INGEST]")
 
 
 def test_ingest_external_opportunity_tristate(fake_db):

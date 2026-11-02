@@ -17,6 +17,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from src.utils.logs_codec import append_log
+
 APPLY_ENV_FLAG = "SEMANTIC_REWRITE_APPLY_ENABLED"
 # Automatic rewrite may touch title/description/aspects only — never categoryId.
 SEMANTIC_REWRITE_AUTOFIX_FIX_KEYS = frozenset({"title", "description", "aspects"})
@@ -1973,16 +1975,13 @@ def apply_rewrite(ebay, conn, plan: RewritePlan, *, cli_apply: bool = False) -> 
         opt["aspects"] = aspects
         if category_id:
             opt["categoryId"] = str(category_id)
-        logs = []
-        if row and row.get("logs"):
-            try:
-                logs = json.loads(row["logs"]) if isinstance(row["logs"], str) else list(row["logs"])
-            except Exception:
-                logs = []
-        logs.append({"event": "semantic_rewrite", "sku": plan.sku})
+        logs_json = append_log(
+            row.get("logs") if row else None,
+            {"event": "semantic_rewrite", "sku": plan.sku},
+        )
         conn.execute(
             "UPDATE collected_products SET optimization = ?, logs = ? WHERE sku = ?",
-            (json.dumps(opt, ensure_ascii=False), json.dumps(logs, ensure_ascii=False), plan.sku),
+            (json.dumps(opt, ensure_ascii=False), logs_json, plan.sku),
         )
         conn.commit()
     except Exception as db_exc:

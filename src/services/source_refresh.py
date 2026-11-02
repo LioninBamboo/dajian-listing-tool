@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Any, Iterable, Mapping
 
 from src.utils.dimension_helpers import extract_dajian_measurements
+from src.utils.logs_codec import append_log
 from src.utils.title_sanitizer import strip_supplier_brand_prefix
 
 
@@ -389,10 +390,11 @@ def apply_snapshot(conn, sku: str, snapshot: SourceSnapshot, drifts: list[dict[s
         return False
 
     row = conn.execute("SELECT logs FROM collected_products WHERE sku = ?", (sku,)).fetchone()
-    logs = _parse_json(row[0] if row else None, [])
     changed = ", ".join(sorted({d["field"] for d in drifts}))
-    logs.append(f"Source refresh at {datetime.now().isoformat()}: drift in [{changed}]")
-    updates["logs"] = json.dumps(logs, ensure_ascii=False)
+    updates["logs"] = append_log(
+        row[0] if row else None,
+        f"Source refresh at {datetime.now().isoformat()}: drift in [{changed}]",
+    )
 
     assignments = ", ".join(f"{column} = ?" for column in updates)
     conn.execute(

@@ -53,7 +53,7 @@ from src.utils.mi_draft_origin import (
     append_mi_draft_log,
 )
 from src.db.database_safety import assert_runtime_not_in_maintenance, validate_runtime_database
-from src.utils.task_result_status import classify_daily_task_outcome
+from src.utils.task_result_status import classify_daily_task_outcome, exit_code_for_task_results
 from src.utils.report_retention import cleanup_runtime_artifacts
 from src.utils.report_retention import purge_named_artifacts
 from src.utils.inventory_audit_contract import (
@@ -147,7 +147,7 @@ def analyze_collected_products(
 ) -> dict:
     """分析指定状态的产品并生成 READY 草稿。"""
     from src.db.collection_db import SessionLocal
-    from src.db.collection_models import CollectedProduct
+    from src.db.collection_models import CollectedProduct, CorruptLogs
     from src.services.pricing_engine import PricingEngine
     from sqlalchemy.orm.attributes import flag_modified
     from qwen_optimizer import QwenOptimizer, optimize_product_full_with_timeout
@@ -188,13 +188,15 @@ def analyze_collected_products(
             logger.warning(f"FactSheet connection unavailable: {fact_conn_error}")
         
         qwen = QwenOptimizer(api_key=QWEN_KEY)
-        
-        query = db.query(CollectedProduct).filter(CollectedProduct.status.in_(normalized_statuses))
+
+        candidate_query = db.query(CollectedProduct.id, CollectedProduct.sku).filter(
+            CollectedProduct.status.in_(normalized_statuses)
+        )
         if normalized_skus:
-            query = query.filter(CollectedProduct.sku.in_(normalized_skus))
-        products = query.all()
+            candidate_query = candidate_query.filter(CollectedProduct.sku.in_(normalized_skus))
+        candidates = candidate_query.all()
         
-        if not products:
+        if not candidates:
             logger.info(f"没有需要处理的 {', '.join(normalized_statuses)} 状态产品")
             return {
                 'success': 0,
@@ -202,20 +204,40 @@ def analyze_collected_products(
                 'requested': len(normalized_skus),
                 'matched': 0,
                 'prepared_skus': [],
+                'skipped_corrupt': 0,
+                'corrupt_skus': [],
+                'load_errors': 0,
             }
         
-        logger.info(f"发现 {len(products)} 个待处理产品")
+        logger.info(f"发现 {len(candidates)} 个待处理产品")
         
         success = 0
         failed = 0
         skipped = 0
+        skipped_corrupt = 0
+        load_errors = 0
         skip_reasons: dict[str, list[str]] = {}
         prepared_skus: list[str] = []
+        corrupt_skus: list[str] = []
         
-        for i, product in enumerate(products, 1):
-            logger.info(f"[{i}/{len(products)}] 处理 {product.sku}...")
+        for i, candidate in enumerate(candidates, 1):
+            product_id, sku = candidate[0], candidate[1]
+            product = None
+            logger.info(f"[{i}/{len(candidates)}] 处理 {sku}...")
             
             try:
+                product = (
+                    db.query(CollectedProduct)
+                    .filter(CollectedProduct.id == product_id)
+                    .one()
+                )
+                if isinstance(product.logs, CorruptLogs):
+                    reason = f"corrupt_logs:{product.logs.parse_status}"
+                    skip_reasons[sku] = [reason]
+                    skipped_corrupt += 1
+                    corrupt_skus.append(sku)
+                    logger.warning("skip %s %s (no write)", sku, reason)
+                    continue
                 # 1. 计算价格 — live cargo recheck when the supplier API is up,
                 #    then cheap publishability gates BEFORE any title/desc LLM.
                 from sqlalchemy.orm.attributes import flag_modified as _flag_modified
@@ -404,8 +426,12 @@ def analyze_collected_products(
                 
             except Exception as e:
                 logger.error(f"  ❌ 失败: {e}")
-                failed += 1
                 db.rollback()
+                if product is None:
+                    skip_reasons[sku] = [f"load_error:{type(e).__name__}"]
+                    load_errors += 1
+                    continue
+                failed += 1
                 product = db.merge(product)
                 product.status = "ERROR"
                 product.logs = (product.logs or []) + [
@@ -414,15 +440,21 @@ def analyze_collected_products(
                 flag_modified(product, 'logs')
                 db.commit()
         
-        logger.info(f"\n分析完成: 成功 {success}, 跳过文案 {skipped}, 失败 {failed}")
+        logger.info(
+            f"\n分析完成: 成功 {success}, 跳过文案 {skipped}, "
+            f"跳过损坏日志 {skipped_corrupt}, 加载失败 {load_errors}, 失败 {failed}"
+        )
         return {
             'success': success,
             'failed': failed,
             'skipped': skipped,
             'skip_reasons': skip_reasons,
-            'requested': len(normalized_skus) if normalized_skus else len(products),
-            'matched': len(products),
+            'requested': len(normalized_skus) if normalized_skus else len(candidates),
+            'matched': len(candidates),
             'prepared_skus': prepared_skus,
+            'skipped_corrupt': skipped_corrupt,
+            'corrupt_skus': corrupt_skus,
+            'load_errors': load_errors,
         }
     finally:
         if fact_sheet_conn is not None:
@@ -2679,15 +2711,14 @@ if __name__ == "__main__":
     try:
         task_results = main()
         outcome = classify_daily_task_outcome(task_results)
+        exit_code = exit_code_for_task_results(task_results)
         if outcome == 'partial_success':
             logger.warning(
-                "任务部分完成：仅存在逐 SKU 级失败（改价/库存同步）；"
+                "任务部分完成：仅存在逐 SKU 级失败（改价/库存同步/损坏日志）；"
                 "禁止全量补跑，应走定向重试"
             )
-            exit_code = 2
         elif outcome == 'failed':
             logger.error("任务结果包含业务失败，进程将返回非零退出码")
-            exit_code = 1
     except Exception as e:
         logger.error(f"脚本异常退出: {e}")
         import traceback

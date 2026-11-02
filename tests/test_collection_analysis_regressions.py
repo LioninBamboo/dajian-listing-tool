@@ -1038,6 +1038,7 @@ def test_daily_tasks_hallucination_retry(monkeypatch):
     # Mock database
     class DummyProduct:
         def __init__(self):
+            self.id = 1
             self.sku = "TEST_RETRY"
             self.status = "ERROR"
             self.title = "A basic chair"
@@ -1055,14 +1056,24 @@ def test_daily_tasks_hallucination_retry(monkeypatch):
     product = DummyProduct()
     
     class DummyQuery:
+        def __init__(self, entities=()):
+            self._entities = entities
+
         def filter(self, *args, **kwargs):
             return self
+
         def all(self):
+            keys = [getattr(entity, "key", None) for entity in self._entities]
+            if keys == ["id", "sku"]:
+                return [(product.id, product.sku)]
             return [product]
+
+        def one(self):
+            return product
             
     class DummySession:
         def query(self, *args, **kwargs):
-            return DummyQuery()
+            return DummyQuery(args)
         def merge(self, p):
             return p
         def commit(self):
