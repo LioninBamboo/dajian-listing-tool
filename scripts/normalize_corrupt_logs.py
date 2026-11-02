@@ -1,7 +1,8 @@
 """Opt-in repair for collected_products.logs cells that are JSON + trailing text.
 
-Dry-run by default. --apply needs --store, --confirm-count, a maintenance-lock
-check, and a fresh backup. Never run against a live store without Sergey's yes.
+Dry-run by default. --apply needs --store, --confirm-count, an active
+logs/_maintenance.lock (so daily_tasks/scheduler stay off the DB), and a
+fresh backup. Never run against a live store without Sergey's yes.
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.db.collection_db import DATABASE_PATH
-from src.db.database_safety import assert_runtime_not_in_maintenance
 from src.utils.db_backup import create_online_backup
 from src.utils.logs_codec import dump_logs, parse_logs
 
@@ -37,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Write logs. Requires --store, --confirm-count, and a fresh backup.",
+        help="Write logs. Requires --store, --confirm-count, an active maintenance lock, and a fresh backup.",
     )
     parser.add_argument("--store", choices=STORE_CHOICES, help="Which store this checkout is.")
     parser.add_argument(
@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--maintenance-lock",
         type=Path,
         default=None,
-        help="Path of logs/_maintenance.lock (defaults to PROJECT_ROOT/logs/_maintenance.lock).",
+        help="Path of logs/_maintenance.lock. --apply requires this file to exist.",
     )
     parser.add_argument(
         "--timestamp",
@@ -126,17 +126,26 @@ def _report_lines(rows: list[dict]) -> list[str]:
     return lines
 
 
+def _maintenance_lock_path(raw: Path | None) -> Path:
+    return Path(raw) if raw is not None else PROJECT_ROOT / "logs" / "_maintenance.lock"
+
+
+def require_maintenance_lock(path: Path) -> None:
+    """Operator write gate: --apply only while runtime is parked by the lock."""
+    lock = Path(path).resolve()
+    if not lock.is_file():
+        raise RuntimeError(
+            f"--apply requires an active maintenance lock at {lock} "
+            "(create logs/_maintenance.lock so daily_tasks/scheduler stay off the DB)"
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
     db_path = Path(args.db) if args.db is not None else Path(DATABASE_PATH)
-    maintenance_lock = (
-        Path(args.maintenance_lock)
-        if args.maintenance_lock is not None
-        else PROJECT_ROOT / "logs" / "_maintenance.lock"
-    )
-    assert_runtime_not_in_maintenance(maintenance_lock)
+    maintenance_lock = _maintenance_lock_path(args.maintenance_lock)
 
     conn = sqlite3.connect(str(db_path), timeout=30)
     try:
@@ -148,6 +157,12 @@ def main(argv: list[str] | None = None) -> int:
         if not args.apply:
             print("Dry-run: no writes. Pass --apply --store {main,gp,aqua} --confirm-count <n> to write.")
             return 0
+
+        try:
+            require_maintenance_lock(maintenance_lock)
+        except RuntimeError as exc:
+            print(f"{exc}; writing nothing.")
+            return 2
 
         if not args.store:
             parser.error("--apply requires --store {main,gp,aqua}")

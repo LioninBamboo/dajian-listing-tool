@@ -58,14 +58,16 @@ def _is_live(status: str, listing_id: str | None) -> bool:
 def _missing_description(optimization_raw: str | None) -> bool:
     try:
         opt = json.loads(optimization_raw) if optimization_raw else {}
-    except (TypeError, ValueError):
+        if not isinstance(opt, dict):
+            return False
+        desc = opt.get("description", "")
+        if not isinstance(desc, str):
+            desc = "" if desc is None else str(desc)
+        has_highlights = "KEY FEATURES" in desc
+        has_list = "<li" in desc.lower()
+        return not has_highlights or not has_list
+    except Exception:
         return False
-    if not isinstance(opt, dict):
-        return False
-    desc = opt.get("description", "")
-    has_highlights = "KEY FEATURES" in desc
-    has_list = "<li" in desc.lower()
-    return not has_highlights or not has_list
 
 
 def main(argv: list[str] | None = None) -> int:

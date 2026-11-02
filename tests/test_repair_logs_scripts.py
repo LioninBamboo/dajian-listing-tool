@@ -113,6 +113,30 @@ def test_repair_claim_dry_run_and_confirm_gate(tmp_path):
     assert after["LIVE1"][1] == before["LIVE1"][1]
 
 
+def test_repair_empty_skips_null_or_non_string_description(tmp_path):
+    from scripts.repair_empty_descriptions import main
+
+    db = _make_products_db(
+        tmp_path / "ebay_collection.db",
+        [
+            _row("NULL-DESC", status="READY", optimization=json.dumps({"description": None})),
+            _row("DICT-DESC", status="READY", optimization=json.dumps({"description": {"html": "<p>x</p>"}})),
+            _row(
+                "BAD-DESC",
+                status="READY",
+                listing_id=None,
+                optimization=json.dumps({"title": "Oak", "description": "<p>no list</p>"}),
+            ),
+        ],
+    )
+    before = db.read_bytes()
+    assert main(["--db", str(db)]) == 0
+    assert db.read_bytes() == before
+    after = _statuses(db)
+    assert after["NULL-DESC"][0] == "READY"
+    assert after["DICT-DESC"][0] == "READY"
+
+
 def test_normalize_dry_run_and_apply_only_logs(tmp_path):
     from scripts.normalize_corrupt_logs import main
 
@@ -124,7 +148,9 @@ def test_normalize_dry_run_and_apply_only_logs(tmp_path):
             _row("BAD2", status="COLLECTED", logs=TRAILING_XML, updated_at="2026-09-03"),
         ],
     )
-    lock = tmp_path / "_no_maintenance.lock"
+    missing_lock = tmp_path / "_no_maintenance.lock"
+    lock = tmp_path / "_maintenance.lock"
+    lock.write_text("parked for normalize\n", encoding="utf-8")
     backups = tmp_path / "backups"
     reports = tmp_path / "logs"
     common = [
@@ -140,7 +166,25 @@ def test_normalize_dry_run_and_apply_only_logs(tmp_path):
         "20261102_120000",
     ]
     before = _statuses(db)
-    assert main(common) == 0
+    assert main(["--db", str(db), "--maintenance-lock", str(missing_lock)]) == 0
+    assert _statuses(db) == before
+
+    assert (
+        main(
+            [
+                "--db",
+                str(db),
+                "--maintenance-lock",
+                str(missing_lock),
+                "--apply",
+                "--store",
+                "main",
+                "--confirm-count",
+                "2",
+            ]
+        )
+        == 2
+    )
     assert _statuses(db) == before
 
     assert main(common + ["--apply", "--store", "main", "--confirm-count", "99"]) == 2
