@@ -80,7 +80,15 @@ from src.utils.text_deletion_guard import (
     ordered_subsequence,
     tokenize_text,
 )
+from src.utils.source_checked_draft import (
+    local_draft_refusal,
+    run_draft_claim_guards,
+    validate_aspect_value,
+    validate_draft_title,
+)
 from src.utils.title_sanitizer import normalize_listing_title_for_ebay
+
+SOURCE_WRITE_KINDS = frozenset({"set_title", "set_aspect"})
 
 EXIT_OK = 0
 EXIT_REFUSED = 2
@@ -241,6 +249,7 @@ class SkuFieldEditContext:
     acquire_lock: Callable[..., Any] | None = None
     writer_timeouts: Mapping[str, int] | None = None
     lock_is_stale: Callable[..., bool] | None = None
+    fact_sheet_conn: Any = None
 
 
 @dataclass
@@ -410,6 +419,11 @@ def parse_cli_ops(raw_ops: Iterable[Mapping[str, Any]]) -> list[EditOp]:
             ops.append(EditOp(kind="set_from_file", field_name=field_name, path=path, raw=dict(item)))
         elif kind == "set_category":
             ops.append(EditOp(kind="set_category", category_id=str(item.get("category_id") or ""), raw=dict(item)))
+        elif kind == "set_title":
+            ops.append(EditOp(kind="set_title", text=str(item.get("title") or item.get("text") or ""), raw=dict(item)))
+        elif kind == "set_aspect":
+            name, value = parse_name_value(str(item.get("spec") or ""))
+            ops.append(EditOp(kind="set_aspect", aspect_name=name, aspect_value=value, raw=dict(item)))
         else:
             raise ToolRefused("field_not_editable")
     return ops
@@ -460,6 +474,21 @@ def parse_manifest_ops(raw_ops: Iterable[Mapping[str, Any]]) -> list[EditOp]:
                     raw=dict(item),
                 )
             )
+        elif kind == "set_title":
+            ops.append(
+                EditOp(
+                    kind="set_title",
+                    text=str(item.get("title") or item.get("text") or ""),
+                    raw=dict(item),
+                )
+            )
+        elif kind == "set_aspect":
+            if item.get("spec"):
+                name, value = parse_name_value(str(item.get("spec")))
+            else:
+                name = str(item.get("name") or item.get("aspect") or "")
+                value = str(item.get("value") or "")
+            ops.append(EditOp(kind="set_aspect", aspect_name=name, aspect_value=value, raw=dict(item)))
         else:
             field_name = str(item.get("field") or kind)
             if field_name in NEVER_EDITABLE_FIELDS or field_name in QTY_PRICE_FIELDS:
@@ -738,12 +767,163 @@ def _strip_title(title: str, claim: str) -> tuple[str, str]:
     return after, STATUS_WILL_STRIP
 
 
+def _has_source_write(ops: Iterable[EditOp] | None) -> bool:
+    return any(getattr(op, "kind", "") in SOURCE_WRITE_KINDS for op in (ops or []))
+
+
+def _args_have_source_write(cli_ops: Iterable[Mapping[str, Any]] | None, manifest: list[dict[str, Any]] | None) -> bool:
+    for item in cli_ops or []:
+        if str(item.get("kind") or "") in SOURCE_WRITE_KINDS:
+            return True
+    for entry in manifest or []:
+        for op in entry.get("ops") or []:
+            kind = str(op.get("op") or op.get("kind") or "").replace("-", "_")
+            if kind in SOURCE_WRITE_KINDS:
+                return True
+    return False
+
+
+def apply_source_write_ops(
+    plan: SkuPlan,
+    ops: list[EditOp],
+    ctx: SkuFieldEditContext,
+    args: Any,
+) -> SkuPlan:
+    """Replace a local-draft title/aspect when every write is GIGA-sourced."""
+    draft_reason = local_draft_refusal(plan.row)
+    if draft_reason:
+        return refuse(plan, draft_reason, draft_reason)
+    if getattr(args, "push_live", False):
+        return refuse(plan, "source_write_live_forbidden", "source_write_live_forbidden")
+
+    opt = deepcopy(plan.optimization_before)
+    aspects = _normalize_aspects(opt.get("aspects"))
+    description = str(opt.get("description") or "")
+    title = str(opt.get("title") or "")
+    changed = False
+    token_evidence: list[dict[str, Any]] = []
+    aspect_evidence: dict[str, dict[str, Any]] = {}
+
+    for op in ops:
+        plan.ops.append({"kind": op.kind, **{k: v for k, v in op.raw.items() if k != "kind"}})
+        if op.kind == "set_title":
+            new_title = str(op.text or "").replace("\r\n", "\n").replace("\r", "")
+            checked = validate_draft_title(new_title, plan.row)
+            token_evidence.extend(item.as_dict() for item in checked.evidence)
+            add_gate(plan, "title_source", checked.ok, checked.reason or ",".join(checked.unsourced))
+            if not checked.ok:
+                plan.diff["title"] = {
+                    "before": title,
+                    "after": new_title,
+                    "token_evidence": [item.as_dict() for item in checked.evidence],
+                }
+                return refuse(
+                    plan,
+                    checked.reason,
+                    checked.reason + (f":{','.join(checked.unsourced)}" if checked.unsourced else ""),
+                )
+            if new_title != title:
+                title = new_title
+                changed = True
+        elif op.kind == "set_aspect":
+            name = str(op.aspect_name or "").strip()
+            value = str(op.aspect_value or "").replace("\r", "").strip()
+            if not name:
+                return refuse(plan, "field_not_editable", "field_not_editable")
+            checked = validate_aspect_value(name, value, plan.row)
+            add_gate(plan, f"aspect_source:{name}", checked.ok, checked.reason or value)
+            if checked.evidence:
+                aspect_evidence[name] = checked.evidence[0].as_dict()
+            if not checked.ok:
+                plan.diff["aspects"] = {
+                    "before": deepcopy(aspects),
+                    "after": deepcopy(aspects),
+                    "source_evidence": {name: checked.evidence[0].as_dict() if checked.evidence else {}},
+                }
+                return refuse(
+                    plan,
+                    checked.reason,
+                    checked.reason + (f":{','.join(checked.unsourced)}" if checked.unsourced else ""),
+                )
+            key = find_aspect_key(aspects, name)
+            target_key = key or name
+            current = list(aspects.get(target_key) or [])
+            if current != [value]:
+                aspects = dict(aspects)
+                aspects[target_key] = [value]
+                changed = True
+        else:
+            return refuse(plan, "source_write_mixed_ops", "source_write_mixed_ops")
+
+    opt["description"] = description
+    opt["title"] = title
+    opt["aspects"] = aspects
+    preview = build_diff(plan.optimization_before, opt)
+    if "title" in preview:
+        preview["title"]["token_evidence"] = token_evidence
+    elif token_evidence:
+        preview["title"] = {
+            "before": str(plan.optimization_before.get("title") or ""),
+            "after": title,
+            "token_evidence": token_evidence,
+        }
+    if "aspects" in preview and aspect_evidence:
+        preview["aspects"]["source_evidence"] = aspect_evidence
+    plan.diff = preview
+
+    fact_conn = ctx.fact_sheet_conn
+    owned_conn = False
+    if fact_conn is None:
+        fact_conn = sqlite3.connect(":memory:")
+        owned_conn = True
+    try:
+        claim = run_draft_claim_guards(
+            fact_conn,
+            plan.row,
+            candidate_title=title,
+            candidate_description=description,
+            candidate_aspects=aspects,
+        )
+    finally:
+        if owned_conn:
+            fact_conn.close()
+    add_gate(plan, "claim_guard", claim.ok, claim.reason)
+    if not claim.ok:
+        return refuse(
+            plan,
+            claim.reason,
+            claim.reason + (f":{','.join(claim.unsourced)}" if claim.unsourced else ""),
+        )
+    if (
+        claim.reason == "fact_sheet_unavailable"
+        and getattr(args, "apply", False)
+        and not getattr(args, "allow_factsheet_unavailable", False)
+    ):
+        return refuse(plan, "fact_sheet_unavailable", "fact_sheet_unavailable")
+
+    plan.optimization_after = opt
+    if not changed:
+        plan.status = "already_absent"
+        plan.optimization_after = deepcopy(plan.optimization_before)
+        plan.db_changed = False
+        return plan
+
+    plan.db_changed = True
+    plan.status = "planned"
+    return plan
+
+
 def apply_ops(
     plan: SkuPlan,
     ops: list[EditOp],
     ctx: SkuFieldEditContext,
     args: Any,
 ) -> SkuPlan:
+    if _has_source_write(ops):
+        if any(op.kind not in SOURCE_WRITE_KINDS for op in ops):
+            return refuse(plan, "source_write_mixed_ops", "source_write_mixed_ops")
+        return apply_source_write_ops(plan, ops, ctx, args)
+
     opt = deepcopy(plan.optimization_before)
     aspects = _normalize_aspects(opt.get("aspects"))
     description = str(opt.get("description") or "")
@@ -1335,12 +1515,21 @@ def print_plan(plan: SkuPlan) -> None:
                 print(f"    removed: {unit}")
         elif field_name == "aspects":
             print(f"    removed={payload.get('removed')} added={payload.get('added')}")
+            if payload.get("source_evidence"):
+                print(f"    source_evidence={payload.get('source_evidence')}")
         elif field_name == "categoryId":
             print(f"    {payload.get('before')} → {payload.get('after')}")
         elif "unified" in payload:
             print(payload["unified"])
         else:
             print(f"    {payload.get('before')} → {payload.get('after')}")
+        if field_name == "title" and payload.get("token_evidence"):
+            if "unified" in payload:
+                print(f"    {payload.get('before')} → {payload.get('after')}")
+            for item in payload["token_evidence"]:
+                mark = "ok" if item.get("sourced") else "UNSOURCED"
+                extra = str(item.get("evidence") or "").strip()
+                print(f"    token {item.get('token')}: {mark}{(' ' + extra) if extra else ''}")
     for gate in plan.gates:
         mark = "ok" if gate.ok else "FAIL"
         print(f"  gate {gate.name}: {mark} {gate.reason}".rstrip())
@@ -1527,7 +1716,11 @@ def apply_live_ops(
         return after, units
 
     try:
+        if _has_source_write(ops):
+            return refuse(plan, "source_write_live_forbidden", "source_write_live_forbidden")
         for op in ops:
+            if op.kind in SOURCE_WRITE_KINDS:
+                return refuse(plan, "source_write_live_forbidden", "source_write_live_forbidden")
             if op.kind == "set_from_file" and op.field_name in QTY_PRICE_FIELDS:
                 return refuse(plan, "qty_price_not_editable", "qty_price_not_editable")
             if op.kind == "strip_claim":
@@ -2241,6 +2434,11 @@ def run_from_args(args: Any, ctx: SkuFieldEditContext | None = None) -> int:
             if not isinstance(manifest, list):
                 raise ToolRefused("field_not_editable")
         skus = collect_skus(args)
+        if _args_have_source_write(cli_ops, manifest):
+            if len(skus) != 1:
+                raise ToolRefused("source_write_single_sku_only")
+            if getattr(args, "push_live", False):
+                raise ToolRefused("source_write_live_forbidden")
         profile = ctx.profile if ctx and ctx.profile is not None else get_store_profile()
         ctx = ctx or SkuFieldEditContext(
             db_path=Path(DATABASE_PATH),

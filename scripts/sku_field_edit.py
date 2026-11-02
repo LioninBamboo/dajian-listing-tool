@@ -41,6 +41,12 @@ class _OpAction(argparse.Action):
         if flag == "--set-category":
             ops.append({"kind": "set_category", "category_id": values})
             return
+        if flag == "--set-title":
+            ops.append({"kind": "set_title", "title": values})
+            return
+        if flag == "--set-aspect":
+            ops.append({"kind": "set_aspect", "spec": values})
+            return
         parser.error(f"unknown edit flag {flag}")
 
 
@@ -49,7 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
         prog="sku_field_edit.py",
         description=(
             "Dry-run-first editor for one SKU (or an explicit list). "
-            "Default is dry-run: no DB or eBay writes."
+            "Default is dry-run: no DB or eBay writes. "
+            "--set-title / --set-aspect are source-checked writes for local "
+            "drafts only (READY/COLLECTED/DRAFT and other rows without a "
+            "listing_id). They refuse PUBLISHED/ENDED rows, never call eBay, "
+            "and require every content token or aspect value to appear in the "
+            "stored GIGA source."
         ),
     )
     parser.add_argument("--store", required=True, choices=("main", "gp", "aqua"))
@@ -70,11 +81,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--remove-aspect", action=_OpAction)
     parser.add_argument("--set-from-file", action=_OpAction, help="FIELD=PATH")
+    parser.add_argument(
+        "--set-title",
+        action=_OpAction,
+        help=(
+            "Replace a local-draft optimization title. Must be <=80 chars, "
+            "non-empty, no HTML; every content token must appear in the GIGA "
+            "source (unit-aware). Single SKU only; use --apply to write."
+        ),
+    )
+    parser.add_argument(
+        "--set-aspect",
+        action=_OpAction,
+        help=(
+            "Set/replace one draft item specific as NAME=VALUE. VALUE must "
+            "exactly equal the same or equivalent source attribute/spec "
+            "(Material/Frame Material/Main Material/Upholstery Material, "
+            "Color/Colour), or one whole comma/slash/and list item. "
+            "Substrings do not count. No named source field → "
+            "aspect_no_named_source. Dimensions still unit-convert. "
+            "Brand/MPN/UPC/EAN/ISBN refused. Repeatable. Local drafts only."
+        ),
+    )
     parser.add_argument("--set-category", action=_OpAction)
     parser.add_argument("--manifest", help="JSON list of per-SKU ops; cannot mix with CLI ops")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--push-live", action="store_true")
     parser.add_argument("--allow-category", action="store_true")
+    parser.add_argument(
+        "--allow-factsheet-unavailable",
+        action="store_true",
+        help=(
+            "Required with --apply when FactSheet status is unavailable. "
+            "Dry-run still reports gate reason fact_sheet_unavailable."
+        ),
+    )
     parser.add_argument(
         "--allow-multi-unit",
         action="store_true",

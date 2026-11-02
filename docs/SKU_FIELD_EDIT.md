@@ -12,8 +12,8 @@ Operator-only CLI that edits **one SKU** (or an explicit `--skus` list, max 50) 
 - `--apply` 只写本地库。要推 eBay 必须同时给 `--push-live`，且发生在库写成功并回读通过之后。
 - Automatic online SQLite backup before the first write. On Main this is a full copy of `ebay_collection.db` (about 200 MB). Keep a short retention window under `deploy_backup/sku_edit_*`.
 - 第一次写入前做在线 SQLite 备份。Main 库整库约 200 MB；`deploy_backup/sku_edit_*` 请做短期留存。
-- Text edits are **deletion-only**. There is no `--allow-add` in v1.
-- 文本编辑只允许删除。v1 没有 `--allow-add`。
+- Text edits are **deletion-only**, except the local-draft source-checked write mode below.
+- 文本编辑只允许删除。唯一例外是下面的本地草稿来源校验写入（`--set-title` / `--set-aspect`）。
 - Category edits require `--allow-category` plus the high-fee / leaf / lock / required-aspect gates.
 - 改类目必须 `--allow-category`，并经过高费、叶子、锁定、目标必填项门禁。
 - Quantity, price, status, listing_id, images, source GIGA fields are never editable.
@@ -37,7 +37,34 @@ python scripts/sku_field_edit.py --store main --sku W465140910 \
 python scripts/sku_field_edit.py --store main --sku W465P341531 \
   --strip-claim plywood --location features \
   --apply --push-live --note "claim scrub"
+
+# Local-draft source-checked title rewrite (dry-run default)
+python scripts/sku_field_edit.py --store main --sku W2615P429613 \
+  --set-title 'Wall Mounted Narrow Bathroom Cabinet 12" with 2 Open Shelves, Sintered Stone Top'
+
+# Same write, plus a sourced item specific
+python scripts/sku_field_edit.py --store main --sku W2615P429613 \
+  --set-title 'Wall Mounted Narrow Bathroom Cabinet 12" with 2 Open Shelves, Sintered Stone Top' \
+  --set-aspect "Mounting=Wall Mounted" --apply --note "source-checked draft title"
+# Mounting=VALUE requires a Mounting (or exact-name) source attribute/spec.
 ```
+
+### Local-draft source-checked writes / 本地草稿来源校验写入
+
+`--set-title` and `--set-aspect` replace draft `optimization` fields when the new text is grounded in the stored GIGA source (row `title`, HTML description, attributes, specs). This is the only add/replace path.
+
+`--set-title` / `--set-aspect` 用 GIGA 源文本校验后改草稿 `optimization`。这是唯一允许新增/替换标题或 item specific 的路径。
+
+- **Local drafts only.** Statuses such as READY / COLLECTED / DRAFT are allowed. PUBLISHED, ENDED, or any row with a `listing_id` is refused (`published_not_editable` / `listing_id_present`).
+- **仅本地草稿。** READY / COLLECTED / DRAFT 等可写。PUBLISHED、ENDED、或带 `listing_id` 的行一律拒绝。
+- **One SKU per invocation.** `--push-live` is refused (`source_write_live_forbidden`); no eBay API calls.
+- **每次只改一个 SKU。** 禁止 `--push-live`，不调 eBay。
+- Title rules: length ≤ 80, non-empty, no HTML, existing banned-term QC, every content token must appear in source (word boundary, simple plural/stem, unit-aware `12"` / `12 in` / `12-inch`). `in` is inches only at end of text or before punctuation / `x` / a dimension word — not in `N-in-1` / `N in 1` or `12 in White`. Neutral connectors (`with`, `and`, `for`, `of`, `the`, `a`, `in`, `&`, `-`, `,`) are configurable via `SKU_FIELD_EDIT_TITLE_CONNECTORS`; `set` is not a connector. Compound leftovers are allowlisted only (`countertop`/`tabletop`→`top`, `bookshelf`→`shelf`). `Set of N` / `N-Piece` / `N Pack` / `N-Pcs` in a title must match the same count in source (`Set of N` or `N pcs/pieces/pack`). A bare `N + plural noun` (`4 Dining Chairs`) is also a count claim and must match that noun count or a count phrase with the same number (`4 legs` does not source `4 Chairs`). Attribute/spec values `No`/`None`/`False`/`N/A`/empty/`0` do not evidence their key words in titles. Then FactSheet / claim-guard runs; unsourced claims block. FactSheet `unavailable` is reported as `fact_sheet_unavailable` (not `pass`) and blocks `--apply` unless `--allow-factsheet-unavailable`.
+- 标题：≤80、非空、无 HTML、走已有违禁词；每个内容词必须在源里。`in` 仅在句末或标点/`x`/尺寸词前视为英寸。连接词不含 `set`。复合词仅白名单。套装数量短语和「数字+复数名词」都必须对上源里的同一数量。否定属性值不能给标题里的键名当证据。`unavailable` 记 `fact_sheet_unavailable`，`--apply` 默认拦截。
+- Aspect `NAME=VALUE` must exactly equal the same or equivalent source attribute/spec (case/whitespace/hyphen normalized), or one whole comma/slash/`and` list item. `Material=Leather` is refused against `PU Leather` / `Faux Leather`; `Color=White` is refused against `Off-White`. No named/equivalent source field → `aspect_no_named_source` (no whole-source fallback). Dimension keys still match the corresponding source dimension with unit conversion. Copying an exact negative named spec is allowed (`Assembly Required=No` when the spec is `No`). Protected keys refused: Brand, MPN, UPC, EAN, ISBN, Manufacturer Part Number.
+- item specific 必须与同名/等价源字段整值相等（或列表中的完整一项）；没有该源字段就 `aspect_no_named_source`。尺寸键仍走对应维 + 单位换算。否定规格可以原样复制，但不能给标题词当证据。Brand/MPN/UPC/EAN/ISBN 拒绝写入。
+- Same safety as the rest of the tool: dry-run default, explicit `--apply`, maintenance / DB lock, online backup + `field_edit_report` JSON, readback, non-zero exit on refusal. Never touches image URLs (GigaB2B `x-cc` / `x-cu` / `x-ct` / `x-cs` stay intact).
+- 安全约定与现有模式相同：默认 dry-run、`--apply` 才写、维护锁、备份+JSON 报告、回读、拒绝非 0 退出。绝不改图片 URL。
 
 `--store` must match the loaded profile (`main` = AquaVerve inventory, `gp` = GrovePop inventory, `aqua` = AquaRides trading site 100). The tool never writes `.env` or `config/store_profile*.yaml`.
 

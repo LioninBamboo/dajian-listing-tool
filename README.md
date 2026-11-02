@@ -23,7 +23,10 @@ python scheduler_daemon.py --status
 python server.py
 streamlit run app.py --server.port 8501
 python tools/refresh_token.py
+python scripts/sku_field_edit.py --help
 ```
+
+`scripts/sku_field_edit.py` is the dry-run-first single-SKU editor. Deletion-only for published/live rows; `--set-title` / `--set-aspect` are source-checked local-draft writes. See `docs/SKU_FIELD_EDIT.md`.
 
 Windows helpers:
 
