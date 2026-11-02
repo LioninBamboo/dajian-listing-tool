@@ -56,10 +56,19 @@ def fix_product(sku):
     current_count = len((item.get('product') or {}).get('imageUrls') or [])
     print(f'{sku}: eBay currently has {current_count} images')
 
-    # Upload to EPS and use eBay-hosted URLs (raw GigaB2B URLs are unreliable).
-    eps_urls = ebay_client.upload_images_to_eps(images, max_images=24)
+    # Upload via Media API and use eBay-hosted URLs (raw GigaB2B URLs are unreliable).
+    from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
+
+    try:
+        eps_urls = ebay_client.upload_images_to_eps(images, max_images=24)
+    except MediaApiScopeError as scope_err:
+        print(f'{sku}: {scope_err}')
+        return False
+    except MediaImageUploadError as upload_err:
+        print(f'{sku}: image upload failed: {upload_err}')
+        return False
     if not eps_urls:
-        print(f'{sku}: EPS upload returned 0 images, abort')
+        print(f'{sku}: Media API upload returned 0 images, abort')
         return False
     print(f'{sku}: Uploaded {len(eps_urls)} images to EPS')
 

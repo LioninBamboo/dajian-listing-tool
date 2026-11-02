@@ -12,7 +12,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import json
-import os
 import logging
 import re
 import time
@@ -388,6 +387,9 @@ class RealEbayClient:
         # else on EBAY_US (the default).
         self.marketplace_id = get_store_profile().ebay_marketplace_id
         self.session = create_ebay_session()
+        from src.clients.ebay_media_images import EbayMediaImageUploader
+
+        self.media_images = EbayMediaImageUploader(oauth_service)
 
     def _complete_listing_policies(self, existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Return listingPolicies with required business policy IDs present."""
@@ -432,14 +434,28 @@ class RealEbayClient:
         live_hosted_urls = [url for url in live_image_urls if is_ebay_hosted_image_url(url)]
 
         logging.info(
-            f"[IMAGES] {sku}: converting {len(cleaned_urls)} source image URLs to eBay EPS before inventory PUT"
+            f"[MEDIA] {sku}: converting {len(cleaned_urls)} source image URLs via Media API before inventory PUT"
         )
-        eps_urls = normalize_inventory_image_urls(
-            self.upload_images_to_eps(cleaned_urls, max_images=max_images),
-            max_images=max_images,
-        )
+        from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
 
-        chosen_urls = eps_urls if len(eps_urls) >= len(live_hosted_urls) else live_hosted_urls
+        try:
+            eps_urls = normalize_inventory_image_urls(
+                self.upload_images_to_eps(cleaned_urls, max_images=max_images),
+                max_images=max_images,
+            )
+        except MediaApiScopeError:
+            raise
+        except MediaImageUploadError:
+            if live_hosted_urls:
+                logging.warning(
+                    f"[MEDIA] {sku}: Media API upload failed; keeping {len(live_hosted_urls)} live hosted image URL(s)"
+                )
+                chosen_urls = live_hosted_urls
+            else:
+                raise
+        else:
+            chosen_urls = eps_urls
+
         if not chosen_urls:
             raise ValueError(f"{sku}: unable to prepare stable eBay-hosted image URLs")
 
@@ -1906,170 +1922,33 @@ class RealEbayClient:
 
 
     def upload_picture(self, image_url: str) -> Optional[str]:
+        """Deprecated wrapper over Media API createImageFromUrl.
+
+        Trading UploadSiteHostedPictures (release 1489, 2026-10-26) is gone.
+        Publish paths must use upload_images_to_eps / Media API directly.
         """
-        Upload a picture to eBay's Picture Services (EPS) via UploadSiteHostedPictures.
-        
-        Downloads the image from the source URL and uploads it to eBay,
-        returning a permanent eBay-hosted URL (https://i.ebayimg.com/...).
-        
-        Args:
-            image_url: Source image URL (e.g., GigaCloud CDN)
-            
-        Returns:
-            eBay-hosted image URL, or None on failure
-        """
+        if not image_url or not str(image_url).strip():
+            return None
+        from src.clients.ebay_media_images import MediaApiScopeError, media_url_prefix
+
         try:
-            # 1. Download the image
-            resp = requests.get(image_url, timeout=30, stream=True, verify=False)
-            if resp.status_code != 200:
-                logging.warning(f"[EPS] Failed to download image: HTTP {resp.status_code} from {image_url[:80]}")
-                return None
-            
-            image_data = resp.content
-            content_type = resp.headers.get('Content-Type', 'image/jpeg')
-            
-            # Validate it's actually an image
-            if not content_type.startswith('image/'):
-                logging.warning(f"[EPS] Not an image: {content_type} from {image_url[:80]}")
-                return None
-            
-            try:
-                image_data, content_type, (width, height) = normalize_eps_image_data(
-                    image_data,
-                    content_type,
-                )
-            except Exception as image_exc:
-                logging.warning(f"[EPS] Failed to prepare image for EPS: {image_exc}")
-                return None
-
-            if len(image_data) > EPS_MAX_IMAGE_BYTES:
-                logging.warning(
-                    f"[EPS] Image too large after normalization: {len(image_data)} bytes from {image_url[:80]}"
-                )
-                return None
-
-            if width < EPS_MIN_IMAGE_SIDE or height < EPS_MIN_IMAGE_SIDE:
-                logging.warning(
-                    f"[EPS] Image too small after normalization ({width}x{height}) from {image_url[:80]}"
-                )
-                return None
-            
-            # 2. Build XML request
-            xml_request = """<?xml version="1.0" encoding="utf-8"?>
-<UploadSiteHostedPicturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-    <ErrorLanguage>en_US</ErrorLanguage>
-    <WarningLevel>High</WarningLevel>
-    <PictureName>product_image</PictureName>
-    <PictureSet>Supersize</PictureSet>
-</UploadSiteHostedPicturesRequest>"""
-            
-            # 3. Get OAuth token
-            token = self.oauth.get_valid_token()
-            
-            # 4. Build Trading API headers
-            app_id = os.environ.get('EBAY_APP_ID', '')
-            dev_id = os.environ.get('EBAY_DEV_ID', '')
-            cert_id = os.environ.get('EBAY_CERT_ID', '')
-            
-            env = self.oauth.environment.lower()
-            api_endpoint = "https://api.ebay.com/ws/api.dll" if env == "production" else "https://api.sandbox.ebay.com/ws/api.dll"
-            
-            # 5. Build multipart/form-data with XML + binary image
-            boundary = "MIME_boundary_eBay_image_upload"
-            body = (
-                f"--{boundary}\r\n"
-                f"Content-Disposition: form-data; name=\"XML Payload\"\r\n"
-                f"Content-Type: text/xml;charset=utf-8\r\n\r\n"
-                f"{xml_request}\r\n"
-                f"--{boundary}\r\n"
-                f"Content-Disposition: form-data; name=\"image\"; filename=\"image.jpg\"\r\n"
-                f"Content-Type: {content_type}\r\n"
-                f"Content-Transfer-Encoding: binary\r\n\r\n"
-            ).encode('utf-8') + image_data + f"\r\n--{boundary}--\r\n".encode('utf-8')
-            
-            headers = {
-                "X-EBAY-API-COMPATIBILITY-LEVEL": "967",
-                "X-EBAY-API-CALL-NAME": "UploadSiteHostedPictures",
-                "X-EBAY-API-SITEID": "0",
-                "X-EBAY-API-IAF-TOKEN": token,
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "Content-Length": str(len(body)),
-            }
-            
-            # 6. Upload
-            resp = requests.post(api_endpoint, headers=headers, data=body, timeout=60, verify=False)
-            
-            if resp.status_code != 200:
-                logging.error(f"[EPS] Upload failed: HTTP {resp.status_code}")
-                return None
-            
-            # 7. Parse response XML for the hosted URL
-            import xml.etree.ElementTree as ET
-            root = ET.fromstring(resp.text)
-            ns = {'ebay': 'urn:ebay:apis:eBLBaseComponents'}
-            
-            ack = root.find('ebay:Ack', ns)
-            if ack is not None and ack.text in ('Success', 'Warning'):
-                pic_data = root.find('.//ebay:SiteHostedPictureDetails', ns)
-                if pic_data is not None:
-                    full_url = pic_data.find('ebay:FullURL', ns)
-                    if full_url is not None and full_url.text:
-                        logging.info(f"[EPS] Uploaded: {full_url.text[:80]}")
-                        return full_url.text
-            
-            # Parse errors
-            errors = root.findall('.//ebay:Errors', ns)
-            for err in errors:
-                code = err.find('ebay:ErrorCode', ns)
-                msg = err.find('ebay:LongMessage', ns)
-                logging.error(f"[EPS] Error {code.text if code is not None else '?'}: {msg.text if msg is not None else '?'}")
-            
+            media = self.media_images.upload_one(image_url)
+            return media.image_url
+        except MediaApiScopeError:
+            raise
+        except Exception as exc:
+            logging.error("[MEDIA] upload_picture failed for %s: %s", media_url_prefix(image_url), exc)
             return None
-            
-        except Exception as e:
-            logging.error(f"[EPS] Exception uploading image: {e}")
-            return None
-    
+
     def upload_images_to_eps(self, image_urls: List[str], max_images: int = 24) -> List[str]:
+        """Host every source URL via the Media API. All-or-nothing per SKU.
+
+        Already-hosted i.ebayimg.com URLs pass through. A single failure raises
+        MediaImageUploadError (ValueError) and never returns a partial mix.
         """
-        Upload multiple images to eBay EPS, returning eBay-hosted URLs.
-        Skips failed uploads to avoid mixed EPS/non-EPS URL errors.
+        from src.clients.ebay_media_images import upload_images_via_media
 
-        Args:
-            image_urls: List of source image URLs
-            max_images: Maximum number of images to upload (eBay limit used by this app: 24)
-
-        Returns:
-            List of eBay-hosted image URLs (only successfully uploaded)
-        """
-        eps_urls = []
-        for i, url in enumerate(image_urls[:max_images]):
-            clean_url = clean_image_url(url) if url else ""
-            if not clean_url:
-                continue
-
-            # Try to upload to EPS with retry for SSL errors
-            eps_url = None
-            for attempt in range(3):
-                eps_url = self.upload_picture(url)
-                if not eps_url:
-                    eps_url = self.upload_picture(clean_url)
-                if eps_url:
-                    break
-                logging.warning(f"[EPS] Upload attempt {attempt+1}/3 failed for image {i+1}, retrying in {3*(attempt+1)}s...")
-                time.sleep(3 * (attempt + 1))
-
-            if eps_url:
-                eps_urls.append(eps_url)
-            else:
-                # Do NOT fall back to non-EPS URL — eBay rejects mixed sets
-                logging.warning(f"[EPS] Upload failed for image {i+1} after 3 attempts, skipping (no fallback)")
-
-            # Rate limit
-            if i < len(image_urls[:max_images]) - 1:
-                time.sleep(0.5)
-
-        return eps_urls
+        return upload_images_via_media(self.media_images, image_urls, max_images=max_images)
 
 
 # Factory function for easy initialization

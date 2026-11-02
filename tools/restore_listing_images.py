@@ -75,10 +75,19 @@ def restore_one(sku: str, ebay_client, oauth: EbayOAuthService) -> bool:
         print(f"[{sku}] already has enough images, no-op")
         return True
 
-    # Upload DB images to EPS so eBay hosts them permanently.
-    eps_urls = ebay_client.upload_images_to_eps(src_images, max_images=24)
+    # Upload DB images via Media API so eBay hosts them permanently.
+    from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
+
+    try:
+        eps_urls = ebay_client.upload_images_to_eps(src_images, max_images=24)
+    except MediaApiScopeError as scope_err:
+        print(f"[{sku}] {scope_err}")
+        return False
+    except MediaImageUploadError as upload_err:
+        print(f"[{sku}] image upload failed: {upload_err}")
+        return False
     if not eps_urls:
-        print(f"[{sku}] EPS upload returned 0 images, abort")
+        print(f"[{sku}] Media API upload returned 0 images, abort")
         return False
     print(f"[{sku}] uploaded {len(eps_urls)} images to EPS")
 

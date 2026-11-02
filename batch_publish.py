@@ -5,7 +5,7 @@ Robust Batch Publisher — Publish all READY products to eBay
 Features:
   1. Dajian API dimension enrichment (auto-fetch missing L/W/H/Weight)
   2. Terapeak market-aware smart pricing
-  3. Image upload to eBay EPS (permanent hosting)
+  3. Image upload via eBay Media API (permanent EPS hosting)
   4. Auto category matching + required aspect completion
   5. Price validation against cost + margin
   6. Robust error handling with retries & auto-fix
@@ -103,6 +103,7 @@ from src.services.listing_publish_readback import (
     verify_publish_readback,
 )
 from src.clients.real_ebay_client import PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT
+from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
 # ─── Logging ───────────────────────────────────────────────────
 LOG_DIR = PROJECT_ROOT / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -253,6 +254,13 @@ def is_tree_unavailable_hold(result):
     if not isinstance(result, dict):
         return False
     return result.get("action") == "hold_tree_unavailable"
+
+
+def is_media_scope_abort(result):
+    """True when a Media API scope failure should abort the rest of the batch."""
+    if not isinstance(result, dict):
+        return False
+    return result.get("action") == "abort_media_scope"
 
 
 def record_error(sku: str, error_msg: str):
@@ -1878,16 +1886,27 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             policy_manager = EbayPolicyManager(oauth)
             ebay_client = RealEbayClient(oauth, policy_manager)
 
-            # Upload images to EPS (once — reuse on retries)
+            # Upload images via Media API (once — reuse on retries)
             if eps_images is None:
                 raw_images = product.get('images', [])[:publish_image_limit]
                 if raw_images:
                     logger.info(f"  Preparing {len(raw_images)} stable image URLs...")
-                    eps_images = ebay_client._prepare_inventory_image_urls(
-                        sku,
-                        raw_images,
-                        max_images=publish_image_limit,
-                    )
+                    try:
+                        eps_images = ebay_client._prepare_inventory_image_urls(
+                            sku,
+                            raw_images,
+                            max_images=publish_image_limit,
+                        )
+                    except MediaApiScopeError as scope_err:
+                        record_error(sku, str(scope_err))
+                        raise
+                    except MediaImageUploadError as upload_err:
+                        msg = (
+                            f"image upload failed: {upload_err.uploaded_count} of "
+                            f"{len(raw_images)} images: {upload_err.reasons_text()}"
+                        )
+                        record_error(sku, msg)
+                        return {"status": "error", "message": msg}
                     logger.info(f"  Images: {len(eps_images)}/{len(raw_images)} ready")
                 else:
                     eps_images = []
@@ -2100,6 +2119,16 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 "qc_evidence_refs": qc_result.get("evidence_refs", []),
             }
 
+        except MediaApiScopeError:
+            raise
+        except MediaImageUploadError as upload_err:
+            msg = (
+                f"image upload failed: {upload_err.uploaded_count} of "
+                f"{len(product.get('images', [])[:publish_image_limit])} images: "
+                f"{upload_err.reasons_text()}"
+            )
+            record_error(sku, msg)
+            return {"status": "error", "message": msg}
         except Exception as e:
             last_error = str(e)
             logger.warning(f"  [Attempt {attempt+1}/{MAX_RETRIES}] {last_error[:300]}")
@@ -2515,6 +2544,9 @@ def main():
 
         try:
             result = publish_single_product(product, dry_run=args.dry_run)
+        except MediaApiScopeError as e:
+            logger.error(f"  MEDIA SCOPE: {e}")
+            result = {"status": "error", "message": str(e), "action": "abort_media_scope"}
         except Exception as e:
             logger.error(f"  UNHANDLED: {e}")
             logger.error(traceback.format_exc())
@@ -2531,6 +2563,13 @@ def main():
         else:
             fail += 1
             logger.error(f"  FAIL: {result['message']}\n")
+
+        if is_media_scope_abort(result):
+            logger.error(
+                "Media API scope refused; stopping batch: %s",
+                result.get("message"),
+            )
+            break
 
         if is_tree_unavailable_hold(result):
             logger.error(
@@ -2558,11 +2597,13 @@ def main():
         for r in results:
             if r['status'] == 'error':
                 logger.info(f"  {r['sku']}: {r['message'][:120]}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main() or 0)
     except Exception as e:
         logging.error(f"FATAL: {e}")
         logging.error(traceback.format_exc())

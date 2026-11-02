@@ -513,7 +513,14 @@ def main():
             if live_image_urls and len(live_image_urls) >= max(1, expected_count - 1):
                 image_urls_for_put = list(live_image_urls)
             elif db_images:
-                image_urls_for_put = ebay.upload_images_to_eps(db_images, max_images=24) or list(live_image_urls)
+                from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
+
+                try:
+                    image_urls_for_put = ebay.upload_images_to_eps(db_images, max_images=24) or list(live_image_urls)
+                except MediaApiScopeError:
+                    raise
+                except MediaImageUploadError:
+                    image_urls_for_put = list(live_image_urls)
             else:
                 image_urls_for_put = list(live_image_urls)
             live_quantity = (
