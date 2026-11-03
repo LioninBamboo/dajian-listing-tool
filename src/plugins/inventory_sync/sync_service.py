@@ -9,9 +9,11 @@
 import sys
 import os
 import json
+import math
 import sqlite3
 import logging
 import time
+from decimal import Decimal
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -105,6 +107,231 @@ def _env_float(name: str, default: float) -> float:
     return parsed if parsed >= 0 else default
 
 
+# Inventory sync may write an eBay price only when the GIGA base-cost move is
+# material, or when the live listing is below the existing cost floor.
+# Values are USD. SYNC_PRICE_CHANGE_PCT is a percent (2 → 2%), not a ratio.
+SYNC_PRICE_CHANGE_PCT = 2.0
+SYNC_PRICE_CHANGE_MIN_USD = 1.0
+PRICE_WRITE_BASE_COST_KEY = "price_write_base_cost"
+_LISTING_PRICE_META_KEYS = (
+    "selling_price",
+    "market_avg_price",
+    "pricing_strategy",
+    "repriced_at",
+    "health_repriced_at",
+    PRICE_WRITE_BASE_COST_KEY,
+)
+
+
+def sync_price_change_pct() -> float:
+    return _env_float("SYNC_PRICE_CHANGE_PCT", SYNC_PRICE_CHANGE_PCT)
+
+
+def sync_price_change_min_usd() -> float:
+    return _env_float("SYNC_PRICE_CHANGE_MIN_USD", SYNC_PRICE_CHANGE_MIN_USD)
+
+
+def parse_usd(value) -> Optional[float]:
+    """Parse a USD amount. None / blank / NaN / inf / non-numeric → None."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def baseline_base_cost(cost_breakdown) -> Optional[float]:
+    """Cost at the last eBay price write, not the last sync's refreshed cost.
+
+    Small GIGA drifts must accumulate against this baseline. Using the cost
+    stored on the previous sync would reset the delta every day and never
+    cross the 2% / $1 thresholds.
+    """
+    if isinstance(cost_breakdown, str):
+        try:
+            cost_breakdown = json.loads(cost_breakdown)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+    if not isinstance(cost_breakdown, dict):
+        return None
+    written = parse_usd(cost_breakdown.get(PRICE_WRITE_BASE_COST_KEY))
+    if written is not None and written > 0:
+        return written
+    stored = parse_usd(cost_breakdown.get("base_cost"))
+    if stored is not None and stored > 0:
+        return stored
+    return None
+
+
+def is_material_base_cost_change(
+    old_base_cost,
+    new_base_cost,
+    *,
+    pct_threshold: Optional[float] = None,
+    min_usd: Optional[float] = None,
+) -> bool:
+    """True iff |Δ| / old > pct/100 AND |Δ| > min_usd. Both strictly greater."""
+    old = parse_usd(old_base_cost)
+    new = parse_usd(new_base_cost)
+    if old is None or new is None or old <= 0 or new < 0:
+        return False
+    if pct_threshold is None:
+        pct_threshold = sync_price_change_pct()
+    if min_usd is None:
+        min_usd = sync_price_change_min_usd()
+    try:
+        pct_threshold = float(pct_threshold)
+        min_usd = float(min_usd)
+    except (TypeError, ValueError):
+        pct_threshold = SYNC_PRICE_CHANGE_PCT
+        min_usd = SYNC_PRICE_CHANGE_MIN_USD
+    if not math.isfinite(pct_threshold) or not math.isfinite(min_usd):
+        pct_threshold = SYNC_PRICE_CHANGE_PCT
+        min_usd = SYNC_PRICE_CHANGE_MIN_USD
+    old_d = Decimal(str(old))
+    new_d = Decimal(str(new))
+    delta = abs(new_d - old_d)
+    pct = delta / old_d
+    return (
+        pct > (Decimal(str(pct_threshold)) / Decimal("100"))
+        and delta > Decimal(str(min_usd))
+    )
+
+
+def listing_price_below_cost_floor(
+    live_price, product_price, shipping_cost
+) -> bool:
+    """True when the live listing fails the existing 10% cost-floor guard.
+
+    Uses PricingEngine.assert_safe_price + MIN_NET_MARGIN_ON_COST as-is
+    (1-cent tolerance). Unknown live / cost → False (no write).
+    """
+    live = parse_usd(live_price)
+    product = parse_usd(product_price)
+    shipping = parse_usd(shipping_cost)
+    if live is None or live <= 0 or product is None or product <= 0:
+        return False
+    if shipping is None:
+        shipping = 0.0
+    if shipping < 0:
+        return False
+    try:
+        from src.services.pricing_engine import PricingEngine
+
+        landed = PricingEngine.calculate_dajian_cost(product, shipping)[
+            "total_dajian_cost"
+        ]
+        ok, _reason = PricingEngine.assert_safe_price(
+            live,
+            landed,
+            safety_margin=float(PricingEngine.MIN_NET_MARGIN_ON_COST),
+        )
+    except Exception:
+        return False
+    return not ok
+
+
+def resolve_current_listing_price(
+    product: Optional[Dict], live_offer_price=None
+) -> Optional[float]:
+    """Live listing price for the floor check.
+
+    Prefer the last price smart reprice wrote (cost_breakdown.selling_price),
+    then a live eBay offer. Never use collected_products.suggested_price —
+    that column is the sync 15% target and is the stale DB=$230.74 in
+    ``eBay=$202.46 vs DB=$230.74``.
+    """
+    if isinstance(product, dict):
+        injected = parse_usd(product.get("live_price"))
+        if injected is not None and injected > 0:
+            return injected
+        breakdown = product.get("cost_breakdown")
+        if isinstance(breakdown, str):
+            try:
+                breakdown = json.loads(breakdown)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                breakdown = None
+        if isinstance(breakdown, dict):
+            selling = parse_usd(breakdown.get("selling_price"))
+            if selling is not None and selling > 0:
+                return selling
+    live = parse_usd(live_offer_price)
+    if live is not None and live > 0:
+        return live
+    return None
+
+
+@dataclass(frozen=True)
+class SyncPriceDecision:
+    write: bool
+    reason: str
+    new_base_cost: Optional[float] = None
+    baseline_base_cost: Optional[float] = None
+    live_price: Optional[float] = None
+
+
+def decide_sync_price_action(
+    *,
+    giga_product_price,
+    giga_shipping_cost,
+    cost_breakdown,
+    live_listing_price,
+    pct_threshold: Optional[float] = None,
+    min_usd: Optional[float] = None,
+) -> SyncPriceDecision:
+    """Decide whether inventory sync may write an eBay price.
+
+    Rule 1: material GIGA base-cost change vs last price-write baseline.
+    Rule 2: live listing below the existing cost floor.
+    Otherwise keep the live price. Store-agnostic (main / GP / Aqua).
+    """
+    product = parse_usd(giga_product_price)
+    if product is None or product <= 0:
+        return SyncPriceDecision(False, "no_price_data")
+
+    if giga_shipping_cost is None or (
+        isinstance(giga_shipping_cost, str) and not giga_shipping_cost.strip()
+    ):
+        shipping = 0.0
+    else:
+        shipping = parse_usd(giga_shipping_cost)
+        if shipping is None or shipping < 0:
+            return SyncPriceDecision(False, "unknown_cost")
+
+    new_base = product + shipping
+    baseline = baseline_base_cost(cost_breakdown)
+    live = parse_usd(live_listing_price)
+    if live is not None and live <= 0:
+        live = None
+
+    if is_material_base_cost_change(
+        baseline, new_base, pct_threshold=pct_threshold, min_usd=min_usd
+    ):
+        return SyncPriceDecision(
+            True, "material_cost_change", new_base, baseline, live
+        )
+
+    if listing_price_below_cost_floor(live, product, shipping):
+        return SyncPriceDecision(True, "below_floor", new_base, baseline, live)
+
+    if baseline is None:
+        return SyncPriceDecision(False, "unknown_cost", new_base, None, live)
+
+    if abs(new_base - baseline) > 0:
+        return SyncPriceDecision(
+            False, "small_cost_change", new_base, baseline, live
+        )
+    return SyncPriceDecision(False, "no_change", new_base, baseline, live)
+
+
 def _is_transient_dajian_connect_error(error: Exception) -> bool:
     message = str(error)
     transient_markers = (
@@ -145,6 +372,9 @@ class InventorySyncService:
         self.last_sync_scope_count = 0
         self.last_sync_skipped_count = 0
         self.last_coverage_report: Optional[CoverageReport] = None
+        self.price_writes = 0
+        self.small_cost_change_skipped = 0
+        self.floor_raises = 0
         self._init_sync_table()
 
     def _connect(self) -> sqlite3.Connection:
@@ -334,20 +564,88 @@ class InventorySyncService:
         
         return count
     
-    def update_product_cost_in_db(self, sku: str, new_price: float, 
-                                   shipping_cost: float, new_selling_price: float):
-        """更新数据库中的 cost_breakdown 和 suggested_price"""
+    def _incr_price_counter(self, name: str) -> None:
+        setattr(self, name, getattr(self, name, 0) + 1)
+
+    def _reset_price_counters(self) -> None:
+        self.price_writes = 0
+        self.small_cost_change_skipped = 0
+        self.floor_raises = 0
+
+    def _load_cost_breakdown(self, sku: str) -> Dict:
+        try:
+            conn = self._connect()
+            row = conn.execute(
+                "SELECT cost_breakdown FROM collected_products WHERE sku = ?",
+                (str(sku),),
+            ).fetchone()
+            conn.close()
+        except Exception:
+            return {}
+        if not row or not row[0]:
+            return {}
+        raw = row[0]
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _merge_cost_breakdown(
+        self,
+        sku: str,
+        new_price: float,
+        shipping_cost: float,
+        *,
+        listing_price: Optional[float] = None,
+        price_write_base: Optional[float] = None,
+        refresh_write_baseline: bool = False,
+    ) -> Dict:
         from src.services.pricing_engine import PricingEngine
-        
-        conn = self._connect()
-        cur = conn.cursor()
-        
-        # 重新计算完整成本分解
+
+        existing = self._load_cost_breakdown(sku)
         is_oversize = True  # 大件商品默认超大
         cost_breakdown = PricingEngine.calculate_dajian_cost(
             new_price, shipping_cost, is_oversize=is_oversize
         )
-        
+        for key in _LISTING_PRICE_META_KEYS:
+            if key in existing:
+                cost_breakdown[key] = existing[key]
+        if listing_price is not None:
+            cost_breakdown["selling_price"] = float(listing_price)
+        if refresh_write_baseline and price_write_base is not None and price_write_base > 0:
+            cost_breakdown[PRICE_WRITE_BASE_COST_KEY] = float(price_write_base)
+        else:
+            seeded = parse_usd(cost_breakdown.get(PRICE_WRITE_BASE_COST_KEY))
+            if seeded is None or seeded <= 0:
+                seed = parse_usd(price_write_base)
+                if seed is None or seed <= 0:
+                    seed = parse_usd(existing.get("base_cost"))
+                if seed is not None and seed > 0:
+                    cost_breakdown[PRICE_WRITE_BASE_COST_KEY] = seed
+        return cost_breakdown
+
+    def update_product_cost_in_db(self, sku: str, new_price: float, 
+                                   shipping_cost: float, new_selling_price: float):
+        """更新数据库中的 cost_breakdown 和 suggested_price"""
+        sku = str(sku)
+        product = parse_usd(new_price)
+        shipping = parse_usd(shipping_cost)
+        if product is None:
+            product = 0.0
+        if shipping is None:
+            shipping = 0.0
+        cost_breakdown = self._merge_cost_breakdown(
+            sku,
+            product,
+            shipping,
+            listing_price=new_selling_price,
+            price_write_base=product + shipping,
+            refresh_write_baseline=True,
+        )
+
+        conn = self._connect()
+        cur = conn.cursor()
         cur.execute("""
             UPDATE collected_products 
             SET cost_breakdown = ?, suggested_price = ?
@@ -357,6 +655,47 @@ class InventorySyncService:
         conn.commit()
         conn.close()
         self.logger.info(f"  已更新 {sku} 数据库: 成本={json.dumps(cost_breakdown)}, 售价=${new_selling_price:.2f}")
+
+    def update_stored_cost_fields(
+        self,
+        sku: str,
+        new_price: float,
+        shipping_cost: float,
+        *,
+        baseline_base_cost_value: Optional[float] = None,
+        listing_price: Optional[float] = None,
+    ) -> None:
+        """Refresh GIGA cost fields without touching the live listing price.
+
+        ``suggested_price`` stays at the last eBay write / 15% target.
+        ``selling_price`` is kept (or recorded from a live offer read) so the
+        next floor check uses the real listing price, not suggested_price.
+        ``price_write_base_cost`` is seeded from the last write baseline so
+        later $0.30 drifts can accumulate.
+        """
+        sku = str(sku)
+        product = parse_usd(new_price)
+        shipping = parse_usd(shipping_cost)
+        if product is None:
+            return
+        if shipping is None:
+            shipping = 0.0
+        live = parse_usd(listing_price)
+        cost_breakdown = self._merge_cost_breakdown(
+            sku,
+            product,
+            shipping,
+            listing_price=live if live is not None and live > 0 else None,
+            price_write_base=baseline_base_cost_value,
+            refresh_write_baseline=False,
+        )
+        conn = self._connect()
+        conn.execute(
+            "UPDATE collected_products SET cost_breakdown = ? WHERE sku = ?",
+            (json.dumps(cost_breakdown), sku),
+        )
+        conn.commit()
+        conn.close()
 
     def _get_total_cost_for_sku(self, sku: str) -> Optional[float]:
         """读取 SKU 的总到岸成本 (cost_breakdown.total_dajian_cost).
@@ -1297,6 +1636,37 @@ class InventorySyncService:
         
         return selling_price['selling_price']
     
+    def _resolve_listing_price(self, sku: str, product: Optional[Dict]) -> Optional[float]:
+        resolved = resolve_current_listing_price(product, live_offer_price=None)
+        if resolved is not None:
+            return resolved
+        try:
+            offer = self.get_live_offer_price(str(sku))
+        except Exception as exc:
+            self.logger.debug("%s: live offer price unavailable: %s", sku, exc)
+            return None
+        return resolve_current_listing_price(product, live_offer_price=offer)
+
+    def _refresh_stored_cost_on_skip(
+        self,
+        sku: str,
+        current_price,
+        shipping_cost,
+        decision: SyncPriceDecision,
+    ) -> None:
+        if decision.new_base_cost is None or parse_usd(current_price) is None:
+            return
+        try:
+            self.update_stored_cost_fields(
+                sku,
+                current_price,
+                shipping_cost if shipping_cost is not None else 0,
+                baseline_base_cost_value=decision.baseline_base_cost,
+                listing_price=decision.live_price,
+            )
+        except Exception as exc:
+            self.logger.warning(f"  {sku}: stored cost refresh failed: {exc}")
+
     def _check_and_update_price(
         self,
         sku: str,
@@ -1306,32 +1676,56 @@ class InventorySyncService:
         dry_run: bool,
     ) -> Optional[float]:
         """
-        检查大建价格是否变化，如有变化则更新 eBay 售价和数据库。
+        检查大建价格是否变化，仅在成本实质变动或现价低于成本底时改 eBay。
 
         Returns:
             新售价（float）如果更新了，否则 None。
         """
-        # 价格数据不可用 → 跳过价格对比（安全保护：不能用 0 去计算售价）
-        if current_price is None or current_price <= 0:
+        sku = str(sku) if sku is not None else sku
+        live_price = self._resolve_listing_price(sku, product)
+        decision = decide_sync_price_action(
+            giga_product_price=current_price,
+            giga_shipping_cost=shipping_cost,
+            cost_breakdown=(product or {}).get("cost_breakdown"),
+            live_listing_price=live_price,
+            pct_threshold=sync_price_change_pct(),
+            min_usd=sync_price_change_min_usd(),
+        )
+
+        if decision.reason == "small_cost_change":
+            baseline = decision.baseline_base_cost or 0.0
+            new_base = decision.new_base_cost or 0.0
+            self.logger.debug(
+                f"  {sku}: small cost change skipped "
+                f"(baseline=${baseline:.2f} new=${new_base:.2f} "
+                f"Δ=${abs(new_base - baseline):.2f})"
+            )
+            self._incr_price_counter("small_cost_change_skipped")
+
+        if not decision.write:
+            if not dry_run:
+                self._refresh_stored_cost_on_skip(
+                    sku, current_price, shipping_cost, decision
+                )
             return None
 
-        old_cost = product.get('cost_breakdown', {})
-        old_base_cost = old_cost.get('base_cost', 0) or 0
-
-        new_base_cost = current_price + (shipping_cost or 0)
-
-        # 必须有旧成本作为对比基准，且差异超过阈值
-        if old_base_cost <= 0 or abs(new_base_cost - old_base_cost) <= 0.01:
+        product_price = parse_usd(current_price)
+        ship = parse_usd(shipping_cost) or 0.0
+        if product_price is None:
             return None
-
-        new_selling_price = self.calculate_new_price(current_price, shipping_cost or 0)
+        new_selling_price = self.calculate_new_price(product_price, ship)
 
         if not dry_run:
             ebay_ok = self.update_ebay_price(sku, new_selling_price)
             if ebay_ok:
                 verified, live_price = self.verify_ebay_price(sku, new_selling_price)
                 if verified:
-                    self.update_product_cost_in_db(sku, current_price, shipping_cost or 0, new_selling_price)
+                    self.update_product_cost_in_db(
+                        sku, product_price, ship, new_selling_price
+                    )
+                    self._incr_price_counter("price_writes")
+                    if decision.reason == "below_floor":
+                        self._incr_price_counter("floor_raises")
                 else:
                     self.logger.warning(
                         f"  {sku}: eBay 改价返回成功但未通过 live 校验 "
@@ -1341,6 +1735,10 @@ class InventorySyncService:
             else:
                 self.logger.warning(f"  {sku}: eBay 改价失败，跳过 DB 更新以保持数据一致")
                 raise RuntimeError(f"eBay price update failed for {sku}")
+        else:
+            self._incr_price_counter("price_writes")
+            if decision.reason == "below_floor":
+                self._incr_price_counter("floor_raises")
 
         return new_selling_price
     
@@ -1383,6 +1781,7 @@ class InventorySyncService:
             同步结果列表
         """
         results = []
+        self._reset_price_counters()
         products = self.load_live_sync_products(
             live_listings=live_listings,
             fetch_complete=fetch_complete,
@@ -1449,7 +1848,12 @@ class InventorySyncService:
             except Exception as e:
                 self.logger.error(f"同步 {sku} 出错: {e}")
                 results.append(SyncResult(sku=sku, action='error', message=str(e)))
-        
+
+        self.logger.info(
+            f"price_writes={getattr(self, 'price_writes', 0)} "
+            f"small_cost_change_skipped={getattr(self, 'small_cost_change_skipped', 0)} "
+            f"floor_raises={getattr(self, 'floor_raises', 0)}"
+        )
         return results
     
     def _sync_single_product(self, product: Dict, dry_run: bool, 
