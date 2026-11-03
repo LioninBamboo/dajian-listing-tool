@@ -163,6 +163,11 @@ _GENERIC_MATERIAL_MEMBERS: dict[str, frozenset[str]] = {
         "mdf", "particle board", "particleboard", "melamine", "plywood",
         "chipboard", "fiberboard", "osb", "veneer", "composite wood",
     }),
+    # Owner rule 2026-11-03: rubberwood / eucalyptus / acacia count as solid
+    # wood. MDF / particleboard / veneer / engineered wood do not.
+    "solid wood": frozenset({
+        "rubberwood", "rubber wood", "eucalyptus", "acacia", "hardwood",
+    }),
     # HDPE/polyethylene is what "PE rattan" is made of. Requiring a PE member
     # keeps a polyester+PU tent claiming HDPE flagged (W2505P427760).
     "hdpe": frozenset({

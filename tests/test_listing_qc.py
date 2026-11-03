@@ -601,6 +601,54 @@ def test_motors_blocks_invented_capacity_against_source(monkeypatch):
     assert not any(item.startswith("[Fitment]") for item in result["blockers"])
 
 
+def test_motors_blocks_invented_load_and_keeps_source_range(monkeypatch):
+    _forbid_furniture_gate(monkeypatch)
+    invented = listing_qc.run_listing_qc(
+        sku="LOAD-CHAIR",
+        candidate={
+            "title": "Universal Chair supports up to 45 lb",
+            "description": "Supports up to 45 lb.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal"]},
+        },
+        source_title="Chair",
+        source_description="Steel chair. No load figure.",
+        qc_profile="motors",
+    )
+    assert invented["status"] == "blocked"
+    assert any("semantic_capacity" in item and "45" in item for item in invented["blockers"])
+
+    ranged = listing_qc.run_listing_qc(
+        sku="OCC-TENT",
+        candidate={
+            "title": "Universal 6 person tent",
+            "description": "6 person tent.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal"]},
+        },
+        source_title="4-6 person tent",
+        source_description="Occupancy 4-6 person.",
+        qc_profile="motors",
+    )
+    assert ranged["status"] == "blocked"
+    assert any("semantic_capacity" in item and "6" in item for item in ranged["blockers"])
+    assert any("4-6" in item for item in ranged["blockers"])
+
+    keep = listing_qc.run_listing_qc(
+        sku="OCC-KEEP",
+        candidate={
+            "title": "Universal 4-6 person tent",
+            "description": "4-6 person tent.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal"]},
+        },
+        source_title="4-6 person tent",
+        source_description="Occupancy 4-6 person.",
+        qc_profile="motors",
+    )
+    assert not any("semantic_capacity" in item for item in keep["blockers"])
+
+
 def test_motors_universal_fit_still_blocks_claim_invent(monkeypatch):
     _forbid_furniture_gate(monkeypatch)
     result = listing_qc.run_listing_qc(

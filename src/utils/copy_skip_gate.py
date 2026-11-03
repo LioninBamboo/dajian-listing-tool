@@ -8,8 +8,12 @@ dimensions, materials, or Year/Make/Model.
 Reason codes (stored on the product log and ``cost_breakdown``):
 
 - ``blacklist_seller`` — SKU matches N735* / W1706* / ZL* / known skip-seller prefixes
-- ``cargo_cost_over_cap`` — supplier product + cargo (shipping) > MAX_SUPPLIER_CARGO_COST_USD
-  (env, default USD 250; legacy alias ``cargo_cost_over_200``)
+- ``cargo_cost_over_cap`` — supplier product unit price (goods value, shipping
+  excluded) > MAX_SUPPLIER_CARGO_COST_USD (env, default USD 250; legacy alias
+  ``cargo_cost_over_200``). $250.00 passes; $250.01 fails.
+- ``product_price_missing`` — product unit price is None / empty / non-positive
+- ``product_price_unreadable`` — product unit price is present but not numeric
+- ``unsupported_currency`` — a non-USD currency reached the goods-value gate
 - ``unclear_dims`` — item L/W/H missing, placeholder, or not source-grounded
 - ``far_above_market`` — a real market median exists and the SAFE_15 price
   still sits above the near-market band (median × 1.30). When
@@ -45,8 +49,8 @@ from src.utils.listing_fact_sheet import (
 # skip-seller prefixes (matched at the start of the SKU).
 SKIP_SELLER_PREFIXES: tuple[str, ...] = ("N735", "W1706", "ZL")
 
-# Supplier product price + cargo/shipping. Insurance and payment fees are
-# not part of this cap.
+# Goods-value cap is product unit price only (Sergey 2026-11-03: 不包运费).
+# Shipping still feeds SAFE_15 / landed-cost / margin math via supplier_cargo_cost.
 def _load_cargo_cap(default: float = 250.0) -> float:
     """Read MAX_SUPPLIER_CARGO_COST_USD from env, falling back to the repo .env."""
     raw = os.getenv("MAX_SUPPLIER_CARGO_COST_USD")
@@ -78,9 +82,38 @@ REASON_BLACKLIST_SELLER = "blacklist_seller"
 REASON_CARGO_COST = "cargo_cost_over_cap"
 REASON_CARGO_COST_LEGACY = "cargo_cost_over_200"  # legacy alias
 CARGO_COST_REASONS: frozenset[str] = frozenset({REASON_CARGO_COST, REASON_CARGO_COST_LEGACY})
+REASON_PRODUCT_PRICE_MISSING = "product_price_missing"
+REASON_PRODUCT_PRICE_UNREADABLE = "product_price_unreadable"
+REASON_UNSUPPORTED_CURRENCY = "unsupported_currency"
 REASON_UNCLEAR_DIMS = "unclear_dims"
 REASON_FAR_ABOVE = "far_above_market"
 REASON_MATERIAL_CONFLICT = "factsheet_material_conflict"
+
+_CURRENCY_KEYS = (
+    "currency",
+    "Currency",
+    "price_currency",
+    "priceCurrency",
+    "_currency",
+    "_supplier_currency",
+)
+_CURRENCY_CODES = frozenset(
+    {"USD", "EUR", "GBP", "CNY", "JPY", "CAD", "AUD", "HKD", "MXN", "TWD", "KRW"}
+)
+_SYMBOL_TO_CODE = {"$": "USD", "€": "EUR", "£": "GBP"}
+_PRICE_TOKEN_RE = re.compile(
+    r"""
+    ^\s*
+    (?:(?P<prefix_code>USD|EUR|GBP|CNY|JPY|CAD|AUD|HKD|MXN|TWD|KRW)\s*)?
+    (?P<symbol>[$€£¥])?
+    \s*
+    (?P<num>-?\d{1,3}(?:,\d{3})*(?:\.\d+)?|-?\d+(?:\.\d+)?)
+    \s*
+    (?:(?P<suffix_code>USD|EUR|GBP|CNY|JPY|CAD|AUD|HKD|MXN|TWD|KRW))?
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 _TRUTHY_ENV = {"1", "true", "yes", "on"}
 
@@ -170,10 +203,119 @@ def seller_is_blacklisted(sku: str) -> bool:
 def _as_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
+    if isinstance(value, bool):
+        return None
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def _currency_from_maps(*sources: Mapping[str, Any] | None) -> str | None:
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in _CURRENCY_KEYS:
+            raw = source.get(key)
+            if raw in (None, ""):
+                continue
+            text = str(raw).strip()
+            if text:
+                return text
+    return None
+
+
+def parse_supplier_unit_price(value: Any) -> tuple[float | None, str | None, str | None]:
+    """Parse a GIGA product unit price.
+
+    Returns ``(amount, currency_from_value, error_reason)``.
+    ``error_reason`` is ``REASON_PRODUCT_PRICE_MISSING`` or
+    ``REASON_PRODUCT_PRICE_UNREADABLE`` when the amount cannot be used.
+    Currency is only set when the value itself names one (``$220``, ``EUR 99``).
+    """
+    if value is None or value == "":
+        return None, None, REASON_PRODUCT_PRICE_MISSING
+    if isinstance(value, bool):
+        return None, None, REASON_PRODUCT_PRICE_UNREADABLE
+    if isinstance(value, (int, float)):
+        number = _as_float(value)
+        if number is None:
+            return None, None, REASON_PRODUCT_PRICE_UNREADABLE
+        if number <= 0:
+            return None, None, REASON_PRODUCT_PRICE_MISSING
+        return number, None, None
+    text = str(value).strip()
+    if not text:
+        return None, None, REASON_PRODUCT_PRICE_MISSING
+    match = _PRICE_TOKEN_RE.match(text.replace("\u00a0", " "))
+    if not match:
+        return None, None, REASON_PRODUCT_PRICE_UNREADABLE
+    raw_num = match.group("num").replace(",", "")
+    number = _as_float(raw_num)
+    if number is None:
+        return None, None, REASON_PRODUCT_PRICE_UNREADABLE
+    if number <= 0:
+        return None, None, REASON_PRODUCT_PRICE_MISSING
+    code = (match.group("prefix_code") or match.group("suffix_code") or "").strip().upper() or None
+    symbol = match.group("symbol") or ""
+    if symbol == "¥" and not code:
+        return number, "¥", None
+    if symbol and not code:
+        code = _SYMBOL_TO_CODE.get(symbol)
+        if code is None:
+            return number, symbol, None
+    return number, code, None
+
+
+def evaluate_goods_value_cap(
+    product_price: Any,
+    *,
+    currency: Any = None,
+    specs: Mapping[str, Any] | None = None,
+    attributes: Mapping[str, Any] | None = None,
+    apply: bool = True,
+) -> tuple[list[str], dict[str, Any]]:
+    """Compare product unit price only against MAX_SUPPLIER_CARGO_COST_USD.
+
+    Shipping is ignored. Multiple independent failures are all reported;
+    ranking is missing → unreadable → unsupported currency → over cap.
+    Missing currency is treated as USD (GIGA default). A present non-USD
+    currency always blocks. When ``apply`` is False (eBay-listing drafts
+    without a live GIGA quote) the cap is not applied.
+    """
+    amount, value_ccy, parse_err = parse_supplier_unit_price(product_price)
+    explicit = None if currency in (None, "") else str(currency).strip()
+    mapped = _currency_from_maps(specs, attributes)
+    named = explicit or mapped or value_ccy
+    detail: dict[str, Any] = {}
+    if amount is not None:
+        detail["supplier_product_price_usd"] = round(amount, 2)
+    if named:
+        detail["supplier_price_currency"] = named
+
+    if not apply:
+        return [], detail
+
+    reasons: list[str] = []
+    if parse_err == REASON_PRODUCT_PRICE_MISSING:
+        reasons.append(REASON_PRODUCT_PRICE_MISSING)
+    elif parse_err == REASON_PRODUCT_PRICE_UNREADABLE:
+        reasons.append(REASON_PRODUCT_PRICE_UNREADABLE)
+    if named:
+        currency_err = PricingEngine.assert_usd_currency(named)
+        if currency_err:
+            reasons.append(REASON_UNSUPPORTED_CURRENCY)
+            detail["currency_reason"] = currency_err
+        elif str(named).strip() == "¥":
+            reasons.append(REASON_UNSUPPORTED_CURRENCY)
+            detail["currency_reason"] = "unsupported_currency:¥"
+    if parse_err is None and amount is not None and amount > MAX_SUPPLIER_CARGO_COST_USD:
+        reasons.append(REASON_CARGO_COST)
+        detail["goods_value_cap_usd"] = MAX_SUPPLIER_CARGO_COST_USD
+    return reasons, detail
 
 
 def supplier_cargo_cost(product_price: Any, shipping: Any) -> float | None:
@@ -194,8 +336,8 @@ def supplier_cargo_cost(product_price: Any, shipping: Any) -> float | None:
 def lookup_live_supplier_quote(sku: str) -> dict[str, Any] | None:
     """Live DaJian price + shipping when credentials exist. Never raises.
 
-    Returns ``{"price": float, "shipping": float}`` or None. A missing quote
-    must not be treated as zero cost.
+    Returns ``{"price": float, "shipping": float, "currency": str?}`` or None.
+    A missing quote must not be treated as zero cost.
     """
     key = os.getenv("DAJIAN_API_KEY")
     secret = os.getenv("DAJIAN_API_SECRET")
@@ -218,6 +360,9 @@ def lookup_live_supplier_quote(sku: str) -> dict[str, Any] | None:
         quote["price"] = price
     if shipping is not None and shipping >= 0 and "price" in quote:
         quote["shipping"] = shipping
+    ccy = info.get("currency")
+    if ccy not in (None, ""):
+        quote["currency"] = str(ccy).strip()
     return quote or None
 
 
@@ -234,6 +379,13 @@ def apply_live_supplier_quote(product: Any, quote: Mapping[str, Any] | None) -> 
     if shipping is not None and shipping >= 0 and _as_float(getattr(product, "shipping", None)) != shipping:
         product.shipping = shipping
         changed = True
+    ccy = quote.get("currency")
+    if ccy not in (None, ""):
+        specs = dict(getattr(product, "specs", None) or {})
+        if specs.get("_supplier_currency") != str(ccy).strip():
+            specs["_supplier_currency"] = str(ccy).strip()
+            product.specs = specs
+            changed = True
     return changed
 
 
@@ -460,6 +612,7 @@ def evaluate_copy_skip(
     include_market: bool = True,
     dims_mode: str = "require",
     apply_cargo: bool = True,
+    currency: Any = None,
 ) -> CopySkipDecision:
     """Return every cheap skip reason that already applies.
 
@@ -481,8 +634,15 @@ def evaluate_copy_skip(
     cargo = supplier_cargo_cost(product_price, shipping)
     if cargo is not None:
         detail["supplier_cargo_cost_usd"] = round(cargo, 2)
-        if apply_cargo and cargo > MAX_SUPPLIER_CARGO_COST_USD:
-            reasons.append(REASON_CARGO_COST)
+    cap_reasons, cap_detail = evaluate_goods_value_cap(
+        product_price,
+        currency=currency,
+        specs=specs,
+        attributes=attributes,
+        apply=apply_cargo,
+    )
+    detail.update(cap_detail)
+    reasons.extend(cap_reasons)
 
     dims, saw_placeholder = resolve_item_dimensions(attributes, specs, description)
     detail["item_dims"] = {axis: dims.get(axis) for axis in ("length", "width", "height")}
@@ -527,6 +687,9 @@ def evaluate_copy_skip(
     # Stable order even if a caller inspects a partial evaluation.
     order = (
         REASON_BLACKLIST_SELLER,
+        REASON_PRODUCT_PRICE_MISSING,
+        REASON_PRODUCT_PRICE_UNREADABLE,
+        REASON_UNSUPPORTED_CURRENCY,
         REASON_CARGO_COST,
         REASON_UNCLEAR_DIMS,
         REASON_MATERIAL_CONFLICT,

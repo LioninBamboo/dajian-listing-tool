@@ -54,7 +54,7 @@
 | 原因码 | 何时跳过文案 |
 |--------|----------------|
 | `blacklist_seller` | SKU 前缀命中 N735* / W1706* / ZL* 或已知跳过卖家 |
-| `cargo_cost_over_200` | 供应商货价 + 运费 > USD 200（有大建实时报价时先用报价） |
+| `cargo_cost_over_cap` | 供应商货值（产品单价，不含运费）> `MAX_SUPPLIER_CARGO_COST_USD`（默认 USD 250；`$250.00` 过，`$250.01` 不过）。缺价 / 非数字 / 非 USD 分别记 `product_price_missing` / `product_price_unreadable` / `unsupported_currency` |
 | `unclear_dims` | 源数据里没有可信的物品长宽高（占位值、缺失都不许编造；包装/箱规尺寸不能填成组装尺寸） |
 | `far_above_market` | 已有市场中位价，且 SAFE_15 仍高于近市价带（中位 × 1.15，与 dry-run 的超价带一致） |
 | `factsheet_material_conflict` | 源字段与标题之间已有确定性材质冲突，不需要 LLM 发明事实表 |

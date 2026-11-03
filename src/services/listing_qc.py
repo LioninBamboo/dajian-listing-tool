@@ -149,8 +149,9 @@ _COLOR_RE = re.compile(
 )
 _COLOR_CANONICAL = {"grey": "gray"}
 _CAPACITY_RE = re.compile(
-    r"\b(?P<num>\d+(?:\.\d+)?)\s*(?:(?:-|–|to)\s*\d+(?:\.\d+)?\s*)?"
-    r"(?P<unit>persons?|people|seats?|seaters?|occupants?|gallons?|gals?|quarts?|liters?|litres?)\b",
+    r"\b(?P<num>\d+(?:\.\d+)?)(?:\s*(?:-|–|to)\s*(?P<num2>\d+(?:\.\d+)?))?\s*"
+    r"(?P<unit>persons?|people|seats?|seaters?|occupants?|gallons?|gals?|"
+    r"quarts?|liters?|litres?|lbs?|pounds?)\b",
     re.IGNORECASE,
 )
 _OCCUPANCY_UNITS = {
@@ -161,6 +162,7 @@ _VOLUME_UNITS = {
     "gallon", "gallons", "gal", "gals", "quart", "quarts",
     "liter", "liters", "litre", "litres",
 }
+_LOAD_UNITS = {"lb", "lbs", "pound", "pounds"}
 
 
 def _plain_blob(*parts: object) -> str:
@@ -231,6 +233,8 @@ def _capacity_family(unit: str) -> str:
         return "occupancy"
     if lowered in _VOLUME_UNITS:
         return "volume"
+    if lowered in _LOAD_UNITS:
+        return "load"
     return ""
 
 
@@ -241,6 +245,18 @@ def _capacity_number(raw: str) -> str:
     return f"{value:g}"
 
 
+def _capacity_token(num: str, num2: str | None = None) -> str:
+    first = _capacity_number(num)
+    if num2:
+        return f"{first}-{_capacity_number(num2)}"
+    return first
+
+
+def _capacity_sort_key(token: str) -> float:
+    head = str(token or "").split("-", 1)[0]
+    return float(head)
+
+
 def _capacity_mentions(text: str) -> list[tuple[str, str, str]]:
     mentions: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -248,7 +264,7 @@ def _capacity_mentions(text: str) -> list[tuple[str, str, str]]:
         family = _capacity_family(match.group("unit"))
         if not family:
             continue
-        number = _capacity_number(match.group("num"))
+        number = _capacity_token(match.group("num"), match.group("num2"))
         key = (number, family)
         if key in seen:
             continue
@@ -336,7 +352,7 @@ def motors_deterministic_fact_violations(
         if number in known:
             continue
         if known:
-            evidence = ", ".join(sorted(known, key=float))
+            evidence = ", ".join(sorted(known, key=_capacity_sort_key))
             severity = "CRITICAL"
             claim_text = f"{raw} (source: {evidence})"
         else:

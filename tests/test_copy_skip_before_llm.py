@@ -77,9 +77,12 @@ def test_blacklist_cargo_dims_and_material_reasons():
     ok = _decision(sku="N710P100001", include_market=False)
     assert REASON_BLACKLIST_SELLER not in ok.reasons
 
-    cargo = _decision(product_price=230, shipping=25, include_market=False)
+    cargo = _decision(product_price=250.01, shipping=25, include_market=False)
     assert REASON_CARGO_COST in cargo.reasons
-    assert supplier_cargo_cost(230, 25) == 255
+    # Shipping is still used for landed-cost math, not the goods-value cap.
+    assert supplier_cargo_cost(220, 60.53) == pytest.approx(280.53)
+    ship_only = _decision(product_price=220, shipping=60.53, include_market=False)
+    assert REASON_CARGO_COST not in ship_only.reasons
 
     missing = _decision(attributes={}, specs={}, description="", include_market=False)
     assert missing.reasons == [REASON_UNCLEAR_DIMS]
@@ -385,7 +388,7 @@ def _run_analyze(monkeypatch, product, *, intel, live_quote=None):
         ("N735P000111", 40, 10, "Oak Side Table", CLEAR_DIMS, None, None, REASON_BLACKLIST_SELLER, False),
         ("W1706P000222", 40, 10, "Oak Side Table", CLEAR_DIMS, None, None, REASON_BLACKLIST_SELLER, False),
         ("ZL000333", 40, 10, "Oak Side Table", CLEAR_DIMS, None, None, REASON_BLACKLIST_SELLER, False),
-        ("N710P100001", 230, 30, "Oak Side Table", CLEAR_DIMS, None, None, REASON_CARGO_COST, False),
+        ("N710P100001", 250.01, 30, "Oak Side Table", CLEAR_DIMS, None, None, REASON_CARGO_COST, False),
         ("N710P100001", 40, 10, "Oak Side Table", {}, None, None, REASON_UNCLEAR_DIMS, False),
         (
             "N710P100001",
@@ -423,13 +426,13 @@ def test_live_cargo_recheck_skips_before_llm(monkeypatch):
         monkeypatch,
         product,
         intel=None,
-        live_quote={"price": 240, "shipping": 20},
+        live_quote={"price": 250.01, "shipping": 20},
     )
     assert calls["optimize"] == 0
     assert calls["fact_sheet"] == 0
     assert calls["live"] == 1
     assert calls["market"] == 0
-    assert product.price == 240
+    assert product.price == 250.01
     assert product.shipping == 20
     assert REASON_CARGO_COST in result["skip_reasons"][product.sku]
 
@@ -482,10 +485,31 @@ def test_safe_15_no_market_and_near_market_still_generate_copy(monkeypatch):
 
 
 def test_cargo_cap_250_boundary():
-    passes = _decision(product_price=190, shipping=30, include_market=False)  # $220
-    assert REASON_CARGO_COST not in passes.reasons
-    skipped = _decision(product_price=224.76, shipping=30, include_market=False)  # $254.76
+    from src.utils.copy_skip_gate import (
+        REASON_PRODUCT_PRICE_MISSING,
+        REASON_PRODUCT_PRICE_UNREADABLE,
+        REASON_UNSUPPORTED_CURRENCY,
+    )
+
+    exact = _decision(product_price=250, shipping=60.53, include_market=False)
+    assert REASON_CARGO_COST not in exact.reasons
+    assert exact.skip is False or REASON_CARGO_COST not in exact.reasons
+    cents = _decision(product_price=250.00, shipping=99, include_market=False)
+    assert REASON_CARGO_COST not in cents.reasons
+    skipped = _decision(product_price=250.01, shipping=0, include_market=False)
     assert REASON_CARGO_COST in skipped.reasons
+    # Owner examples: product ≤ 250 must pass even when product+ship > 250.
+    for price, ship in ((220, 60.53), (135, 128.32), (219, 129.07), (249, 46.70)):
+        row = _decision(product_price=price, shipping=ship, include_market=False)
+        assert REASON_CARGO_COST not in row.reasons, (price, ship)
+    missing = _decision(product_price=None, shipping=40, include_market=False)
+    assert REASON_PRODUCT_PRICE_MISSING in missing.reasons
+    blank = _decision(product_price="", shipping=10, include_market=False)
+    assert REASON_PRODUCT_PRICE_MISSING in blank.reasons
+    junk = _decision(product_price="not-a-price", shipping=10, include_market=False)
+    assert REASON_PRODUCT_PRICE_UNREADABLE in junk.reasons
+    euro = _decision(product_price=80, currency="EUR", include_market=False)
+    assert REASON_UNSUPPORTED_CURRENCY in euro.reasons
     from src.utils import copy_skip_gate as _g
     assert _g.REASON_CARGO_COST == "cargo_cost_over_cap"
     assert _g.REASON_CARGO_COST_LEGACY == "cargo_cost_over_200"

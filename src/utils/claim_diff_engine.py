@@ -99,6 +99,12 @@ FEATURE_CLAIM_PATTERNS: dict[str, tuple[str, ...]] = {
     ),
     "tsa_approved":    (r"\btsa\b", r"\btransportation\s+security\b"),
     "cushion":         (r"\bcushions?\b", r"\bcushioned\b", r"\bupholstered\b"),
+    "no_electricity": (
+        r"\bno\s+electricity(?:\s+or\s+batteries?)?\s+required\b",
+        r"\bno\s+batteries?\s+required\b",
+        r"\bno\s+electricity\s+needed\b",
+        r"\bno\s+electricity\s+or\s+batteries\s+required\b",
+    ),
 }
 
 # 对应 source 的检测正则——用于判断 source 是否支持某 feature
@@ -118,6 +124,7 @@ FEATURE_SOURCE_PATTERNS: dict[str, tuple[str, ...]] = {
     "convertible":     (r"\bconvertible\b", r"\bsleeper\b", r"\bpull[\s-]*out\b", r"\bsofa\s*bed\b", r"\bfold[\s-]*out\b", r"\b(?:2|3|two|three)[\s-]*in[\s-]*(?:1|one)\b", r"\brecline", r"变形", r"两用"),
     "massage":         (r"\bmassage\b", r"\bmassaging\b", r"按摩"),
     "heated":          (r"\bheated\b", r"\bheating\b", r"\bwarm(?:er|ing)?\b", r"加热", r"发热"),
+    "no_electricity":  (r"\bno\s+electricity\b", r"无需电", r"不用电"),
     "removable_floor": (
         r"\bremovable\s+(?:floor|bottom\s+cloth|groundsheet)\b",
         r"\bdetachable\s+(?:floor|bottom\s+cloth|groundsheet)\b",
@@ -137,7 +144,7 @@ COUNTABLE_CLAIMS: dict[str, tuple[str, ...]] = {
     "shelf":    (r"\b(\d+)\s*(?:shelf|shelves)\b",),
     "drawer":   (r"\b(\d+)\s*drawer\b",),
     "door":     (r"\b(\d+)\s*door\b",),
-    "seat":     (r"\b(\d+)[\s-]*seat\b",),
+    "seat":     (r"\b(\d+)[\s-]*seats?\b", r"\b(\d+)[\s-]*seaters?\b"),
 }
 
 CERTIFICATION_PATTERNS: tuple[str, ...] = (

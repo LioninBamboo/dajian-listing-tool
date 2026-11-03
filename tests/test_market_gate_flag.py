@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from src.utils.copy_skip_gate import (
     COPY_SKIP_STATUS,
     REASON_BLACKLIST_SELLER,
@@ -64,10 +66,14 @@ def test_missing_env_key_behaves_like_false(monkeypatch):
 def test_flag_false_other_gates_still_skip(monkeypatch):
     monkeypatch.setenv("MARKET_GATE_ENABLED", "false")
 
-    cargo = _decision(product_price=240, shipping=20, include_market=False)
+    cargo = _decision(product_price=250.01, shipping=20, include_market=False)
     assert cargo.skip is True
     assert REASON_CARGO_COST in cargo.reasons
-    assert cargo.detail["supplier_cargo_cost_usd"] == 260
+    assert cargo.detail["supplier_cargo_cost_usd"] == pytest.approx(270.01)
+    assert cargo.detail["supplier_product_price_usd"] == 250.01
+    # Product $240 + ship $20 used to trip the old landed-cost cap; goods-value only must pass.
+    under = _decision(product_price=240, shipping=20, include_market=False)
+    assert REASON_CARGO_COST not in under.reasons
 
     black = evaluate_copy_skip(
         sku="N735P000111",
