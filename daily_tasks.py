@@ -284,6 +284,7 @@ def analyze_collected_products(
                     include_market=False,
                     dims_mode="require",
                     apply_cargo=apply_cargo,
+                    currency=getattr(product, "supplier_currency", None),
                 )
                 if local_skip.skip:
                     apply_copy_skip(product, local_skip, cost_breakdown=dajian_costs)
@@ -318,6 +319,7 @@ def analyze_collected_products(
                     include_market=True,
                     dims_mode="require",
                     apply_cargo=apply_cargo,
+                    currency=getattr(product, "supplier_currency", None),
                 )
                 advisory_line = market_advisory_log_line(market_skip.detail)
                 if advisory_line:

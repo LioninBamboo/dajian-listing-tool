@@ -49,6 +49,7 @@ def _utcnow_naive() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 from src.services.pricing_engine import PricingEngine
+from src.utils.copy_skip_gate import evaluate_goods_value_cap
 from src.utils.logs_codec import append_log
 
 logger = logging.getLogger(__name__)
@@ -223,6 +224,7 @@ def discover_external_opportunities(
         "skipped_blacklist": 0,
         "candidates": 0,
         "dropped_no_price": 0,
+        "dropped_goods_value_cap": 0,
         "dropped_no_title": 0,
         "dropped_no_keyword": 0,
         "dropped_no_market": 0,
@@ -284,6 +286,14 @@ def discover_external_opportunities(
         product_price = _select_price(price_rec)
         if not product_price:
             diag["dropped_no_price"] += 1
+            continue
+        cap_reasons, _cap_detail = evaluate_goods_value_cap(
+            product_price,
+            currency=price_rec.get("currency"),
+            apply=True,
+        )
+        if cap_reasons:
+            diag["dropped_goods_value_cap"] += 1
             continue
         shipping_cost = _select_shipping(price_rec)
         cost_breakdown = PricingEngine.calculate_dajian_cost(
@@ -347,6 +357,7 @@ def discover_external_opportunities(
             "dajian_cost": round(total_cost, 2),
             "product_price": product_price,
             "shipping_cost": shipping_cost,
+            "currency": price_rec.get("currency"),
             "cost_breakdown": cost_breakdown,
             "market_avg_price": market.avg_price,
             "market_median_price": market.median_price,
@@ -508,6 +519,14 @@ def ingest_uncollected_for_mi(
         sku = str(opp.get("sku") or "").strip()
         if not sku:
             skipped["invalid"] += 1
+            continue
+        cap_reasons, _cap_detail = evaluate_goods_value_cap(
+            opp.get("product_price"),
+            currency=opp.get("currency"),
+            apply=True,
+        )
+        if cap_reasons:
+            skipped[cap_reasons[0]] += 1
             continue
         existing = str(opp.get("existing_status") or opp.get("status") or "").strip().upper()
         if existing in {"PUBLISHED", "READY", "READY_TO_PUBLISH", "ENDED", "DELISTED", "PENDING", "COLLECTED", "ERROR"}:

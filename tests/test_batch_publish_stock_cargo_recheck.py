@@ -70,9 +70,9 @@ def test_publish_blocks_out_of_stock_after_live_refresh(monkeypatch):
 
 
 def test_publish_blocks_cargo_cost_over_cap_after_live_refresh(monkeypatch):
-    over_cap_price = 240.0
+    over_cap_price = 250.01
     over_cap_ship = 20.0
-    assert over_cap_price + over_cap_ship > MAX_SUPPLIER_CARGO_COST_USD
+    assert over_cap_price > MAX_SUPPLIER_CARGO_COST_USD
 
     def _price(product, market_p):
         product["live_quantity"] = 5
@@ -88,6 +88,38 @@ def test_publish_blocks_cargo_cost_over_cap_after_live_refresh(monkeypatch):
     assert result["status"] == "error"
     assert result["copy_skip_reasons"] == [REASON_CARGO_COST]
     assert "cargo_cost_over_cap" in result["message"]
+
+
+def test_publish_allows_product_under_cap_when_landed_exceeds(monkeypatch):
+    """W504P541843-style: $220 + $60.53 ship must not trip the goods-value cap."""
+    import src.utils.copy_skip_gate as gate
+
+    seen: list = []
+    real = gate.evaluate_goods_value_cap
+
+    def _wrap(*args, **kwargs):
+        result = real(*args, **kwargs)
+        seen.append((args, kwargs, result))
+        return result
+
+    monkeypatch.setattr(gate, "evaluate_goods_value_cap", _wrap)
+
+    def _price(product, market_p):
+        product["live_quantity"] = 5
+        product["live_in_stock"] = True
+        product["price"] = 220.0
+        product["shipping"] = 60.53
+        return 399.0
+
+    _stub_publish_preamble(monkeypatch, price_side_effect=_price)
+    result = batch_publish.publish_single_product(_product(), dry_run=True)
+    assert seen, "publish must reach evaluate_goods_value_cap"
+    reasons, detail = seen[0][2]
+    assert reasons == []
+    assert seen[0][0][0] == 220.0
+    assert detail["supplier_product_price_usd"] == 220.0
+    assert REASON_CARGO_COST not in (result.get("copy_skip_reasons") or [])
+    assert "cargo_cost_over_cap" not in str(result.get("message") or "")
 
 
 def test_calculate_smart_final_price_stores_live_stock(monkeypatch):

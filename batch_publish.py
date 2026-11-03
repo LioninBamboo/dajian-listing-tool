@@ -1433,10 +1433,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
 
     # Re-check live stock + supplier cargo after the live supplier refresh.
     # Same gates apply to --dry-run so the preview matches real publish outcome.
-    from src.utils.copy_skip_gate import (
-        MAX_SUPPLIER_CARGO_COST_USD,
-        supplier_cargo_cost,
-    )
+    from src.utils.copy_skip_gate import evaluate_goods_value_cap
     live_qty = product.get("live_quantity")
     live_in_stock = product.get("live_in_stock")
     if live_qty is not None or live_in_stock is not None:
@@ -1453,17 +1450,27 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 "copy_skip_reasons": ["out_of_stock"],
             }
 
-    cargo = supplier_cargo_cost(product.get("price"), product.get("shipping"))
-    if cargo is not None and cargo > MAX_SUPPLIER_CARGO_COST_USD:
+    cap_reasons, cap_detail = evaluate_goods_value_cap(
+        product.get("price"),
+        currency=product.get("supplier_currency") or product.get("currency"),
+        specs=product.get("specs") if isinstance(product.get("specs"), dict) else None,
+        attributes=product.get("attributes") if isinstance(product.get("attributes"), dict) else None,
+        apply=True,
+    )
+    if cap_reasons:
+        shown = cap_detail.get("supplier_product_price_usd")
+        price_bit = f"${shown:.2f}" if isinstance(shown, (int, float)) else str(product.get("price"))
         msg = (
-            f"Blocked cargo_cost_over_cap: supplier cargo "
-            f"${cargo:.2f} > ${MAX_SUPPLIER_CARGO_COST_USD:g}"
+            f"Blocked {cap_reasons[0]}: supplier product price "
+            f"{price_bit} (shipping excluded)"
         )
+        if cap_detail.get("currency_reason"):
+            msg = f"Blocked {cap_reasons[0]}: {cap_detail['currency_reason']}"
         record_error(sku, msg)
         return {
             "status": "error",
             "message": msg,
-            "copy_skip_reasons": ["cargo_cost_over_cap"],
+            "copy_skip_reasons": list(cap_reasons),
         }
 
     # Guard: refuse to publish with empty or placeholder description

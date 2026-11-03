@@ -859,6 +859,7 @@ class DaJianClient:
         available = price_info.get("skuAvailable", False)
         price = float(price_info.get("price", 0) or 0)
         shipping = float(price_info.get("shippingFee", 0) or 0)
+        currency = str(price_info.get("currency") or "").strip() or None
         
         # 使用官方库存 API 获取数量
         qty = 0
@@ -871,10 +872,13 @@ class DaJianClient:
         
         in_stock = available and qty > 0
         
-        return {
+        payload = {
             "in_stock": in_stock,
             "quantity": qty,
             "price": price,
             "shipping_fee": shipping,
             "total_cost": price + shipping
         }
+        if currency:
+            payload["currency"] = currency
+        return payload

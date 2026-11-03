@@ -404,6 +404,7 @@ def test_ingest_uncollected_for_mi_inserts_new_skips_live_ended_and_low_score(fa
             "existing_status": "",
             "opportunity_score": 78,
             "images": ["https://a.jpg", "https://b.jpg"],
+            "product_price": 150.0,
             "cost_breakdown": {"total_dajian_cost": 120.0},
             "suggested_price": 249.0,
         },
@@ -414,6 +415,7 @@ def test_ingest_uncollected_for_mi_inserts_new_skips_live_ended_and_low_score(fa
             "existing_status": "",
             "opportunity_score": 32,
             "images": ["https://a.jpg", "https://b.jpg"],
+            "product_price": 80.0,
             "cost_breakdown": {"total_dajian_cost": 80.0},
         },
         {
@@ -423,6 +425,7 @@ def test_ingest_uncollected_for_mi_inserts_new_skips_live_ended_and_low_score(fa
             "existing_status": "ENDED",
             "opportunity_score": 80,
             "images": ["https://a.jpg", "https://b.jpg"],
+            "product_price": 99.0,
         },
         {
             "sku": "LIVE-SKU",
@@ -431,6 +434,7 @@ def test_ingest_uncollected_for_mi_inserts_new_skips_live_ended_and_low_score(fa
             "existing_status": "PUBLISHED",
             "opportunity_score": 90,
             "images": ["https://a.jpg", "https://b.jpg"],
+            "product_price": 199.0,
         },
         {
             "sku": "HITCH-NEW",
@@ -439,6 +443,7 @@ def test_ingest_uncollected_for_mi_inserts_new_skips_live_ended_and_low_score(fa
             "existing_status": "",
             "opportunity_score": 88,
             "images": ["https://a.jpg", "https://b.jpg"],
+            "product_price": 88.0,
         },
         {
             "sku": "OOS-NEW",
@@ -447,6 +452,7 @@ def test_ingest_uncollected_for_mi_inserts_new_skips_live_ended_and_low_score(fa
             "existing_status": "",
             "opportunity_score": 70,
             "images": ["https://a.jpg", "https://b.jpg"],
+            "product_price": 70.0,
         },
     ]
 
@@ -472,4 +478,112 @@ def test_ingest_uncollected_for_mi_inserts_new_skips_live_ended_and_low_score(fa
     assert status["ENDED-SKU"] == "ENDED"
     assert "HITCH-NEW" not in status
     assert "OOS-NEW" not in status
+
+
+def test_discover_drops_over_cap_product_price_not_landed(fake_db):
+    from src.plugins.terapeak_research.external_discovery import (
+        discover_external_opportunities,
+    )
+
+    records = [
+        {"sku": "OVER-CAP"},
+        {"sku": "UNDER-WITH-SHIP"},
+        {"sku": "EUR-SKU"},
+    ]
+    details = {
+        sku: {
+            "sku": sku,
+            "productName": "Garden Side Table",
+            "imageUrls": ["https://img.example/a.jpg"],
+            "weight": 20,
+            "weightUnit": "lbs",
+        }
+        for sku in ("OVER-CAP", "UNDER-WITH-SHIP", "EUR-SKU")
+    }
+    prices = {
+        "OVER-CAP": {"sku": "OVER-CAP", "price": 250.01, "shippingFee": 5.0},
+        "UNDER-WITH-SHIP": {"sku": "UNDER-WITH-SHIP", "price": 220.0, "shippingFee": 60.53},
+        "EUR-SKU": {"sku": "EUR-SKU", "price": 80.0, "shippingFee": 10.0, "currency": "EUR"},
+    }
+    client = _make_dajian_client(records, details, prices)
+    intel = _make_intel(fake_db)
+    opps, diag = discover_external_opportunities(
+        intel,
+        dajian_client=client,
+        min_margin=0.20,
+        max_results=10,
+        max_candidates=10,
+        page_size=100,
+        max_pages=1,
+        db_path=fake_db,
+        return_diagnostics=True,
+    )
+    skus = {o["sku"] for o in opps}
+    assert "OVER-CAP" not in skus
+    assert "EUR-SKU" not in skus
+    assert "UNDER-WITH-SHIP" in skus
+    assert diag["dropped_goods_value_cap"] == 2
+
+
+def test_ingest_skips_over_cap_missing_and_non_usd(fake_db):
+    from src.plugins.terapeak_research.external_discovery import (
+        ingest_uncollected_for_mi,
+    )
+    from src.utils.copy_skip_gate import (
+        REASON_CARGO_COST,
+        REASON_PRODUCT_PRICE_MISSING,
+        REASON_UNSUPPORTED_CURRENCY,
+    )
+
+    intel = _make_intel(fake_db)
+    opps = [
+        {
+            "sku": "CAP-OK",
+            "title": "Garden Side Table",
+            "status": "UNCOLLECTED",
+            "existing_status": "",
+            "opportunity_score": 80,
+            "images": ["https://a.jpg", "https://b.jpg"],
+            "product_price": 249.0,
+        },
+        {
+            "sku": "CAP-OVER",
+            "title": "Garden Side Table",
+            "status": "UNCOLLECTED",
+            "existing_status": "",
+            "opportunity_score": 80,
+            "images": ["https://a.jpg", "https://b.jpg"],
+            "product_price": 250.01,
+        },
+        {
+            "sku": "CAP-MISS",
+            "title": "Garden Side Table",
+            "status": "UNCOLLECTED",
+            "existing_status": "",
+            "opportunity_score": 80,
+            "images": ["https://a.jpg", "https://b.jpg"],
+        },
+        {
+            "sku": "CAP-EUR",
+            "title": "Garden Side Table",
+            "status": "UNCOLLECTED",
+            "existing_status": "",
+            "opportunity_score": 80,
+            "images": ["https://a.jpg", "https://b.jpg"],
+            "product_price": 80.0,
+            "currency": "EUR",
+        },
+    ]
+    report = ingest_uncollected_for_mi(
+        intel,
+        opportunities=opps,
+        limit=10,
+        store_kind="furniture",
+        db_path=fake_db,
+        stock_lookup=lambda sku: 4,
+    )
+    assert report["inserted"] == ["CAP-OK"]
+    assert report["skipped"][REASON_CARGO_COST] == 1
+    assert report["skipped"][REASON_PRODUCT_PRICE_MISSING] == 1
+    assert report["skipped"][REASON_UNSUPPORTED_CURRENCY] == 1
 
