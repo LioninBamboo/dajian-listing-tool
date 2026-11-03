@@ -685,8 +685,19 @@ def run_smart_reprice(market_mode: str | None = None) -> dict:
             raise RuntimeError("智能调价返回了未知结果格式")
 
         summary = report.get('summary', {}) or {}
+        processed = report.get('processed', summary.get('total', 0))
+        remaining = report.get('remaining', 0)
+        if str(report.get('status') or '').strip().lower() == 'partial':
+            logger.warning(
+                "SMART_REPRICE partial: processed=%s remaining=%s",
+                processed,
+                remaining,
+            )
         logger.info("智能调价完成:")
+        logger.info(f"  状态: {report.get('status', 'ok')}")
         logger.info(f"  检查: {summary.get('total', 0)}")
+        logger.info(f"  已处理: {processed}")
+        logger.info(f"  剩余: {remaining}")
         logger.info(f"  调价: {summary.get('price_changes', 0)}")
         logger.info(f"  涨价: {summary.get('price_up', 0)}")
         logger.info(f"  降价: {summary.get('price_down', 0)}")
@@ -1596,7 +1607,7 @@ def send_daily_summary_email(results: dict):
     except Exception as _ch_exc:
         logger.warning(f"成本异动检测失败 (非阻塞): {_ch_exc}")
 
-    if smart_reprice_status == 'ok':
+    if smart_reprice_status in {'ok', 'partial'}:
         report_time = str(smart_reprice.get('timestamp', '') or '').replace('T', ' ')[:19]
         shown_reprice_items = smart_reprice_items[:8]
         extra_reprice_count = max(0, len(smart_reprice_items) - len(shown_reprice_items))
@@ -1634,7 +1645,14 @@ def send_daily_summary_email(results: dict):
             </table>
             {f'<p style="margin:8px 0 0;color:#666;font-size:12px;">其余 {extra_reprice_count} 个 SKU 未在邮件展开，详见当天调价报告。</p>' if extra_reprice_count else ''}
             </details>''') if smart_reprice_items else ''
-        if smart_reprice_items:
+        if smart_reprice_status == 'partial':
+            status_banner = (
+                '<div style="margin:10px 0 12px;padding:10px 12px;border-radius:8px;'
+                'background:#fff7ed;border:1px solid #fdba74;color:#9a3412;font-weight:bold;">'
+                f'⏱️ 智能调价部分完成（时间预算）：已处理 {html_escape(str(smart_reprice.get("processed", 0)))}，'
+                f'剩余 {html_escape(str(smart_reprice.get("remaining", 0)))}</div>'
+            )
+        elif smart_reprice_items:
             status_banner = '<div style="margin:10px 0 12px;padding:10px 12px;border-radius:8px;background:#ecfdf3;border:1px solid #a6f4c5;color:#067647;font-weight:bold;">✅ 本次每日主任务已执行智能调价，并产生调价结果</div>'
         else:
             status_banner = '<div style="margin:10px 0 12px;padding:10px 12px;border-radius:8px;background:#f8f9fc;border:1px solid #d0d5dd;color:#344054;font-weight:bold;">ℹ️ 本次每日主任务已执行智能调价，但没有需要改价的 SKU</div>'
@@ -1764,7 +1782,7 @@ def send_daily_summary_email(results: dict):
 
     health_problems = health.get('summary', {}).get('problems', 0) if isinstance(health, dict) else 0
     health_icon = '🔴' if health_problems > 5 else ('🟡' if health_problems > 0 else '🟢')
-    smart_reprice_count = len(smart_reprice_items) if smart_reprice_status == 'ok' else 0
+    smart_reprice_count = len(smart_reprice_items) if smart_reprice_status in {'ok', 'partial'} else 0
     subject = (f"📋 {get_store_profile().brand_name} 每日汇总 - {date_str} | "
                f"增量同步{inv.get('checked_count', inv.get('checked', 0))}个 全量审核{full_oos_audit.get('checked_count', 0)}个 "
                f"调价{smart_reprice_count} "

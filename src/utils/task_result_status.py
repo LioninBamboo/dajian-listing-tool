@@ -64,7 +64,7 @@ def _is_reprice_item_level_failure(result: Any) -> bool:
 
     if not isinstance(result, Mapping):
         return False
-    if str(result.get("status") or "").strip().lower() not in {"ok", "success"}:
+    if str(result.get("status") or "").strip().lower() not in {"ok", "success", "partial"}:
         return False
     summary = result.get("summary")
     if not isinstance(summary, Mapping):
@@ -138,6 +138,13 @@ def is_analyze_soft_degradation(payload: Any) -> bool:
     return _int_field(payload, "skipped_corrupt") > 0 or _int_field(payload, "load_errors") > 0
 
 
+def _is_reprice_time_budget_partial(result: Any) -> bool:
+    """A catalog reprice that stopped on its wall-clock budget is not a failure."""
+    if not isinstance(result, Mapping):
+        return False
+    return str(result.get("status") or "").strip().lower() == "partial"
+
+
 def classify_daily_task_outcome(results: Any) -> str:
     """Classify a daily run without turning per-SKU reprice errors into reruns.
 
@@ -147,11 +154,15 @@ def classify_daily_task_outcome(results: Any) -> str:
 
     ``results['analyze']`` with ``skipped_corrupt > 0`` or ``load_errors > 0``
     (and no analyze ``error``) is at least ``partial_success``. An analyze
-    ``error`` remains ``failed``.
+    ``error`` remains ``failed``. A smart-reprice ``status='partial'`` time-budget
+    stop is also ``partial_success`` (not silent success, not failed).
     """
 
     if not has_task_failure(results):
-        if isinstance(results, Mapping) and is_analyze_soft_degradation(results.get("analyze")):
+        if isinstance(results, Mapping) and (
+            is_analyze_soft_degradation(results.get("analyze"))
+            or _is_reprice_time_budget_partial(results.get("smart_reprice"))
+        ):
             return "partial_success"
         return "success"
     if not isinstance(results, Mapping):

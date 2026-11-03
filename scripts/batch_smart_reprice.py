@@ -16,6 +16,8 @@ Usage:
     python scripts/batch_smart_reprice.py                # 干跑 (仅计算, 不改价)
     python scripts/batch_smart_reprice.py --apply        # 实际改价
     python scripts/batch_smart_reprice.py --apply --email  # 改价 + 邮件报告
+    python scripts/batch_smart_reprice.py --apply --time-budget-min 150
+    # 0 / negative budget = unlimited. Env: SMART_REPRICE_TIME_BUDGET_MIN (default 150).
 """
 
 import os
@@ -52,6 +54,18 @@ from src.utils.reprice_sales_cooldown import (
     cooldown_decision,
     fetch_recently_sold_skus,
     load_sales_cooldown,
+)
+from src.utils.smart_reprice_budget import (
+    DEFAULT_TIME_BUDGET_MIN,
+    TIME_BUDGET_ENV,
+    checkpoint_path,
+    clear_checkpoint,
+    is_time_budget_exhausted,
+    load_checkpoint,
+    normalize_sku,
+    order_products_for_resume,
+    resolve_time_budget_min,
+    write_checkpoint,
 )
 
 warnings.filterwarnings('ignore')
@@ -1050,10 +1064,40 @@ def generate_search_keyword(product: dict) -> str:
     return ' '.join(words) if words else title[:40]
 
 
+def _catalog_checkpoint_enabled(only_skus: set | None, from_cro_queue: bool) -> bool:
+    """Resume checkpoint belongs to the full-catalog run, not scoped CRO/only_skus jobs."""
+    return only_skus is None and not from_cro_queue
+
+
+def _remaining_sku_strings(products) -> list[str]:
+    remaining: list[str] = []
+    seen: set[str] = set()
+    for product in products:
+        key = normalize_sku(product.get("sku"))
+        if key is None or key in seen:
+            continue
+        seen.add(key)
+        remaining.append(key)
+    return remaining
+
+
 def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
                       market_mode: str = None, from_cro_queue: bool = False,
-                      only_skus: set | None = None):
-    """主函数"""
+                      only_skus: set | None = None,
+                      time_budget_min=None):
+    """主函数.
+
+    ``time_budget_min`` is wall-clock minutes for the whole run, including
+    phase 1. Default 150; ``0`` / negative / resolved ``None`` means no
+    budget. Env override: ``SMART_REPRICE_TIME_BUDGET_MIN``.
+    """
+    started_at = time.monotonic()
+    budget_min = resolve_time_budget_min(time_budget_min)
+    if budget_min is None:
+        log.info("Time budget: unlimited (0/negative or disabled)")
+    else:
+        log.info(f"Time budget: {budget_min:g} minutes (env {TIME_BUDGET_ENV})")
+
     log.info("=" * 70)
     log.info("BATCH SMART REPRICE — Terapeak 市场调研 + 智能定价")
     log.info("=" * 70)
@@ -1065,6 +1109,20 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
         wanted = {str(sku) for sku in only_skus}
         products = [p for p in products if str(p.get("sku") or "") in wanted]
         log.info(f"Filtered to {len(products)} products by only_skus ({len(wanted)} requested)")
+
+    ckpt_file = checkpoint_path(PROJECT_ROOT)
+    use_checkpoint = _catalog_checkpoint_enabled(only_skus, from_cro_queue)
+    if use_checkpoint:
+        checkpoint = load_checkpoint(ckpt_file)
+        if checkpoint is not None:
+            resume_skus = checkpoint.get("remaining_skus") or []
+            log.info(
+                "Resume checkpoint %s: %s leftover SKU(s) from run_date=%s",
+                ckpt_file,
+                len(resume_skus),
+                checkpoint.get("run_date"),
+            )
+            products = order_products_for_resume(products, resume_skus)
 
     cro_queue_skus: set = set()
     if from_cro_queue:
@@ -1084,6 +1142,8 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
 
     if not products:
         log.info("No products to reprice.")
+        if use_checkpoint:
+            clear_checkpoint(ckpt_file, dry_run=dry_run)
         return {
             'status': 'ok',
             'timestamp': datetime.now().isoformat(),
@@ -1092,6 +1152,10 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
             'marketplace_insights_access': {},
             'path': None,
             'change_reports': {'csv': None, 'html': None},
+            'processed': 0,
+            'remaining': 0,
+            'remaining_skus': [],
+            'stopped_reason': None,
             'summary': {
                 'total': 0,
                 'price_changes': 0,
@@ -1211,7 +1275,19 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
     log.info("PHASE 2: Smart Pricing + Price Update")
     log.info("=" * 50)
 
+    stopped_reason = None
+    remaining_skus: list[str] = []
     for p in products:
+        if is_time_budget_exhausted(started_at, budget_min, now=time.monotonic()):
+            remaining_skus = _remaining_sku_strings(products[processed:])
+            stopped_reason = 'time_budget'
+            log.info(
+                "Time budget reached before SKU %s: processed=%s remaining=%s",
+                normalize_sku(p.get('sku')) or p.get('sku'),
+                processed,
+                len(remaining_skus),
+            )
+            break
         processed += 1
         sku = p['sku']
         total_cost = p['total_cost']
@@ -1396,8 +1472,31 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
         changes_csv_path, changes_html_path = _write_change_reports(results, timestamp_label)
     report_timestamp = datetime.now().isoformat()
     changed_rows = _build_changed_rows(results)
+    if stopped_reason:
+        run_status = 'partial'
+        if use_checkpoint:
+            write_checkpoint(
+                ckpt_file,
+                remaining_skus,
+                datetime.now().date(),
+                dry_run=dry_run,
+            )
+            if not dry_run:
+                log.info(
+                    "Wrote resume checkpoint %s (%s SKU(s))",
+                    ckpt_file,
+                    len(remaining_skus),
+                )
+    else:
+        run_status = 'ok'
+        remaining_skus = []
+        if use_checkpoint:
+            clear_checkpoint(ckpt_file, dry_run=dry_run)
+            if not dry_run:
+                log.info("Cleared resume checkpoint (run completed all SKUs)")
+
     report_payload = {
-        'status': 'ok',
+        'status': run_status,
         'timestamp': report_timestamp,
         'mode': 'dry_run' if dry_run else 'apply',
         'market_mode': market_client.market_mode,
@@ -1407,6 +1506,10 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
             'csv': str(changes_csv_path) if changes_csv_path else None,
             'html': str(changes_html_path) if changes_html_path else None,
         },
+        'processed': processed,
+        'remaining': len(remaining_skus),
+        'remaining_skus': remaining_skus,
+        'stopped_reason': stopped_reason,
         'summary': {
             'total': total,
             'price_changes': price_changes,
@@ -1579,6 +1682,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--from-cro-queue", action="store_true",
                         help="Only reprice SKUs in logs/cro_action_queue.jsonl pending P1 price_drop list")
+    parser.add_argument(
+        "--time-budget-min",
+        type=float,
+        default=None,
+        help=(
+            "Wall-clock minutes for the whole run including phase 1 "
+            f"(default {DEFAULT_TIME_BUDGET_MIN}; 0 or negative disables the budget). "
+            f"Overrides env {TIME_BUDGET_ENV}."
+        ),
+    )
     args = parser.parse_args()
 
     run_batch_reprice(
@@ -1586,4 +1699,5 @@ if __name__ == "__main__":
         send_email=args.email,
         market_mode=args.market_mode,
         from_cro_queue=args.from_cro_queue,
+        time_budget_min=args.time_budget_min,
     )
