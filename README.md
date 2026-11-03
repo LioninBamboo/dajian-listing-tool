@@ -248,6 +248,8 @@ QWEN_API_KEY=your_qwen_api_key
 NOTIFICATION_EMAIL=your_email@example.com
 NOTIFICATION_EMAIL_PASSWORD=your_email_password
 SMART_REPRICE_EMAIL_ENABLED=1
+SMART_REPRICE_TIME_BUDGET_MIN=150
+# 0 or negative disables the wall-clock budget (unlimited). Unset defaults to 150.
 ```
 
 ## Data Stores
