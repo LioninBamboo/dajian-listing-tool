@@ -365,17 +365,17 @@ def _capacity_supported(
 ) -> bool:
     if any(number == token for token, _src_raw in known):
         return True
-    claim_span = _span_in_pounds(number, raw) if family in {"load", "weight"} else _numeric_span(number)
+    # Occupancy/volume: exact token only. "6" / "5" is not sourced by "4-6".
+    if family not in {"load", "weight"}:
+        return False
+    claim_span = _span_in_pounds(number, raw)
     if claim_span is None:
         return False
-    convert = family in {"load", "weight"}
     for token, src_raw in known:
-        source_span = (
-            _span_in_pounds(token, src_raw) if convert else _numeric_span(token)
-        )
+        source_span = _span_in_pounds(token, src_raw)
         if source_span is None:
             continue
-        if _span_supported(claim_span, source_span, convert=convert):
+        if _span_supported(claim_span, source_span, convert=True):
             return True
     return False
 

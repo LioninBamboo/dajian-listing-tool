@@ -69,6 +69,12 @@ _LOAD_NUMBER_RE = re.compile(
     r"(?P<num>\d+(?:\.\d+)?)(?:\s*(?:-|–|to)\s*(?P<num2>\d+(?:\.\d+)?))?",
 )
 _MATERIAL_FIELD_RE = re.compile(r"^material$", re.I)
+_MULTI_MATERIAL_SPLIT_RE = re.compile(r"\s*(?:,|/|&|\band\b|\+)\s*", re.I)
+FABRIC_FAMILY = frozenset({
+    "chenille", "corduroy", "velvet", "polyester", "cotton", "linen",
+    "oxford", "canvas", "boucle", "suede", "mesh", "nylon", "upholstery",
+    "microsuede", "micro suede", "micro-suede", "microfiber", "microfibre",
+})
 _QTY_CLAIM_RE = re.compile(
     r"(?:claimed\s+)?(?P<n>\d+)[\s-]*(?P<noun>[a-z]+)(?:.*source has (?P<src>\d+))?",
     re.I,
@@ -490,6 +496,21 @@ def _source_material_field_value(source: Mapping[str, Any] | None) -> str | None
     return None
 
 
+def _single_fabric_material(value: str | None) -> str | None:
+    """Replace Fabric only with one vocab fabric word. Mixed/non-fabric → None."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parts = [part.strip() for part in _MULTI_MATERIAL_SPLIT_RE.split(text) if part.strip()]
+    if len(parts) != 1:
+        return None
+    whole = normalize_once(parts[0]).casefold()
+    for term in FABRIC_FAMILY:
+        if whole == term or terms_equivalent(whole, term):
+            return parts[0]
+    return None
+
+
 def _whole_number_in_text(wanted: str, text: str) -> bool:
     if not wanted or not text:
         return False
@@ -510,12 +531,11 @@ def _source_capacity_raw(source_blob: str, family: str, evidence: str) -> str | 
     return None
 
 
-def _source_labelled_load_raw(source_blob: str, evidence: str) -> str | None:
-    """Replace a load number only when source labels capacity/load/max load."""
-    wanted = normalize_once(evidence).casefold()
-    if not wanted or wanted == "not_found":
-        return None
+def _labelled_load_values(source_blob: str) -> list[tuple[str, str]]:
+    """Distinct labelled capacity/load figures in source order."""
     blob = source_blob or ""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for match in re.finditer(
         r"\b(?P<num>\d+(?:\.\d+)?)(?:\s*(?:-|–|to)\s*(?P<num2>\d+(?:\.\d+)?))?\s*"
         r"(?P<unit>lbs?|pounds?|kgs?|kilograms?)\b",
@@ -535,17 +555,33 @@ def _source_labelled_load_raw(source_blob: str, evidence: str) -> str | None:
         token = match.group("num")
         if match.group("num2"):
             token = f"{token}-{match.group('num2')}"
-        token_n = normalize_once(token).casefold()
-        raw_n = normalize_once(raw).casefold()
-        if (
-            token_n == wanted
-            or _whole_number_in_text(wanted, raw_n)
-            or any(_whole_number_in_text(part.strip(), raw_n) for part in wanted.split(",") if part.strip())
-        ):
-            return raw
-        # Evidence may be the labelled source figure we want to write back.
-        if wanted in {token_n, raw_n} or _whole_number_in_text(token_n, wanted):
-            return raw
+        key = normalize_once(token).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append((token, raw))
+    return found
+
+
+def _source_labelled_load_raw(source_blob: str, evidence: str) -> str | None:
+    """Replace a load number only when exactly one labelled source load exists."""
+    wanted = normalize_once(evidence).casefold()
+    if not wanted or wanted == "not_found":
+        return None
+    labelled = _labelled_load_values(source_blob)
+    if len(labelled) != 1:
+        return None
+    token, raw = labelled[0]
+    token_n = normalize_once(token).casefold()
+    raw_n = normalize_once(raw).casefold()
+    if (
+        token_n == wanted
+        or _whole_number_in_text(wanted, raw_n)
+        or any(_whole_number_in_text(part.strip(), raw_n) for part in wanted.split(",") if part.strip())
+        or wanted in {token_n, raw_n}
+        or _whole_number_in_text(token_n, wanted)
+    ):
+        return raw
     return None
 
 
@@ -712,9 +748,7 @@ def _patterns_for_claim(
         phrase = _generated_capacity_phrase(claim_text)
         replacement = None
         if phrase.casefold() in {"fabric", "cloth"}:
-            material = _source_material_field_value(source)
-            if material:
-                replacement = material
+            replacement = _single_fabric_material(_source_material_field_value(source))
         pattern = _safe_claim_pattern(phrase)
         if pattern is not None:
             edits.append((pattern, replacement))

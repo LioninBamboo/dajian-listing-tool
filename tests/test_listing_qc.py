@@ -630,7 +630,24 @@ def test_motors_blocks_invented_load_and_keeps_source_range(monkeypatch):
         source_description="Occupancy 4-6 person.",
         qc_profile="motors",
     )
-    assert not any("semantic_capacity" in item for item in ranged["blockers"])
+    assert ranged["status"] == "blocked"
+    assert any("semantic_capacity" in item and "6" in item for item in ranged["blockers"])
+    assert any("4-6" in item for item in ranged["blockers"])
+
+    five = listing_qc.run_listing_qc(
+        sku="OCC-FIVE",
+        candidate={
+            "title": "Universal 5 person tent",
+            "description": "5 person tent.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal"]},
+        },
+        source_title="4-6 person tent",
+        source_description="Occupancy 4-6 person.",
+        qc_profile="motors",
+    )
+    assert five["status"] == "blocked"
+    assert any("semantic_capacity" in item and "5" in item for item in five["blockers"])
 
     keep = listing_qc.run_listing_qc(
         sku="OCC-KEEP",

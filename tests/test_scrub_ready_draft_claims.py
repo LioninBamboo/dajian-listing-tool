@@ -197,7 +197,7 @@ def test_table_w527p510517_removes_no_electricity_on_heated_product():
     assert "heated" in text
 
 
-def test_table_w3590p576948_keeps_occupancy_inside_source_range():
+def test_table_w3590p576948_source_corrects_6_person_to_4_6():
     cand = _cand(
         title="6 person camping tent",
         description="<p>Spacious 6 person shelter.</p>",
@@ -205,12 +205,16 @@ def test_table_w3590p576948_keeps_occupancy_inside_source_range():
     )
     source = _src(title="4-6 person tent", description="Occupancy 4-6 person tent.")
     before = collect_flagged_claims(cand, source)
-    assert not any(c.claim_type == "semantic_capacity" for c in before)
+    assert any(c.claim_type == "semantic_capacity" for c in before)
     out, result = scrub_candidate(cand, source, sku="W3590P576948")
     text = _joined(out).lower()
-    assert "6 person" in text
-    assert result.status == "unchanged"
-    assert result.diffs == []
+    assert result.status == "cleaned"
+    assert "6 person" not in text.replace("4-6 person", "").replace("4-6", "")
+    assert "4-6" in text or "6 person" not in text
+    if any(d.action == "source_correct" for d in result.diffs):
+        assert "4-6" in text
+    else:
+        assert all(d.action == "remove" for d in result.diffs)
 
 
 def test_table_w5870p523990_source_corrects_fabric_and_seat_count():
@@ -833,8 +837,8 @@ def test_linen_look_polyester_is_not_guessed_as_linen():
     }
     apply_claim_to_candidate(working, claim, "Upholstery in linen-look polyester.", sourced)
     text = _joined(working).lower()
-    assert "linen-look polyester" in text
-    assert not re.search(r"\blinen\b", text.replace("linen-look polyester", ""))
+    assert "linen" not in text
+    assert "fabric" not in text
 
     guessed = _src(description="Upholstery in linen-look polyester.")
     working2 = {
@@ -846,6 +850,62 @@ def test_linen_look_polyester_is_not_guessed_as_linen():
     text2 = _joined(working2).lower()
     assert "linen" not in text2
     assert "fabric" not in text2
+
+
+def test_fabric_replaced_only_with_single_fabric_material():
+    claim = FlaggedClaim(
+        claim_type="semantic_material",
+        claim_text="Fabric",
+        source_evidence="NOT_FOUND",
+        location="title",
+        detector="motors_fact",
+        severity="CRITICAL",
+    )
+
+    def _apply(material: str) -> str:
+        working = {
+            "title": "Fabric seat",
+            "description": "<p>Fabric seat.</p>",
+            "aspects": {"Material": ["Fabric"]},
+        }
+        source = _src(description="Source item.", attributes={"Material": material})
+        apply_claim_to_candidate(working, claim, f"Material {material}", source)
+        return _joined(working)
+
+    metal = _apply("Metal")
+    assert "metal" not in metal.lower()
+    assert "fabric" not in metal.lower()
+
+    wood = _apply("Solid Wood")
+    assert "solid wood" not in wood.lower()
+    assert "fabric" not in wood.lower()
+
+    mixed = _apply("Polyester, Steel")
+    assert "polyester, steel" not in mixed.lower()
+    assert "steel" not in mixed.lower()
+    assert "fabric" not in mixed.lower()
+
+    poly = _apply("Polyester")
+    assert "polyester" in poly.lower()
+    assert "fabric" not in poly.lower()
+
+
+def test_multiple_labelled_loads_are_removed_not_replaced():
+    cand = _cand(
+        title="Chair supports 300 lbs",
+        description="<p>Supports 300 lbs.</p>",
+    )
+    source = _src(
+        description="Seat weight capacity 250 lb. Shelf max load 20 lb.",
+    )
+    out, result = scrub_candidate(cand, source, sku="MULTI-LOAD")
+    text = _joined(out).lower()
+    assert "300" not in text
+    assert "250" not in text
+    assert "20 lb" not in text and "20 lbs" not in text
+    assert result.status == "cleaned"
+    assert any(d.action == "remove" for d in result.diffs)
+    assert not any(d.action == "source_correct" for d in result.diffs)
 
 
 def test_six_persons_not_sourced_by_sixteen_persons():
