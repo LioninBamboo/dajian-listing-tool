@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 
-HIGH_INSERTION_FEE_USD = 20.0
 HIGH_FEE_PATH_SEGMENTS = (
     "trailers",
     "other vehicles & trailers",
@@ -206,23 +205,17 @@ def category_is_high_fee(
     category_name: str = "",
     blacklist_path: Optional[str] = None,
 ) -> bool:
-    cat_id = str(category_id or "").strip()
-    if cat_id and cat_id in load_high_fee_category_blacklist(blacklist_path):
-        return True
+    from src.utils.zero_fee_gate import REASON_HIGH_FEE_CATEGORY, category_match_reason
 
-    segments = _path_segments(category_path, category_name)
-    if any(segment in HIGH_FEE_PATH_SEGMENTS for segment in segments):
-        return True
-    path_norm = re.sub(r"\s+", " ", str(category_path or "")).strip().lower()
-    if path_norm and any(path_norm.startswith(prefix) for prefix in HIGH_FEE_PATH_PREFIXES):
-        return True
-
-    incoming = _path_segments(category_path)
-    if incoming:
-        for extra in _path_entries_from_blacklist_payload(_read_blacklist_payload(blacklist_path) or {}):
-            if incoming == _path_segments(extra):
-                return True
-    return False
+    return (
+        category_match_reason(
+            category_id,
+            category_path,
+            category_name,
+            blacklist_path=blacklist_path,
+        )
+        == REASON_HIGH_FEE_CATEGORY
+    )
 
 
 def resolve_category_taxonomy_path(category_id: str, index=None) -> str:
@@ -260,20 +253,36 @@ def guard_category_write_high_fee(
     path-segment check. ``get_listing_fees(offer_id)`` is intentionally not
     called here: it reflects the offer's *current* category, not the target.
     """
+    from src.utils.zero_fee_gate import (
+        REASON_BLACKLIST_UNAVAILABLE,
+        REASON_CATEGORY_UNKNOWN,
+        evaluate_fee_gate,
+        human_block_reason,
+    )
+
     cid = str(category_id or "").strip()
     path = resolve_category_taxonomy_path(cid, index=index)
-    empty_blacklist = blacklist_file_is_empty(blacklist_path)
-    if not path and empty_blacklist and not allow_unverified_fee:
-        return (
-            f"BLOCKED_HIGH_FEE_UNVERIFIED: category {cid or category_name or '?'} "
-            "path unresolved and high-fee blacklist empty"
-        )
-    return high_fee_category_block_reason(
+    result = evaluate_fee_gate(
         category_id=cid,
         category_path=path,
         category_name=category_name,
         blacklist_path=blacklist_path,
     )
+    if result.ok:
+        # Path-segment / prefix rules cannot run without a taxonomy path.
+        # Fail closed unless the caller explicitly allows an unverified write.
+        if not path and not allow_unverified_fee:
+            return (
+                f"BLOCKED_HIGH_FEE_UNVERIFIED: category {cid or category_name or '?'} "
+                "path unresolved"
+            )
+        return None
+    if allow_unverified_fee and result.reason in {
+        REASON_BLACKLIST_UNAVAILABLE,
+        REASON_CATEGORY_UNKNOWN,
+    }:
+        return None
+    return human_block_reason(result, category_name=category_name)
 
 
 def high_fee_category_block_reason(
@@ -283,61 +292,18 @@ def high_fee_category_block_reason(
     listing_fees: Optional[Mapping[str, Any]] = None,
     blacklist_path: Optional[str] = None,
 ) -> Optional[str]:
-    """Human-readable BLOCKED_HIGH_FEE reason, or None if the write may proceed.
+    """Human-readable BLOCKED_HIGH_FEE reason, or None if the write may proceed."""
+    from src.utils.zero_fee_gate import evaluate_fee_gate, human_block_reason
 
-    Empty/missing blacklist still applies HIGH_FEE_PATH_SEGMENTS. A $20+
-    insertion-fee preview fails closed. Missing preview is not a block here —
-    callers that already have a fee payload must pass it.
-    """
-    cid = str(category_id or "").strip()
-    # Touch the blacklist so a missing file logs its warning.
-    load_high_fee_category_blacklist(blacklist_path)
-    if category_is_high_fee(
-        cid,
+    result = evaluate_fee_gate(
+        category_id=category_id,
         category_path=category_path,
         category_name=category_name,
+        listing_fees=listing_fees,
+        lookup_attempted=listing_fees is not None,
         blacklist_path=blacklist_path,
-    ):
-        return (
-            f"BLOCKED_HIGH_FEE: category {cid or category_name or category_path} "
-            "is on the high-fee blacklist or path-segment list"
-        )
-    if listing_fees is not None:
-        fee = insertion_fee_usd(listing_fees)
-        if fee is not None and fee >= HIGH_INSERTION_FEE_USD:
-            return (
-                f"BLOCKED_HIGH_FEE: category {cid} insertion fee ${fee:.2f} >= "
-                f"${HIGH_INSERTION_FEE_USD:.2f}"
-            )
-    return None
-
-
-def insertion_fee_usd(listing_fees: Optional[Mapping[str, Any]]) -> Optional[float]:
-    if listing_fees is None or not isinstance(listing_fees, Mapping):
-        return None
-    found: Optional[float] = None
-    target = normalize_fee_type("INSERTION_FEE")
-    for summary in listing_fees.get("feeSummaries") or []:
-        if not isinstance(summary, Mapping):
-            continue
-        for fee in summary.get("fees") or []:
-            if not isinstance(fee, Mapping):
-                continue
-            if normalize_fee_type(str(fee.get("feeType") or "")) != target:
-                continue
-            amount = fee.get("amount") or {}
-            raw = amount.get("value") if isinstance(amount, Mapping) else None
-            try:
-                value = float(raw)
-            except (TypeError, ValueError):
-                continue
-            found = value if found is None else max(found, value)
-    # A successful fee payload with no insertion-fee line is $0, not unavailable.
-    return 0.0 if found is None else found
-
-
-def allow_publish_without_fee_preview() -> bool:
-    return str(os.getenv("ALLOW_PUBLISH_WITHOUT_FEE_PREVIEW") or "").strip() == "1"
+    )
+    return human_block_reason(result, category_name=category_name)
 
 
 def evaluate_insertion_fee_preview(
@@ -349,29 +315,16 @@ def evaluate_insertion_fee_preview(
     lookup_error: Optional[BaseException] = None,
     lookup_attempted: bool = False,
     blacklist_path: Optional[str] = None,
-    allow_without_preview: Optional[bool] = None,
 ) -> Optional[str]:
-    if category_is_high_fee(
-        category_id,
+    from src.utils.zero_fee_gate import evaluate_fee_gate, wrapper_reason
+
+    result = evaluate_fee_gate(
+        category_id=category_id,
         category_path=category_path,
         category_name=category_name,
+        listing_fees=listing_fees,
+        lookup_error=lookup_error,
+        lookup_attempted=lookup_attempted,
         blacklist_path=blacklist_path,
-    ):
-        return "high_insertion_fee"
-
-    if lookup_error is not None or (lookup_attempted and listing_fees is None):
-        if allow_without_preview is None:
-            allow_without_preview = allow_publish_without_fee_preview()
-        return None if allow_without_preview else "fee_preview_unavailable"
-
-    if listing_fees is None:
-        return None
-
-    fee = insertion_fee_usd(listing_fees)
-    if fee is None:
-        if allow_without_preview is None:
-            allow_without_preview = allow_publish_without_fee_preview()
-        return None if allow_without_preview else "fee_preview_unavailable"
-    if fee >= HIGH_INSERTION_FEE_USD:
-        return "high_insertion_fee"
-    return None
+    )
+    return wrapper_reason(result)

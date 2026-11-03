@@ -137,6 +137,7 @@ def test_unresolvable_path_empty_blacklist_fails_closed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(publish_fee_preview, "REPO_ROOT", tmp_path)
     publish_fee_preview._EMPTY_BLACKLIST_WARNED.clear()
+    monkeypatch.delenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", raising=False)
     monkeypatch.setattr("src.utils.category_tree_cache.build_category_path", lambda *a, **k: "")
     reason = publish_fee_preview.guard_category_write_high_fee(category_id="999001")
     assert reason and reason.startswith("BLOCKED_HIGH_FEE_UNVERIFIED")

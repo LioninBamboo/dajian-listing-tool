@@ -159,10 +159,12 @@ def publish_variation_group(
         built_items.append({"sku": v["sku"], "product": product, "price": v["price"]})
         if not dry_run:
             client.create_or_replace_inventory_item(v["sku"], product)
-            client.create_offer(
+            offer = client.create_offer(
                 v["sku"], v["price"], category_id=category_id,
                 listing_description=v.get("description") or description,
             )
+            if isinstance(offer, dict) and offer.get("offerId"):
+                built_items[-1]["offer_id"] = offer.get("offerId")
 
     group_payload = build_inventory_item_group_payload(
         title=title, description=description, image_urls=image_urls,
@@ -180,5 +182,38 @@ def publish_variation_group(
         }
 
     client.create_or_replace_inventory_item_group(group_key, group_payload)
+    from src.utils.zero_fee_gate import (
+        ZeroFeeGateBlocked,
+        assert_zero_fee_before_live,
+        preview_inventory_group_listing_fees,
+    )
+
+    offer_ids = [str(item.get("offer_id") or "") for item in built_items if item.get("offer_id")]
+    fee_sink: list = []
+    try:
+        assert_zero_fee_before_live(
+            path_name="variation_publisher.publish_variation_group",
+            sku=group_key,
+            category_id=str(category_id or ""),
+            category_path="",
+            preview=lambda: preview_inventory_group_listing_fees(client, offer_ids),
+            results_sink=fee_sink,
+        )
+    except ZeroFeeGateBlocked as exc:
+        return {
+            "dry_run": False,
+            "status": "error",
+            "blocked_fee": True,
+            "message": exc.result.reason,
+            "fee_preview": fee_sink,
+            "group_key": group_key,
+            "variant_count": len(variants),
+        }
     result = client.publish_by_inventory_item_group(group_key)
-    return {"dry_run": False, "group_key": group_key, "variant_count": len(variants), **result}
+    return {
+        "dry_run": False,
+        "group_key": group_key,
+        "variant_count": len(variants),
+        "fee_preview": fee_sink,
+        **result,
+    }

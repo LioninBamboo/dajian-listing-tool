@@ -1602,6 +1602,15 @@ def test_r2_rebind_kept_stored_reapplies_source_dimensions(monkeypatch):
             return {"offerId": "OFFER1"}
         def publish_offer(self, offer_id):
             return {"listingId": "123"}
+        def get_listing_fees(self, offer_id):
+            return {
+                "feeSummaries": [{
+                    "fees": [{
+                        "feeType": "INSERTION_FEE",
+                        "amount": {"value": "0.00", "currency": "USD"},
+                    }]
+                }]
+            }
         def get_offers_by_sku(self, sku):
             return [{"categoryId": "88057", "listing": {"listingId": "123"}}]
 

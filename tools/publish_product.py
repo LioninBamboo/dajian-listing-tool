@@ -112,7 +112,15 @@ Full customer support.
     # Publish offer
     print("\n[5] Publishing Offer to eBay...")
     try:
-        publish_result = client.publish_offer(offer_id)
+        from src.utils.zero_fee_gate import publish_offer_if_zero_fee
+
+        publish_result = publish_offer_if_zero_fee(
+            ebay_client=client,
+            offer_id=offer_id,
+            path_name="tools.publish_product_complete",
+            sku=demo_sku,
+            category_id="",
+        )
         listing_id = publish_result.get("listingId")
         print("[OK] Published successfully!")
         print("[*] Listing ID: " + str(listing_id))
@@ -173,7 +181,15 @@ def publish_custom(sku, title, price, quantity=1):
         offer_result = client.create_offer(sku, price)
         offer_id = offer_result.get("offerId")
         
-        publish_result = client.publish_offer(offer_id)
+        from src.utils.zero_fee_gate import publish_offer_if_zero_fee
+
+        publish_result = publish_offer_if_zero_fee(
+            ebay_client=client,
+            offer_id=offer_id,
+            path_name="tools.publish_custom",
+            sku=sku,
+            category_id="",
+        )
         listing_id = publish_result.get("listingId")
         
         print("[OK] Published: " + str(listing_id))

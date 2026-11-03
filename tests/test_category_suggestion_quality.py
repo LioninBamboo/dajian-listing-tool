@@ -784,6 +784,16 @@ def _run_approved_retry_branch(monkeypatch, sku, title, stored, target, attrs, a
         def publish_offer(self, offer_id):
             return {"listingId": "123"}
 
+        def get_listing_fees(self, offer_id):
+            return {
+                "feeSummaries": [{
+                    "fees": [{
+                        "feeType": "INSERTION_FEE",
+                        "amount": {"value": "0.00", "currency": "USD"},
+                    }]
+                }]
+            }
+
         def get_offers_by_sku(self, sku):
             return [{"categoryId": target, "listing": {"listingId": "123"}}]
 

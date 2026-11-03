@@ -23,6 +23,10 @@ def _completed_item_xml(item_id: str = OLD_ITEM, sku: str = SKU) -> str:
       <Item>
         <ItemID>{item_id}</ItemID>
         <SKU>{sku}</SKU>
+        <PrimaryCategory>
+          <CategoryID>33615</CategoryID>
+          <CategoryName>Other</CategoryName>
+        </PrimaryCategory>
         <Quantity>1</Quantity>
         <QuantityAvailable>0</QuantityAvailable>
         <ListingDetails><EndingReason>Sold</EndingReason></ListingDetails>
@@ -143,6 +147,13 @@ def test_completed_sold_with_supplier_stock_relists_on_motors_site(monkeypatch, 
 
     def trading_call(call_name, xml_body, site_id):
         calls.append((call_name, xml_body, site_id))
+        if call_name == "VerifyRelistItem":
+            return (
+                "<VerifyRelistItemResponse><Ack>Success</Ack>"
+                "<Fees><Fee><Name>InsertionFee</Name>"
+                "<Fee currencyID=\"USD\">0.00</Fee></Fee></Fees>"
+                "</VerifyRelistItemResponse>"
+            )
         if call_name == "RelistFixedPriceItem":
             return (
                 "<RelistFixedPriceItemResponse><Ack>Success</Ack>"

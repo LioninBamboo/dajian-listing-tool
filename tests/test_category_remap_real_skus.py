@@ -307,8 +307,13 @@ def test_edge_wine_rack_head_maps_wine_cabinet_does_not():
     assert cabinet.category_id not in {"20689"}
 
 
-def test_edge_unverified_high_fee_override_column():
+def test_edge_unverified_high_fee_override_column(monkeypatch, tmp_path):
+    from src.utils import publish_fee_preview
     from src.utils.publish_fee_preview import guard_category_write_high_fee
+
+    monkeypatch.delenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", raising=False)
+    monkeypatch.setattr(publish_fee_preview, "REPO_ROOT", tmp_path)
+    publish_fee_preview._EMPTY_BLACKLIST_WARNED.clear()
 
     blocked = guard_category_write_high_fee(
         category_id="999001",

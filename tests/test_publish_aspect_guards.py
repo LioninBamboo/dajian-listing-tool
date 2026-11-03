@@ -5,7 +5,6 @@ from __future__ import annotations
 import batch_publish
 from src.utils.publish_fee_preview import (
     evaluate_insertion_fee_preview,
-    insertion_fee_usd,
     load_high_fee_blacklist_category_paths,
     load_high_fee_category_blacklist,
 )
@@ -248,7 +247,13 @@ def test_wood_matches_solid_wood():
     assert value_supported_by_source("Wood", "solid wood frame") is True
 
 
-def test_insertion_fee_real_shape_zero_is_allowed():
+def _ok_blacklist(tmp_path):
+    path = tmp_path / "ok_high_fee.json"
+    path.write_text('{"categoryIds": ["00000"]}', encoding="utf-8")
+    return str(path)
+
+
+def test_insertion_fee_real_shape_zero_is_allowed(tmp_path):
     reason = evaluate_insertion_fee_preview(
         listing_fees={
             "feeSummaries": [{
@@ -259,12 +264,12 @@ def test_insertion_fee_real_shape_zero_is_allowed():
             }]
         },
         lookup_attempted=True,
-        blacklist_path="/nonexistent-high-fee-blacklist.json",
+        blacklist_path=_ok_blacklist(tmp_path),
     )
     assert reason is None
 
 
-def test_insertion_fee_real_shape_twenty_blocks():
+def test_insertion_fee_real_shape_twenty_blocks(tmp_path):
     reason = evaluate_insertion_fee_preview(
         listing_fees={
             "feeSummaries": [{
@@ -275,28 +280,20 @@ def test_insertion_fee_real_shape_twenty_blocks():
             }]
         },
         lookup_attempted=True,
-        blacklist_path="/nonexistent-high-fee-blacklist.json",
+        blacklist_path=_ok_blacklist(tmp_path),
     )
     assert reason == "high_insertion_fee"
 
 
-def test_successful_fee_response_without_insertion_line_counts_as_zero():
-    assert insertion_fee_usd({
-        "feeSummaries": [{
-            "fees": [{
-                "feeType": "FinalValueFee",
-                "amount": {"value": "3.00", "currency": "USD"},
-            }]
-        }]
-    }) == 0.0
+def test_successful_fee_response_without_insertion_line_is_unavailable(tmp_path):
     assert evaluate_insertion_fee_preview(
         listing_fees={"feeSummaries": [{"fees": []}]},
         lookup_attempted=True,
-        blacklist_path="/nonexistent-high-fee-blacklist.json",
-    ) is None
+        blacklist_path=_ok_blacklist(tmp_path),
+    ) == "fee_preview_unavailable"
 
 
-def test_insertion_fee_at_least_20_blocks():
+def test_insertion_fee_at_least_20_blocks(tmp_path):
     reason = evaluate_insertion_fee_preview(
         listing_fees={
             "feeSummaries": [{
@@ -307,7 +304,7 @@ def test_insertion_fee_at_least_20_blocks():
             }]
         },
         lookup_attempted=True,
-        blacklist_path="/nonexistent-high-fee-blacklist.json",
+        blacklist_path=_ok_blacklist(tmp_path),
     )
     assert reason == "high_insertion_fee"
 
@@ -322,7 +319,7 @@ def test_motors_vehicles_trailers_path_blocks_as_high_insertion_fee():
     assert reason == "high_insertion_fee"
 
 
-def test_fee_preview_unavailable_unless_explicitly_allowed(monkeypatch):
+def test_fee_preview_unavailable_bypass_removed(monkeypatch):
     monkeypatch.delenv("ALLOW_PUBLISH_WITHOUT_FEE_PREVIEW", raising=False)
     assert evaluate_insertion_fee_preview(
         lookup_attempted=True,
@@ -333,7 +330,7 @@ def test_fee_preview_unavailable_unless_explicitly_allowed(monkeypatch):
     assert evaluate_insertion_fee_preview(
         lookup_attempted=True,
         lookup_error=RuntimeError("boom"),
-    ) is None
+    ) == "fee_preview_unavailable"
 
 
 def test_high_fee_category_blacklist_json(tmp_path):
@@ -402,13 +399,13 @@ def test_empty_blacklist_logs_warning(tmp_path, monkeypatch, caplog):
     assert "empty" in caplog.text.lower()
 
 
-def test_trailer_hitches_leaf_does_not_block():
+def test_trailer_hitches_leaf_does_not_block(tmp_path):
     assert evaluate_insertion_fee_preview(
         category_id="33653",
         category_name="Trailer Hitches",
         category_path="eBay Motors / Parts & Accessories / Trailer Hitches",
         lookup_attempted=False,
-        blacklist_path="/nonexistent-high-fee-blacklist.json",
+        blacklist_path=_ok_blacklist(tmp_path),
     ) is None
 
 
