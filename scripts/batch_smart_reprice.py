@@ -296,7 +296,7 @@ def _write_change_reports(results, timestamp_label: str):
         writer = csv.writer(f)
         writer.writerow([
             'sku', 'title', 'image_url', 'old_price', 'new_price', 'price_diff', 'pct_change',
-            'margin_pct', 'strategy', 'total_cost', 'market_avg', 'market_source',
+            'margin_pct', 'strategy', 'pause_ad', 'total_cost', 'market_avg', 'market_source',
             'market_sample_size', 'market_sold_count', 'price_reason'
         ])
         for r in changed_sorted:
@@ -310,6 +310,7 @@ def _write_change_reports(results, timestamp_label: str):
                 r.get('pct_change', ''),
                 _format_margin_pct(r.get('margin')),
                 r.get('strategy', ''),
+                r.get('pause_ad', False),
                 r.get('total_cost', ''),
                 r.get('market_avg', ''),
                 r.get('market_source', ''),
@@ -335,6 +336,7 @@ def _write_change_reports(results, timestamp_label: str):
             f"<td style='color:{diff_color}'>{float(r.get('pct_change') or 0):+.1f}%</td>"
             f"<td>{_format_margin_pct(r.get('margin'))}</td>"
             f"<td>{r.get('strategy', '')}</td>"
+            f"<td>{'yes' if r.get('pause_ad') else 'no'}</td>"
             f"<td>${float(r.get('total_cost') or 0):.2f}</td>"
             f"<td>${float(r.get('market_avg') or 0):.2f}</td>"
             f"<td>{r.get('market_source', '')}</td>"
@@ -368,6 +370,7 @@ def _write_change_reports(results, timestamp_label: str):
       <th>Change</th>
       <th>Margin</th>
       <th>Strategy</th>
+      <th>Pause Ad</th>
       <th>Cost</th>
       <th>Market Avg</th>
       <th>Source</th>
@@ -405,6 +408,7 @@ def _build_changed_rows(results):
             'price_diff': float(row.get('price_diff') or 0),
             'pct_change': float(row.get('pct_change') or 0),
             'strategy': row.get('strategy', ''),
+            'pause_ad': bool(row.get('pause_ad')),
             'market_source': row.get('market_source', ''),
             'market_avg': float(row.get('market_avg') or 0),
             'market_sample_size': int(row.get('market_sample_size') or 0),
@@ -680,6 +684,7 @@ def smart_price(total_cost: float, market_avg: float,
         'market_avg': r.get('market_price') or 0,
         'strategy': r['strategy'],
         'margin': r['margin'],
+        'pause_ad': bool(r.get('pause_ad')),
     }
 
 
@@ -854,9 +859,9 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
     Trading-channel Motors listings use ReviseFixedPriceItem. Furniture and
     other Inventory stores keep the existing offer PUT path unchanged.
 
-    🛡️ 安全护栏 (2026-05): 写出前调用 repricing_guard.precheck_price 校验.
-    - 价格 < 带广告死线 但 >= 关广告死线 → 自动关广告后放行
-    - 价格 < 关广告死线 (即真亏本) → 拒绝, 不调任何 eBay API
+    🛡️ 安全护栏: 写出前调用 repricing_guard.precheck_price 校验.
+    - 价格 < 带广告 10% 净利底但关广告后达标 → 标记 pause_ad; 未 opt-in 关广告则抬到带广告地板
+    - 关广告后仍 < 10% → 抬到 10% 净利底 (不再拒绝)
     - 守门员自身异常 → fail-closed (返回 PRICE_GUARD_ERROR, 不写 eBay)
 
     Returns:
@@ -867,15 +872,20 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
     # ── 守门员: 死线 + 广告自适应 (与 InventorySyncService 共用) ──
     from src.services.repricing_guard import precheck_price, reprice_write_channel
     try:
-        ok, reason = precheck_price(
+        decision = precheck_price(
             sku=sku, new_price=new_price,
             db_path='ebay_collection.db',
             listing_id=expected_listing_id,
             allow_ad_disable=True,
         )
+        ok = decision.ok if hasattr(decision, "ok") else decision[0]
+        reason = decision.reason if hasattr(decision, "reason") else decision[1]
         if not ok:
             log.error(f"  {sku}: 🚫 PRICE GUARD 拒绝改价 ({reason})")
             return False
+        adjusted = getattr(decision, "adjusted_price", None)
+        if adjusted is not None:
+            new_price = float(adjusted)
     except Exception as guard_exc:
         log.error(f"  {sku}: 🚫 PRICE GUARD 异常, 拒绝改价 (fail-closed): {guard_exc}")
         return PRICE_GUARD_ERROR
@@ -1333,6 +1343,7 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
             'market_sold_count': mkt.get('sold_count', 0),
             'strategy': strategy,
             'margin': pricing['margin'],
+            'pause_ad': bool(pricing.get('pause_ad')),
             'price_diff': round(price_diff, 2),
             'pct_change': round(pct_change, 1),
             'status': 'pending',

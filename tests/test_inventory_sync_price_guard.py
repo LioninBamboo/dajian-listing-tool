@@ -109,10 +109,13 @@ def _product(sku, breakdown, live_price=None):
 
 def _landed_and_floor(product_price, shipping_cost):
     landed = PricingEngine.calculate_dajian_cost(product_price, shipping_cost)["total_dajian_cost"]
-    floor = PricingEngine.safe_floor_price(
-        landed, float(PricingEngine.MIN_NET_MARGIN_ON_COST)
-    )
+    floor = PricingEngine.net_margin_floor_price(landed)
     return landed, floor
+
+
+def _live_above_floor(product_price, shipping_cost, pad=10.0):
+    _landed, floor = _landed_and_floor(product_price, shipping_cost)
+    return round(floor + pad, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -179,13 +182,18 @@ def test_baseline_prefers_last_price_write_cost_not_last_sync_cost():
     assert baseline_base_cost({PRICE_WRITE_BASE_COST_KEY: "40.00"}) == pytest.approx(40.0)
 
 
-def test_listing_price_below_floor_uses_existing_safe_floor():
-    _landed, floor = _landed_and_floor(40.0, 5.0)
+def test_listing_price_below_floor_uses_sale_price_net_margin():
+    landed, floor = _landed_and_floor(40.0, 5.0)
+    old_floor = PricingEngine.safe_floor_price(landed, 0.10)
+    assert floor > old_floor
     assert listing_price_below_cost_floor(floor - 1.0, 40.0, 5.0) is True
     assert listing_price_below_cost_floor(floor, 40.0, 5.0) is False
     assert listing_price_below_cost_floor(floor + 1.0, 40.0, 5.0) is False
+    assert listing_price_below_cost_floor(old_floor, 40.0, 5.0) is True
     assert listing_price_below_cost_floor(None, 40.0, 5.0) is False
     assert listing_price_below_cost_floor(10.0, None, 5.0) is False
+    margin = PricingEngine.net_margin_at_price(floor, landed)
+    assert margin >= PricingEngine.min_net_margin()
 
 
 def test_resolve_current_listing_price_ignores_stale_suggested_price():
@@ -206,14 +214,28 @@ def test_resolve_current_listing_price_ignores_stale_suggested_price():
 
 
 def test_decide_shipping_only_cents_move_is_not_a_write():
+    live = _live_above_floor(107.09, 21.21)
+    decision = decide_sync_price_action(
+        giga_product_price=107.09,
+        giga_shipping_cost=21.21,
+        cost_breakdown={"base_cost": 107.09 + 21.33, "selling_price": live},
+        live_listing_price=live,
+    )
+    assert decision.write is False
+    assert decision.reason == "small_cost_change"
+
+
+def test_nov02_old_cost_floor_live_price_is_now_below_sale_net_floor():
+    """$202.46 sat on the old cost×1.10 floor (~9.1% of net). Sale-price 10% is higher."""
+    assert listing_price_below_cost_floor(202.46, 107.09, 21.21) is True
     decision = decide_sync_price_action(
         giga_product_price=107.09,
         giga_shipping_cost=21.21,
         cost_breakdown={"base_cost": 107.09 + 21.33, "selling_price": 202.46},
         live_listing_price=202.46,
     )
-    assert decision.write is False
-    assert decision.reason == "small_cost_change"
+    assert decision.write is True
+    assert decision.reason == "below_floor"
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +247,7 @@ def test_nov02_shipping_cents_move_does_not_write_ebay(tmp_path):
     old_shipping = 21.33
     new_shipping = 21.21
     product_price = 107.09
-    live = 202.46
+    live = _live_above_floor(product_price, new_shipping)
     stale_sync_target = 230.74
     service, writes, db = _service(
         tmp_path,
@@ -262,13 +284,14 @@ def test_nov02_shipping_cents_move_does_not_write_ebay(tmp_path):
 
 def test_w465_tiny_cost_move_keeps_live_reprice(tmp_path):
     sku = "W465P194603"
+    live = _live_above_floor(107.21, 21.21)
     service, writes, _db = _service(
         tmp_path,
-        [(sku, "1", {"base_cost": 128.42, "selling_price": 202.46}, 230.74)],
+        [(sku, "1", {"base_cost": 128.42, "selling_price": live}, 230.74)],
     )
     result = service._check_and_update_price(
         sku,
-        _product(sku, {"base_cost": 128.42, "selling_price": 202.46}),
+        _product(sku, {"base_cost": 128.42, "selling_price": live}),
         107.21,
         21.21,
         dry_run=False,
@@ -491,13 +514,14 @@ def test_unknown_inputs_do_not_crash_or_write(
 
 def test_string_numbers_and_int_sku_are_safe(tmp_path):
     sku = 194603
+    live = _live_above_floor(107.21, 21.21)
     service, writes, db = _service(
         tmp_path,
-        [("194603", "1", {"base_cost": "128.42", "selling_price": "202.46"}, 230.74)],
+        [("194603", "1", {"base_cost": "128.42", "selling_price": f"{live:.2f}"}, 230.74)],
     )
     result = service._check_and_update_price(
         sku,
-        _product(sku, {"base_cost": "128.42", "selling_price": "202.46"}),
+        _product(sku, {"base_cost": "128.42", "selling_price": f"{live:.2f}"}),
         "107.21",
         "21.21",
         dry_run=False,

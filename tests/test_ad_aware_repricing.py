@@ -119,58 +119,94 @@ class PrecheckPriceTests(unittest.TestCase):
 
     def test_safe_price_passes(self):
         from src.services.repricing_guard import precheck_price
-        ok, reason = precheck_price('SKU-100', 150.0, db_path=self.db_path)
+        ok, reason = precheck_price('SKU-100', 200.0, db_path=self.db_path)
         self.assertTrue(ok)
         self.assertEqual(reason, 'ok')
 
-    def test_unsafe_below_break_even_rejected(self):
+    def test_unsafe_below_break_even_is_raised(self):
+        from src.services.pricing_engine import PricingEngine
         from src.services.repricing_guard import precheck_price
-        # $100 远低于关广告 10% 成本底 $138.99 → 拒
-        ok, reason = precheck_price('SKU-100', 100.0, db_path=self.db_path)
-        self.assertFalse(ok)
-        self.assertIn('unsafe_even_without_ad', reason)
+        # $100 远低于关广告 10% 售价净利底 → 抬到带广告地板, 不再拒绝
+        decision = precheck_price('SKU-100', 100.0, db_path=self.db_path)
+        self.assertTrue(decision.ok)
+        self.assertIn('raised_to_net_floor', decision.reason)
+        self.assertAlmostEqual(
+            decision.adjusted_price,
+            PricingEngine.net_margin_floor_price(100.0),
+            places=2,
+        )
 
-    def test_no_cost_data_fails_open(self):
+    def test_no_cost_data_fails_closed(self):
         from src.services.repricing_guard import precheck_price
         ok, reason = precheck_price('SKU-NOCOST', 5.0, db_path=self.db_path)
-        self.assertTrue(ok)
-        self.assertEqual(reason, 'no_cost_data')
+        self.assertFalse(ok)
+        self.assertEqual(reason, 'unknown_or_invalid_cost')
 
-    def test_below_ad_floor_no_ad_passes(self):
-        """价格 < 带广告 10% 成本底, 但 >= 关广告 10% 成本底, 且没在打广告 → 放行."""
+    def test_below_ad_floor_no_ad_keeps_target_when_pause_executes(self):
+        """带广告 <10% 但关广告 ≥10%, 且 opt-in 关广告成功 → 保持目标价."""
         from src.services import repricing_guard
+        from src.services.pricing_engine import PricingEngine
+        target = (
+            PricingEngine.net_margin_floor_price(100.0)
+            + PricingEngine.net_margin_floor_price(100.0, ad_rate=0.0)
+        ) / 2
         with patch.object(repricing_guard, '_try_disable_ad', return_value=(False, 'no_ad')):
-            ok, reason = repricing_guard.precheck_price(
-                'SKU-100', 144.0, db_path=self.db_path,
+            decision = repricing_guard.precheck_price(
+                'SKU-100', target, db_path=self.db_path, execute_ad_pause=True,
             )
-        self.assertTrue(ok)
-        self.assertEqual(reason, 'ok_no_ad_to_disable')
+        self.assertTrue(decision.ok)
+        self.assertEqual(decision.reason, 'ok_no_ad_to_disable')
+        self.assertAlmostEqual(decision.adjusted_price, target, places=2)
 
     def test_below_ad_floor_with_ad_disable_succeeds(self):
         from src.services import repricing_guard
+        from src.services.pricing_engine import PricingEngine
+        target = (
+            PricingEngine.net_margin_floor_price(100.0)
+            + PricingEngine.net_margin_floor_price(100.0, ad_rate=0.0)
+        ) / 2
         with patch.object(repricing_guard, '_try_disable_ad', return_value=(True, 'disabled')):
-            ok, reason = repricing_guard.precheck_price(
-                'SKU-100', 144.0, db_path=self.db_path,
+            decision = repricing_guard.precheck_price(
+                'SKU-100', target, db_path=self.db_path, execute_ad_pause=True,
             )
-        self.assertTrue(ok)
-        self.assertIn('ok_after_ad_disabled', reason)
+        self.assertTrue(decision.ok)
+        self.assertIn('ok_after_ad_disabled', decision.reason)
 
-    def test_below_ad_floor_with_ad_disable_failed_rejected(self):
+    def test_below_ad_floor_with_ad_disable_failed_raises_to_with_ad_floor(self):
         from src.services import repricing_guard
+        from src.services.pricing_engine import PricingEngine
+        target = (
+            PricingEngine.net_margin_floor_price(100.0)
+            + PricingEngine.net_margin_floor_price(100.0, ad_rate=0.0)
+        ) / 2
         with patch.object(repricing_guard, '_try_disable_ad', return_value=(False, 'failed')):
-            ok, reason = repricing_guard.precheck_price(
-                'SKU-100', 144.0, db_path=self.db_path,
+            decision = repricing_guard.precheck_price(
+                'SKU-100', target, db_path=self.db_path, execute_ad_pause=True,
             )
-        self.assertFalse(ok)
-        self.assertIn('ad_disable_failed', reason)
-
-    def test_allow_ad_disable_false_rejects_below_ad_floor(self):
-        from src.services.repricing_guard import precheck_price
-        ok, reason = precheck_price(
-            'SKU-100', 144.0, db_path=self.db_path, allow_ad_disable=False,
+        self.assertTrue(decision.ok)
+        self.assertIn('raised_to_with_ad_floor', decision.reason)
+        self.assertAlmostEqual(
+            decision.adjusted_price,
+            PricingEngine.net_margin_floor_price(100.0),
+            places=2,
         )
-        self.assertFalse(ok)
-        self.assertIn('unsafe_with_ad_no_disable', reason)
+
+    def test_allow_ad_disable_false_raises_to_with_ad_floor(self):
+        from src.services.pricing_engine import PricingEngine
+        from src.services.repricing_guard import precheck_price
+        target = (
+            PricingEngine.net_margin_floor_price(100.0)
+            + PricingEngine.net_margin_floor_price(100.0, ad_rate=0.0)
+        ) / 2
+        decision = precheck_price(
+            'SKU-100', target, db_path=self.db_path, allow_ad_disable=False,
+        )
+        self.assertTrue(decision.ok)
+        self.assertAlmostEqual(
+            decision.adjusted_price,
+            PricingEngine.net_margin_floor_price(100.0),
+            places=2,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────

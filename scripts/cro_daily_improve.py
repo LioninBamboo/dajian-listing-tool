@@ -743,21 +743,35 @@ def guard_price_fail_closed(
 
         fn = precheck_price
     try:
-        ok, reason = fn(
+        result = fn(
             sku=sku,
             new_price=new_price,
             db_path=str(ctx.db_path),
             listing_id=listing_id,
             allow_ad_disable=False,
         )
+        ok = result.ok if hasattr(result, "ok") else result[0]
+        reason = result.reason if hasattr(result, "reason") else result[1]
+        adjusted = getattr(result, "adjusted_price", None)
     except Exception as exc:
         return False, f"guard_error:{exc}"
     reason_s = str(reason or "")
-    # precheck_price fail-opens on missing cost; this CLI must fail closed (#44).
-    if reason_s in {"no_cost_data", "pricing_engine_unavailable"} or reason_s.startswith("no_cost"):
+    # precheck_price fail-closed on missing cost; keep the extra deny for mocks.
+    if reason_s in {
+        "no_cost_data",
+        "unknown_or_invalid_cost",
+        "pricing_engine_unavailable",
+    } or reason_s.startswith("no_cost") or reason_s.startswith("unknown_or_invalid"):
         return False, f"guard_error:{reason_s or 'no_cost_data'}"
     if not ok:
         return False, reason_s or "guard_denied"
+    # Price-drop CLI must not write a raised floor as if it were the drop target.
+    if adjusted is not None:
+        try:
+            if float(adjusted) > float(new_price) + 0.001:
+                return False, reason_s or "below_net_floor"
+        except (TypeError, ValueError):
+            return False, reason_s or "below_net_floor"
     return True, reason_s or "ok"
 
 

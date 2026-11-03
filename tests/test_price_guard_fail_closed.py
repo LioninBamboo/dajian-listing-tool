@@ -187,22 +187,20 @@ class TestInventorySyncGuardFailClosed:
         mock_oauth.assert_not_called()
         mock_get.assert_not_called()
 
-    def test_guard_refuse_still_blocks(self):
+    def test_guard_refuse_unknown_cost_still_blocks(self):
         svc = self._make_service()
-        floor = PricingEngine.absolute_floor_price(100.0)
-        unsafe = floor - 20.0
         with patch(
             "src.services.repricing_guard._fetch_cost_and_listing",
-            return_value=(100.0, "L1"),
+            return_value=(None, None),
         ), patch("src.services.ebay_auth.EbayOAuthService") as mock_oauth:
-            ok = svc.update_ebay_price("LOSSY-SKU", unsafe)
+            ok = svc.update_ebay_price("LOSSY-SKU", 50.0)
 
         assert ok is False
         mock_oauth.assert_not_called()
 
     def test_guard_pass_still_reaches_ebay(self):
         svc = self._make_service()
-        safe = PricingEngine.safe_floor_price(100.0, 0.10)
+        safe = PricingEngine.net_margin_floor_price(100.0)
         with patch(
             "src.services.repricing_guard._fetch_cost_and_listing",
             return_value=(100.0, "L1"),
