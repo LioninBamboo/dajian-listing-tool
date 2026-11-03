@@ -31,7 +31,8 @@ FACT_SHEET_CACHE_SCHEMA_VERSION = 1
 _MATERIAL_LEXICON: tuple[str, ...] = (
     "stainless steel", "tempered glass", "solid wood", "memory foam",
     "genuine leather", "real leather", "top grain leather", "full grain leather",
-    "pu leather", "faux leather", "bonded leather", "particle board",
+    "synthetic leather", "pu leather", "faux leather", "bonded leather",
+    "leatherette", "particle board",
     "engineered wood", "canvas", "oxford", "polyester", "nylon", "cotton",
     "linen", "velvet", "boucle", "suede", "oak", "pine", "teak", "walnut",
     "acacia", "bamboo", "eucalyptus", "rubberwood", "mdf", "plywood",
@@ -127,6 +128,17 @@ _SYNONYM_GROUPS: tuple[frozenset[str], ...] = (
         "aluminium",
         "aluminum alloy",
         "aluminium alloy",
+    }),
+    # Non-genuine leather family. Bare "leather" is deliberately absent.
+    frozenset({
+        "pu leather",
+        "faux leather",
+        "leatherette",
+        "synthetic leather",
+        "vegan leather",
+        "bonded leather",
+        "artificial leather",
+        "imitation leather",
     }),
 )
 
@@ -624,12 +636,17 @@ def _word_bounded_phrase_in(phrase: str, text: str) -> bool:
     """True when `phrase` appears in `text` as a whole phrase (not a part-word).
 
     Short material tokens like ``mdf`` / ``foam`` / ``linen`` must not match
-    inside unrelated words (e.g. ``pipeline``, ``sofa``).
+    inside unrelated words (e.g. ``pipeline``, ``sofa``). Bare ``leather``
+    is not the ``leather`` inside ``PU Leather`` / ``Leatherette``.
     """
+    from src.utils.claim_diff_engine import leather_claim_kind, source_supports_leather_claim
+
     phrase = re.sub(r"\s+", " ", str(phrase or "").lower()).strip()
     text = re.sub(r"\s+", " ", str(text or "").lower())
     if not phrase or not text:
         return False
+    if leather_claim_kind(phrase):
+        return source_supports_leather_claim(phrase, text)
     pattern = rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])"
     return re.search(pattern, text) is not None
 
@@ -687,6 +704,10 @@ def _claim_in_text(claim: str, text: str) -> bool:
     claim_norm = re.sub(r"\s+", " ", str(claim or "").lower()).strip()
     if not claim_norm:
         return False
+    from src.utils.claim_diff_engine import leather_claim_kind, source_supports_leather_claim
+
+    if leather_claim_kind(claim_norm):
+        return source_supports_leather_claim(claim_norm, text)
     text_norm = re.sub(r"\s+", " ", str(text).lower())
     if claim_norm in text_norm:
         return True
@@ -709,6 +730,10 @@ def _supported_by_any(claim: str, source_items: list[str], source_blob_tokens: s
     """A live claim is supported when any source item shares a token, when the
     claim's tokens all appear in the source sheet, or when claim and source
     express the same thing through a known synonym group (4 season ≈ year-round)."""
+    from src.utils.claim_diff_engine import leather_claim_kind, source_supports_leather_claim
+
+    if leather_claim_kind(claim):
+        return source_supports_leather_claim(claim, *source_items, source_blob_text)
     claim_tokens = _tokens(claim)
     if not claim_tokens:
         return True
@@ -1134,13 +1159,23 @@ def compare_fact_sheets(
         # Volume claims ("5 gallon") belong in the same bucket: if the source title
         # already states the number+unit, the live sheet did not invent occupancy.
         _is_weight = bool(re.search(r"(lb|lbs|pound|ton|tonne|kg|oz)\b", live["capacity"], re.I))
+        _is_labelled_load = bool(re.search(
+            r"weight\s+capacity|load\s+capacity|max(?:imum)?\s+load|"
+            r"\bsupports?\b|\bhold(?:s|ing)?\b|\brated\b|\bup\s+to\b",
+            live["capacity"],
+            re.I,
+        ))
         _num = re.search(r"\d+(?:\.\d+)?", live["capacity"])
         _num_in_source = bool(_num and source_text and _num.group(0) in source_text)
         live_range = _capacity_numbers(live["capacity"])
         if source_text is not None and _claim_in_text(live["capacity"], source_text):
             pass  # grounded in source copy (title/description)
-        elif _is_weight and (_num_in_source or source_text is None):
-            pass  # grounded load rating (or source text unavailable) — not fabricated
+        elif (
+            _is_weight
+            and not _is_labelled_load
+            and (_num_in_source or source_text is None)
+        ):
+            pass  # grounded item/package weight (or source text unavailable)
         elif live_range is None or live_range[1] >= 3:
             violations.append(
                 {
@@ -1517,6 +1552,20 @@ def check_fact_sheet_violations(
                           " ".join(f"{k}: {v}" for k, v in candidate_aspects.items())])
 
     violations = compare_fact_sheets(source_sheet, live_sheet, live_text=live_txt, source_text=source_txt)
+    from src.services.listing_qc import merge_deterministic_fact_violations
+
+    violations = merge_deterministic_fact_violations(
+        violations,
+        {
+            "title": candidate_title,
+            "description": candidate_description,
+            "aspects": candidate_aspects,
+        },
+        source_title=source_title,
+        source_description=source_description,
+        source_attributes=source_attributes,
+        source_specs=source_specs,
+    )
 
     # Some supplier feeds expose a structured seat count (for example
     # Seats=4 Seat) while retaining stale copy that says 5 people. If the live

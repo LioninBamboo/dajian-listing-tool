@@ -52,6 +52,7 @@ def test_run_listing_qc_returns_pass_with_shared_inputs(monkeypatch):
         images=["one", "two"],
         videos=[],
         fact_sheet_conn=sqlite3.connect(":memory:"),
+        qc_profile="furniture",
     )
 
     assert result["status"] == "pass"
@@ -89,6 +90,7 @@ def test_run_listing_qc_blocks_fact_sheet_violation(monkeypatch):
         source_specs={},
         images=["one", "two"],
         fact_sheet_conn=sqlite3.connect(":memory:"),
+        qc_profile="furniture",
     )
 
     assert result["status"] == "blocked"
@@ -147,6 +149,7 @@ def test_run_listing_qc_attaches_rule_and_experience_provenance(monkeypatch):
         source_specs={},
         images=["one", "two"],
         fact_sheet_conn=conn,
+        qc_profile="furniture",
     )
 
     assert result["rule_ids"] == ["FACT_SHEET-SEMANTIC_MATERIAL"]
@@ -184,6 +187,7 @@ def test_run_listing_qc_attaches_narrow_side_table_rule_provenance(monkeypatch):
         source_specs={},
         images=["one", "two"],
         fact_sheet_conn=conn,
+        qc_profile="furniture",
     )
 
     assert result["status"] == "blocked"
@@ -211,6 +215,7 @@ def test_run_listing_qc_marks_fact_sheet_unavailable_and_blocks(monkeypatch):
         source_specs={},
         images=["one", "two"],
         fact_sheet_conn=sqlite3.connect(":memory:"),
+        qc_profile="furniture",
     )
 
     assert result["status"] == "unavailable"
@@ -229,6 +234,7 @@ def test_run_listing_qc_does_not_skip_fact_sheet_when_connection_is_missing(monk
         source_attributes={"Material": "Solid Wood"},
         source_specs={},
         images=["one", "two"],
+        qc_profile="furniture",
     )
 
     assert result["status"] == "unavailable"
@@ -251,6 +257,7 @@ def test_run_listing_qc_blocks_quality_gate_exception(monkeypatch):
         source_specs={},
         images=["one", "two"],
         fact_sheet_conn=sqlite3.connect(":memory:"),
+        qc_profile="furniture",
     )
 
     assert result["status"] == "blocked"

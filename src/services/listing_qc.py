@@ -9,6 +9,7 @@ FactSheet comparison supplied by the caller.
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping
 from typing import Any
 
@@ -186,10 +187,129 @@ _WEIGHT_CONTEXT_RE = re.compile(
     r"(?<!load\s)(?<!max\s)(?<!maximum\s)\bweight\b(?!\s+capacity)(?!\s+limit)(?!\s+rating)",
     re.I,
 )
+# Whole-label product/package weight keys after stripping unit parentheses.
+# "Weight Capacity" / "Maximum Weight" / "Load Weight" are not weight facts.
+_WEIGHT_FIELD_LABELS = frozenset({
+    "weight",
+    "item weight",
+    "product weight",
+    "net weight",
+    "package weight",
+    "shipping weight",
+    "gross weight",
+    "overall weight",
+    "overall product weight",
+    "unit weight",
+    "assembled weight",
+})
 _WEIGHT_ASPECT_KEY_RE = re.compile(
-    r"^(?:item|product|package|shipping|net|gross)\s+weight$|^weight$",
+    r"^(?:(?:item|product|package|shipping|net|gross|overall(?:\s+product)?|unit|assembled)\s+)?"
+    r"weight"
+    r"(?:\s*\([^)]*\))?$",
     re.I,
 )
+_WEIGHT_LABEL_UNIT_RE = re.compile(
+    r"\((?P<unit>lbs?|pounds?|kgs?|kilograms?)\)|(?P<unit2>lbs?|pounds?|kgs?|kilograms?)\.?$",
+    re.I,
+)
+_MASS_UNIT_IN_VALUE_RE = re.compile(
+    r"\b(?P<unit>lbs?|pounds?|kgs?|kilograms?)\b",
+    re.I,
+)
+_NUMERIC_MASS_RE = re.compile(
+    r"(?P<num>\d+(?:\.\d+)?)(?:\s*(?:-|–|to)\s*(?P<num2>\d+(?:\.\d+)?))?",
+)
+
+
+def _normalize_weight_label(key: object) -> str:
+    text = unicodedata.normalize("NFKC", str(key or ""))
+    text = re.sub(r"\s+", " ", text.strip().lower())
+    text = re.sub(r"\s*\([^)]*\)\s*", " ", text)
+    text = re.sub(r"\s+(?:lbs?|pounds?|kgs?|kilograms?)\.?$", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def is_product_weight_label(key: object) -> bool:
+    """Whole-label weight field. ``Weight Capacity`` is not a weight fact."""
+    normalized = _normalize_weight_label(key)
+    if not normalized or "capacity" in normalized or "limit" in normalized:
+        return False
+    if re.search(r"\b(?:max|maximum|load|rated)\b", normalized):
+        return False
+    return normalized in _WEIGHT_FIELD_LABELS
+
+
+def _unit_from_weight_key(key: object) -> str:
+    text = str(key or "")
+    match = _WEIGHT_LABEL_UNIT_RE.search(text)
+    if not match:
+        return "lbs"
+    unit = match.group("unit") or match.group("unit2") or "lbs"
+    return "kg" if unit.lower() in _KG_UNITS else "lbs"
+
+
+def _render_structured_weight(key: object, value: object) -> str | None:
+    """Turn a numeric Item/Package Weight field into a unit-bearing mention."""
+    if value is None:
+        return None
+    raw = unicodedata.normalize("NFKC", str(value)).strip()
+    if not raw or raw.lower() in {"none", "null", "n/a", "na"}:
+        return None
+    if raw.startswith(("-", "−", "–")):
+        return None
+    if _MASS_UNIT_IN_VALUE_RE.search(raw) and _NUMERIC_MASS_RE.search(raw):
+        try:
+            number = float(_NUMERIC_MASS_RE.search(raw).group("num"))
+        except (TypeError, ValueError):
+            return None
+        if number <= 0:
+            return None
+        return raw
+    match = _NUMERIC_MASS_RE.search(raw)
+    if not match:
+        return None
+    try:
+        number = float(match.group("num"))
+        number2 = float(match.group("num2")) if match.group("num2") else None
+    except (TypeError, ValueError):
+        return None
+    if number <= 0 or (number2 is not None and number2 <= 0):
+        return None
+    unit = _unit_from_weight_key(key)
+    token = match.group(0).replace("–", "-")
+    return f"{token} {unit}"
+
+
+def structured_weight_mentions(*mappings: Mapping[str, Any] | None) -> list[tuple[str, str, str]]:
+    """Source item/package weight facts from structured fields, unit optional."""
+    mentions: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for mapping in mappings:
+        if not isinstance(mapping, Mapping):
+            continue
+        for key, value in mapping.items():
+            if not is_product_weight_label(key):
+                continue
+            raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+            for raw in raw_values:
+                rendered = _render_structured_weight(key, raw)
+                if not rendered:
+                    continue
+                parsed = _CAPACITY_RE.search(rendered)
+                if parsed is None:
+                    unit = _unit_from_weight_key(key)
+                    synthetic = f"{rendered} {unit}"
+                    parsed = _CAPACITY_RE.search(synthetic)
+                    if parsed is None:
+                        continue
+                    rendered = synthetic
+                number = _capacity_token(parsed.group("num"), parsed.group("num2"))
+                key_pair = (number, "weight")
+                if key_pair in seen:
+                    continue
+                seen.add(key_pair)
+                mentions.append((number, "weight", rendered.strip().lower()))
+    return mentions
 
 
 def _plain_blob(*parts: object) -> str:
@@ -197,11 +317,20 @@ def _plain_blob(*parts: object) -> str:
     for part in parts:
         if isinstance(part, Mapping):
             for key, value in part.items():
+                raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+                if is_product_weight_label(key):
+                    for raw in raw_values:
+                        rendered = _render_structured_weight(key, raw)
+                        if rendered:
+                            chunks.append(f"{key}: {rendered}")
+                        elif raw is not None and str(raw).strip():
+                            chunks.append(str(key))
+                            chunks.append(str(raw))
+                    continue
                 chunks.append(str(key))
-                if isinstance(value, (list, tuple, set)):
-                    chunks.extend(str(item) for item in value)
-                elif value is not None:
-                    chunks.append(str(value))
+                for raw in raw_values:
+                    if raw is not None:
+                        chunks.append(str(raw))
         elif part:
             chunks.append(str(part))
     text = re.sub(r"<[^>]+>", " ", " ".join(chunks))
@@ -391,25 +520,39 @@ def capacity_window_is_product_weight(window: str) -> bool:
 
 
 def is_weight_aspect_key(key: str) -> bool:
-    return bool(_WEIGHT_ASPECT_KEY_RE.match(str(key or "").strip()))
+    text = str(key or "").strip()
+    if is_product_weight_label(text):
+        return True
+    return bool(_WEIGHT_ASPECT_KEY_RE.match(text))
 
 
-def _capacity_mentions(text: str) -> list[tuple[str, str, str]]:
-    mentions: list[tuple[str, str, str]] = []
+def _mention_is_labelled_load(text: str, match: re.Match[str]) -> bool:
+    blob = text or ""
+    left = blob[max(0, match.start() - 56):match.start()]
+    right = blob[match.end():match.end() + 16]
+    if capacity_window_is_labelled_load(left) or capacity_window_is_labelled_load(right):
+        return True
+    return bool(_LOAD_CONTEXT_RE.search(left) or _LOAD_CONTEXT_RE.search(right))
+
+
+def _capacity_mentions(text: str) -> list[tuple[str, str, str, bool]]:
+    mentions: list[tuple[str, str, str, bool]] = []
     seen: set[tuple[str, str]] = set()
     for match in _CAPACITY_RE.finditer(text or ""):
         unit = match.group("unit")
         family = _capacity_family(unit)
         if not family:
             continue
+        labelled_load = False
         if family == "load":
             family = _mass_family(text or "", match)
+            labelled_load = _mention_is_labelled_load(text or "", match)
         number = _capacity_token(match.group("num"), match.group("num2"))
         key = (number, family)
         if key in seen:
             continue
         seen.add(key)
-        mentions.append((number, family, match.group(0).strip().lower()))
+        mentions.append((number, family, match.group(0).strip().lower(), labelled_load))
     return mentions
 
 
@@ -485,11 +628,23 @@ def motors_deterministic_fact_violations(
 
     source_caps = _capacity_mentions(source_text)
     source_by_family: dict[str, list[tuple[str, str]]] = {}
-    for number, family, raw in source_caps:
+    for number, family, raw, _labelled in source_caps:
         source_by_family.setdefault(family, []).append((number, raw))
-    for number, family, raw in _capacity_mentions(candidate_text):
+    for number, family, raw in structured_weight_mentions(source_attributes, source_specs):
+        known_weight = source_by_family.setdefault("weight", [])
+        if not any(number == token for token, _src in known_weight):
+            known_weight.append((number, raw))
+    source_weights = source_by_family.get("weight") or []
+    for number, family, raw, labelled_load in _capacity_mentions(candidate_text):
         known = source_by_family.get(family) or []
         if _capacity_supported(number, raw, family, known):
+            continue
+        # Unlabelled bare "X lbs": a source-weight match is a supported weight
+        # fact, not a capacity claim. Labelled load/capacity/holds/supports/
+        # up-to must still match a labelled source load.
+        if family == "load" and not labelled_load and _capacity_supported(
+            number, raw, "weight", source_weights
+        ):
             continue
         if known:
             evidence = ", ".join(
@@ -677,6 +832,72 @@ def _serialize_fact_violation(violation: Any) -> dict[str, Any]:
     return {"claim_text": str(violation)}
 
 
+def _mass_token_from_claim(text: object) -> str | None:
+    match = _CAPACITY_RE.search(str(text or ""))
+    if match is None:
+        return None
+    if _capacity_family(match.group("unit")) != "load":
+        return None
+    return _capacity_token(match.group("num"), match.group("num2"))
+
+
+def merge_deterministic_fact_violations(
+    violations: list[Any],
+    candidate: Mapping[str, Any],
+    *,
+    source_title: str = "",
+    source_description: str = "",
+    source_attributes: Mapping[str, Any] | None = None,
+    source_specs: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Union LLM FactSheet hits with the deterministic invent gate.
+
+    An LLM ``semantic_capacity`` lb/kg row that the deterministic gate treats
+    as a supported weight fact is dropped (never a guessed correction).
+    Occupancy / volume / labelled-load hits stay strict.
+    """
+    det = [
+        _serialize_fact_violation(item)
+        for item in motors_deterministic_fact_violations(
+            candidate,
+            source_title=source_title,
+            source_description=source_description,
+            source_attributes=source_attributes or {},
+            source_specs=source_specs or {},
+        )
+    ]
+    det_mass = {
+        _mass_token_from_claim(item.get("claim_text"))
+        for item in det
+        if str(item.get("claim_type") or "") == "semantic_capacity"
+    }
+    det_mass.discard(None)
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(item: Mapping[str, Any]) -> None:
+        payload = _serialize_fact_violation(item)
+        key = (
+            str(payload.get("claim_type") or ""),
+            re.sub(r"\s+", " ", str(payload.get("claim_text") or "")).strip().lower(),
+        )
+        if not key[0] or key in seen:
+            return
+        seen.add(key)
+        merged.append(payload)
+
+    for item in violations or []:
+        payload = _serialize_fact_violation(item)
+        if str(payload.get("claim_type") or "") == "semantic_capacity":
+            token = _mass_token_from_claim(payload.get("claim_text"))
+            if token is not None and token not in det_mass:
+                continue
+        _add(payload)
+    for item in det:
+        _add(item)
+    return merged
+
+
 def _fact_sheet_message(violation: Mapping[str, Any]) -> str:
     claim_type = str(violation.get("claim_type") or "unknown")
     severity = str(violation.get("severity") or "UNKNOWN")
@@ -809,12 +1030,19 @@ def run_listing_qc(
                 "error": str(exc),
             }
 
+    fact_violations = merge_deterministic_fact_violations(
+        list(fact_result.get("violations") or []),
+        candidate,
+        source_title=source_title,
+        source_description=source_description,
+        source_attributes=source_attributes,
+        source_specs=source_specs,
+    )
     fact_status = str(fact_result.get("status") or "unavailable").lower()
+    if fact_violations and fact_status == "pass":
+        fact_status = "violations"
     result["fact_sheet_status"] = fact_status
-    result["fact_sheet_violations"] = [
-        _serialize_fact_violation(violation)
-        for violation in (fact_result.get("violations") or [])
-    ]
+    result["fact_sheet_violations"] = fact_violations
     result["source_fingerprint"] = str(fact_result.get("source_fingerprint") or "")
     result["candidate_fingerprint"] = str(fact_result.get("candidate_fingerprint") or "")
 
@@ -879,22 +1107,25 @@ def run_listing_qc(
             result["blockers"].append(f"FactSheet guard error: {fact_result['error']}")
         else:
             result["blockers"].append("FactSheet guard unavailable (LLM failed or disabled)")
-    elif fact_status == "violations":
-        for violation in result["fact_sheet_violations"]:
-            severity = str(violation.get("severity") or "UNKNOWN").upper()
-            message = _fact_sheet_message(violation)
-            if severity in FACT_SHEET_BLOCKING_SEVERITIES:
-                result["blockers"].append(message)
-            else:
-                result["warnings"].append(message)
-    elif fact_status != "pass":
+    elif fact_status != "pass" and fact_status != "violations":
         result["blockers"].append(f"FactSheet guard returned invalid status: {fact_status}")
+    for violation in result["fact_sheet_violations"]:
+        severity = str(violation.get("severity") or "UNKNOWN").upper()
+        message = _fact_sheet_message(violation)
+        if severity in FACT_SHEET_BLOCKING_SEVERITIES:
+            result["blockers"].append(message)
+        else:
+            result["warnings"].append(message)
 
     result["blockers"] = _dedupe(result["blockers"])
     result["warnings"] = _dedupe(result["warnings"])
 
     if result["blockers"]:
-        if fact_status == "unavailable" and not result["quality_issues"]:
+        if (
+            fact_status == "unavailable"
+            and not result["quality_issues"]
+            and not result["fact_sheet_violations"]
+        ):
             result["status"] = "unavailable"
         else:
             result["status"] = "blocked"

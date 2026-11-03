@@ -17,6 +17,14 @@ def test_detects_genuine_leather_hallucination():
     violations = detect_claim_violations(source, "Chair", "Made of genuine leather", {"Material": "Genuine Leather"})
     assert any(v.claim_text == "genuine leather" for v in violations)
 
+
+def test_detects_bare_leather_against_pu_leather():
+    source = build_source_constraints({"Material": "PU Leather"}, {}, "Nice sofa", "Sofa")
+    violations = detect_claim_violations(source, "Leather sofa", "Leather sofa.", {"Material": "Leather"})
+    assert any(v.claim_text == "leather" for v in violations)
+    pu = detect_claim_violations(source, "PU Leather sofa", "PU Leather sofa.", {"Material": "PU Leather"})
+    assert not any(v.claim_text == "leather" for v in pu)
+
 def test_detects_solid_wood_hallucination():
     source = build_source_constraints({"Material": "MDF"}, {}, "Nice table", "Table")
     violations = detect_claim_violations(source, "Solid wood table", "Solid wood construction", {})

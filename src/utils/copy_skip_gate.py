@@ -495,7 +495,13 @@ def _upgrade_conflicts(title: str, structured_values: list[str], description: st
     such as leather-in-PU-leather do not hide the upgrade. Description text
     that already states the upgrade is source-grounded and is not a conflict.
     """
-    from src.utils.claim_diff_engine import MATERIAL_UPGRADE_CHAINS
+    from src.utils.claim_diff_engine import (
+        MATERIAL_UPGRADE_CHAINS,
+        _LEATHER_UPGRADE_CLAIMS,
+        generated_has_bare_leather_claim,
+        generated_has_genuine_leather_claim,
+        source_supports_leather_claim,
+    )
 
     structured_blob = " ".join(structured_values).lower()
     grounded = f"{structured_blob}\n{description or ''}".lower()
@@ -505,12 +511,22 @@ def _upgrade_conflicts(title: str, structured_values: list[str], description: st
         if not re.search(rf"\b{re.escape(base)}\b", structured_blob):
             continue
         for upgrade in upgrades:
+            if upgrade in _LEATHER_UPGRADE_CLAIMS:
+                continue
             if not re.search(rf"\b{re.escape(upgrade)}\b", title_l):
                 continue
             if re.search(rf"\b{re.escape(upgrade)}\b", grounded):
                 continue
             if upgrade not in found:
                 found.append(upgrade)
+    if generated_has_genuine_leather_claim(title_l) and not source_supports_leather_claim(
+        "genuine leather", grounded
+    ):
+        found.append("genuine leather")
+    if generated_has_bare_leather_claim(title_l) and not source_supports_leather_claim(
+        "leather", grounded
+    ):
+        found.append("leather")
     return found
 
 
