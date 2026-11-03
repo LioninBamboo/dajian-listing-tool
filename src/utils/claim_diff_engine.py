@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -28,8 +29,10 @@ class ClaimViolation:
 MATERIAL_UPGRADE_CHAINS: dict[str, set[str]] = {
     # source 材料 (lowercase) → 禁止升级到的材料集合
     "glass":           {"tempered glass", "borosilicate glass"},
-    "pu leather":      {"genuine leather", "real leather", "top grain leather", "full grain leather"},
-    "faux leather":    {"genuine leather", "real leather", "top grain leather"},
+    "pu leather":      {"genuine leather", "real leather", "top grain leather", "full grain leather", "leather"},
+    "faux leather":    {"genuine leather", "real leather", "top grain leather", "leather"},
+    "leatherette":     {"genuine leather", "real leather", "top grain leather", "leather"},
+    "synthetic leather": {"genuine leather", "real leather", "top grain leather", "leather"},
     "leather":         {"genuine leather", "real leather"},
     "mdf":             {"solid wood", "hardwood"},
     "particle board":  {"solid wood", "hardwood"},
@@ -162,6 +165,59 @@ NATURALLY_FOLDABLE_KEYWORDS: tuple[str, ...] = (
     "umbrella", "camping chair", "canopy", "shade sail", "tent", "hammock",
 )
 
+# Whole-phrase leather families. "PU Leather" is not "Leather"; "Leatherette"
+# is not "Leather". Prefix match is left-side only — no substring.
+SYNTHETIC_LEATHER_PHRASES: frozenset[str] = frozenset({
+    "pu leather",
+    "p.u. leather",
+    "p u leather",
+    "faux leather",
+    "vegan leather",
+    "bonded leather",
+    "synthetic leather",
+    "artificial leather",
+    "imitation leather",
+    "polyurethane leather",
+    "pvc leather",
+    "leatherette",
+    "pu",
+})
+GENUINE_LEATHER_PHRASES: frozenset[str] = frozenset({
+    "genuine leather",
+    "real leather",
+    "top grain leather",
+    "full grain leather",
+})
+_LEATHER_UPGRADE_CLAIMS: frozenset[str] = GENUINE_LEATHER_PHRASES | {"leather"}
+_LEATHER_WORD_RE = re.compile(r"(?<![a-z0-9])leather(?![a-z0-9])", re.I)
+_LEATHER_SYNTHETIC_PREFIX_RE = re.compile(
+    r"(?:pu|p\.u\.|p\s+u|faux|vegan|bonded|synthetic|artificial|imitation)[\s-]*$",
+    re.I,
+)
+_LEATHER_GENUINE_PREFIX_RE = re.compile(
+    r"(?:genuine|real|top[\s-]+grain|full[\s-]+grain)[\s-]*$",
+    re.I,
+)
+_SYNTHETIC_LEATHER_PHRASE_RE = re.compile(
+    r"(?<![a-z0-9])(?:"
+    r"pu[\s-]+leather|p\.u\.[\s-]+leather|p\s+u[\s-]+leather|"
+    r"faux[\s-]+leather|vegan[\s-]+leather|bonded[\s-]+leather|"
+    r"synthetic[\s-]+leather|artificial[\s-]+leather|imitation[\s-]+leather|"
+    r"polyurethane[\s-]+leather|pvc[\s-]+leather|"
+    r"leatherette"
+    r")(?![a-z0-9])",
+    re.I,
+)
+_MATERIAL_FIELD_LABEL_RE = re.compile(
+    r"^(?:(?:frame|main|upholstery|seat|back|cushion)\s+)?material\s*:?\s*",
+    re.I,
+)
+_MATERIAL_LIST_SPLIT_RE = re.compile(r"\s*(?:,|/|\+|&|\band\b)\s*", re.I)
+_GENUINE_LEATHER_PHRASE_RE = re.compile(
+    r"(?<![a-z0-9])(?:genuine|real|top[\s-]+grain|full[\s-]+grain)[\s-]+leather(?![a-z0-9])",
+    re.I,
+)
+
 
 def _strip_html_text(value: str) -> str:
     if not value:
@@ -169,6 +225,129 @@ def _strip_html_text(value: str) -> str:
     text = re.sub(r"<[^>]+>", " ", value)
     text = html.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_leather_phrase(value: str) -> str:
+    text = unicodedata.normalize("NFKC", str(value or ""))
+    return re.sub(r"[\s-]+", " ", text.strip().lower())
+
+
+def leather_match_kind(text: str, start: int, end: int | None = None) -> str | None:
+    """Classify one ``leather`` span: synthetic, genuine, or bare.
+
+    ``Leatherette`` never yields a hit because the word-boundary regex
+    requires a non-letter after ``leather``. A PU/faux prefix is whole-label
+    on the left side only.
+    """
+    blob = text or ""
+    if end is None:
+        end = start + 7
+    token = blob[start:end]
+    if _normalize_leather_phrase(token) != "leather":
+        return None
+    prefix = blob[max(0, start - 24):start]
+    if _LEATHER_SYNTHETIC_PREFIX_RE.search(prefix):
+        return "synthetic"
+    if _LEATHER_GENUINE_PREFIX_RE.search(prefix):
+        return "genuine"
+    return "bare"
+
+
+def iter_leather_word_matches(text: str):
+    """Yield ``(kind, start, end)`` for each whole-word ``leather``."""
+    blob = unicodedata.normalize("NFKC", text or "")
+    for match in _LEATHER_WORD_RE.finditer(blob):
+        kind = leather_match_kind(blob, match.start(), match.end())
+        if kind:
+            yield kind, match.start(), match.end()
+
+
+def leather_claim_kind(claim: str) -> str | None:
+    """Whole-phrase leather family for a material token."""
+    normalized = _normalize_leather_phrase(claim)
+    if not normalized:
+        return None
+    if normalized in SYNTHETIC_LEATHER_PHRASES or normalized == "leatherette":
+        return "synthetic"
+    if normalized in GENUINE_LEATHER_PHRASES:
+        return "genuine"
+    if normalized == "leather":
+        return "bare"
+    return None
+
+
+def _exact_pu_material_value(blob: object) -> bool:
+    """Whole Material value (or list item) is exactly PU. ``PU foam`` is not."""
+    raw = unicodedata.normalize("NFKC", _strip_html_text(str(blob or "")))
+    text = _normalize_leather_phrase(raw)
+    if not text:
+        return False
+    stripped = _MATERIAL_FIELD_LABEL_RE.sub("", text).strip()
+    if stripped == "pu":
+        return True
+    if not _MATERIAL_LIST_SPLIT_RE.search(stripped):
+        return False
+    items = [_normalize_leather_phrase(part) for part in _MATERIAL_LIST_SPLIT_RE.split(stripped) if part.strip()]
+    return "pu" in items
+
+
+def source_has_synthetic_leather(*blobs: object) -> bool:
+    """Explicit synthetic-leather phrase, or a Material field that is exactly PU."""
+    parts = [
+        unicodedata.normalize("NFKC", _strip_html_text(str(part or "")))
+        for part in blobs
+        if part
+    ]
+    if not parts:
+        return False
+    if any(_SYNTHETIC_LEATHER_PHRASE_RE.search(part) for part in parts):
+        return True
+    hay = " ".join(parts)
+    if _SYNTHETIC_LEATHER_PHRASE_RE.search(hay):
+        return True
+    return any(_exact_pu_material_value(part) for part in parts)
+
+
+def source_supports_leather_claim(claim: str, *blobs: object) -> bool:
+    """Whether source copy/materials support a leather-family claim.
+
+    Bare ``Leather`` is supported by source ``Leather`` or ``Genuine Leather``.
+    It is not supported by ``PU Leather`` / ``Faux Leather`` / ``PU`` /
+    ``Leatherette`` / ``Synthetic Leather``. Synthetic draft phrases are
+    supported by an explicit synthetic-leather phrase or a Material field
+    whose whole value (or list item) is exactly ``PU``. ``PU foam`` /
+    ``PU wheels`` / ``PU coating`` never count.
+    """
+    kind = leather_claim_kind(claim)
+    if kind is None:
+        return False
+    parts = [
+        unicodedata.normalize("NFKC", _strip_html_text(str(part or "")))
+        for part in blobs
+        if part
+    ]
+    if not parts:
+        return False
+    if kind == "synthetic":
+        return source_has_synthetic_leather(*parts)
+    hay = " ".join(parts)
+    kinds = {item for item, _start, _end in iter_leather_word_matches(hay)}
+    if kind == "bare":
+        return "bare" in kinds or "genuine" in kinds
+    if kind == "genuine":
+        return "genuine" in kinds or bool(_GENUINE_LEATHER_PHRASE_RE.search(hay))
+    return False
+
+
+def generated_has_bare_leather_claim(text: str) -> bool:
+    return any(kind == "bare" for kind, _start, _end in iter_leather_word_matches(text or ""))
+
+
+def generated_has_genuine_leather_claim(text: str) -> bool:
+    blob = unicodedata.normalize("NFKC", text or "")
+    return any(kind == "genuine" for kind, _start, _end in iter_leather_word_matches(blob)) or bool(
+        _GENUINE_LEATHER_PHRASE_RE.search(blob)
+    )
 
 
 def _extract_source_material_hint(attrs: Mapping[str, Any] | None, description: str) -> list[str]:
@@ -342,6 +521,8 @@ def _check_material_claims(
             if upgrade in checked_upgrades:
                 continue
             checked_upgrades.add(upgrade)
+            if upgrade in _LEATHER_UPGRADE_CLAIMS:
+                continue
             
             if upgrade in generated_text:
                 # Check if the upgrade string actually matches as a full word
@@ -357,6 +538,29 @@ def _check_material_claims(
                             severity="CRITICAL",
                             auto_fixable=True,
                         ))
+
+    source_blob_parts = [source_text_lower, *[str(item).lower() for item in source_materials]]
+    evidence = source_materials[0] if source_materials else "NOT_FOUND"
+    if generated_has_genuine_leather_claim(generated_text):
+        if not source_supports_leather_claim("genuine leather", *source_blob_parts):
+            violations.append(ClaimViolation(
+                claim_type="material_upgrade",
+                claim_text="genuine leather",
+                location="generated content",
+                source_evidence=evidence,
+                severity="CRITICAL",
+                auto_fixable=True,
+            ))
+    if generated_has_bare_leather_claim(generated_text):
+        if not source_supports_leather_claim("leather", *source_blob_parts):
+            violations.append(ClaimViolation(
+                claim_type="material_upgrade",
+                claim_text="leather",
+                location="generated content",
+                source_evidence=evidence,
+                severity="CRITICAL",
+                auto_fixable=True,
+            ))
                         
     return violations
 

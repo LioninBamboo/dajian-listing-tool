@@ -1018,6 +1018,16 @@ class TestAluminumAluminiumSpelling:
         assert lfs._claim_in_text("aluminum", "frame material: aluminium alloy") is True
         assert lfs._claim_in_text("aluminium", "Aluminum Frame Double Sliding") is True
 
+    def test_bare_leather_is_not_grounded_by_pu_leather(self):
+        assert lfs._claim_in_text("leather", "Material: PU Leather") is False
+        assert lfs._claim_in_text("pu leather", "Material: PU Leather") is True
+        source = dict(SOURCE_SHEET, materials=["pu leather"])
+        live = dict(SOURCE_SHEET, materials=["leather"])
+        violations = compare_fact_sheets(
+            source, live, live_text="Leather sofa", source_text="Material: PU Leather"
+        )
+        assert any(v["claim_type"] == "semantic_material" and v["claim_text"] == "leather" for v in violations)
+
     def test_aluminum_not_supported_by_unrelated_metal(self):
         # Spelling synonym only — iron must not back aluminum.
         source = dict(SOURCE_SHEET, materials=["iron", "glass"])

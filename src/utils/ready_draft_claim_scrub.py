@@ -34,8 +34,10 @@ from src.services.listing_qc import (
 from src.utils.claim_diff_engine import (
     COUNTABLE_CLAIMS,
     FEATURE_CLAIM_PATTERNS,
+    SYNTHETIC_LEATHER_PHRASES,
     build_source_constraints,
     detect_claim_violations,
+    leather_claim_kind,
 )
 from src.utils.claim_strip import claim_matches_text, claim_pattern, collapse_ws, normalize_entities
 from src.utils.listing_quality_gate import (
@@ -61,7 +63,10 @@ ENGINEERED_WOOD_RE = (
     re.compile(r"\bplywood\b", re.I),
 )
 SOLID_WOOD_CLAIM_RE = re.compile(r"\bsolid\s+wood\b", re.I)
-LEATHER_PREFIX_RE = re.compile(r"(?:pu|p\.u\.|faux|vegan|bonded)[\s-]*$", re.I)
+LEATHER_PREFIX_RE = re.compile(
+    r"(?:pu|p\.u\.|p\s+u|faux|vegan|bonded|synthetic|artificial|imitation)[\s-]*$",
+    re.I,
+)
 IMAGE_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
 GIGA_IMAGE_PARAMS = ("x-cc", "x-cu", "x-ct", "x-cs")
 BARE_NO_ASSEMBLY_RE = re.compile(r"\bno\s+assembly\b", re.I)
@@ -496,6 +501,20 @@ def _source_material_field_value(source: Mapping[str, Any] | None) -> str | None
     return None
 
 
+def _single_synthetic_leather_material(value: str | None) -> str | None:
+    """Replace bare Leather only when Material is exactly one PU/faux phrase."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    parts = [part.strip() for part in _MULTI_MATERIAL_SPLIT_RE.split(text) if part.strip()]
+    if len(parts) != 1:
+        return None
+    whole = normalize_once(parts[0]).casefold()
+    if leather_claim_kind(whole) == "synthetic" or whole in SYNTHETIC_LEATHER_PHRASES:
+        return parts[0]
+    return None
+
+
 def _single_fabric_material(value: str | None) -> str | None:
     """Replace Fabric only with one vocab fabric word. Mixed/non-fabric → None."""
     text = str(value or "").strip()
@@ -521,7 +540,7 @@ def _source_capacity_raw(source_blob: str, family: str, evidence: str) -> str | 
     wanted = normalize_once(evidence).casefold()
     if not wanted or wanted == "not_found":
         return None
-    for number, fam, raw in _capacity_mentions(source_blob):
+    for number, fam, raw, _labelled in _capacity_mentions(source_blob):
         if fam != family:
             continue
         number_n = normalize_once(number).casefold()
@@ -749,6 +768,8 @@ def _patterns_for_claim(
         replacement = None
         if phrase.casefold() in {"fabric", "cloth"}:
             replacement = _single_fabric_material(_source_material_field_value(source))
+        elif leather_claim_kind(phrase) == "bare":
+            replacement = _single_synthetic_leather_material(_source_material_field_value(source))
         pattern = _safe_claim_pattern(phrase)
         if pattern is not None:
             edits.append((pattern, replacement))

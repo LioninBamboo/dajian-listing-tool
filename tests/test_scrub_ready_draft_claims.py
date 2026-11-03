@@ -30,6 +30,19 @@ from src.utils.ready_draft_claim_scrub import (
     FlaggedClaim,
 )
 
+def _profile_store_arg() -> str:
+    from src.utils.store_profile import get_store_profile
+
+    return str(getattr(get_store_profile(), "brand_name", "") or "AquaVerve")
+
+
+def _mismatch_store_arg() -> str:
+    brand = _profile_store_arg().casefold()
+    if brand == "grovepop":
+        return "main"
+    return "gp"
+
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "scrub_ready_draft_claims.py"
 
@@ -615,7 +628,7 @@ def test_cli_apply_writes_ready_refuses_published_and_backs_up(tmp_path):
         "--sku", "LIVE-SKU",
         "--apply",
         "--report-dir", str(reports),
-        "--store", "main",
+        "--store", _profile_store_arg(),
     ])
     assert code == 0
     conn = sqlite3.connect(db)
@@ -951,7 +964,7 @@ def test_cli_store_mismatch_is_rejected(tmp_path):
     mod = _load_script()
     db = _make_db(tmp_path)
     reports = tmp_path / "reports"
-    code = mod.main(["--db", str(db), "--store", "gp", "--report-dir", str(reports)])
+    code = mod.main(["--db", str(db), "--store", _mismatch_store_arg(), "--report-dir", str(reports)])
     assert code != 0
     assert list(reports.glob("*.json")) == []
 
@@ -971,7 +984,7 @@ def test_cli_apply_skips_needs_manual_with_partial_diffs(tmp_path):
         "--sku", "EMPTY-TITLE",
         "--apply",
         "--report-dir", str(reports),
-        "--store", "main",
+        "--store", _profile_store_arg(),
     ])
     assert code == 0
     conn = sqlite3.connect(db)
