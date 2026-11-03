@@ -65,31 +65,39 @@ class PrecheckHonorsTenPercentOfCostTests(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
-    def test_price_at_ten_percent_cost_floor_passes_with_ads(self):
-        floor = PricingEngine.safe_floor_price(COST, 0.10)
+    def test_price_at_ten_percent_sale_floor_passes_with_ads(self):
+        floor = PricingEngine.net_margin_floor_price(COST)
         ok, reason = precheck_price("SKU-100", floor, db_path=self.db_path)
         self.assertTrue(ok)
         self.assertEqual(reason, "ok")
 
-    def test_break_even_price_is_rejected_even_if_ads_can_be_disabled(self):
-        """旧死线 (利润=0) 约 $129; 口径 A 要求关广告后仍留成本的 10%."""
+    def test_break_even_price_is_raised_to_net_floor(self):
+        """旧死线 (利润=0) 约 $129; 售价口径 10% 净利底会把价格抬上去."""
         break_even = PricingEngine.absolute_floor_price(COST)
-        ok, reason = precheck_price("SKU-100", break_even, db_path=self.db_path)
-        self.assertFalse(ok)
-        self.assertIn("unsafe_even_without_ad", reason)
+        decision = precheck_price("SKU-100", break_even, db_path=self.db_path)
+        self.assertTrue(decision.ok)
+        self.assertIn("raised_to_net_floor", decision.reason)
+        self.assertAlmostEqual(
+            decision.adjusted_price,
+            PricingEngine.net_margin_floor_price(COST),
+            places=2,
+        )
 
     def test_between_ad_on_and_ad_off_ten_percent_floors_disables_ads(self):
-        # $144: 低于带广告 10% 底 (~$148.78), 高于关广告 10% 底 (~$138.99)
         from src.services import repricing_guard
 
+        target = (
+            PricingEngine.net_margin_floor_price(COST)
+            + PricingEngine.net_margin_floor_price(COST, ad_rate=0.0)
+        ) / 2
         with patch.object(
             repricing_guard, "_try_disable_ad", return_value=(True, "disabled")
         ):
-            ok, reason = repricing_guard.precheck_price(
-                "SKU-100", 144.0, db_path=self.db_path
+            decision = repricing_guard.precheck_price(
+                "SKU-100", target, db_path=self.db_path, execute_ad_pause=True
             )
-        self.assertTrue(ok)
-        self.assertIn("ok_after_ad_disabled", reason)
+        self.assertTrue(decision.ok)
+        self.assertIn("ok_after_ad_disabled", decision.reason)
 
 
 class CreateAdSafeTenPercentOfCostTests(unittest.TestCase):

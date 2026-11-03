@@ -1,4 +1,35 @@
-from decimal import Decimal, ROUND_HALF_UP
+from __future__ import annotations
+
+import logging
+import os
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_HALF_UP
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# Net profit / sale price. Env MIN_NET_MARGIN_PCT overrides (fraction, e.g. 0.12).
+MIN_NET_MARGIN = Decimal("0.10")
+_CENTS = Decimal("0.01")
+
+
+def parse_money(value: Any) -> Optional[Decimal]:
+    """Parse a USD amount. None / 0 / negative / unreadable → None."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        amount = value
+    else:
+        try:
+            text = str(value).strip()
+            if not text:
+                return None
+            amount = Decimal(text)
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+    if not amount.is_finite() or amount <= 0:
+        return None
+    return amount
+
 
 class PricingEngine:
     """
@@ -33,10 +64,54 @@ class PricingEngine:
     # Store Discount (长期店铺折扣)
     STORE_DISCOUNT_RATE = Decimal("0.05")  # 5% 买家折扣
 
-    # 口径 A: 写出 / 开广告 / CRO 加价的统一净利底 = 到岸成本的 10%。
-    # 智能定价 min_margin 已经是这个数; 改价死线与广告守卫必须同一口径,
-    # 不能再用盈亏平衡 (0%) 或广告后只留 5%。
-    MIN_NET_MARGIN_ON_COST = Decimal("0.10")
+    # 写出 / 智能定价 / 价格守卫的统一净利底 = 净利润 / 标价 ≥ 10%。
+    # MIN_NET_MARGIN_ON_COST 是同值别名, 留给 CRO / 开广告的成本加价口径调用方.
+    MIN_NET_MARGIN = MIN_NET_MARGIN
+    MIN_NET_MARGIN_ON_COST = MIN_NET_MARGIN
+
+    @staticmethod
+    def min_net_margin() -> Decimal:
+        """Sale-price net margin floor. Env ``MIN_NET_MARGIN_PCT`` overrides.
+
+        Expected override is a fraction (``0.12`` = 12%). Invalid / empty /
+        out-of-range values fall back to 0.10 with a warning. Does not read
+        or write ``.env``.
+        """
+        raw = os.environ.get("MIN_NET_MARGIN_PCT")
+        if raw is None:
+            return PricingEngine.MIN_NET_MARGIN
+        text = str(raw).strip()
+        if not text:
+            return PricingEngine.MIN_NET_MARGIN
+        try:
+            value = Decimal(text)
+        except (InvalidOperation, ValueError, TypeError):
+            logger.warning(
+                "Invalid MIN_NET_MARGIN_PCT=%r; using default %s",
+                raw,
+                PricingEngine.MIN_NET_MARGIN,
+            )
+            return PricingEngine.MIN_NET_MARGIN
+        if not value.is_finite() or value < 0 or value >= Decimal("0.70"):
+            logger.warning(
+                "Out-of-range MIN_NET_MARGIN_PCT=%r; using default %s",
+                raw,
+                PricingEngine.MIN_NET_MARGIN,
+            )
+            return PricingEngine.MIN_NET_MARGIN
+        return value
+
+    @staticmethod
+    def assert_usd_currency(currency: Any = "USD") -> Optional[str]:
+        """Return a refusal reason when currency is present and not USD."""
+        if currency is None:
+            return None
+        text = str(currency).strip()
+        if not text:
+            return None
+        if text.upper() != "USD":
+            return f"unsupported_currency:{text}"
+        return None
 
     @staticmethod
     def calculate_dajian_cost(
@@ -219,6 +294,171 @@ class PricingEngine:
         )
 
     @staticmethod
+    def net_profit_and_margin(
+        price: Any,
+        total_cost: Any,
+        ad_rate: float = None,
+        *,
+        currency: Any = "USD",
+    ) -> tuple[Optional[Decimal], Optional[Decimal], str]:
+        """Net profit and sale-price margin using the existing fee model.
+
+        net_profit = listing_price × discount_denom − fixed_fee − cost
+        margin     = net_profit / listing_price
+
+        Returns (net_profit, margin, reason). reason is ``ok`` on success.
+        """
+        currency_err = PricingEngine.assert_usd_currency(currency)
+        if currency_err:
+            return None, None, currency_err
+        cost = parse_money(total_cost)
+        listing = parse_money(price)
+        if cost is None:
+            return None, None, "unknown_or_invalid_cost"
+        if listing is None:
+            return None, None, "invalid_price"
+        try:
+            denom = PricingEngine._discount_denom(ad_rate)
+        except ValueError as exc:
+            return None, None, f"fee_data_invalid:{exc}"
+        net_profit = listing * denom - PricingEngine.FIXED_FEE - cost
+        margin = net_profit / listing
+        return net_profit, margin, "ok"
+
+    @staticmethod
+    def net_margin_at_price(
+        price: Any,
+        total_cost: Any,
+        ad_rate: float = None,
+        *,
+        currency: Any = "USD",
+    ) -> Optional[Decimal]:
+        """Sale-price net margin, or None when price/cost/fees cannot be used."""
+        _profit, margin, _reason = PricingEngine.net_profit_and_margin(
+            price, total_cost, ad_rate, currency=currency
+        )
+        return margin
+
+    @staticmethod
+    def net_margin_floor_price(
+        total_cost: Any,
+        ad_rate: float = None,
+        min_margin: Any = None,
+        *,
+        currency: Any = "USD",
+    ) -> float:
+        """Lowest listing price with net profit / sale price ≥ min_margin.
+
+        Algebra: listing = (cost + fixed) / (discount_denom − min_margin).
+        Rounds UP to the cent so rounding cannot drop the margin below the
+        floor. Single source of truth for smart reprice, price guard, publish
+        pricing, and inventory-sync floor checks.
+
+        Raises:
+            ValueError: unknown/invalid cost, unsupported currency, or fee
+                data that leaves no residual for the requested margin.
+        """
+        result = PricingEngine.compute_net_margin_floor(
+            total_cost, ad_rate=ad_rate, min_margin=min_margin, currency=currency
+        )
+        if not result["ok"]:
+            raise ValueError(result["reason"])
+        return float(result["price"])
+
+    @staticmethod
+    def compute_net_margin_floor(
+        total_cost: Any,
+        ad_rate: float = None,
+        min_margin: Any = None,
+        *,
+        currency: Any = "USD",
+    ) -> dict:
+        """Floor result dict: ``ok``, ``price``, ``reason``, ``margin``, ``min_margin``."""
+        currency_err = PricingEngine.assert_usd_currency(currency)
+        if currency_err:
+            return {
+                "ok": False,
+                "price": None,
+                "reason": currency_err,
+                "margin": None,
+                "min_margin": None,
+            }
+        cost = parse_money(total_cost)
+        if cost is None:
+            return {
+                "ok": False,
+                "price": None,
+                "reason": "unknown_or_invalid_cost",
+                "margin": None,
+                "min_margin": None,
+            }
+        if min_margin is None:
+            target = PricingEngine.min_net_margin()
+        else:
+            try:
+                if isinstance(min_margin, bool):
+                    raise InvalidOperation("bool")
+                target = Decimal(str(min_margin).strip())
+            except (InvalidOperation, ValueError, TypeError):
+                return {
+                    "ok": False,
+                    "price": None,
+                    "reason": "invalid_min_margin",
+                    "margin": None,
+                    "min_margin": None,
+                }
+        if not target.is_finite() or target < 0:
+            return {
+                "ok": False,
+                "price": None,
+                "reason": "invalid_min_margin",
+                "margin": None,
+                "min_margin": None,
+            }
+        try:
+            denom = PricingEngine._discount_denom(ad_rate)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "price": None,
+                "reason": f"fee_data_invalid:{exc}",
+                "margin": None,
+                "min_margin": float(target),
+            }
+        leftover = denom - target
+        if leftover <= 0:
+            return {
+                "ok": False,
+                "price": None,
+                "reason": (
+                    f"fee_data_invalid:margin {target} + fees leave no residual "
+                    f"(denom={denom})"
+                ),
+                "margin": None,
+                "min_margin": float(target),
+            }
+        raw = (cost + PricingEngine.FIXED_FEE) / leftover
+        floor = raw.quantize(_CENTS, rounding=ROUND_CEILING)
+        _profit, margin, margin_reason = PricingEngine.net_profit_and_margin(
+            floor, cost, ad_rate, currency=currency
+        )
+        if margin is None:
+            return {
+                "ok": False,
+                "price": None,
+                "reason": margin_reason,
+                "margin": None,
+                "min_margin": float(target),
+            }
+        return {
+            "ok": True,
+            "price": floor,
+            "reason": "ok",
+            "margin": margin,
+            "min_margin": float(target),
+        }
+
+    @staticmethod
     def absolute_floor_price(total_cost: float, ad_rate: float = None) -> float:
         """
         ⚠️ 死线: listing price 在此值以下卖一定亏损 (含所有费率与折扣).
@@ -362,7 +602,14 @@ class PricingEngine:
             
         price = (cost + PricingEngine.FIXED_FEE) / denominator
         selling_price = float(price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        
+        # Publish / inventory 15% target still cannot slip under the 10% sale-price floor.
+        try:
+            policy_floor = PricingEngine.net_margin_floor_price(cost)
+            if selling_price < policy_floor:
+                selling_price = policy_floor
+        except ValueError:
+            pass
+
         return {
             "selling_price": selling_price,
             "total_cost": float(cost),
@@ -383,44 +630,88 @@ class PricingEngine:
         
         考虑 5% 店铺折扣后的卖家净收 (含国际费与 10% 税垫):
           净收 = listing_price × discount_denom - $0.40
+          净利率 = (净收 - 成本) / listing_price  (售价口径, 不是成本加价)
         """
-        cost = Decimal(str(total_cost))
-        market = Decimal(str(market_price)) if market_price and market_price > 0 else Decimal("0")
+        refused = {
+            "final_price": None,
+            "floor_price": None,
+            "ceiling_price": None,
+            "competitive_price": None,
+            "market_price": None,
+            "strategy": "REFUSED",
+            "margin": None,
+            "min_margin": min_margin,
+            "max_margin": max_margin,
+            "status": "INVALID_COST",
+            "reason": "unknown_or_invalid_cost",
+            "pause_ad": False,
+        }
+        cost = parse_money(total_cost)
+        if cost is None:
+            return refused
+
+        try:
+            market = (
+                Decimal(str(market_price))
+                if market_price and parse_money(market_price) is not None
+                else Decimal("0")
+            )
+        except (InvalidOperation, ValueError, TypeError):
+            market = Decimal("0")
         min_m = Decimal(str(min_margin))
         max_m = Decimal(str(max_margin))
-        
+        policy = PricingEngine.min_net_margin()
+
         discount_denom = PricingEngine._discount_denom()
         fixed_fee = PricingEngine.FIXED_FEE
-        
-        # 计算 listing price 边界 (基于折扣后净收)
-        floor_lp = (cost * (1 + min_m) + fixed_fee) / discount_denom
+
+        floor_result = PricingEngine.compute_net_margin_floor(cost, min_margin=min_m)
+        if not floor_result["ok"]:
+            refused["reason"] = floor_result["reason"]
+            refused["status"] = "INVALID_FLOOR"
+            return refused
+        floor_lp = floor_result["price"]
         ceiling_lp = (cost * (1 + max_m) + fixed_fee) / discount_denom
-        
+
         # 如果没有市场价格，使用传统定价 (15% 利润)
         if market <= 0:
             target_price = PricingEngine.calculate_selling_price(float(cost), 0.15)
+            final_price = Decimal(str(target_price["selling_price"]))
+            if final_price < floor_lp:
+                final_price = floor_lp
+            _profit, actual_margin, _reason = PricingEngine.net_profit_and_margin(
+                final_price, cost
+            )
             return {
-                "final_price": target_price["selling_price"],
-                "floor_price": float(floor_lp.quantize(Decimal("0.01"))),
-                "ceiling_price": float(ceiling_lp.quantize(Decimal("0.01"))),
+                "final_price": float(final_price),
+                "floor_price": float(floor_lp),
+                "ceiling_price": float(ceiling_lp.quantize(_CENTS, rounding=ROUND_HALF_UP)),
                 "competitive_price": None,
                 "market_price": None,
                 "strategy": "STANDARD",
-                "margin": 0.15,
-                "status": "NO_MARKET_DATA"
+                "margin": float(actual_margin.quantize(Decimal("0.001"))) if actual_margin is not None else 0.15,
+                "min_margin": min_margin,
+                "max_margin": max_margin,
+                "status": "NO_MARKET_DATA",
+                "pause_ad": False,
             }
-        
+
         # 竞争性定价 (比市场低 5%)
         competitive_lp = market * Decimal("0.95")
-        
+
         # 应用定价公式: max(Floor, min(Competitive, Ceiling))
         inner_min = min(competitive_lp, ceiling_lp)
         final_lp = max(floor_lp, inner_min)
-        
-        # 防亏损保护: 不低于口径 A (成本的 10%), 即使调用方传入更低的 min_margin
-        min_safe = max(min_m, PricingEngine.MIN_NET_MARGIN_ON_COST)
-        anti_loss_floor = (cost * (Decimal("1") + min_safe) + fixed_fee) / discount_denom
-        
+
+        # 防亏损保护: 不低于售价口径净利底, 即使调用方传入更低的 min_margin
+        min_safe = max(min_m, policy)
+        anti_loss = PricingEngine.compute_net_margin_floor(cost, min_margin=min_safe)
+        if not anti_loss["ok"]:
+            refused["reason"] = anti_loss["reason"]
+            refused["status"] = "INVALID_FLOOR"
+            return refused
+        anti_loss_floor = anti_loss["price"]
+
         if final_lp < anti_loss_floor:
             final_lp = anti_loss_floor
             strategy = "ANTI_LOSS"
@@ -434,22 +725,32 @@ class PricingEngine:
         else:
             strategy = "COMPETITIVE"
             status = "OPTIMAL"
-        
-        # 计算实际利润率 (基于折扣后卖家净收)
-        net_revenue = final_lp * discount_denom - fixed_fee
-        actual_margin = (net_revenue - cost) / net_revenue if net_revenue > 0 else Decimal("0")
-        
+
+        if not isinstance(final_lp, Decimal):
+            final_lp = Decimal(str(final_lp))
+        if final_lp == anti_loss_floor or final_lp == floor_lp:
+            priced = final_lp
+        else:
+            priced = final_lp.quantize(_CENTS, rounding=ROUND_HALF_UP)
+            if priced < floor_lp:
+                priced = floor_lp
+
+        _profit, actual_margin, _reason = PricingEngine.net_profit_and_margin(
+            priced, cost
+        )
+
         return {
-            "final_price": float(final_lp.quantize(Decimal("0.01"))),
-            "floor_price": float(floor_lp.quantize(Decimal("0.01"))),
-            "ceiling_price": float(ceiling_lp.quantize(Decimal("0.01"))),
-            "competitive_price": float(competitive_lp.quantize(Decimal("0.01"))),
+            "final_price": float(priced),
+            "floor_price": float(floor_lp),
+            "ceiling_price": float(ceiling_lp.quantize(_CENTS, rounding=ROUND_HALF_UP)),
+            "competitive_price": float(competitive_lp.quantize(_CENTS, rounding=ROUND_HALF_UP)),
             "market_price": float(market),
             "strategy": strategy,
-            "margin": float(actual_margin.quantize(Decimal("0.001"))),
+            "margin": float(actual_margin.quantize(Decimal("0.001"))) if actual_margin is not None else Decimal("0"),
             "min_margin": min_margin,
             "max_margin": max_margin,
-            "status": status
+            "status": status,
+            "pause_ad": False,
         }
 
     @staticmethod

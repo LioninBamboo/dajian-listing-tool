@@ -209,10 +209,10 @@ def is_material_base_cost_change(
 def listing_price_below_cost_floor(
     live_price, product_price, shipping_cost
 ) -> bool:
-    """True when the live listing fails the existing 10% cost-floor guard.
+    """True when the live listing fails the 10% sale-price net-margin floor.
 
-    Uses PricingEngine.assert_safe_price + MIN_NET_MARGIN_ON_COST as-is
-    (1-cent tolerance). Unknown live / cost → False (no write).
+    Uses ``PricingEngine.net_margin_floor_price`` (MIN_NET_MARGIN, 1-cent
+    tolerance). Unknown live / cost → False (no write).
     """
     live = parse_usd(live_price)
     product = parse_usd(product_price)
@@ -229,14 +229,13 @@ def listing_price_below_cost_floor(
         landed = PricingEngine.calculate_dajian_cost(product, shipping)[
             "total_dajian_cost"
         ]
-        ok, _reason = PricingEngine.assert_safe_price(
-            live,
-            landed,
-            safety_margin=float(PricingEngine.MIN_NET_MARGIN_ON_COST),
-        )
+        floor_result = PricingEngine.compute_net_margin_floor(landed)
+        if not floor_result["ok"]:
+            return False
+        floor = float(floor_result["price"])
     except Exception:
         return False
-    return not ok
+    return live + 0.01 < floor
 
 
 def resolve_current_listing_price(
@@ -290,7 +289,7 @@ def decide_sync_price_action(
     """Decide whether inventory sync may write an eBay price.
 
     Rule 1: material GIGA base-cost change vs last price-write baseline.
-    Rule 2: live listing below the existing cost floor.
+    Rule 2: live listing below the 10% sale-price net-margin floor.
     Otherwise keep the live price. Store-agnostic (main / GP / Aqua).
     """
     product = parse_usd(giga_product_price)
@@ -1443,25 +1442,26 @@ class InventorySyncService:
         """更新 eBay 售价 (支持自动处理促销阻止 + 触底自动关广告).
 
         🛡️ 安全护栏: 写出前走 repricing_guard.precheck_price.
-        口径 A: 标价必须至少留下到岸成本的 10% (含 5% 折扣 + 13.6% FVF + 1.3% 国际费 + 广告 + $0.40 + 10% 税垫).
-        低于该底则拒绝并写日志, 不调任何 eBay API.
+        售价口径: 标价必须至少留下 10% 净利 (含 5% 折扣 + 13.6% FVF + 1.3% 国际费 + 广告 + $0.40 + 10% 税垫).
+        低于该底则抬到 10% 净利底再写出; 成本未知则拒绝.
 
-        🎯 广告自适应: 当 new_price < 带 5% 广告的 10% 成本底
-        但 >= 关广告的 10% 成本底时:
-          - 若 listing 当前在广告中 → 自动关广告, 然后放行改价 (维持竞争力)
-          - 若 listing 不在广告中 → 直接放行 (本就没付广告费)
-        关广告/价改顺序: 先 delete_ad → 再 PUT offer, 避免转化期同时收到广告费.
+        🎯 广告决策: 目标价带广告低于 10% 时标记 pause_ad.
+        真正关广告仅 opt-in; 未关广告时按带广告地板抬价.
         """
         # ── 守门员: 死线 + 广告自适应 (统一逻辑见 src/services/repricing_guard.py) ──
         try:
             from src.services.repricing_guard import precheck_price
-            ok, reason = precheck_price(
+            decision = precheck_price(
                 sku=sku, new_price=new_price,
                 db_path=self.db_path, allow_ad_disable=True,
             )
+            ok = decision.ok if hasattr(decision, "ok") else decision[0]
             if not ok:
                 # precheck_price 已写过详细 ERROR 日志, 这里直接拒绝
                 return False
+            adjusted = getattr(decision, "adjusted_price", None)
+            if adjusted is not None:
+                new_price = float(adjusted)
         except Exception as guard_exc:
             # 守门员自身异常 → fail-closed: 跳过该 SKU, 不调任何 eBay 改价 API
             self.logger.error(

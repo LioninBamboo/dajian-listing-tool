@@ -86,10 +86,16 @@ def test_precheck_uses_shipping_column_not_understated_breakdown():
     conn.commit()
     conn.close()
     try:
-        ok, reason = precheck_price("W465P475235", understated_floor, db_path=db_path)
-        assert ok is False
-        assert "unsafe_even_without_ad" in reason
-        ok_high, _ = precheck_price("W465P475235", true_break_even + 5, db_path=db_path)
+        decision = precheck_price("W465P475235", understated_floor, db_path=db_path)
+        assert decision.ok is True
+        assert decision.adjusted_price is not None
+        assert decision.adjusted_price > understated_floor
+        assert decision.adjusted_price + 0.01 >= PE.net_margin_floor_price(true_cost)
+        ok_high, _ = precheck_price(
+            "W465P475235",
+            PE.net_margin_floor_price(true_cost),
+            db_path=db_path,
+        )
         assert ok_high is True
     finally:
         tmp.cleanup()

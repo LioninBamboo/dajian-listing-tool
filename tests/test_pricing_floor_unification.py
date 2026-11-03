@@ -189,36 +189,38 @@ class UpdateEbayPriceGuardTests(unittest.TestCase):
         svc.db_path = "ebay_collection.db"
         return svc
 
-    def test_blocks_below_break_even_without_calling_ebay(self):
+    def test_raises_below_break_even_and_reaches_write_path(self):
         svc = self._make_service()
         floor = PricingEngine.absolute_floor_price(100.0)
-        unsafe = floor - 20.0  # 明显低于关广告死线 → 真亏本
+        unsafe = floor - 20.0
 
-        # mock _fetch_cost_and_listing → cost=100 listing=L1
         with patch("src.services.repricing_guard._fetch_cost_and_listing",
                    return_value=(100.0, "L1")), \
+             patch("requests.get") as mock_get, \
              patch("src.services.ebay_auth.EbayOAuthService") as mock_oauth:
+            mock_oauth.return_value.get_valid_token.return_value = "tok"
+            mock_get.return_value = MagicMock(
+                status_code=200, json=lambda: {"offers": []}
+            )
             ok = svc.update_ebay_price("LOSSY-SKU", unsafe)
 
-        self.assertFalse(ok)
-        mock_oauth.assert_not_called()  # eBay API 完全没被触达
+        self.assertFalse(ok)  # offers=[] → write 失败, 但守门员已放行抬价
+        mock_get.assert_called()
 
-    def test_passthrough_when_cost_unknown(self):
-        # cost 缺失时不应该阻塞 (fail-open, 让原流程继续)
+    def test_unknown_cost_blocks_write(self):
         svc = self._make_service()
         with patch("src.services.repricing_guard._fetch_cost_and_listing",
                    return_value=(None, None)), \
              patch("requests.get") as mock_get, \
-             patch("src.services.ebay_auth.EbayOAuthService"):
-            mock_get.return_value = MagicMock(status_code=500)
+             patch("src.services.ebay_auth.EbayOAuthService") as mock_oauth:
             ok = svc.update_ebay_price("UNKNOWN-COST", 50.0)
-        self.assertFalse(ok)  # 因 eBay 500, 不是因守门员
-        # 关键: requests.get 被调用了 → 守门员放行了
-        mock_get.assert_called()
+        self.assertFalse(ok)
+        mock_oauth.assert_not_called()
+        mock_get.assert_not_called()
 
     def test_allows_safe_price(self):
         svc = self._make_service()
-        safe = PricingEngine.safe_floor_price(100.0, 0.10)  # 口径 A: 成本 10%
+        safe = PricingEngine.net_margin_floor_price(100.0)
         with patch("src.services.repricing_guard._fetch_cost_and_listing",
                    return_value=(100.0, "L1")), \
              patch("requests.get") as mock_get, \
@@ -228,7 +230,6 @@ class UpdateEbayPriceGuardTests(unittest.TestCase):
             )
             ok = svc.update_ebay_price("SAFE-SKU", safe)
         self.assertFalse(ok)  # 因 offers=[] → 失败, 不是守门员
-        # 关键: requests.get 被调用了, 说明守门员放行
         mock_get.assert_called_once()
 
 
