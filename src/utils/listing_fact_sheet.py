@@ -1160,8 +1160,9 @@ def compare_fact_sheets(
         # already states the number+unit, the live sheet did not invent occupancy.
         _is_weight = bool(re.search(r"(lb|lbs|pound|ton|tonne|kg|oz)\b", live["capacity"], re.I))
         _is_labelled_load = bool(re.search(
-            r"weight\s+capacity|load\s+capacity|max(?:imum)?\s+load|"
-            r"\bsupports?\b|\bhold(?:s|ing)?\b|\brated\b|\bup\s+to\b",
+            r"\b(?:max(?:imum)?|limit|load(?:ing)?|capacit(?:y|ies)|"
+            r"bears?|holds?|holding|supports?|rated)\b|"
+            r"\bup\s+to\b",
             live["capacity"],
             re.I,
         ))

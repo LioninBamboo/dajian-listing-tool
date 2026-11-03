@@ -177,6 +177,8 @@ SYNTHETIC_LEATHER_PHRASES: frozenset[str] = frozenset({
     "synthetic leather",
     "artificial leather",
     "imitation leather",
+    "polyurethane leather",
+    "pvc leather",
     "leatherette",
     "pu",
 })
@@ -201,10 +203,16 @@ _SYNTHETIC_LEATHER_PHRASE_RE = re.compile(
     r"pu[\s-]+leather|p\.u\.[\s-]+leather|p\s+u[\s-]+leather|"
     r"faux[\s-]+leather|vegan[\s-]+leather|bonded[\s-]+leather|"
     r"synthetic[\s-]+leather|artificial[\s-]+leather|imitation[\s-]+leather|"
-    r"leatherette|(?<![a-z])pu(?![a-z0-9])"
+    r"polyurethane[\s-]+leather|pvc[\s-]+leather|"
+    r"leatherette"
     r")(?![a-z0-9])",
     re.I,
 )
+_MATERIAL_FIELD_LABEL_RE = re.compile(
+    r"^(?:(?:frame|main|upholstery|seat|back|cushion)\s+)?material\s*:?\s*",
+    re.I,
+)
+_MATERIAL_LIST_SPLIT_RE = re.compile(r"\s*(?:,|/|\+|&|\band\b)\s*", re.I)
 _GENUINE_LEATHER_PHRASE_RE = re.compile(
     r"(?<![a-z0-9])(?:genuine|real|top[\s-]+grain|full[\s-]+grain)[\s-]+leather(?![a-z0-9])",
     re.I,
@@ -268,14 +276,36 @@ def leather_claim_kind(claim: str) -> str | None:
     return None
 
 
-def source_has_synthetic_leather(*blobs: object) -> bool:
-    hay = unicodedata.normalize(
-        "NFKC",
-        " ".join(_strip_html_text(str(part or "")) for part in blobs if part),
-    )
-    if not hay:
+def _exact_pu_material_value(blob: object) -> bool:
+    """Whole Material value (or list item) is exactly PU. ``PU foam`` is not."""
+    raw = unicodedata.normalize("NFKC", _strip_html_text(str(blob or "")))
+    text = _normalize_leather_phrase(raw)
+    if not text:
         return False
-    return bool(_SYNTHETIC_LEATHER_PHRASE_RE.search(hay))
+    stripped = _MATERIAL_FIELD_LABEL_RE.sub("", text).strip()
+    if stripped == "pu":
+        return True
+    if not _MATERIAL_LIST_SPLIT_RE.search(stripped):
+        return False
+    items = [_normalize_leather_phrase(part) for part in _MATERIAL_LIST_SPLIT_RE.split(stripped) if part.strip()]
+    return "pu" in items
+
+
+def source_has_synthetic_leather(*blobs: object) -> bool:
+    """Explicit synthetic-leather phrase, or a Material field that is exactly PU."""
+    parts = [
+        unicodedata.normalize("NFKC", _strip_html_text(str(part or "")))
+        for part in blobs
+        if part
+    ]
+    if not parts:
+        return False
+    if any(_SYNTHETIC_LEATHER_PHRASE_RE.search(part) for part in parts):
+        return True
+    hay = " ".join(parts)
+    if _SYNTHETIC_LEATHER_PHRASE_RE.search(hay):
+        return True
+    return any(_exact_pu_material_value(part) for part in parts)
 
 
 def source_supports_leather_claim(claim: str, *blobs: object) -> bool:
@@ -284,19 +314,23 @@ def source_supports_leather_claim(claim: str, *blobs: object) -> bool:
     Bare ``Leather`` is supported by source ``Leather`` or ``Genuine Leather``.
     It is not supported by ``PU Leather`` / ``Faux Leather`` / ``PU`` /
     ``Leatherette`` / ``Synthetic Leather``. Synthetic draft phrases are
-    supported by any synthetic source phrase (both are non-genuine).
+    supported by an explicit synthetic-leather phrase or a Material field
+    whose whole value (or list item) is exactly ``PU``. ``PU foam`` /
+    ``PU wheels`` / ``PU coating`` never count.
     """
     kind = leather_claim_kind(claim)
     if kind is None:
         return False
-    hay = unicodedata.normalize(
-        "NFKC",
-        " ".join(_strip_html_text(str(part or "")) for part in blobs if part),
-    )
-    if not hay:
+    parts = [
+        unicodedata.normalize("NFKC", _strip_html_text(str(part or "")))
+        for part in blobs
+        if part
+    ]
+    if not parts:
         return False
     if kind == "synthetic":
-        return source_has_synthetic_leather(hay)
+        return source_has_synthetic_leather(*parts)
+    hay = " ".join(parts)
     kinds = {item for item, _start, _end in iter_leather_word_matches(hay)}
     if kind == "bare":
         return "bare" in kinds or "genuine" in kinds

@@ -6,10 +6,13 @@ Spec table + boundary checklist for the shared invent gate used by listing QC
 
 from __future__ import annotations
 
+import re
+
 from src.services.listing_qc import (
     _LB_PER_KG,
     _span_supported,
     is_product_weight_label,
+    merge_deterministic_fact_violations,
     motors_deterministic_fact_violations,
     structured_weight_mentions,
 )
@@ -467,7 +470,9 @@ def test_numbers_zero_negative_decimals_ranges_unit_missing():
     assert structured_weight_mentions({"Item Weight": "-5"}) == []
     assert structured_weight_mentions({"Item Weight": "67.02"})[0][0] == "67.02"
     unitless = _caps(_cand(description="<p>Item Weight: 20</p>"), attributes={"Item Weight": "50"})
-    assert not any("20" in text and "lbs" in text for text in _cap_texts(unitless))
+    unitless_texts = _cap_texts(unitless)
+    assert not any(re.search(r"\b20\b", text) for text in unitless_texts)
+    assert not any(re.search(r"\b20\s*(?:lbs?|pounds?)\b", text, re.I) for text in unitless_texts)
     ranged = _caps(
         _cand(title="6 person tent", description="<p>6 person tent.</p>"),
         description="Occupancy 4-6 person.",
@@ -489,3 +494,233 @@ def test_supported_by_any_does_not_count_leather_inside_pu():
     assert _supported_by_any("pu leather", ["pu leather"], set(), "pu leather") is True
     assert _claim_in_text("leather", "PU Leather sofa") is False
     assert _claim_in_text("pu leather", "PU Leather sofa") is True
+
+
+# ── follow-up: capacity phrasing + standalone PU ─────────────────────────────
+
+
+def _claim_vs_item_weight(claim: str):
+    cand = _cand(title="Chair", description=f"<p>{claim}</p>")
+    return _cap_texts(_caps(cand, attributes={"Item Weight": "45"}))
+
+
+def _claim_vs_labelled_load(claim: str):
+    cand = _cand(title="Chair", description=f"<p>{claim}</p>")
+    return _cap_texts(
+        _caps(
+            cand,
+            description="Weight capacity 45 lbs.",
+            attributes={"Item Weight": "20"},
+        )
+    )
+
+
+def _assert_flagged_45(texts, claim: str) -> None:
+    assert any("45" in text for text in texts), f"{claim!r} should flag vs item weight 45; got {texts}"
+
+
+def _assert_pass_45(texts, claim: str) -> None:
+    assert not any("45" in text for text in texts), f"{claim!r} should pass vs labelled load 45; got {texts}"
+
+
+def test_phrasing_45_lb_capacity_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("45 lb capacity"), "45 lb capacity")
+
+
+def test_phrasing_45_lb_capacity_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("45 lb capacity"), "45 lb capacity")
+
+
+def test_phrasing_maximum_weight_45_lbs_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("Maximum Weight 45 lbs"), "Maximum Weight 45 lbs")
+
+
+def test_phrasing_maximum_weight_45_lbs_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("Maximum Weight 45 lbs"), "Maximum Weight 45 lbs")
+
+
+def test_phrasing_max_dot_load_45_lbs_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("Max. Load: 45 lbs"), "Max. Load: 45 lbs")
+
+
+def test_phrasing_max_dot_load_45_lbs_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("Max. Load: 45 lbs"), "Max. Load: 45 lbs")
+
+
+def test_phrasing_capacity_45_lbs_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("Capacity 45 lbs"), "Capacity 45 lbs")
+
+
+def test_phrasing_capacity_45_lbs_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("Capacity 45 lbs"), "Capacity 45 lbs")
+
+
+def test_phrasing_bears_45_lbs_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("Bears 45 lbs"), "Bears 45 lbs")
+
+
+def test_phrasing_bears_45_lbs_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("Bears 45 lbs"), "Bears 45 lbs")
+
+
+def test_phrasing_load_capacity_of_45_lbs_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("load capacity of 45 lbs"), "load capacity of 45 lbs")
+
+
+def test_phrasing_load_capacity_of_45_lbs_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("load capacity of 45 lbs"), "load capacity of 45 lbs")
+
+
+def test_phrasing_holds_up_to_45_lb_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("holds up to 45 lb"), "holds up to 45 lb")
+
+
+def test_phrasing_holds_up_to_45_lb_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("holds up to 45 lb"), "holds up to 45 lb")
+
+
+def test_phrasing_rated_for_45_lbs_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("rated for 45 lbs"), "rated for 45 lbs")
+
+
+def test_phrasing_rated_for_45_lbs_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("rated for 45 lbs"), "rated for 45 lbs")
+
+
+def test_phrasing_weight_limit_45_lbs_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("weight limit 45 lbs"), "weight limit 45 lbs")
+
+
+def test_phrasing_weight_limit_45_lbs_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("weight limit 45 lbs"), "weight limit 45 lbs")
+
+
+def test_phrasing_max_weight_45_lbs_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("max weight 45 lbs"), "max weight 45 lbs")
+
+
+def test_phrasing_max_weight_45_lbs_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("max weight 45 lbs"), "max weight 45 lbs")
+
+
+def test_phrasing_maximum_load_45_lbs_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("maximum load 45 lbs"), "maximum load 45 lbs")
+
+
+def test_phrasing_maximum_load_45_lbs_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("maximum load 45 lbs"), "maximum load 45 lbs")
+
+
+def test_phrasing_loading_capacity_45_lbs_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("loading capacity 45 lbs"), "loading capacity 45 lbs")
+
+
+def test_phrasing_loading_capacity_45_lbs_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("loading capacity 45 lbs"), "loading capacity 45 lbs")
+
+
+def test_phrasing_supports_45_lbs_vs_item_weight_flagged():
+    _assert_flagged_45(_claim_vs_item_weight("supports 45 lbs"), "supports 45 lbs")
+
+
+def test_phrasing_supports_45_lbs_vs_labelled_load_passes():
+    _assert_pass_45(_claim_vs_labelled_load("supports 45 lbs"), "supports 45 lbs")
+
+
+def test_item_weight_45_lbs_vs_source_weight_45_passes():
+    texts = _cap_texts(
+        _caps(
+            _cand(title="Chair", description="<p>Item Weight: 45 lbs</p>"),
+            attributes={"Item Weight": "45"},
+        )
+    )
+    assert not any("45" in text for text in texts)
+
+
+def test_maximum_weight_45_lbs_vs_source_weight_45_flagged():
+    texts = _cap_texts(
+        _caps(
+            _cand(title="Chair", description="<p>Maximum Weight 45 lbs</p>"),
+            attributes={"Item Weight": "45"},
+        )
+    )
+    assert any("45" in text for text in texts)
+
+
+def test_merge_keeps_llm_capacity_flag_when_det_misses_own_weight():
+    cand = _cand(title="Chair", description="<p>45 lb capacity</p>")
+    llm = [
+        {
+            "claim_type": "semantic_capacity",
+            "claim_text": "45 lb capacity",
+            "severity": "HIGH",
+            "source_evidence": "NOT_FOUND",
+        }
+    ]
+    merged = merge_deterministic_fact_violations(
+        llm,
+        cand,
+        source_title="Chair",
+        source_description="Chair.",
+        source_attributes={"Item Weight": "45"},
+        source_specs={},
+    )
+    texts = _cap_texts(merged)
+    assert any("45" in text for text in texts)
+    assert any("capacity" in text.lower() for text in texts)
+
+
+def test_pu_leather_draft_vs_pu_foam_cushions_flagged():
+    source_desc = "Fabric sofa with high-density PU foam cushions"
+    assert source_supports_leather_claim("PU Leather", source_desc) is False
+    cand = _cand(
+        title="PU Leather sofa",
+        description="<p>PU Leather sofa.</p>",
+        aspects={"Material": ["PU Leather"]},
+    )
+    mats = _mat_texts(_caps(cand, description=source_desc))
+    assert any("pu leather" in text for text in mats)
+
+
+def test_pu_leather_draft_vs_material_pu_passes():
+    assert source_supports_leather_claim("PU Leather", "PU") is True
+    cand = _cand(
+        title="PU Leather sofa",
+        description="<p>PU Leather sofa.</p>",
+        aspects={"Material": ["PU Leather"]},
+    )
+    mats = _mat_texts(_caps(cand, attributes={"Material": "PU"}))
+    assert not any("pu leather" in text for text in mats)
+
+
+def test_pu_leather_draft_vs_pu_wheels_flagged():
+    assert source_supports_leather_claim("PU Leather", "PU wheels") is False
+    cand = _cand(
+        title="PU Leather sofa",
+        description="<p>PU Leather sofa.</p>",
+        aspects={"Material": ["PU Leather"]},
+    )
+    mats = _mat_texts(_caps(cand, description="Chair with PU wheels."))
+    assert any("pu leather" in text for text in mats)
+
+
+def test_pu_leather_draft_vs_pu_coating_flagged():
+    assert source_supports_leather_claim("PU Leather", "PU coating") is False
+    cand = _cand(
+        title="PU Leather sofa",
+        description="<p>PU Leather sofa.</p>",
+        aspects={"Material": ["PU Leather"]},
+    )
+    mats = _mat_texts(_caps(cand, description="Steel frame with PU coating."))
+    assert any("pu leather" in text for text in mats)
+
+
+def test_pu_leather_draft_vs_faux_leather_text_passes():
+    assert source_supports_leather_claim("PU Leather", "Faux Leather sofa") is True
+    cand = _cand(
+        title="PU Leather sofa",
+        description="<p>PU Leather sofa.</p>",
+        aspects={"Material": ["PU Leather"]},
+    )
+    mats = _mat_texts(_caps(cand, description="Faux Leather sofa."))
+    assert not any("pu leather" in text for text in mats)
