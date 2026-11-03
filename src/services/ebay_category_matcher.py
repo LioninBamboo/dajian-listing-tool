@@ -97,6 +97,11 @@ class EbayCategoryMatcher:
         cid = str(category_id or "").strip()
         if not cid:
             return None, category_name
+        # Retired bathroom/pantry leaf. Never silently remap into furniture
+        # cabinets (20487) — a different product family. Publish blocks with
+        # retired_category and a report-only suggestion.
+        if cid == "42428":
+            return cid, category_name
 
         text_lower = self._normalize_keyword_text(
             " ".join(part for part in (title or "", description or "", category_name or "") if part)
@@ -601,7 +606,9 @@ class EbayCategoryMatcher:
             "116366": ("108884", "Dog Houses"),
             "116403": ("116389", "Ramps & Stairs"),
             "38205": ("38204", "Tables"),
-            "42428": ("20487", "Cabinets & Cupboards"),
+            # 42428 is retired. Never silently remap it into furniture
+            # cabinets (20487) — a different product family. Publish holds
+            # with retired_category and a report-only suggestion.
             "45331": ("20689", "Wine Racks & Bottle Holders"),
             "66756": ("66743", "Play Table & Chair Sets"),
             "175761": ("20490", "Ottomans, Footstools & Poufs"),

@@ -1171,6 +1171,38 @@ def run_category_gates(
                 return False, "target_required_aspect_missing", name
     if ctx.store == "aqua" and getattr(args, "push_live", False):
         return False, "aqua_live_category_unsupported", name
+    from src.utils.category_decision import BLOCKED_CATEGORY_REVIEW, prepublish_category_check
+
+    title = str(optimization.get("title") or "")
+    description = str(optimization.get("description") or "")
+    attributes = None
+    if plan is not None and isinstance(plan.row.get("attributes"), dict):
+        attributes = plan.row.get("attributes")
+    pre_verdict = prepublish_category_check(
+        plan.sku if plan is not None else "",
+        category_id,
+        name,
+        title,
+        attributes,
+        description,
+        store=ctx.store,
+        index=ctx.category_index,
+    )
+    if not pre_verdict.ok:
+        # Human --set-category is the review step. Unknown types are not a
+        # guessed remap; allow the operator-chosen leaf. True mismatches and
+        # retired/empty/unavailable still refuse.
+        if pre_verdict.reason == "unknown_product_type":
+            return True, "", name
+        reason = pre_verdict.reason or BLOCKED_CATEGORY_REVIEW
+        if reason not in {
+            "hold_empty",
+            "hold_tree_unavailable",
+            "set_vs_single",
+            "retired_category",
+        }:
+            reason = BLOCKED_CATEGORY_REVIEW
+        return False, reason, name
     return True, "", name
 
 

@@ -819,6 +819,12 @@ def _run_approved_retry_branch(monkeypatch, sku, title, stored, target, attrs, a
         lambda *a, **k: type("D", (), {"approved": False, "preserve": False, "error": ""})(),
     )
     monkeypatch.setattr("src.utils.ebay_quantity.resolve_publish_quantity", lambda *a, **k: 1)
+    monkeypatch.setattr(
+        "src.utils.category_decision.prepublish_category_check",
+        lambda *a, **k: __import__(
+            "src.utils.category_decision", fromlist=["Verdict"]
+        ).Verdict(True, "", None),
+    )
 
     result = asyncio.run(srv.publish_product(sku, BackgroundTasks(), _DB()))
     return result, published, product
