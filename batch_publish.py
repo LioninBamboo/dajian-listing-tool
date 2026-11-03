@@ -1716,7 +1716,16 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         attributes=product.get('attributes', {}) or {},
         specs=product.get('specs', {}) or {},
     )
-    restore_sourced_aspects(completed_aspects, original_opt_aspects, source_text)
+    source_fields: dict = {}
+    for blob in (product.get("attributes") or {}, product.get("specs") or {}):
+        if isinstance(blob, dict):
+            source_fields.update(blob)
+    restore_sourced_aspects(
+        completed_aspects,
+        original_opt_aspects,
+        source_text,
+        source_fields=source_fields or None,
+    )
     required_aspects_meta, recommended_aspects_meta = category_matcher._get_category_aspects(category_id)
     required_aspect_names_for_guard = {
         aspect.get("name")
@@ -1744,6 +1753,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             current_aspects=completed_aspects,
         ),
         sku=sku,
+        source_fields=source_fields or None,
         log=lambda message: logger.info(f"  {message}"),
     )
 
@@ -1851,7 +1861,11 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             result["copy_skip_reasons"] = skip_reasons
         return result
 
-    if not dry_run:
+    def _persist_prepared_after_success():
+        # Persist only after fee gate + publish succeed so a later block
+        # cannot write auto-filled aspects into the local draft.
+        if dry_run:
+            return
         _persist_prepared_listing(
             sku=sku,
             category_id=category_id,
@@ -2083,6 +2097,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 listing_id = trade.get("itemId")
                 if not listing_id:
                     return {"status": "error", "message": "Trading publish returned no ItemID"}
+                _persist_prepared_after_success()
                 extra_logs = [f"Trading Motors publish (Ack={trade.get('ack')})"]
                 if video_id:
                     extra_logs.append(f"Video: {video_id}")
@@ -2154,6 +2169,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             if not listing_id:
                 return {"status": "error", "message": "No listing ID after publish"}
 
+            _persist_prepared_after_success()
             readback_expectation = build_publish_readback_expectation(
                 sku=sku,
                 inventory_product=inv_product,

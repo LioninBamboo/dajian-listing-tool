@@ -12,6 +12,7 @@ from src.utils.publish_source_aspect_guard import (
     build_giga_source_text,
     find_source_matching_value,
     guard_unsourced_aspects,
+    is_material_aspect,
     restore_sourced_aspects,
     value_supported_by_source,
 )
@@ -245,6 +246,212 @@ def test_red_does_not_match_covered():
 
 def test_wood_matches_solid_wood():
     assert value_supported_by_source("Wood", "solid wood frame") is True
+
+
+_KITCHEN_ISLAND_MATERIAL_ALLOWED = [
+    "Bronze",
+    "MDF/Chipboard",
+    "Solid Wood",
+    "Metal",
+    "Wood",
+    "Marble",
+    "Brass",
+    "Ash",
+    "Oak",
+    "Gold",
+    "Black",
+    "Rubberwood",
+    "Eucalyptus",
+    "Acacia",
+]
+
+
+def test_material_aspect_names_are_whole_name_or_suffix_only():
+    assert is_material_aspect("Material") is True
+    assert is_material_aspect("Countertop Material") is True
+    assert is_material_aspect("Base Material") is True
+    assert is_material_aspect("Upholstery Fabric") is True
+    assert is_material_aspect("Color") is False
+    assert is_material_aspect("Type") is False
+    assert is_material_aspect("Immaterial") is False
+    assert is_material_aspect("Material Safety") is False
+
+
+def test_material_whole_value_equality_not_substring():
+    allowed = list(_KITCHEN_ISLAND_MATERIAL_ALLOWED)
+    assert find_source_matching_value(
+        "Material",
+        "material: Brassiere hardware on an Ashley Oakland cabinet",
+        allowed,
+    ) is None
+    assert find_source_matching_value("Material", "material: Brass", allowed) == "Brass"
+    assert find_source_matching_value("Material", "material: Ash", allowed) == "Ash"
+    assert find_source_matching_value("Material", "material: Oak", allowed) == "Oak"
+
+
+def test_material_normalizes_case_whitespace_and_punctuation():
+    assert find_source_matching_value(
+        "Material",
+        "  Material :  MDF / Chipboard  ",
+        ["MDF/Chipboard", "Solid Wood"],
+    ) == "MDF/Chipboard"
+    assert find_source_matching_value(
+        "Countertop Material",
+        "top: solid-wood",
+        ["Solid Wood", "Metal"],
+    ) == "Solid Wood"
+
+
+def test_hardware_finish_color_context_never_fills_material():
+    allowed = list(_KITCHEN_ISLAND_MATERIAL_ALLOWED)
+    sources = (
+        "cabinet with antique bronze pull handles",
+        "gold-toned hardware on the drawers",
+        "brass knobs and hinges",
+        "black finish on the drawers",
+    )
+    for source in sources:
+        for name in ("Material", "Countertop Material", "Base Material"):
+            assert find_source_matching_value(name, source, allowed) is None
+
+
+def test_multiple_materials_bind_to_their_own_part():
+    source = "MDF top + metal legs. Kitchen island cart."
+    allowed = ["MDF/Chipboard", "Metal", "Solid Wood", "Bronze"]
+    assert find_source_matching_value("Countertop Material", source, allowed) == "MDF/Chipboard"
+    assert find_source_matching_value("Base Material", source, allowed) is None
+    assert find_source_matching_value("Material", source, allowed) is None
+
+
+def test_negated_material_is_not_used():
+    allowed = ["MDF/Chipboard", "Solid Wood", "Metal"]
+    assert find_source_matching_value("Material", "no MDF, metal frame", allowed) == "Metal"
+    assert find_source_matching_value("Material", "not solid wood. Plastic body.", allowed) is None
+    assert find_source_matching_value(
+        "Material",
+        "cabinet with no MDF",
+        ["MDF/Chipboard"],
+    ) is None
+
+
+def test_empty_or_none_source_leaves_material_unset():
+    allowed = ["MDF/Chipboard", "Solid Wood"]
+    assert find_source_matching_value("Material", "", allowed) is None
+    assert find_source_matching_value("Material", None, allowed) is None
+
+
+def test_allowed_list_missing_mapped_value_does_not_invent():
+    assert find_source_matching_value(
+        "Material",
+        "material: MDF",
+        ["Solid Wood", "Metal"],
+    ) is None
+    assert find_source_matching_value(
+        "Material",
+        "material: rubberwood",
+        ["Metal", "MDF/Chipboard"],
+    ) is None
+
+
+def test_mdf_family_maps_only_to_exact_allowed_chipboard_value():
+    assert find_source_matching_value(
+        "Material",
+        "material: particle board",
+        ["MDF/Chipboard", "Solid Wood"],
+    ) == "MDF/Chipboard"
+    assert find_source_matching_value(
+        "Material",
+        "medium density fiberboard cabinet",
+        ["MDF/Chipboard", "Solid Wood"],
+    ) == "MDF/Chipboard"
+    assert find_source_matching_value(
+        "Material",
+        "material: MDF",
+        ["Solid Wood"],
+    ) is None
+
+
+def test_rubberwood_family_maps_to_own_value_or_solid_wood():
+    assert find_source_matching_value(
+        "Material",
+        "material: Rubberwood",
+        ["Rubberwood", "Solid Wood"],
+    ) == "Rubberwood"
+    assert find_source_matching_value(
+        "Material",
+        "material: eucalyptus",
+        ["Solid Wood", "Metal"],
+    ) == "Solid Wood"
+    assert find_source_matching_value(
+        "Material",
+        "material: acacia",
+        ["Acacia", "MDF/Chipboard"],
+    ) == "Acacia"
+    assert find_source_matching_value(
+        "Material",
+        "material: MDF",
+        ["Solid Wood", "MDF/Chipboard"],
+    ) == "MDF/Chipboard"
+
+
+def test_non_material_aspects_still_use_first_source_hit():
+    source = "Silver glass wall mirror with antique bronze pull handles"
+    assert find_source_matching_value("Color", source, ["Red", "Silver", "Black", "Bronze"]) == "Silver"
+
+
+def test_n707_mdf_cabinet_with_bronze_handles_does_not_fill_bronze():
+    source = build_giga_source_text(
+        title="Kitchen Island Cabinet with Antique Bronze Pull Handles",
+        description="MDF cabinet with antique bronze pull handles / bronze hardware.",
+        attributes={
+            "Assembled Length (in.)": "48",
+            "Assembled Width (in.)": "18",
+            "Assembled Height (in.)": "36",
+        },
+    )
+    aspects = {
+        "Type": ["Kitchen Island"],
+        "Countertop Material": ["Bronze"],
+        "Base Material": ["Bronze"],
+        "Material": ["Bronze"],
+    }
+    allowed = {name: list(_KITCHEN_ISLAND_MATERIAL_ALLOWED) for name in (
+        "Countertop Material",
+        "Base Material",
+        "Material",
+    )}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=source,
+        required_names=["Countertop Material", "Base Material", "Material"],
+        allowed_values_by_name=allowed,
+        sku="N707-SHAPED",
+    )
+
+    serialized = str(aspects).lower()
+    assert "bronze" not in serialized
+    assert "Countertop Material" not in aspects
+    assert "Base Material" not in aspects
+    assert "unsourced_required_aspect:Countertop Material" in blockers
+    assert "unsourced_required_aspect:Base Material" in blockers
+    assert aspects.get("Material") == ["MDF/Chipboard"]
+
+
+def test_missing_required_material_blocks_without_default():
+    aspects = {"Type": ["Kitchen Island"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Kitchen island with storage drawers and antique bronze pull handles",
+        required_names=["Countertop Material", "Base Material"],
+        allowed_values_by_name={
+            "Countertop Material": _KITCHEN_ISLAND_MATERIAL_ALLOWED,
+            "Base Material": _KITCHEN_ISLAND_MATERIAL_ALLOWED,
+        },
+    )
+    assert "unsourced_required_aspect:Countertop Material" in blockers
+    assert "unsourced_required_aspect:Base Material" in blockers
+    assert "Countertop Material" not in aspects
+    assert "Base Material" not in aspects
 
 
 def _ok_blacklist(tmp_path):
@@ -740,6 +947,185 @@ def test_publish_blocks_when_insertion_fee_is_at_least_20(monkeypatch):
     assert result["copy_skip_reasons"] == ["high_insertion_fee"]
     assert published == []
     assert deleted == ["offer-1"]
+
+
+def _product_with_confident_material(**overrides):
+    product = _product(
+        title="Kitchen Island with MDF Countertop",
+        description="material: MDF. MDF countertop and storage drawers.",
+        attributes={
+            "Assembled Length (in.)": "48",
+            "Assembled Width (in.)": "18",
+            "Assembled Height (in.)": "36",
+            "Material": "MDF",
+            "Top Material": "MDF",
+        },
+        optimization={
+            "title": "Kitchen Island with MDF Countertop",
+            "description": _long_description("material: MDF. MDF countertop and storage drawers."),
+            "categoryId": "260157",
+            "categoryName": "Kitchen Islands",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Type": ["Kitchen Island"],
+                "Item Length": ["48 in"],
+                "Item Width": ["18 in"],
+                "Item Height": ["36 in"],
+            },
+        },
+    )
+    product.update(overrides)
+    return product
+
+
+def _material_matcher(oauth):
+    return _FakeCategoryMatcher(
+        oauth,
+        category_id="260157",
+        category_name="Kitchen Islands",
+        required=[
+            {
+                "name": "Material",
+                "required": True,
+                "allowed_values": ["MDF/Chipboard", "Solid Wood", "Bronze"],
+            },
+            {
+                "name": "Countertop Material",
+                "required": True,
+                "allowed_values": ["MDF/Chipboard", "Solid Wood", "Bronze"],
+            },
+        ],
+        returned_aspects={
+            "Brand": ["AquaVerve"],
+            "Type": ["Kitchen Island"],
+            "Item Length": ["48 in"],
+            "Item Width": ["18 in"],
+            "Item Height": ["36 in"],
+        },
+    )
+
+
+def test_fee_block_does_not_persist_autofilled_aspects(monkeypatch):
+    persisted = []
+    published = []
+    deleted = []
+
+    class _FakeEbayClient:
+        def __init__(self, oauth, policy_manager):
+            pass
+
+        def _prepare_inventory_image_urls(self, sku, raw_images, max_images=24):
+            return ["https://i.ebayimg.com/images/g/AAA/s-l1600.jpg"]
+
+        def create_or_replace_inventory_item(self, sku, product):
+            return {"status": "success"}
+
+        def create_offer(self, sku, price, category_id=None, listing_description=None, marketplace_id=None):
+            return {"offerId": "offer-1"}
+
+        def get_offer(self, offer_id):
+            return {"status": "UNPUBLISHED"}
+
+        def get_listing_fees(self, offer_id):
+            return {
+                "feeSummaries": [{
+                    "fees": [{
+                        "feeType": "InsertionFee",
+                        "amount": {"value": "20.00", "currency": "USD"},
+                    }]
+                }]
+            }
+
+        def delete_offer(self, offer_id):
+            deleted.append(offer_id)
+            return True
+
+        def publish_offer(self, offer_id):
+            published.append(offer_id)
+            return {"listingId": "listing-1"}
+
+    monkeypatch.setattr(
+        batch_publish,
+        "_persist_prepared_listing",
+        lambda **kwargs: persisted.append(kwargs),
+    )
+    monkeypatch.setattr(batch_publish, "_try_upload_video", lambda *args, **kwargs: (None, "ok"))
+    monkeypatch.setattr(batch_publish, "_sync_motors_compatibility", lambda *args, **kwargs: None)
+    monkeypatch.setattr(batch_publish, "resolve_publish_quantity", lambda sku, logger=None: 1)
+    monkeypatch.setattr("src.clients.real_ebay_client.RealEbayClient", _FakeEbayClient)
+    _stub_publish_common(monkeypatch, matcher_factory=_material_matcher)
+
+    result = batch_publish.publish_single_product(_product_with_confident_material(), dry_run=False)
+
+    assert result["status"] == "error"
+    assert result.get("blocked_fee") is True
+    assert published == []
+    assert deleted == ["offer-1"]
+    assert persisted == []
+
+
+def test_successful_publish_persists_after_fee_gate(monkeypatch):
+    persisted = []
+    published = []
+
+    class _FakeEbayClient:
+        def __init__(self, oauth, policy_manager):
+            pass
+
+        def _prepare_inventory_image_urls(self, sku, raw_images, max_images=24):
+            return ["https://i.ebayimg.com/images/g/AAA/s-l1600.jpg"]
+
+        def create_or_replace_inventory_item(self, sku, product):
+            return {"status": "success"}
+
+        def create_offer(self, sku, price, category_id=None, listing_description=None, marketplace_id=None):
+            return {"offerId": "offer-1"}
+
+        def get_offer(self, offer_id):
+            return {"status": "UNPUBLISHED"}
+
+        def get_listing_fees(self, offer_id):
+            return {
+                "feeSummaries": [{
+                    "fees": [{
+                        "feeType": "InsertionFee",
+                        "amount": {"value": "0.00", "currency": "USD"},
+                    }]
+                }]
+            }
+
+        def get_inventory_item(self, sku):
+            return {"product": {}}
+
+        def publish_offer(self, offer_id):
+            published.append(offer_id)
+            return {"listingId": "listing-1"}
+
+    monkeypatch.setattr(
+        batch_publish,
+        "_persist_prepared_listing",
+        lambda **kwargs: persisted.append(kwargs),
+    )
+    monkeypatch.setattr(batch_publish, "_try_upload_video", lambda *args, **kwargs: (None, "ok"))
+    monkeypatch.setattr(batch_publish, "_sync_motors_compatibility", lambda *args, **kwargs: None)
+    monkeypatch.setattr(batch_publish, "resolve_publish_quantity", lambda sku, logger=None: 1)
+    monkeypatch.setattr(batch_publish, "update_product_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "batch_publish.verify_publish_readback",
+        lambda *a, **k: {"status": "ok", "passed": True, "issues": [], "transport_failures": []},
+    )
+    monkeypatch.setattr("batch_publish.build_publish_readback_expectation", lambda **k: {})
+    monkeypatch.setattr("src.clients.real_ebay_client.RealEbayClient", _FakeEbayClient)
+    _stub_publish_common(monkeypatch, matcher_factory=_material_matcher)
+
+    result = batch_publish.publish_single_product(_product_with_confident_material(), dry_run=False)
+
+    assert result["status"] == "success"
+    assert persisted
+    aspects = persisted[0]["aspects"]
+    assert aspects.get("Material") == ["MDF/Chipboard"]
+    assert aspects.get("Countertop Material") == ["MDF/Chipboard"]
+    assert "Bronze" not in str(aspects)
 
 
 def test_publish_blocks_motors_trailers_using_full_category_path(monkeypatch):
