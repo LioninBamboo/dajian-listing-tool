@@ -18,9 +18,15 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Callable, Mapping
 
+from pathlib import Path
+
 from src.services.listing_qc import (
     _capacity_mentions,
     _plain_blob,
+    capacity_window_is_labelled_load,
+    capacity_window_is_product_weight,
+    is_weight_aspect_key,
+    mass_context_family,
     motors_claim_invent_issues,
     motors_deterministic_fact_violations,
     validate_listing_quality,
@@ -55,19 +61,14 @@ ENGINEERED_WOOD_RE = (
     re.compile(r"\bplywood\b", re.I),
 )
 SOLID_WOOD_CLAIM_RE = re.compile(r"\bsolid\s+wood\b", re.I)
-FABRIC_FAMILY = (
-    "microsuede", "micro suede", "suede", "chenille", "linen", "velvet",
-    "canvas", "oxford", "polyester", "cotton", "boucle", "microfiber",
-)
 LEATHER_PREFIX_RE = re.compile(r"(?:pu|p\.u\.|faux|vegan|bonded)[\s-]*$", re.I)
 IMAGE_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.I)
 GIGA_IMAGE_PARAMS = ("x-cc", "x-cu", "x-ct", "x-cs")
 BARE_NO_ASSEMBLY_RE = re.compile(r"\bno\s+assembly\b", re.I)
-LOAD_WRAPPER_RE = re.compile(
-    r"(?:supports?\s+up\s+to\s+|up\s+to\s+|capacity\s+(?:of\s+)?)?"
-    r"\d+(?:\.\d+)?\s*(?:lb|lbs|pounds?)\b(?:\s+capacity)?",
-    re.I,
+_LOAD_NUMBER_RE = re.compile(
+    r"(?P<num>\d+(?:\.\d+)?)(?:\s*(?:-|–|to)\s*(?P<num2>\d+(?:\.\d+)?))?",
 )
+_MATERIAL_FIELD_RE = re.compile(r"^material$", re.I)
 _QTY_CLAIM_RE = re.compile(
     r"(?:claimed\s+)?(?P<n>\d+)[\s-]*(?P<noun>[a-z]+)(?:.*source has (?P<src>\d+))?",
     re.I,
@@ -205,14 +206,46 @@ def _overlaps(span: tuple[int, int], spans: list[tuple[int, int]]) -> bool:
     return any(start < other_end and end > other_start for other_start, other_end in spans)
 
 
-def _sub_outside_urls(pattern: re.Pattern[str], text: str, repl: str = "") -> str:
+def _match_is_leather_guarded(text: str, match: re.Match[str]) -> bool:
+    if match.group(0).strip().casefold() != "leather":
+        return True
+    return _leather_match_ok(text, match.start())
+
+
+def _match_is_product_weight(text: str, match: re.Match[str]) -> bool:
+    return mass_context_family(text, match.start(), match.end()) == "weight"
+
+
+def _allow_edit_match(
+    text: str,
+    match: re.Match[str],
+    urls: list[tuple[int, int]],
+    *,
+    skip_weight_values: bool = False,
+) -> bool:
+    if _overlaps((match.start(), match.end()), urls):
+        return False
+    if not _match_is_leather_guarded(text, match):
+        return False
+    if skip_weight_values and _match_is_product_weight(text, match):
+        return False
+    return True
+
+
+def _sub_outside_urls(
+    pattern: re.Pattern[str],
+    text: str,
+    repl: str = "",
+    *,
+    skip_weight_values: bool = False,
+) -> str:
     if not text:
         return text or ""
     urls = _url_spans(text)
     parts: list[str] = []
     last = 0
     for match in pattern.finditer(text):
-        if _overlaps((match.start(), match.end()), urls):
+        if not _allow_edit_match(text, match, urls, skip_weight_values=skip_weight_values):
             continue
         parts.append(text[last:match.start()])
         parts.append(repl)
@@ -438,12 +471,29 @@ def _blocker_texts(claims: list[FlaggedClaim]) -> list[str]:
     return list(dict.fromkeys(f"{item.claim_type}:{item.claim_text}" for item in claims if item.claim_text))
 
 
-def _source_fabric_term(source_blob: str) -> str | None:
-    blob = source_blob or ""
-    for term in FABRIC_FAMILY:
-        if whole_value_match(term, blob):
-            return term
+def _source_material_field_value(source: Mapping[str, Any] | None) -> str | None:
+    """Whole Material field only. Never guess a fabric word from free text."""
+    if not isinstance(source, Mapping):
+        return None
+    for mapping_key in ("attributes", "specs"):
+        mapping = source.get(mapping_key)
+        if not isinstance(mapping, Mapping):
+            continue
+        for key, value in mapping.items():
+            if not _MATERIAL_FIELD_RE.match(str(key or "").strip()):
+                continue
+            raw_values = value if isinstance(value, (list, tuple, set)) else [value]
+            for raw in raw_values:
+                text = str(raw or "").strip()
+                if text:
+                    return text
     return None
+
+
+def _whole_number_in_text(wanted: str, text: str) -> bool:
+    if not wanted or not text:
+        return False
+    return bool(re.search(rf"(?<![\d.]){re.escape(wanted)}(?![\d.])", text))
 
 
 def _source_capacity_raw(source_blob: str, family: str, evidence: str) -> str | None:
@@ -453,15 +503,73 @@ def _source_capacity_raw(source_blob: str, family: str, evidence: str) -> str | 
     for number, fam, raw in _capacity_mentions(source_blob):
         if fam != family:
             continue
-        if normalize_once(number).casefold() == wanted or wanted in normalize_once(raw).casefold():
+        number_n = normalize_once(number).casefold()
+        raw_n = normalize_once(raw).casefold()
+        if number_n == wanted or _whole_number_in_text(wanted, raw_n):
             return raw
     return None
+
+
+def _source_labelled_load_raw(source_blob: str, evidence: str) -> str | None:
+    """Replace a load number only when source labels capacity/load/max load."""
+    wanted = normalize_once(evidence).casefold()
+    if not wanted or wanted == "not_found":
+        return None
+    blob = source_blob or ""
+    for match in re.finditer(
+        r"\b(?P<num>\d+(?:\.\d+)?)(?:\s*(?:-|–|to)\s*(?P<num2>\d+(?:\.\d+)?))?\s*"
+        r"(?P<unit>lbs?|pounds?|kgs?|kilograms?)\b",
+        blob,
+        re.I,
+    ):
+        left = blob[max(0, match.start() - 56):match.start()]
+        right = blob[match.end():match.end() + 16]
+        if mass_context_family(blob, match.start(), match.end()) != "load":
+            continue
+        if not (
+            capacity_window_is_labelled_load(left)
+            or capacity_window_is_labelled_load(right)
+        ):
+            continue
+        raw = match.group(0).strip()
+        token = match.group("num")
+        if match.group("num2"):
+            token = f"{token}-{match.group('num2')}"
+        token_n = normalize_once(token).casefold()
+        raw_n = normalize_once(raw).casefold()
+        if (
+            token_n == wanted
+            or _whole_number_in_text(wanted, raw_n)
+            or any(_whole_number_in_text(part.strip(), raw_n) for part in wanted.split(",") if part.strip())
+        ):
+            return raw
+        # Evidence may be the labelled source figure we want to write back.
+        if wanted in {token_n, raw_n} or _whole_number_in_text(token_n, wanted):
+            return raw
+    return None
+
+
+def _load_phrase_pattern(generated: str) -> re.Pattern[str] | None:
+    """Edit only the flagged load phrase, never every N lb in the field."""
+    text = generated or ""
+    number = _LOAD_NUMBER_RE.search(text)
+    if number is None:
+        return _safe_claim_pattern(text)
+    num = re.escape(number.group("num"))
+    num2 = number.group("num2")
+    number_pat = rf"{num}(?:\s*(?:-|–|to)\s*{re.escape(num2)})?" if num2 else num
+    return re.compile(
+        rf"(?<![\d.])(?:supports?\s+(?:up\s+to\s+)?|up\s+to\s+|"
+        rf"rated\s+(?:up\s+to\s+)?|capacity\s+(?:of\s+)?)?"
+        rf"{number_pat}\s*(?:lb|lbs|pounds?|kgs?|kilograms?)\b(?:\s+capacity)?",
+        re.I,
+    )
 
 
 def _capacity_family_from_claim(claim_text: str) -> str:
     match = re.search(
         r"\b(persons?|people|seats?|seaters?|occupants?|gallons?|gals?|"
-        r"quarts?|liters?|litres?|lbs?|pounds?)\b",
+        r"quarts?|liters?|litres?|lbs?|pounds?|kgs?|kilograms?)\b",
         claim_text or "",
         re.I,
     )
@@ -469,7 +577,10 @@ def _capacity_family_from_claim(claim_text: str) -> str:
         return ""
     from src.services.listing_qc import _capacity_family
 
-    return _capacity_family(match.group(1))
+    family = _capacity_family(match.group(1))
+    if family == "load" and capacity_window_is_product_weight(claim_text or ""):
+        return "weight"
+    return family
 
 
 def _generated_capacity_phrase(claim_text: str) -> str:
@@ -506,9 +617,28 @@ def _quantity_edit(claim: FlaggedClaim) -> tuple[re.Pattern[str], str | None] | 
     return pattern, None
 
 
+def _feature_name_from_claim(claim: FlaggedClaim) -> str:
+    claim_text = claim.claim_text or ""
+    code = claim.code or ""
+    if claim_text in FEATURE_CLAIM_PATTERNS:
+        return claim_text
+    if code in FEATURE_CLAIM_PATTERNS:
+        return code
+    stripped = code[6:] if code.startswith("claim_") else code
+    if stripped in FEATURE_CLAIM_PATTERNS:
+        return stripped
+    blob = f"{claim_text} {code}"
+    for key in FEATURE_CLAIM_PATTERNS:
+        spaced = key.replace("_", " ")
+        if whole_value_match(key, blob) or whole_value_match(spaced, blob):
+            return key
+    return ""
+
+
 def _patterns_for_claim(
     claim: FlaggedClaim,
     source_blob: str,
+    source: Mapping[str, Any] | None = None,
 ) -> list[tuple[re.Pattern[str], str | None]]:
     """Return (pattern, replacement_or_None). None replacement means remove.
 
@@ -520,12 +650,7 @@ def _patterns_for_claim(
     evidence = str(claim.source_evidence or "NOT_FOUND")
 
     if claim_type in {"unsupported_feature", "claim_unsupported_feature"} or claim_text in FEATURE_CLAIM_PATTERNS:
-        name = claim_text if claim_text in FEATURE_CLAIM_PATTERNS else ""
-        if not name:
-            for key in FEATURE_CLAIM_PATTERNS:
-                if key in claim_text or key in (claim.code or ""):
-                    name = key
-                    break
+        name = _feature_name_from_claim(claim)
         for pattern in _feature_patterns(name):
             edits.append((pattern, None))
         return edits
@@ -553,13 +678,23 @@ def _patterns_for_claim(
         generated = _generated_capacity_phrase(claim_text)
         family = _capacity_family_from_claim(generated)
         replacement = None
+        if family == "load":
+            if evidence and evidence.upper() != "NOT_FOUND":
+                replacement = _source_labelled_load_raw(source_blob, evidence)
+            pattern = _load_phrase_pattern(generated)
+            if pattern is not None:
+                edits.append((pattern, replacement))
+            return edits
+        if family == "weight":
+            return edits
         if evidence and evidence.upper() != "NOT_FOUND":
             raw = _source_capacity_raw(source_blob, family, evidence)
             if raw:
                 replacement = raw
             elif re.fullmatch(r"\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?", evidence):
                 unit_match = re.search(
-                    r"(persons?|people|seats?|seaters?|occupants?|lbs?|pounds?)",
+                    r"(persons?|people|seats?|seaters?|occupants?|gallons?|gals?|"
+                    r"quarts?|liters?|litres?)",
                     generated,
                     re.I,
                 )
@@ -567,11 +702,6 @@ def _patterns_for_claim(
                     replacement = f"{evidence} {unit_match.group(1)}"
                 else:
                     replacement = evidence
-            else:
-                replacement = None
-        if family == "load":
-            # Longer wrapper first so "supports up to 45 lb" is removed whole.
-            edits.append((LOAD_WRAPPER_RE, None if replacement is None else replacement))
         if generated:
             pattern = _safe_claim_pattern(generated)
             if pattern is not None:
@@ -582,9 +712,9 @@ def _patterns_for_claim(
         phrase = _generated_capacity_phrase(claim_text)
         replacement = None
         if phrase.casefold() in {"fabric", "cloth"}:
-            fabric = _source_fabric_term(source_blob)
-            if fabric:
-                replacement = fabric
+            material = _source_material_field_value(source)
+            if material:
+                replacement = material
         pattern = _safe_claim_pattern(phrase)
         if pattern is not None:
             edits.append((pattern, replacement))
@@ -603,19 +733,24 @@ def _edit_text(
     replacement: str | None,
     *,
     is_title: bool = False,
+    skip_weight_values: bool = False,
 ) -> tuple[str, bool, str | None]:
     if text is None:
         return "", False, None
     original = text
     if replacement is None:
-        updated = _sub_outside_urls(pattern, text, "")
+        updated = _sub_outside_urls(
+            pattern, text, "", skip_weight_values=skip_weight_values
+        )
     else:
         urls = _url_spans(text)
         parts: list[str] = []
         last = 0
         changed = False
         for match in pattern.finditer(text):
-            if _overlaps((match.start(), match.end()), urls):
+            if not _allow_edit_match(
+                text, match, urls, skip_weight_values=skip_weight_values
+            ):
                 continue
             parts.append(text[last:match.start()])
             parts.append(replacement)
@@ -635,11 +770,19 @@ def _edit_text(
     return updated, updated != original, None
 
 
-def _edit_aspect_value(value: Any, pattern: re.Pattern[str], replacement: str | None) -> Any:
+def _edit_aspect_value(
+    value: Any,
+    pattern: re.Pattern[str],
+    replacement: str | None,
+    *,
+    skip_weight_values: bool = False,
+) -> Any:
     if value is None:
         return value
     text = str(value)
-    updated, changed, _reason = _edit_text(text, pattern, replacement)
+    updated, changed, _reason = _edit_text(
+        text, pattern, replacement, skip_weight_values=skip_weight_values
+    )
     if not changed:
         return value
     return updated
@@ -649,18 +792,24 @@ def apply_claim_to_candidate(
     candidate: dict[str, Any],
     claim: FlaggedClaim,
     source_blob: str,
+    source: Mapping[str, Any] | None = None,
 ) -> tuple[list[FieldDiff], str | None]:
     diffs: list[FieldDiff] = []
     needs_manual: str | None = None
-    edits = _patterns_for_claim(claim, source_blob)
+    edits = _patterns_for_claim(claim, source_blob, source)
     if not edits:
         return [], None
+    skip_weight_values = (claim.claim_type or "").lower() == "semantic_capacity"
 
     for pattern, replacement in edits:
         action = "source_correct" if replacement else "remove"
         title_before = str(candidate.get("title") or "")
         title_after, title_changed, title_reason = _edit_text(
-            title_before, pattern, replacement, is_title=True
+            title_before,
+            pattern,
+            replacement,
+            is_title=True,
+            skip_weight_values=skip_weight_values,
         )
         if title_reason:
             needs_manual = title_reason
@@ -679,7 +828,9 @@ def apply_claim_to_candidate(
             )
 
         desc_before = str(candidate.get("description") or "")
-        desc_after, desc_changed, _reason = _edit_text(desc_before, pattern, replacement)
+        desc_after, desc_changed, _reason = _edit_text(
+            desc_before, pattern, replacement, skip_weight_values=skip_weight_values
+        )
         if desc_changed:
             candidate["description"] = desc_after
             diffs.append(
@@ -700,6 +851,8 @@ def apply_claim_to_candidate(
         aspect_changed = False
         aspects_before = copy.deepcopy(aspects)
         for key, raw in list(aspects.items()):
+            if skip_weight_values and is_weight_aspect_key(str(key)):
+                continue
             values = list(raw) if isinstance(raw, (list, tuple)) else [raw]
             new_values: list[Any] = []
             for item in values:
@@ -709,7 +862,9 @@ def apply_claim_to_candidate(
                     if normalize_once(item).casefold() in {"no", "false", "n"}:
                         aspect_changed = True
                         continue
-                updated = _edit_aspect_value(item, pattern, replacement)
+                updated = _edit_aspect_value(
+                    item, pattern, replacement, skip_weight_values=skip_weight_values
+                )
                 if str(updated).strip() == "":
                     aspect_changed = True
                     continue
@@ -761,7 +916,9 @@ def scrub_candidate(
     for claim in before:
         if skip_solid_wood_fix(claim, source_blob):
             continue
-        claim_diffs, reason = apply_claim_to_candidate(working, claim, source_blob)
+        claim_diffs, reason = apply_claim_to_candidate(
+            working, claim, source_blob, source_map
+        )
         diffs.extend(claim_diffs)
         if reason:
             needs_manual = reason
@@ -844,8 +1001,23 @@ def is_ready_unpublished(status: Any, listing_id: Any) -> bool:
     return str(status or "").strip().upper() in READY_STATUSES and not is_live_row(status, listing_id)
 
 
-def connect_collection_db(path: str, *, timeout: float = 30.0) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path), timeout=timeout)
+def connect_collection_db(
+    path: str,
+    *,
+    timeout: float = 30.0,
+    readonly: bool = False,
+) -> sqlite3.Connection:
+    target = Path(path)
+    if not target.exists() or not target.is_file():
+        raise FileNotFoundError(f"database does not exist: {path}")
+    if readonly:
+        conn = sqlite3.connect(
+            f"{target.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=timeout,
+        )
+    else:
+        conn = sqlite3.connect(str(target), timeout=timeout)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
     return conn
@@ -901,7 +1073,7 @@ def apply_scrub_to_row(
     logs = append_log(row["logs"] if "logs" in row.keys() else None, f"ready_draft_claim_scrub applied at {stamp}")
 
     def _write() -> None:
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE collected_products
             SET optimization = ?, logs = ?, updated_at = ?
@@ -911,7 +1083,7 @@ def apply_scrub_to_row(
             """,
             (json.dumps(new_opt, ensure_ascii=False), logs, stamp, sku),
         )
-        if conn.total_changes < 1:
+        if cursor.rowcount < 1:
             raise PermissionError(f"refused write for {sku}: not a READY unpublished row")
         conn.commit()
 

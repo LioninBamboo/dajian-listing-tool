@@ -1452,7 +1452,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
 
     cap_reasons, cap_detail = evaluate_goods_value_cap(
         product.get("price"),
-        currency=product.get("currency"),
+        currency=product.get("supplier_currency") or product.get("currency"),
         specs=product.get("specs") if isinstance(product.get("specs"), dict) else None,
         attributes=product.get("attributes") if isinstance(product.get("attributes"), dict) else None,
         apply=True,

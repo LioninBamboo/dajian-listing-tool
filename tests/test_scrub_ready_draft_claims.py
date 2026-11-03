@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -12,6 +13,8 @@ import pytest
 
 from src.utils.ready_draft_claim_scrub import (
     MULTIPLE_MATCH_POLICY,
+    apply_claim_to_candidate,
+    apply_scrub_to_row,
     collect_flagged_claims,
     connect_collection_db,
     format_diff_lines,
@@ -194,7 +197,7 @@ def test_table_w527p510517_removes_no_electricity_on_heated_product():
     assert "heated" in text
 
 
-def test_table_w3590p576948_source_corrects_6_person_to_4_6():
+def test_table_w3590p576948_keeps_occupancy_inside_source_range():
     cand = _cand(
         title="6 person camping tent",
         description="<p>Spacious 6 person shelter.</p>",
@@ -202,17 +205,12 @@ def test_table_w3590p576948_source_corrects_6_person_to_4_6():
     )
     source = _src(title="4-6 person tent", description="Occupancy 4-6 person tent.")
     before = collect_flagged_claims(cand, source)
-    assert any(c.claim_type == "semantic_capacity" for c in before)
+    assert not any(c.claim_type == "semantic_capacity" for c in before)
     out, result = scrub_candidate(cand, source, sku="W3590P576948")
     text = _joined(out).lower()
-    assert "4-6" in text
-    assert result.status == "cleaned"
-    assert any(d.action == "source_correct" for d in result.diffs)
-    # Must not invent a single "4 person" or keep unsourced "6 person" alone.
-    assert not any(
-        phrase in text.replace("4-6", "")
-        for phrase in ("6 person", "6-person")
-    )
+    assert "6 person" in text
+    assert result.status == "unchanged"
+    assert result.diffs == []
 
 
 def test_table_w5870p523990_source_corrects_fabric_and_seat_count():
@@ -299,11 +297,25 @@ def test_table_gp_w2500p623899_keeps_cushioned_paraphrase():
 
 
 def test_solid_wood_rubberwood_not_scrubbed_mdf_is_removed():
+    solid = FlaggedClaim(
+        claim_type="semantic_material",
+        claim_text="solid wood",
+        source_evidence="NOT_FOUND",
+        location="title",
+        detector="motors_fact",
+        severity="CRITICAL",
+    )
+    assert skip_solid_wood_fix(solid, "rubberwood dining table") is True
+    assert skip_solid_wood_fix(solid, "eucalyptus frame") is True
+    assert skip_solid_wood_fix(solid, "acacia wood") is True
+    assert skip_solid_wood_fix(solid, "MDF particle board desk") is False
+
     rubber = _src(description="Rubberwood dining table.", attributes={"Material": "Rubberwood"})
     live_ok = _cand(title="Solid wood dining table", description="<p>Solid wood top.</p>")
     flags = collect_flagged_claims(live_ok, rubber)
     solid_flags = [c for c in flags if "solid wood" in c.claim_text.lower()]
-    assert all(skip_solid_wood_fix(c, "rubberwood dining table") for c in solid_flags) or not solid_flags
+    if solid_flags:
+        assert all(skip_solid_wood_fix(c, "rubberwood dining table") for c in solid_flags)
     out, result = scrub_candidate(live_ok, rubber, sku="WOOD-RUBBER")
     assert "solid wood" in _joined(out).lower()
 
@@ -348,8 +360,8 @@ def test_whole_value_equality_not_substring():
 
 def test_normalization_once_same_on_both_sides():
     left = "Black ＆ White 　Chairs"
-    right = "black and white chair"
-    assert normalize_once(left).casefold().replace("chairs", "chair")
+    right = "black and white chairs"
+    assert normalize_once(left).casefold() == normalize_once(right).casefold()
     assert terms_equivalent("Black & White Chairs", "black and white chair")
     assert terms_equivalent("２　Pack", "2 pack")
     assert normalize_once("a\r\nb") == "a b"
@@ -357,12 +369,14 @@ def test_normalization_once_same_on_both_sides():
 
 def test_empty_none_missing_fields_never_crash():
     out, result = scrub_candidate(None, None, sku="EMPTY")
-    assert result.status in {"unchanged", "needs_manual"}
+    assert result.status == "unchanged"
+    assert isinstance(out, dict)
+    assert result.diffs == []
     out2, result2 = scrub_candidate({"title": None, "description": None, "aspects": None}, {}, sku="NONE")
     assert isinstance(out2, dict)
-    assert result2.status in {"unchanged", "needs_manual"}
+    assert result2.status == "unchanged"
     flags = collect_flagged_claims({}, None)
-    assert flags == [] or isinstance(flags, list)
+    assert flags == []
 
 
 def test_multiple_matches_first_then_all_and_policy_stated():
@@ -452,15 +466,41 @@ def test_idempotent_second_pass_makes_no_further_changes():
 
 def test_scrub_does_not_strip_pu_leather_when_claim_is_leather():
     cand = _cand(
-        title="PU Leather sofa 45 lb",
-        description="<p>PU Leather sofa. Supports up to 45 lb.</p>",
+        title="Genuine Leather sofa with PU Leather trim",
+        description="<p>Genuine leather upholstery on a PU Leather sofa.</p>",
         aspects={"Material": ["PU Leather"]},
     )
     source = _src(description="PU Leather sofa.", attributes={"Material": "PU Leather"})
-    out, _result = scrub_candidate(cand, source, sku="PU-LEATHER")
+    before = collect_flagged_claims(cand, source)
+    leather_flags = [
+        c for c in before
+        if "leather" in f"{c.claim_text} {c.claim_type}".lower()
+        and "pu" not in c.claim_text.lower()
+    ]
+    assert leather_flags, "must flag a Leather claim while PU Leather is present"
+    out, result = scrub_candidate(cand, source, sku="PU-LEATHER")
     text = _joined(out)
     assert "PU Leather" in text
-    assert "45" not in text.lower()
+    assert "genuine leather" not in text.lower()
+    claim = FlaggedClaim(
+        claim_type="semantic_material",
+        claim_text="Leather",
+        source_evidence="NOT_FOUND",
+        location="title",
+        detector="motors_fact",
+        severity="CRITICAL",
+    )
+    working = {
+        "title": "Leather PU Leather sofa",
+        "description": "<p>Leather. PU Leather sofa.</p>",
+        "aspects": {"Material": ["PU Leather"]},
+    }
+    diffs, _reason = apply_claim_to_candidate(working, claim, "PU Leather sofa.", source)
+    assert "PU Leather" in working["title"]
+    assert "PU Leather" in working["description"]
+    assert working["aspects"]["Material"] == ["PU Leather"]
+    assert diffs
+    assert working["title"].startswith("PU Leather") or "Leather PU Leather" not in working["title"]
 
 
 def test_never_touch_giga_image_url_params():
@@ -612,8 +652,10 @@ def test_cli_apply_refuses_ready_with_listing_id(tmp_path):
 def test_cli_missing_db_is_degraded_exit_2(tmp_path):
     mod = _load_script()
     reports = tmp_path / "reports"
-    code = mod.main(["--db", str(tmp_path / "missing.db"), "--sku", "X", "--report-dir", str(reports)])
+    missing = tmp_path / "missing.db"
+    code = mod.main(["--db", str(missing), "--sku", "X", "--report-dir", str(reports)])
     assert code == 2
+    assert not missing.exists()
 
 
 def test_retry_locked_retries_then_raises():
@@ -735,3 +777,189 @@ def test_connect_sets_busy_timeout(tmp_path):
     timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
     conn.close()
     assert int(timeout) >= 30000
+
+
+def test_supported_weight_untouched_when_unsupported_load_removed():
+    cand = _cand(
+        title="Chair supports 300 lbs",
+        description="<p>Supports 300 lbs. Net weight 30 lbs. Weighs 30 lbs.</p>",
+        aspects={"Item Weight": ["30 lbs"], "Weight": ["30 lbs"]},
+    )
+    source = _src(
+        title="Chair",
+        description="Net weight 30 lbs. Weighs 30 lbs.",
+        attributes={"Item Weight": "30 lbs"},
+        specs={"Weight": "30 lbs"},
+    )
+    before = collect_flagged_claims(cand, source)
+    assert any("300" in c.claim_text for c in before)
+    assert not any(
+        "30" in c.claim_text and "300" not in c.claim_text for c in before
+    )
+    out, result = scrub_candidate(cand, source, sku="WEIGHT-LOAD")
+    desc = (out.get("description") or "").lower()
+    assert "300" not in _joined(out).lower()
+    assert "supports 300" not in desc
+    assert "net weight 30 lbs" in desc
+    assert "weighs 30 lbs" in desc
+    assert "30" in str(out["aspects"].get("Item Weight") or "")
+    assert "30" in str(out["aspects"].get("Weight") or "")
+    assert result.status == "cleaned"
+    first, _ = scrub_candidate(cand, source, sku="WEIGHT-LOAD")
+    second, result2 = scrub_candidate(first, source, sku="WEIGHT-LOAD")
+    assert result2.status == "unchanged"
+    assert second["title"] == first["title"]
+    assert second["description"] == first["description"]
+    assert second["aspects"] == first["aspects"]
+
+
+def test_linen_look_polyester_is_not_guessed_as_linen():
+    claim = FlaggedClaim(
+        claim_type="semantic_material",
+        claim_text="Fabric",
+        source_evidence="NOT_FOUND",
+        location="title",
+        detector="motors_fact",
+        severity="CRITICAL",
+    )
+    sourced = _src(
+        description="Upholstery in linen-look polyester.",
+        attributes={"Material": "linen-look polyester"},
+    )
+    working = {
+        "title": "Fabric bench",
+        "description": "<p>Fabric bench.</p>",
+        "aspects": {"Material": ["Fabric"]},
+    }
+    apply_claim_to_candidate(working, claim, "Upholstery in linen-look polyester.", sourced)
+    text = _joined(working).lower()
+    assert "linen-look polyester" in text
+    assert not re.search(r"\blinen\b", text.replace("linen-look polyester", ""))
+
+    guessed = _src(description="Upholstery in linen-look polyester.")
+    working2 = {
+        "title": "Fabric bench",
+        "description": "<p>Fabric bench.</p>",
+        "aspects": {"Material": ["Fabric"]},
+    }
+    apply_claim_to_candidate(working2, claim, "Upholstery in linen-look polyester.", guessed)
+    text2 = _joined(working2).lower()
+    assert "linen" not in text2
+    assert "fabric" not in text2
+
+
+def test_six_persons_not_sourced_by_sixteen_persons():
+    cand = _cand(
+        title="6 person canopy",
+        description="<p>6 person shelter.</p>",
+        aspects={"Seating Capacity": ["6 Person"]},
+    )
+    source = _src(title="16 persons canopy", description="Occupancy 16 persons.")
+    before = collect_flagged_claims(cand, source)
+    cap_flags = [c for c in before if c.claim_type == "semantic_capacity"]
+    assert cap_flags
+    assert any("6" in c.claim_text for c in cap_flags)
+    out, result = scrub_candidate(cand, source, sku="SIX-VS-SIXTEEN")
+    text = _joined(out).lower()
+    assert "6 person" not in text.replace("16 person", "")
+    assert result.status == "cleaned"
+
+
+def test_out_of_range_occupancy_is_source_corrected():
+    cand = _cand(title="8 person tent", description="<p>8 person shelter.</p>")
+    source = _src(title="4-6 person tent", description="Occupancy 4-6 person.")
+    before = collect_flagged_claims(cand, source)
+    assert any(c.claim_type == "semantic_capacity" for c in before)
+    out, result = scrub_candidate(cand, source, sku="OCC-OUT")
+    text = _joined(out).lower()
+    assert "8 person" not in text
+    assert result.status == "cleaned"
+
+
+def test_cli_missing_sku_exits_nonzero(tmp_path):
+    mod = _load_script()
+    db = _make_db(tmp_path)
+    reports = tmp_path / "reports"
+    code = mod.main(["--db", str(db), "--sku", "MISSING-SKU", "--report-dir", str(reports)])
+    assert code != 0
+    report = json.loads(next(reports.glob("*.json")).read_text(encoding="utf-8"))
+    assert report["results"][0]["status"] == "missing"
+    assert "not found" in str(report["results"][0].get("reason") or "").lower()
+
+
+def test_cli_store_mismatch_is_rejected(tmp_path):
+    mod = _load_script()
+    db = _make_db(tmp_path)
+    reports = tmp_path / "reports"
+    code = mod.main(["--db", str(db), "--store", "gp", "--report-dir", str(reports)])
+    assert code != 0
+    assert list(reports.glob("*.json")) == []
+
+
+def test_cli_apply_skips_needs_manual_with_partial_diffs(tmp_path):
+    mod = _load_script()
+    db = _make_db(tmp_path)
+    opt = {
+        "title": "45 lb",
+        "description": "<p>Oak frame. 45 lb hook.</p>",
+        "aspects": {},
+    }
+    _insert(db, "EMPTY-TITLE", "READY", opt, source_desc="Oak frame hook.")
+    reports = tmp_path / "reports"
+    code = mod.main([
+        "--db", str(db),
+        "--sku", "EMPTY-TITLE",
+        "--apply",
+        "--report-dir", str(reports),
+        "--store", "main",
+    ])
+    assert code == 0
+    conn = sqlite3.connect(db)
+    stored = json.loads(conn.execute("SELECT optimization FROM collected_products").fetchone()[0])
+    conn.close()
+    assert stored["title"] == "45 lb"
+    report = json.loads(next(reports.glob("scrub_ready_draft_claims_apply_*.json")).read_text(encoding="utf-8"))
+    assert report["results"][0]["status"] == "needs_manual"
+    assert report.get("written", 0) == 0
+
+
+def test_cli_missing_db_does_not_create_file(tmp_path):
+    mod = _load_script()
+    missing = tmp_path / "missing.db"
+    reports = tmp_path / "reports"
+    code = mod.main(["--db", str(missing), "--sku", "X", "--report-dir", str(reports)])
+    assert code == 2
+    assert not missing.exists()
+
+
+def test_dry_run_opens_db_readonly(tmp_path):
+    db = _make_db(tmp_path)
+    conn = connect_collection_db(str(db), readonly=True)
+    with pytest.raises(sqlite3.OperationalError):
+        conn.execute("CREATE TABLE should_fail (id INTEGER)")
+    conn.close()
+
+
+def test_apply_refused_write_uses_rowcount(tmp_path):
+    db = _make_db(tmp_path)
+    _insert(
+        db,
+        "X",
+        "READY",
+        {"title": "Chair", "description": "<p>Chair.</p>", "aspects": {}},
+    )
+    conn = connect_collection_db(str(db))
+    row = conn.execute("SELECT * FROM collected_products").fetchone()
+    conn.execute("UPDATE collected_products SET status='PUBLISHED' WHERE sku='X'")
+    conn.commit()
+    with pytest.raises(PermissionError, match="refused write"):
+        apply_scrub_to_row(
+            conn,
+            row,
+            {"title": "Edited", "description": "<p>Chair.</p>", "aspects": {}},
+        )
+    stored = json.loads(
+        conn.execute("SELECT optimization FROM collected_products WHERE sku='X'").fetchone()[0]
+    )
+    conn.close()
+    assert stored["title"] == "Chair"

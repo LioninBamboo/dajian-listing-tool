@@ -15,6 +15,7 @@ import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -58,6 +59,12 @@ from src.utils.ready_draft_claim_scrub import (
 )
 from src.utils.store_profile import get_store_profile
 
+STORE_ALIASES = {
+    "AquaVerve": frozenset({"main", "aquaverve", "furniture"}),
+    "GrovePop": frozenset({"gp", "grovepop"}),
+    "AquaRides": frozenset({"aqua", "aquarides", "motors", "motornest"}),
+}
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -68,7 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--store",
         default="",
-        help="Store label for the report (main/gp/aqua). Uses this instance's local ERP DB.",
+        help=(
+            "Store alias (main/aquaverve/furniture, gp/grovepop, "
+            "aqua/aquarides/motors/motornest). Must match this instance's "
+            "store profile; otherwise the run is rejected."
+        ),
     )
     parser.add_argument(
         "--db",
@@ -108,6 +119,26 @@ def _load_sku_args(args: argparse.Namespace) -> list[str]:
     return skus
 
 
+def resolve_store_label(store: str, profile: Any) -> str:
+    brand = str(getattr(profile, "brand_name", "") or "")
+    wanted = str(store or "").strip().lower()
+    aliases = set(STORE_ALIASES.get(brand, set()))
+    if brand:
+        aliases.add(brand.lower())
+    kind = str(getattr(profile, "store_kind", "") or "").strip().lower()
+    if kind:
+        aliases.add(kind)
+    if not wanted:
+        return brand or "unknown"
+    if wanted not in aliases:
+        accepted = ", ".join(sorted(aliases)) or "(none)"
+        raise ValueError(
+            f"store {store!r} does not match this instance profile {brand!r} "
+            f"(accepted: {accepted})"
+        )
+    return brand or wanted
+
+
 def _select_rows(conn: sqlite3.Connection, skus: list[str]) -> list[sqlite3.Row]:
     if skus:
         placeholders = ",".join("?" for _ in skus)
@@ -134,9 +165,13 @@ def main(argv: list[str] | None = None) -> int:
     report_dir = Path(args.report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
     skus = _load_sku_args(args)
-    store = str(args.store or "").strip() or getattr(get_store_profile(), "brand_name", "")
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     mode = "apply" if args.apply else "dry-run"
+    try:
+        store = resolve_store_label(args.store, get_store_profile())
+    except ValueError as exc:
+        print(f"store rejected: {exc}", file=sys.stderr)
+        return 1
     report: dict = {
         "generated_at": datetime.now(UTC).replace(tzinfo=None).isoformat(),
         "mode": mode,
@@ -150,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 0
 
     try:
-        conn = connect_collection_db(str(db_path))
+        conn = connect_collection_db(str(db_path), readonly=not args.apply)
     except Exception as exc:
         print(f"degraded: cannot open db {db_path}: {exc}", file=sys.stderr)
         report["degraded"] = True
@@ -169,17 +204,27 @@ def main(argv: list[str] | None = None) -> int:
             rows = []
 
         seen_skus = {str(row["sku"]) for row in rows}
+        missing_skus: list[str] = []
         for sku in skus:
             if sku not in seen_skus:
+                missing_skus.append(sku)
                 report["results"].append(
                     {
                         "sku": sku,
                         "status": "missing",
+                        "reason": f"requested SKU not found: {sku}",
                         "before_blockers": [],
                         "after_blockers": [],
                         "diffs": [],
                     }
                 )
+        if missing_skus:
+            print(
+                "requested SKU(s) not found: " + ", ".join(missing_skus),
+                file=sys.stderr,
+            )
+            if exit_code == 0:
+                exit_code = 1
 
         for row in rows:
             sku = str(row["sku"])
@@ -254,9 +299,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.apply:
             apply_targets = [
                 item for item in report["results"]
-                if item.get("status") in {"cleaned", "needs_manual"}
+                if item.get("status") == "cleaned"
                 and item.get("sku")
                 and item.get("diffs")
+                and not item.get("needs_manual_reason")
             ]
             by_sku = {str(row["sku"]): row for row in rows}
             to_write = [

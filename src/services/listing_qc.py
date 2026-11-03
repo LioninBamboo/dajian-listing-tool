@@ -151,7 +151,7 @@ _COLOR_CANONICAL = {"grey": "gray"}
 _CAPACITY_RE = re.compile(
     r"\b(?P<num>\d+(?:\.\d+)?)(?:\s*(?:-|–|to)\s*(?P<num2>\d+(?:\.\d+)?))?\s*"
     r"(?P<unit>persons?|people|seats?|seaters?|occupants?|gallons?|gals?|"
-    r"quarts?|liters?|litres?|lbs?|pounds?)\b",
+    r"quarts?|liters?|litres?|lbs?|pounds?|kgs?|kilograms?)\b",
     re.IGNORECASE,
 )
 _OCCUPANCY_UNITS = {
@@ -162,7 +162,34 @@ _VOLUME_UNITS = {
     "gallon", "gallons", "gal", "gals", "quart", "quarts",
     "liter", "liters", "litre", "litres",
 }
-_LOAD_UNITS = {"lb", "lbs", "pound", "pounds"}
+_KG_UNITS = {"kg", "kgs", "kilogram", "kilograms"}
+_LB_UNITS = {"lb", "lbs", "pound", "pounds"}
+_LOAD_UNITS = _LB_UNITS | _KG_UNITS
+_LB_PER_KG = 2.20462
+_LABELLED_CAPACITY_RE = re.compile(
+    r"(?:max(?:imum)?\s+)?(?:load|weight)\s+capacity|"
+    r"\bmax(?:imum)?\s+load\b|"
+    r"\bload\s+capacity\b|\bweight\s+capacity\b|"
+    r"\bcapacity\s*(?:of|:)",
+    re.I,
+)
+_LOAD_CONTEXT_RE = re.compile(
+    r"\bsupports?\b|\bhold(?:s|ing)?\b|\brated\b|\bup\s+to\b|"
+    r"(?:max(?:imum)?\s+)?(?:load|weight)\s+capacity|"
+    r"\bload\s+capacity\b|\bweight\s+capacity\b|\bmax(?:imum)?\s+load\b|"
+    r"\bweight\s+limit\b|\bload\s+limit\b|\bcapacity\s+(?:of|:)",
+    re.I,
+)
+_WEIGHT_CONTEXT_RE = re.compile(
+    r"(?:item|product|package|shipping|net|gross|unit)\s+weight\b|"
+    r"\bweighs?\b|"
+    r"(?<!load\s)(?<!max\s)(?<!maximum\s)\bweight\b(?!\s+capacity)(?!\s+limit)(?!\s+rating)",
+    re.I,
+)
+_WEIGHT_ASPECT_KEY_RE = re.compile(
+    r"^(?:item|product|package|shipping|net|gross)\s+weight$|^weight$",
+    re.I,
+)
 
 
 def _plain_blob(*parts: object) -> str:
@@ -238,6 +265,31 @@ def _capacity_family(unit: str) -> str:
     return ""
 
 
+def mass_context_family(text: str, start: int, end: int) -> str:
+    """Classify an lb/kg mention from the nearest left-hand context.
+
+    A following 'Net weight' phrase must not reclassify 'Supports 300 lbs'.
+    """
+    blob = text or ""
+    left = blob[max(0, start - 56):start]
+    right = blob[end:end + 16]
+    if _LABELLED_CAPACITY_RE.search(left) or _LABELLED_CAPACITY_RE.search(right):
+        return "load"
+    load_hits = list(_LOAD_CONTEXT_RE.finditer(left))
+    weight_hits = list(_WEIGHT_CONTEXT_RE.finditer(left))
+    last_load = load_hits[-1].end() if load_hits else -1
+    last_weight = weight_hits[-1].end() if weight_hits else -1
+    if last_weight > last_load:
+        return "weight"
+    if last_load > last_weight:
+        return "load"
+    return "load"
+
+
+def _mass_family(text: str, match: re.Match[str]) -> str:
+    return mass_context_family(text or "", match.start(), match.end())
+
+
 def _capacity_number(raw: str) -> str:
     value = float(raw)
     if value.is_integer():
@@ -257,13 +309,101 @@ def _capacity_sort_key(token: str) -> float:
     return float(head)
 
 
+def _unit_from_raw(raw: str) -> str:
+    match = re.search(
+        r"(persons?|people|seats?|seaters?|occupants?|gallons?|gals?|"
+        r"quarts?|liters?|litres?|lbs?|pounds?|kgs?|kilograms?)\b",
+        raw or "",
+        re.I,
+    )
+    return match.group(1).lower() if match else ""
+
+
+def _numeric_span(token: str) -> tuple[float, float] | None:
+    text = str(token or "").strip()
+    if not text:
+        return None
+    try:
+        if "-" in text:
+            left, right = text.split("-", 1)
+            return float(left), float(right)
+        value = float(text)
+        return value, value
+    except (TypeError, ValueError):
+        return None
+
+
+def _span_in_pounds(token: str, raw: str) -> tuple[float, float] | None:
+    span = _numeric_span(token)
+    if span is None:
+        return None
+    if _unit_from_raw(raw) in _KG_UNITS:
+        return span[0] * _LB_PER_KG, span[1] * _LB_PER_KG
+    return span
+
+
+def _span_supported(
+    claim: tuple[float, float],
+    source: tuple[float, float],
+    *,
+    convert: bool,
+) -> bool:
+    c_lo, c_hi = claim
+    s_lo, s_hi = source
+    if convert:
+        tol = max(0.6, 0.02 * max(abs(s_lo), abs(s_hi), 1.0))
+    else:
+        tol = 0.0
+    return c_lo + 1e-9 >= s_lo - tol and c_hi - 1e-9 <= s_hi + tol
+
+
+def _capacity_supported(
+    number: str,
+    raw: str,
+    family: str,
+    known: list[tuple[str, str]],
+) -> bool:
+    if any(number == token for token, _src_raw in known):
+        return True
+    claim_span = _span_in_pounds(number, raw) if family in {"load", "weight"} else _numeric_span(number)
+    if claim_span is None:
+        return False
+    convert = family in {"load", "weight"}
+    for token, src_raw in known:
+        source_span = (
+            _span_in_pounds(token, src_raw) if convert else _numeric_span(token)
+        )
+        if source_span is None:
+            continue
+        if _span_supported(claim_span, source_span, convert=convert):
+            return True
+    return False
+
+
+def capacity_window_is_labelled_load(window: str) -> bool:
+    return bool(_LABELLED_CAPACITY_RE.search(window or ""))
+
+
+def capacity_window_is_product_weight(window: str) -> bool:
+    if capacity_window_is_labelled_load(window):
+        return False
+    return bool(_WEIGHT_CONTEXT_RE.search(window or ""))
+
+
+def is_weight_aspect_key(key: str) -> bool:
+    return bool(_WEIGHT_ASPECT_KEY_RE.match(str(key or "").strip()))
+
+
 def _capacity_mentions(text: str) -> list[tuple[str, str, str]]:
     mentions: list[tuple[str, str, str]] = []
     seen: set[tuple[str, str]] = set()
     for match in _CAPACITY_RE.finditer(text or ""):
-        family = _capacity_family(match.group("unit"))
+        unit = match.group("unit")
+        family = _capacity_family(unit)
         if not family:
             continue
+        if family == "load":
+            family = _mass_family(text or "", match)
         number = _capacity_token(match.group("num"), match.group("num2"))
         key = (number, family)
         if key in seen:
@@ -344,15 +484,17 @@ def motors_deterministic_fact_violations(
         )
 
     source_caps = _capacity_mentions(source_text)
-    source_by_family: dict[str, set[str]] = {}
-    for number, family, _raw in source_caps:
-        source_by_family.setdefault(family, set()).add(number)
+    source_by_family: dict[str, list[tuple[str, str]]] = {}
+    for number, family, raw in source_caps:
+        source_by_family.setdefault(family, []).append((number, raw))
     for number, family, raw in _capacity_mentions(candidate_text):
-        known = source_by_family.get(family) or set()
-        if number in known:
+        known = source_by_family.get(family) or []
+        if _capacity_supported(number, raw, family, known):
             continue
         if known:
-            evidence = ", ".join(sorted(known, key=_capacity_sort_key))
+            evidence = ", ".join(
+                dict.fromkeys(sorted((token for token, _src in known), key=_capacity_sort_key))
+            )
             severity = "CRITICAL"
             claim_text = f"{raw} (source: {evidence})"
         else:

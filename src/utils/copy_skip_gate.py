@@ -381,11 +381,18 @@ def apply_live_supplier_quote(product: Any, quote: Mapping[str, Any] | None) -> 
         changed = True
     ccy = quote.get("currency")
     if ccy not in (None, ""):
-        specs = dict(getattr(product, "specs", None) or {})
-        if specs.get("_supplier_currency") != str(ccy).strip():
-            specs["_supplier_currency"] = str(ccy).strip()
-            product.specs = specs
-            changed = True
+        value = str(ccy).strip()
+        current = None
+        if isinstance(product, dict):
+            current = product.get("supplier_currency")
+            if current != value:
+                product["supplier_currency"] = value
+                changed = True
+        else:
+            current = getattr(product, "supplier_currency", None)
+            if current != value:
+                product.supplier_currency = value
+                changed = True
     return changed
 
 

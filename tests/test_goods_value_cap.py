@@ -10,6 +10,7 @@ from src.utils.copy_skip_gate import (
     REASON_PRODUCT_PRICE_MISSING,
     REASON_PRODUCT_PRICE_UNREADABLE,
     REASON_UNSUPPORTED_CURRENCY,
+    apply_live_supplier_quote,
     evaluate_copy_skip,
     evaluate_goods_value_cap,
     parse_supplier_unit_price,
@@ -143,20 +144,86 @@ def test_zero_and_negative_product_price_are_missing_not_silent_pass():
 
 
 def test_same_cap_helper_on_collect_analyze_publish_and_new_arrivals():
-    from pathlib import Path
+    collect_over = evaluate_copy_skip(
+        sku="N710P100001",
+        product_price=250.01,
+        shipping=10,
+        attributes=dict(CLEAR_DIMS),
+        include_market=False,
+        dims_mode="defer_missing",
+    )
+    collect_ok = evaluate_copy_skip(
+        sku="N710P100001",
+        product_price=220,
+        shipping=60.53,
+        attributes=dict(CLEAR_DIMS),
+        include_market=False,
+        dims_mode="defer_missing",
+    )
+    assert REASON_CARGO_COST in collect_over.reasons
+    assert REASON_CARGO_COST not in collect_ok.reasons
+    assert collect_ok.detail["supplier_product_price_usd"] == 220
 
-    root = Path(__file__).resolve().parents[1]
-    copy_skip = (root / "src" / "utils" / "copy_skip_gate.py").read_text(encoding="utf-8")
-    assert "evaluate_goods_value_cap(" in copy_skip
-    assert "evaluate_copy_skip" in copy_skip
-    publish = (root / "batch_publish.py").read_text(encoding="utf-8")
-    assert "evaluate_goods_value_cap" in publish
-    discover = (root / "src" / "plugins" / "terapeak_research" / "external_discovery.py").read_text(encoding="utf-8")
-    assert discover.count("evaluate_goods_value_cap") >= 2
-    server = (root / "server.py").read_text(encoding="utf-8")
-    daily = (root / "daily_tasks.py").read_text(encoding="utf-8")
-    analyze = (root / "batch_analyze.py").read_text(encoding="utf-8")
-    assert "evaluate_copy_skip" in server and "evaluate_copy_skip" in daily and "evaluate_copy_skip" in analyze
+    analyze_over = evaluate_copy_skip(
+        sku="N710P100001",
+        product_price=250.01,
+        shipping=10,
+        attributes=dict(CLEAR_DIMS),
+        include_market=False,
+        dims_mode="require",
+    )
+    analyze_ok = evaluate_copy_skip(
+        sku="N710P100001",
+        product_price=249,
+        shipping=100,
+        attributes=dict(CLEAR_DIMS),
+        include_market=False,
+        dims_mode="require",
+    )
+    assert REASON_CARGO_COST in analyze_over.reasons
+    assert REASON_CARGO_COST not in analyze_ok.reasons
+
+    pub_over, _ = evaluate_goods_value_cap(
+        250.01, currency=None, specs={}, attributes={}, apply=True
+    )
+    pub_ok, pub_detail = evaluate_goods_value_cap(
+        220, currency=None, specs={}, attributes={}, apply=True
+    )
+    assert pub_over == [REASON_CARGO_COST]
+    assert pub_ok == []
+    assert pub_detail["supplier_product_price_usd"] == 220
+
+    discover_over, _ = evaluate_goods_value_cap(250.01, currency="USD", apply=True)
+    ingest_ok, _ = evaluate_goods_value_cap(220, currency="USD", apply=True)
+    ingest_ccy, _ = evaluate_goods_value_cap(80, currency="EUR", apply=True)
+    assert discover_over == [REASON_CARGO_COST]
+    assert ingest_ok == []
+    assert REASON_UNSUPPORTED_CURRENCY in ingest_ccy
+
+
+def test_apply_live_quote_keeps_currency_off_specs():
+    class _Product:
+        price = 10.0
+        shipping = 1.0
+        specs = {"Weight": "5 kg"}
+
+    product = _Product()
+    changed = apply_live_supplier_quote(
+        product, {"price": 12.0, "shipping": 2.0, "currency": "USD"}
+    )
+    assert changed is True
+    assert product.supplier_currency == "USD"
+    assert "_supplier_currency" not in (product.specs or {})
+    decision = evaluate_copy_skip(
+        sku="N710P100001",
+        product_price=product.price,
+        shipping=product.shipping,
+        attributes=dict(CLEAR_DIMS),
+        specs=product.specs,
+        include_market=False,
+        currency=product.supplier_currency,
+    )
+    assert REASON_UNSUPPORTED_CURRENCY not in decision.reasons
 
 
 def test_apply_cargo_false_skips_cap_for_ebay_listing_drafts():

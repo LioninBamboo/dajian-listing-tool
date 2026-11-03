@@ -630,9 +630,7 @@ def test_motors_blocks_invented_load_and_keeps_source_range(monkeypatch):
         source_description="Occupancy 4-6 person.",
         qc_profile="motors",
     )
-    assert ranged["status"] == "blocked"
-    assert any("semantic_capacity" in item and "6" in item for item in ranged["blockers"])
-    assert any("4-6" in item for item in ranged["blockers"])
+    assert not any("semantic_capacity" in item for item in ranged["blockers"])
 
     keep = listing_qc.run_listing_qc(
         sku="OCC-KEEP",
@@ -647,6 +645,66 @@ def test_motors_blocks_invented_load_and_keeps_source_range(monkeypatch):
         qc_profile="motors",
     )
     assert not any("semantic_capacity" in item for item in keep["blockers"])
+
+
+def test_motors_capacity_accepts_kg_lb_and_rejects_weight_as_load(monkeypatch):
+    _forbid_furniture_gate(monkeypatch)
+    converted = listing_qc.run_listing_qc(
+        sku="KG-LB",
+        candidate={
+            "title": "Universal motor",
+            "description": "Unit weighs 44 lb.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal"], "Item Weight": ["44 lb"]},
+        },
+        source_title="Motor",
+        source_description="Weighs 20 kg.",
+        source_specs={"Item Weight": "20 kg"},
+        qc_profile="motors",
+    )
+    assert not any("semantic_capacity" in item for item in converted["blockers"])
+
+    load_converted = listing_qc.run_listing_qc(
+        sku="KG-LB-LOAD",
+        candidate={
+            "title": "Universal chair supports 44 lb",
+            "description": "Supports 44 lb.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal"]},
+        },
+        source_title="Chair",
+        source_description="Weight capacity 20 kg.",
+        qc_profile="motors",
+    )
+    assert not any("semantic_capacity" in item for item in load_converted["blockers"])
+
+    sixteen = listing_qc.run_listing_qc(
+        sku="SIX-VS-16",
+        candidate={
+            "title": "Universal 6 person canopy",
+            "description": "6 person canopy.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal"]},
+        },
+        source_title="16 persons canopy",
+        source_description="Occupancy 16 persons.",
+        qc_profile="motors",
+    )
+    assert any("semantic_capacity" in item and "6" in item for item in sixteen["blockers"])
+
+    mixed = listing_qc.run_listing_qc(
+        sku="WEIGHT-NOT-LOAD",
+        candidate={
+            "title": "Universal chair supports 45 lb",
+            "description": "Supports 45 lb.",
+            "categoryId": "33650",
+            "aspects": {"Fitment Type": ["Universal"]},
+        },
+        source_title="Chair",
+        source_description="Weighs 45 lb.",
+        qc_profile="motors",
+    )
+    assert any("semantic_capacity" in item and "45" in item for item in mixed["blockers"])
 
 
 def test_motors_universal_fit_still_blocks_claim_invent(monkeypatch):
