@@ -1535,9 +1535,48 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         return held_result
     category_id = choice.get("category_id")
     category_name = choice.get("category_name")
+    from src.utils.category_decision import (
+        format_prepublish_error,
+        is_prepublish_block,
+        prepublish_category_check,
+    )
+
+    pre_verdict = prepublish_category_check(
+        sku,
+        category_id,
+        category_name,
+        title_context,
+        product.get("attributes") if isinstance(product.get("attributes"), dict) else None,
+        product.get("description", "") or description,
+        store=get_store_profile(),
+    )
+    # Immediate refuse for leaf/family mismatches, retired, empty, missing tree.
+    # unknown_product_type / wrong_store still run later local gates (aspect /
+    # fee) so those existing blockers keep their error identity; they still
+    # refuse before any eBay write if nothing else blocked.
+    if not pre_verdict.ok and (
+        (
+            is_prepublish_block(pre_verdict)
+            and pre_verdict.reason != "wrong_store"
+        )
+        or pre_verdict.reason in {"retired_category", "hold_empty", "hold_tree_unavailable"}
+    ):
+        msg = format_prepublish_error(pre_verdict)
+        if not dry_run:
+            record_error(sku, msg)
+        result = {
+            "status": "error",
+            "message": msg,
+            "reason": pre_verdict.reason,
+            "suggestion": pre_verdict.suggestion,
+        }
+        if pre_verdict.reason == "hold_tree_unavailable":
+            result["action"] = "hold_tree_unavailable"
+        return result
     if not category_id:
         msg = "Cannot determine eBay category"
-        record_error(sku, msg)
+        if not dry_run:
+            record_error(sku, msg)
         return {"status": "error", "message": msg}
     protected_stored_categories = PROTECTED_STORED_CATEGORY_IDS
 
@@ -1765,6 +1804,19 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         publish_blockers.append(fee_category_reason)
 
     publish_blockers = list(dict.fromkeys(publish_blockers))
+    if not publish_blockers and not pre_verdict.ok:
+        msg = format_prepublish_error(pre_verdict)
+        if not dry_run:
+            record_error(sku, msg)
+        result = {
+            "status": "error",
+            "message": msg,
+            "reason": pre_verdict.reason,
+            "suggestion": pre_verdict.suggestion,
+        }
+        if pre_verdict.reason == "hold_tree_unavailable":
+            result["action"] = "hold_tree_unavailable"
+        return result
     if publish_blockers:
         msg = "; ".join(publish_blockers)
         record_error(sku, msg)
@@ -2227,7 +2279,29 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                             new_id = gated_retry
                             new_name = retry_choice.get("category_name") or new_name
                         if new_id and new_id != category_id:
-                            logger.info(f"  [FIX] Category {category_id} invalid, switching to API-suggested: {new_id} ({new_name})")
+                            retry_verdict = prepublish_category_check(
+                                sku,
+                                new_id,
+                                new_name,
+                                title,
+                                product.get("attributes") if isinstance(product.get("attributes"), dict) else None,
+                                description,
+                                store=get_store_profile(),
+                            )
+                            if not retry_verdict.ok:
+                                msg = format_prepublish_error(retry_verdict)
+                                if not dry_run:
+                                    record_error(sku, msg)
+                                return {
+                                    "status": "error",
+                                    "message": msg,
+                                    "reason": retry_verdict.reason,
+                                    "suggestion": retry_verdict.suggestion,
+                                }
+                            logger.info(
+                                f"  [FIX] Category {category_id} invalid; "
+                                f"accepted {new_id} after prepublish check"
+                            )
                             category_id, category_name = new_id, new_name
                             completed_aspects.clear()
                             completed_aspects.update(retry_choice.get("aspects") or {})

@@ -1697,15 +1697,29 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
         elif not category_id or not auto_plausible:
             category_id = stored_cat
             if not category_id:
-                suggestions = ebay_client.get_category_suggestions(listing_title)
-                if suggestions:
-                    category_id = suggestions[0].get("category", {}).get("categoryId")
-                    print(f"[FALLBACK] Using suggested category: {category_id}")
+                print("[FALLBACK] Empty category; refusing suggested-category auto-fill")
             completed_aspects = existing_aspects
         
         if category_id:
             print(f"[AUTO] Category: {category_id} ({category_name})")
             print(f"[AUTO] Aspects: {len(completed_aspects)} items (was {len(existing_aspects)})")
+
+        from src.utils.category_decision import (
+            format_prepublish_error,
+            prepublish_category_check,
+        )
+
+        pre_verdict = prepublish_category_check(
+            sku,
+            category_id,
+            category_name,
+            title_context or listing_title,
+            product.attributes if isinstance(getattr(product, "attributes", None), dict) else None,
+            product.description,
+            store=get_store_profile(),
+        )
+        if not pre_verdict.ok:
+            raise HTTPException(status_code=400, detail=format_prepublish_error(pre_verdict))
         
         # Prepare description
         description = opt_data.get("description", product.description)

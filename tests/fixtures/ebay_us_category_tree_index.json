@@ -101,5 +101,15 @@
   "900019": ["Sporting Goods", ""],
   "900020": ["Cycling", "900019"],
   "177815": ["Forks", "900020"],
-  "177816": ["Handlebar Grips", "900020"]
+  "177816": ["Handlebar Grips", "900020"],
+  "900033": ["Health & Beauty", ""],
+  "900034": ["Fragrances", "900033"],
+  "11848": ["Women's Fragrances", "900034"],
+  "177849": ["Car & Truck Racks", "900020"],
+  "257900": ["Chairs & Stools", "900030"],
+  "177831": ["Bicycles", "900020"],
+  "900035": ["Towing", "900015"],
+  "33653": ["Trailer Hitches", "900035"],
+  "116389": ["Ramps & Stairs", "900013"],
+  "20748": ["Cages & Crates", "900013"]
 }

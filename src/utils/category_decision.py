@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any
 
@@ -425,6 +426,9 @@ _HEAD_NOUN_SUGGESTED_LEAF: dict[str, tuple[str, str, str]] = {
     "kitchen island": ("260157", "kitchen_island", "high"),
     "kitchen island cart": ("260157", "kitchen_island", "high"),
     "medicine cabinet": ("176991", "medicine", "high"),
+    "bathroom cabinet": ("176991", "medicine", "high"),
+    "mirror cabinet": ("176991", "medicine", "high"),
+    "bathroom mirror cabinet": ("176991", "medicine", "high"),
     "trimming tool": ("71277", "trimmer", "med"),
     "string trimmer": ("71277", "trimmer", "med"),
     "fogger": ("181037", "fogger", "med"),
@@ -1963,3 +1967,659 @@ def gate_publish_category_choice(
             None, action, tree_unavailable_publish_error(), flags, reasons=["hold_tree_unavailable"]
         )
     return CategoryGateResult(gated, action, "", flags)
+
+
+# ---------------------------------------------------------------------------
+# Pre-publish category check (one choke point for every live publish path)
+# ---------------------------------------------------------------------------
+
+BLOCKED_CATEGORY_REVIEW = "BLOCKED_CATEGORY_REVIEW"
+RETIRED_CATEGORY_IDS = frozenset({"42428"})
+
+PREPUBLISH_HOLD_REASONS = frozenset(
+    {
+        "hold_empty",
+        "hold_tree_unavailable",
+        "unknown_product_type",
+        "set_vs_single",
+    }
+)
+
+_PRODUCT_TYPE_LINE_RE = re.compile(
+    r"(?im)(?:^|<li\b[^>]*>)\s*product\s*type\s*[:：]\s*([^\r\n<]+)"
+)
+_MEASUREMENT_NOISE_RE = re.compile(
+    r"(?i)\b\d+(?:\.\d+)?\s*(?:inch(?:es)?|in|cm|mm|\"|”)?\b|"
+    r"\b\d+\s*-\s*packs?\b|"
+    r"\b\d+\s*-\s*pieces?\b|"
+    r"^set\s+of\s+\d+\s+|"
+    r"\b\d+\s*-\s*pack\b"
+)
+_ROUTER_LABEL_KEYS = frozenset({"route_reason", "aqua_kind", "route_why", "specs.route_reason"})
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """Pre-publish category verdict. Never writes a category."""
+
+    ok: bool
+    reason: str
+    suggestion: str | None = None
+
+
+# (phrase, family, implied top-level branches, is_set)
+_PRODUCT_TYPE_ROWS: tuple[tuple[str, str, tuple[str, ...], bool], ...] = (
+    ("outdoor kitchen island", "grill_cart", ("Home & Garden",), False),
+    ("bar table set", "set", ("Home & Garden",), True),
+    ("dining table set", "set", ("Home & Garden",), True),
+    ("nook dining set", "set", ("Home & Garden",), True),
+    ("table set", "set", ("Home & Garden",), True),
+    ("dining set", "set", ("Home & Garden",), True),
+    ("bathroom mirror cabinet", "bathroom_cabinet", ("Home & Garden",), False),
+    ("kitchen island cart", "kitchen_island", ("Home & Garden",), False),
+    ("lumbar support chair", "chair", ("Home & Garden", "Business & Industrial"), False),
+    ("entertainment center", "tv_stand", ("Home & Garden",), False),
+    ("stabilizer jack", "rv_jack", ("eBay Motors",), False),
+    ("leveling block", "rv_leveling", ("eBay Motors",), False),
+    ("trailer hitch", "hitch", ("eBay Motors",), False),
+    ("truck hitch", "hitch", ("eBay Motors",), False),
+    ("game hoist", "hitch", ("eBay Motors",), False),
+    ("human dog bed", "sofa", ("Home & Garden",), False),
+    ("computer desk", "desk", ("Home & Garden", "Business & Industrial"), False),
+    ("office desk", "desk", ("Home & Garden", "Business & Industrial"), False),
+    ("l-shaped desk", "desk", ("Home & Garden", "Business & Industrial"), False),
+    ("l shaped desk", "desk", ("Home & Garden", "Business & Industrial"), False),
+    ("display cabinet", "cabinet", ("Home & Garden",), False),
+    ("curio cabinet", "cabinet", ("Home & Garden",), False),
+    ("glass display cabinet", "cabinet", ("Home & Garden",), False),
+    ("support rod", "hand_tool", ("Home & Garden", "Business & Industrial"), False),
+    ("hand truck", "hand_tool", ("Home & Garden", "Business & Industrial"), False),
+    ("coat rack", "hall_tree", ("Home & Garden",), False),
+    ("hat rack", "hall_tree", ("Home & Garden",), False),
+    ("hall tree", "hall_tree", ("Home & Garden",), False),
+    ("garbage bin shed", "trash_storage", ("Home & Garden",), False),
+    ("trash can storage", "trash_storage", ("Home & Garden",), False),
+    ("bin shed", "trash_storage", ("Home & Garden",), False),
+    ("mirror cabinet", "bathroom_cabinet", ("Home & Garden",), False),
+    ("bathroom cabinet", "bathroom_cabinet", ("Home & Garden",), False),
+    ("medicine cabinet", "bathroom_cabinet", ("Home & Garden",), False),
+    ("storage cabinet", "cabinet", ("Home & Garden",), False),
+    ("bathroom vanity", "vanity", ("Home & Garden",), False),
+    ("makeup vanity", "vanity", ("Home & Garden",), False),
+    ("vanity table", "vanity", ("Home & Garden",), False),
+    ("kitchen island", "kitchen_island", ("Home & Garden",), False),
+    ("office chair", "chair", ("Home & Garden", "Business & Industrial"), False),
+    ("support chair", "chair", ("Home & Garden", "Business & Industrial"), False),
+    ("dining chair", "chair", ("Home & Garden",), False),
+    ("media console", "tv_stand", ("Home & Garden",), False),
+    ("console table", "table", ("Home & Garden",), False),
+    ("coffee table", "table", ("Home & Garden",), False),
+    ("dining table", "table", ("Home & Garden",), False),
+    ("accent table", "table", ("Home & Garden",), False),
+    ("side table", "table", ("Home & Garden",), False),
+    ("end table", "table", ("Home & Garden",), False),
+    ("bar table", "table", ("Home & Garden",), False),
+    ("grill cart", "grill_cart", ("Home & Garden",), False),
+    ("bbq cart", "grill_cart", ("Home & Garden",), False),
+    ("barbecue cart", "grill_cart", ("Home & Garden",), False),
+    ("bar stool", "stool", ("Home & Garden",), False),
+    ("counter stool", "stool", ("Home & Garden",), False),
+    ("tv stand", "tv_stand", ("Home & Garden",), False),
+    ("tv cabinet", "tv_stand", ("Home & Garden",), False),
+    ("dog crate", "dog_crate", ("Pet Supplies",), False),
+    ("dog kennel", "dog_crate", ("Pet Supplies",), False),
+    ("pet crate", "dog_crate", ("Pet Supplies",), False),
+    ("pet cage", "dog_crate", ("Pet Supplies",), False),
+    ("dog ramp", "pet_ramp", ("Pet Supplies",), False),
+    ("kids bike", "bike", ("Sporting Goods",), False),
+    ("rv jack", "rv_jack", ("eBay Motors",), False),
+    ("loveseat", "sofa", ("Home & Garden",), False),
+    ("sectional", "sofa", ("Home & Garden",), False),
+    ("vanity", "vanity", ("Home & Garden",), False),
+    ("desk", "desk", ("Home & Garden", "Business & Industrial"), False),
+    ("cabinet", "cabinet", ("Home & Garden",), False),
+    ("table", "table", ("Home & Garden",), False),
+    ("chair", "chair", ("Home & Garden", "Business & Industrial"), False),
+    ("stool", "stool", ("Home & Garden",), False),
+    ("sofa", "sofa", ("Home & Garden",), False),
+    ("couch", "sofa", ("Home & Garden",), False),
+    ("bench", "bench", ("Home & Garden",), False),
+    ("dolly", "dolly", ("eBay Motors",), False),
+    ("hitch", "hitch", ("eBay Motors",), False),
+    ("bike", "bike", ("Sporting Goods",), False),
+    ("bicycle", "bike", ("Sporting Goods",), False),
+    ("jack", "rv_jack", ("eBay Motors",), False),
+)
+
+_PRODUCT_TYPE_BY_PHRASE = {row[0]: row for row in _PRODUCT_TYPE_ROWS}
+_PRODUCT_TYPE_PHRASES = tuple(
+    sorted((row[0] for row in _PRODUCT_TYPE_ROWS), key=len, reverse=True)
+)
+
+_CATEGORY_ID_FAMILY: dict[str, str] = {
+    "20487": "cabinet",
+    "38217": "cabinet",
+    "176991": "bathroom_cabinet",
+    "42428": "bathroom_cabinet",
+    "42425": "bathroom_cabinet",
+    "32878": "vanity",
+    "54235": "chair",
+    "257900": "chair",
+    "79682": "chair",
+    "38208": "sofa",
+    "103431": "stool",
+    "38204": "table",
+    "38200": "table",
+    "38205": "table",
+    "175761": "table",
+    "112590": "table",
+    "262980": "bench",
+    "20488": "tv_stand",
+    "88057": "desk",
+    "303": "hand_tool",
+    "184155": "hand_tool",
+    "125085": "chest",
+    "22656": "hall_tree",
+    "161059": "trash_storage",
+    "20608": "trash_can",
+    "177000": "power_tools",
+    "11848": "fragrance",
+    "177849": "cycling_rack",
+    "177831": "bike",
+    "33653": "hitch",
+    "179506": "dolly",
+    "121851": "dog_crate",
+    "20748": "dog_crate",
+    "63108": "dog_crate",
+    "116389": "pet_ramp",
+    "20744": "dog_bed",
+    "260157": "kitchen_island",
+    "115753": "kitchen_island",
+    "20725": "grill_cart",
+    "260931": "grill_cart",
+    "107578": "set",
+    "139849": "set",
+    "66743": "set",
+}
+
+_NAME_FAMILY_LABELS: tuple[tuple[str, str], ...] = (
+    ("women's fragrances", "fragrance"),
+    ("car and truck racks", "cycling_rack"),
+    ("power tool sets", "power_tools"),
+    ("trailer hitches", "hitch"),
+    ("ramps and stairs", "pet_ramp"),
+    ("cages and crates", "dog_crate"),
+    ("bathroom cabinets", "bathroom_cabinet"),
+    ("vanities and makeup tables", "vanity"),
+    ("tv stands and entertainment units", "tv_stand"),
+    ("desks and tables", "desk"),
+    ("other hand tools", "hand_tool"),
+    ("trunks and chests", "chest"),
+    ("cabinets and cupboards", "cabinet"),
+    ("bar stools and stools", "stool"),
+    ("sofas, armchairs and couches", "sofa"),
+    ("chairs and stools", "chair"),
+    ("patio chairs", "chair"),
+    ("dining sets", "set"),
+    ("kitchen islands", "kitchen_island"),
+    ("bicycles", "bike"),
+    ("dollies", "dolly"),
+    ("benches", "bench"),
+    ("chairs", "chair"),
+    ("tables", "table"),
+    ("sofas", "sofa"),
+    ("stools", "stool"),
+    ("cabinets", "cabinet"),
+)
+
+# One-way only: a generic storage cabinet may sit on the bathroom-cabinet
+# leaf. A bathroom-cabinet / vanity / mirror-cabinet product must not pass
+# furniture Cabinets & Cupboards (20487) or Vanities (32878).
+_FAMILY_COMPAT_ONE_WAY = {
+    ("cabinet", "bathroom_cabinet"),
+}
+
+_LEAF_CONFLICTS = {
+    frozenset({"table", "chair"}),
+    frozenset({"table", "sofa"}),
+    frozenset({"table", "stool"}),
+    frozenset({"grill_cart", "cabinet"}),
+    frozenset({"kitchen_island", "cabinet"}),
+    frozenset({"set", "stool"}),
+    frozenset({"vanity", "cabinet"}),
+    frozenset({"bathroom_cabinet", "vanity"}),
+    frozenset({"dog_crate", "chair"}),
+    frozenset({"grill_cart", "power_tools"}),
+}
+
+
+def normalize_category_label(value: Any) -> str:
+    """Case, whitespace, NFKC, ``&``/and. Used on both sides of a compare."""
+    text = as_safe_text(value)
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace("\u3000", " ").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("&", " and ")
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text
+
+
+def _singularize_label(text: str) -> str:
+    parts = []
+    for part in normalize_category_label(text).split():
+        part = part.strip(",")
+        if part.endswith("ss") or len(part) <= 2:
+            parts.append(part)
+        elif part.endswith("ies") and len(part) > 3:
+            parts.append(part[:-3] + "y")
+        elif part.endswith("s"):
+            parts.append(part[:-1])
+        else:
+            parts.append(part)
+    return " ".join(parts)
+
+
+def labels_equal(left: Any, right: Any) -> bool:
+    """Whole-value equality after shared normalization. Not substring."""
+    a = normalize_category_label(left)
+    b = normalize_category_label(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return _singularize_label(a) == _singularize_label(b)
+
+
+def _scan_type_phrases(text: str) -> tuple[str, str, tuple[str, ...], bool] | None:
+    hay = normalize_category_label(text)
+    if not hay:
+        return None
+    best: tuple[int, int, tuple[str, str, tuple[str, ...], bool]] | None = None
+    for phrase in _PRODUCT_TYPE_PHRASES:
+        match = re.search(
+            rf"(?<![a-z0-9]){re.escape(phrase)}s?(?![a-z0-9])",
+            hay,
+        )
+        if not match:
+            continue
+        candidate = (match.start(), -len(phrase), _PRODUCT_TYPE_BY_PHRASE[phrase])
+        if best is None or candidate < best:
+            best = candidate
+    return None if best is None else best[2]
+
+
+def _product_type_from_attributes(attributes: Any) -> str:
+    if not isinstance(attributes, dict):
+        return ""
+    for key, value in attributes.items():
+        label = normalize_category_label(key)
+        if label in _ROUTER_LABEL_KEYS or label in {"route reason", "aqua kind", "route why"}:
+            continue
+        if label == "product type":
+            return as_safe_text(value)
+    return ""
+
+
+def _product_type_from_description(description: Any) -> str:
+    """Read a Product Type line before whitespace collapsing can erase newlines."""
+    if description is None or isinstance(description, (dict, list, tuple, set)):
+        return ""
+    try:
+        raw = str(description)
+    except Exception:
+        return ""
+    if not raw or raw in {"None", "nan"}:
+        return ""
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    match = _PRODUCT_TYPE_LINE_RE.search(raw)
+    if match:
+        return as_safe_text(match.group(1))
+    collapsed = as_safe_text(raw)
+    match = _PRODUCT_TYPE_LINE_RE.search("\n" + collapsed)
+    if match:
+        return as_safe_text(match.group(1))
+    return ""
+
+
+def extract_product_type_signal(
+    title: Any = "",
+    attributes: Any = None,
+    description: Any = "",
+) -> str:
+    """Product Type attribute / description line, else title head noun.
+
+    Router labels (``specs.route_reason``, ``aqua_kind``, ``route_why``) are ignored.
+    """
+    raw = _product_type_from_attributes(attributes)
+    if raw:
+        return raw
+    from_desc = _product_type_from_description(description)
+    if from_desc:
+        return from_desc
+    hay = as_safe_text(title)
+    if re.search(r"\bhuman\s+dog\s+beds?\b", hay, re.IGNORECASE):
+        return "human dog bed"
+    if _looks_like_grill_cart_title(hay):
+        return "grill cart"
+    scanned = _scan_type_phrases(_MEASUREMENT_NOISE_RE.sub(" ", hay))
+    if scanned:
+        return scanned[0]
+    head = first_product_noun(hay)
+    deny = unknown_head_noun(head)
+    return deny or ("" if head is None else str(head))
+
+
+def map_product_type(signal: Any) -> tuple[str, tuple[str, ...], bool] | None:
+    """Return (family, top_levels, is_set) or None when the type is unknown."""
+    cleaned = _MEASUREMENT_NOISE_RE.sub(" ", as_safe_text(signal))
+    scanned = _scan_type_phrases(cleaned)
+    if scanned:
+        return scanned[1], scanned[2], scanned[3]
+    return None
+
+
+def _family_from_category_name(name: Any) -> str:
+    norm = normalize_category_label(name)
+    if not norm:
+        return ""
+    stemmed = _singularize_label(norm)
+    for label, family in _NAME_FAMILY_LABELS:
+        if labels_equal(norm, label) or stemmed == _singularize_label(label):
+            return family
+    return ""
+
+
+def _family_from_category(
+    cid: str,
+    name: str,
+    path: str,
+    index=None,
+) -> str:
+    if cid in _CATEGORY_ID_FAMILY:
+        return _CATEGORY_ID_FAMILY[cid]
+    mapped = _suggestion_family_of(cid)
+    family_alias = {
+        "display": "cabinet",
+        "medicine": "bathroom_cabinet",
+        "seating": "sofa",
+        "dining_chair": "chair",
+        "outdoor_chair": "chair",
+        "side_table": "table",
+        "dining_set": "set",
+        "patio_set": "set",
+        "kitchen_cart": "kitchen_island",
+    }
+    if mapped:
+        return family_alias.get(mapped, mapped)
+    from_name = _family_from_category_name(name)
+    if from_name:
+        return from_name
+    path_low = normalize_category_label(path)
+    if path_low.startswith("pet supplies"):
+        if "ramp" in path_low or "stair" in path_low:
+            return "pet_ramp"
+        if "cage" in path_low or "crate" in path_low or "house" in path_low:
+            return "dog_crate"
+    if path_low.startswith("ebay motors"):
+        if "hitch" in path_low:
+            return "hitch"
+        if "doll" in path_low:
+            return "dolly"
+        if "jack" in path_low:
+            return "rv_jack"
+    return ""
+
+
+def _families_compatible(type_family: str, cat_family: str) -> bool:
+    if not type_family or not cat_family:
+        return False
+    if type_family == cat_family:
+        return True
+    return (type_family, cat_family) in _FAMILY_COMPAT_ONE_WAY
+
+
+def _upgrade_bathroom_cabinet(type_family: str, *texts: Any) -> str:
+    """Bathroom + generic cabinet → bathroom_cabinet (head noun, not any 'cabinet')."""
+    if type_family != "cabinet":
+        return type_family
+    blob = normalize_category_label(" ".join(as_safe_text(part) for part in texts if part))
+    if re.search(r"(?<![a-z0-9])bathroom(?![a-z0-9])", blob):
+        return "bathroom_cabinet"
+    return type_family
+
+
+_FAMILY_SUGGESTION_ID = {
+    "bathroom_cabinet": "176991",
+    "vanity": "32878",
+    "grill_cart": "260931",
+    "kitchen_island": "260157",
+    "table": "38204",
+    "set": "107578",
+    "chair": "54235",
+    "stool": "103431",
+    "sofa": "38208",
+    "bench": "262980",
+    "tv_stand": "20488",
+    "dog_crate": "20748",
+    "pet_ramp": "116389",
+    "bike": "177831",
+    "hitch": "33653",
+    "dolly": "179506",
+    "cabinet": "20487",
+    "desk": "88057",
+    "hand_tool": "303",
+    "hall_tree": "22656",
+    "trash_storage": "161059",
+    "rv_jack": "33653",
+}
+
+
+def _report_only_suggestion(
+    cid: str,
+    hay: str,
+    type_family: str = "",
+    *,
+    index=None,
+) -> str | None:
+    suggestion = suggested_alternative_for(cid, "", hay, index=index)
+    if not suggestion and type_family:
+        suggestion = _FAMILY_SUGGESTION_ID.get(type_family)
+    if suggestion == cid:
+        return None
+    return suggestion
+
+
+def _is_motors_store(store: Any) -> bool:
+    if store is None:
+        try:
+            from src.utils.store_profile import get_store_profile
+
+            return bool(get_store_profile().is_motors)
+        except Exception:
+            return False
+    if isinstance(store, str):
+        return store.strip().lower() in {"aqua", "auto", "motors"}
+    if bool(getattr(store, "is_motors", False)):
+        return True
+    kind = str(getattr(store, "store_kind", "") or "").strip().lower()
+    return kind in {"auto", "aqua", "motors"}
+
+
+def _id_name_mismatch(cid: str, stored_name: str, index=None) -> bool:
+    """True when the stored name is a different leaf family than the ID."""
+    name = as_safe_text(stored_name)
+    if not cid or not name:
+        return False
+    flat = _category_index(index)
+    tree_name = ""
+    if cid in flat:
+        tree_name = str(flat[cid][0] or "")
+    if tree_name and labels_equal(name, tree_name):
+        return False
+    name_family = _family_from_category_name(name)
+    id_family = _family_from_category(cid, tree_name, _category_path(cid, index=flat), flat)
+    if name_family and id_family and name_family != id_family:
+        return True
+    return False
+
+
+def format_prepublish_error(verdict: Verdict) -> str:
+    if verdict.ok:
+        return ""
+    if verdict.reason == "hold_empty":
+        return HOLD_EMPTY_PUBLISH_ERROR
+    if verdict.reason == "hold_tree_unavailable":
+        return tree_unavailable_publish_error()
+    extra = f"; suggested {verdict.suggestion}" if verdict.suggestion else ""
+    if verdict.reason in PREPUBLISH_HOLD_REASONS:
+        return f"Category held for review ({verdict.reason}){extra}"
+    if verdict.reason == "retired_category":
+        return f"{BLOCKED_CATEGORY_REVIEW}: retired_category{extra}"
+    return f"{BLOCKED_CATEGORY_REVIEW}: {verdict.reason}{extra}"
+
+
+def is_prepublish_block(verdict: Verdict) -> bool:
+    return (not verdict.ok) and verdict.reason not in PREPUBLISH_HOLD_REASONS
+
+
+def prepublish_category_check(
+    sku: Any = "",
+    category_id: Any = None,
+    category_name: Any = None,
+    title: Any = "",
+    attributes: Any = None,
+    description: Any = "",
+    store: Any = None,
+    *,
+    index=None,
+) -> Verdict:
+    """One pre-publish category check. Never writes or remaps a category.
+
+    Product-type order: ``attributes['Product Type']`` or a Product Type line
+    in the description, else the title head noun. Router labels are ignored.
+    """
+    del sku  # accepted for call-site signatures / logging; unused
+    try:
+        cid = as_safe_category_id(category_id)
+        stored_name = as_safe_text(category_name)
+        hay = as_safe_text(title)
+        flat = _category_index(index)
+        if not cid:
+            return Verdict(False, "hold_empty", None)
+
+        if cid in RETIRED_CATEGORY_IDS:
+            return Verdict(False, "retired_category", _report_only_suggestion(cid, hay, index=flat))
+
+        if not flat:
+            warn_once_tree_unavailable()
+            return Verdict(False, "hold_tree_unavailable", None)
+
+        ok, reason = validate_target_category(cid, "", hay, index=flat)
+        if reason == "tree_unavailable":
+            warn_once_tree_unavailable()
+            return Verdict(False, "hold_tree_unavailable", None)
+        if not ok and reason == "invalid_target_leaf":
+            return Verdict(
+                False,
+                "retired_category" if cid in RETIRED_CATEGORY_IDS else "invalid_target_leaf",
+                _report_only_suggestion(cid, hay, index=flat),
+            )
+
+        path = _category_path(cid, index=flat)
+        tree_name = ""
+        if cid in flat:
+            tree_name = str(flat[cid][0] or "")
+        display_name = stored_name or tree_name
+
+        if _id_name_mismatch(cid, stored_name, index=flat):
+            return Verdict(False, "id_name_mismatch", _report_only_suggestion(cid, hay, index=flat))
+
+        motors_path = path.startswith("eBay Motors")
+        if motors_path and not _is_motors_store(store):
+            return Verdict(False, "wrong_store", _report_only_suggestion(cid, hay, index=flat))
+
+        signal = extract_product_type_signal(hay, attributes, description)
+        mapped = map_product_type(signal) if signal else None
+        if not mapped:
+            return Verdict(False, "unknown_product_type", _report_only_suggestion(cid, hay, index=flat))
+
+        type_family, type_tops, is_set = mapped
+        type_family = _upgrade_bathroom_cabinet(type_family, hay, signal, description)
+        cat_family = _family_from_category(cid, display_name, path, flat)
+        cat_top = path.split(" > ")[0] if path else ""
+
+        if type_tops and cat_top and cat_top not in type_tops:
+            return Verdict(
+                False,
+                "top_level_mismatch",
+                _report_only_suggestion(cid, hay, type_family, index=flat),
+            )
+
+        if is_set and cat_family and cat_family != "set":
+            if cat_family in {"stool", "chair", "sofa", "bench"}:
+                return Verdict(
+                    False,
+                    "leaf_family_conflict",
+                    _report_only_suggestion(cid, hay, type_family, index=flat),
+                )
+            if cat_family == "table":
+                return Verdict(
+                    False,
+                    "set_vs_single",
+                    _report_only_suggestion(cid, hay, type_family, index=flat),
+                )
+
+        pair = frozenset({type_family, cat_family}) if cat_family else frozenset()
+        if cat_family and pair in _LEAF_CONFLICTS:
+            return Verdict(
+                False,
+                "leaf_family_conflict",
+                _report_only_suggestion(cid, hay, type_family, index=flat),
+            )
+        if cat_family and type_family != cat_family and not _families_compatible(type_family, cat_family):
+            return Verdict(
+                False,
+                "leaf_family_conflict",
+                _report_only_suggestion(cid, hay, type_family, index=flat),
+            )
+
+        if not ok:
+            return Verdict(
+                False,
+                reason or "implausible_category",
+                _report_only_suggestion(cid, hay, type_family, index=flat),
+            )
+
+        decision = resolve_category_decision(hay, hay, "", cid, stored_name, index=flat)
+        if decision.reason in {
+            "stored_category_implausible",
+            "implausible_target_path",
+            "invalid_target_leaf",
+            "pet_species_mismatch",
+        }:
+            suggestion = decision.suggested_alternative or _report_only_suggestion(
+                cid, hay, type_family, index=flat
+            )
+            if suggestion == cid:
+                suggestion = None
+            return Verdict(False, "implausible_category", suggestion)
+
+        human_dog_bed = bool(re.search(r"\bhuman\s+dog\s+beds?\b", hay, re.IGNORECASE))
+        if not human_dog_bed:
+            try:
+                matcher = _offline_matcher()
+                if not matcher.is_category_plausible_for_text(hay, cid, display_name):
+                    if not _families_compatible(type_family, cat_family) and type_family != cat_family:
+                        return Verdict(
+                            False,
+                            "implausible_category",
+                            _report_only_suggestion(cid, hay, type_family, index=flat),
+                        )
+            except Exception as exc:
+                logger.warning("prepublish plausibility check failed closed: %s", exc)
+
+        return Verdict(True, "", _report_only_suggestion(cid, hay, type_family, index=flat))
+    except Exception as exc:
+        logger.warning("prepublish_category_check failed closed: %s", exc)
+        return Verdict(False, "unknown_product_type", None)

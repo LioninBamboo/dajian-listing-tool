@@ -122,12 +122,56 @@ def apply_category_publish_gate(
     def _usable(check: dict) -> bool:
         return bool(check.get("valid") and check.get("leaf") and check.get("reason") != "unknown")
 
+    from src.utils.category_decision import (
+        BLOCKED_CATEGORY_REVIEW,
+        format_prepublish_error,
+        prepublish_category_check,
+    )
+
+    def _product_attrs_desc():
+        attrs = {}
+        desc = ""
+        if isinstance(product, dict):
+            if isinstance(product.get("attributes"), dict):
+                attrs = product.get("attributes")
+            desc = product.get("description") or ""
+            opt = product.get("optimization")
+            if isinstance(opt, dict):
+                desc = desc or opt.get("description") or ""
+        elif product is not None:
+            raw_attrs = getattr(product, "attributes", None)
+            if isinstance(raw_attrs, dict):
+                attrs = raw_attrs
+            desc = getattr(product, "description", "") or ""
+        return attrs, desc
+
+    attrs, desc = _product_attrs_desc()
+
     if current_id:
         check = validator.validate(current_id, tree_id)
         reason = check.get("reason") or "unknown"
         if _usable(check) and not force_remap:
             if check.get("name") and not current_name:
                 current_name = check["name"]
+            verdict = prepublish_category_check(
+                getattr(product, "sku", None) if product is not None and not isinstance(product, dict) else (product or {}).get("sku") if isinstance(product, dict) else "",
+                current_id,
+                current_name,
+                title,
+                attrs,
+                desc,
+                store=get_store_profile(),
+            )
+            if not verdict.ok:
+                log_line = format_prepublish_error(verdict)
+                _append_product_log(product, log_line)
+                logger.warning(log_line)
+                return PublishResult(
+                    status=PublishStatus.ERROR,
+                    message=log_line or BLOCKED_CATEGORY_REVIEW,
+                    errors=[BLOCKED_CATEGORY_REVIEW, verdict.reason],
+                    category_id=current_id or None,
+                )
             return current_id, current_name, aspects
 
     suggestions = _normalize_category_suggestions(
@@ -144,6 +188,17 @@ def apply_category_publish_gate(
         if not _usable(check):
             continue
         resolved_name = check.get("name") or name
+        verdict = prepublish_category_check(
+            getattr(product, "sku", None) if product is not None and not isinstance(product, dict) else (product or {}).get("sku") if isinstance(product, dict) else "",
+            cid,
+            resolved_name,
+            title,
+            attrs,
+            desc,
+            store=get_store_profile(),
+        )
+        if not verdict.ok:
+            continue
         log_line = f"[CAT_REMAP] {current_id or '(none)'}→{cid} ({reason})"
         _store_remapped_category(product, cid, resolved_name, log_line)
         logger.info(log_line)
@@ -1426,6 +1481,28 @@ class EbayPublisher:
                     if isinstance(gated, PublishResult):
                         return gated
                     category_id, category_name, completed_aspects = gated
+                    from src.utils.category_decision import (
+                        BLOCKED_CATEGORY_REVIEW,
+                        format_prepublish_error,
+                        prepublish_category_check,
+                    )
+
+                    pre_verdict = prepublish_category_check(
+                        sku,
+                        category_id,
+                        category_name,
+                        publish_data["title"],
+                        product.get("attributes") if isinstance(product.get("attributes"), dict) else None,
+                        publish_data.get("description") or product.get("description"),
+                        store=get_store_profile(),
+                    )
+                    if not pre_verdict.ok:
+                        return PublishResult(
+                            status=PublishStatus.ERROR,
+                            message=format_prepublish_error(pre_verdict),
+                            errors=[BLOCKED_CATEGORY_REVIEW, pre_verdict.reason],
+                            category_id=str(category_id or "") or None,
+                        )
                     publish_data["aspects"] = completed_aspects
                     compatibility = self._prepare_motors_compatibility(
                         category_id,
@@ -1502,6 +1579,28 @@ class EbayPublisher:
             if isinstance(gated, PublishResult):
                 return gated
             category_id, category_name, completed_aspects = gated
+            from src.utils.category_decision import (
+                BLOCKED_CATEGORY_REVIEW,
+                format_prepublish_error,
+                prepublish_category_check,
+            )
+
+            pre_verdict = prepublish_category_check(
+                sku,
+                category_id,
+                category_name,
+                publish_data["title"],
+                product.get("attributes") if isinstance(product.get("attributes"), dict) else None,
+                publish_data.get("description") or product.get("description"),
+                store=get_store_profile(),
+            )
+            if not pre_verdict.ok:
+                return PublishResult(
+                    status=PublishStatus.ERROR,
+                    message=format_prepublish_error(pre_verdict),
+                    errors=[BLOCKED_CATEGORY_REVIEW, pre_verdict.reason],
+                    category_id=str(category_id or "") or None,
+                )
 
             publish_data["category_id"] = category_id
             publish_data["category_name"] = category_name

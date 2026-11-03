@@ -528,8 +528,8 @@ def test_non_leaf_furniture_categories_canonicalize_to_sellable_leaves():
         "Console Tables",
     )
     assert matcher.canonicalize_category("Kitchen Pantry Cabinet with Pull-Out Shelves", "42428", "Pantry Cabinets") == (
-        "20487",
-        "Cabinets & Cupboards",
+        "42428",
+        "Pantry Cabinets",
     )
 
 

@@ -740,6 +740,22 @@ def publish_to_ebay(product: dict) -> dict:
         )
         if hold_err:
             return {"status": "error", "message": hold_err}
+        from src.utils.category_decision import (
+            format_prepublish_error,
+            prepublish_category_check,
+        )
+
+        pre_verdict = prepublish_category_check(
+            sku,
+            category_id,
+            opt_data.get("categoryName"),
+            title,
+            product.get("attributes") if isinstance(product.get("attributes"), dict) else None,
+            description,
+            store=get_store_profile(),
+        )
+        if not pre_verdict.ok:
+            return {"status": "error", "message": format_prepublish_error(pre_verdict)}
         if not category_id:
             return {"status": "error", "message": f"类目无效: {original_stored or '空'}"}
         aspects = apply_compatibility_aspects(
@@ -1082,6 +1098,22 @@ def publish_with_auto_category(product: dict) -> dict:
             )
             if hold_err:
                 return {"status": "error", "message": hold_err}
+            from src.utils.category_decision import (
+                format_prepublish_error,
+                prepublish_category_check,
+            )
+
+            pre_verdict = prepublish_category_check(
+                sku,
+                category_id,
+                opt_data.get("categoryName") or category_name,
+                opt_data.get("title", product.get("title", "")),
+                product.get("attributes") if isinstance(product.get("attributes"), dict) else None,
+                product.get("description", ""),
+                store=get_store_profile(),
+            )
+            if not pre_verdict.ok:
+                return {"status": "error", "message": format_prepublish_error(pre_verdict)}
             if not category_id:
                 return {"status": "error", "message": "无法确定有效类目，请先运行草稿审计修复"}
             if category_id != str(candidate_before_gate or "").strip():
