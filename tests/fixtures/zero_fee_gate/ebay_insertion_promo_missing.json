@@ -1,0 +1,12 @@
+{
+  "feeSummaries": [
+    {
+      "fees": [
+        {
+          "feeType": "InsertionFee",
+          "amount": {"currency": "USD", "value": "0.10"}
+        }
+      ]
+    }
+  ]
+}

@@ -1,7 +1,8 @@
 """One fail-closed zero-fee gate for every eBay create / relist path.
 
-Sergey's rule: never list if any fee line is above $0.00. Category checks run
-first. Promotional discounts are logged and never netted against the gross fee.
+Sergey's rule: never list if any fee line's net (gross minus promotional
+discount) is above $0.00. Category checks run first. Missing discounts count
+as $0.00; invalid or oversize discounts fail closed.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any, Callable, Mapping, Optional
 
 from src.utils.publish_fee_preview import (
@@ -28,6 +29,8 @@ from src.utils.publish_fee_preview import (
 logger = logging.getLogger(__name__)
 
 REASON_FEE_NONZERO = "fee_nonzero"
+REASON_DISCOUNT_INVALID = "fee_discount_invalid"
+REASON_NET_NEGATIVE = "fee_net_negative"
 REASON_PREVIEW_UNAVAILABLE = "fee_preview_unavailable"
 REASON_HIGH_FEE_CATEGORY = "high_fee_category"
 REASON_BLACKLIST_UNAVAILABLE = "high_fee_blacklist_unavailable"
@@ -39,6 +42,7 @@ SOURCE_VERIFY_RELIST = "trading.VerifyRelistItem"
 
 _INSERTION_FEE_NAMES = frozenset({"INSERTIONFEE", "INSERTION_FEE"})
 _ZERO = Decimal("0.00")
+_CENTS = Decimal("0.01")
 
 
 @dataclass(frozen=True)
@@ -193,7 +197,45 @@ def _parse_decimal(raw: Any) -> Decimal | None:
         return None
 
 
+def _to_cents(value: Decimal) -> Decimal:
+    return value.quantize(_CENTS, rounding=ROUND_HALF_EVEN)
+
+
+def line_cents(line: FeeLine) -> tuple[Decimal, Decimal, Decimal]:
+    """Return (gross, discount, net) quantized to cents."""
+    gross = _to_cents(line.amount)
+    discount = _to_cents(line.promotional_discount if line.promotional_discount is not None else _ZERO)
+    return gross, discount, _to_cents(gross - discount)
+
+
+def _promotional_discount(
+    promo: Any,
+    *,
+    amount_currency: str,
+) -> Decimal | str | None:
+    """Parse a promotional discount. None if absent; reason string if invalid."""
+    if promo is None:
+        return None
+    if not isinstance(promo, Mapping):
+        return REASON_DISCOUNT_INVALID
+    discount = _parse_decimal(promo.get("value"))
+    promo_ccy = str(promo.get("currency") or "").strip()
+    if discount is None:
+        return REASON_DISCOUNT_INVALID
+    if not promo_ccy:
+        return REASON_DISCOUNT_INVALID
+    amount_ccy = str(amount_currency or "").strip()
+    if promo_ccy.upper() != "USD" or amount_ccy.upper() != "USD":
+        return REASON_DISCOUNT_INVALID
+    if promo_ccy.upper() != amount_ccy.upper():
+        return REASON_DISCOUNT_INVALID
+    if discount < _ZERO:
+        return REASON_DISCOUNT_INVALID
+    return discount
+
+
 def _is_insertion_fee(fee_type: str) -> bool:
+    # Whole-value after underscore/space collapse. No substring match.
     return str(fee_type or "").replace("_", "").replace(" ", "").upper() in _INSERTION_FEE_NAMES
 
 
@@ -239,17 +281,12 @@ def _inventory_fee_lines(payload: Any, source: str) -> tuple[FeeLine, ...] | str
                 return REASON_PREVIEW_UNAVAILABLE
             if not currency or currency.upper() != "USD":
                 return REASON_PREVIEW_UNAVAILABLE
-            discount = None
-            promo = fee.get("promotionalDiscount") or fee.get("PromotionalDiscount")
-            if promo is not None:
-                if isinstance(promo, Mapping):
-                    discount = _parse_decimal(promo.get("value"))
-                    promo_ccy = str(promo.get("currency") or currency).strip()
-                else:
-                    discount = _parse_decimal(promo)
-                    promo_ccy = currency
-                if discount is None or (promo_ccy and promo_ccy.upper() != "USD"):
-                    return REASON_PREVIEW_UNAVAILABLE
+            promo = fee.get("promotionalDiscount")
+            if promo is None and "PromotionalDiscount" in fee:
+                promo = fee.get("PromotionalDiscount")
+            discount = _promotional_discount(promo, amount_currency=currency)
+            if isinstance(discount, str):
+                return discount
             if _is_insertion_fee(fee_type):
                 has_insertion = True
             lines.append(
@@ -300,7 +337,7 @@ def _trading_fee_lines(payload: Any, source: str, *, http_status: int | None, ac
         name = ""
         amount = None
         currency = ""
-        discount = None
+        promo_raw = None
         for child in list(fee_el):
             local = _local_name(child.tag)
             if local == "Name":
@@ -309,14 +346,19 @@ def _trading_fee_lines(payload: Any, source: str, *, http_status: int | None, ac
                 amount = _parse_decimal(child.text)
                 currency = str(child.attrib.get("currencyID") or child.attrib.get("currency") or "").strip()
             elif local == "PromotionalDiscount":
-                discount = _parse_decimal(child.text)
-                promo_ccy = str(child.attrib.get("currencyID") or child.attrib.get("currency") or "").strip()
-                if discount is None or (promo_ccy and promo_ccy.upper() != "USD"):
-                    return REASON_PREVIEW_UNAVAILABLE
+                promo_raw = {
+                    "value": child.text,
+                    "currency": str(
+                        child.attrib.get("currencyID") or child.attrib.get("currency") or ""
+                    ).strip(),
+                }
         if amount is None or amount < _ZERO:
             return REASON_PREVIEW_UNAVAILABLE
         if not currency or currency.upper() != "USD":
             return REASON_PREVIEW_UNAVAILABLE
+        discount = _promotional_discount(promo_raw, amount_currency=currency)
+        if isinstance(discount, str):
+            return discount
         if _is_insertion_fee(name):
             has_insertion = True
         lines.append(
@@ -356,9 +398,16 @@ def parse_fee_preview(raw: FeeGateRaw) -> tuple[FeeLine, ...] | str:
 
 
 def _nonzero_reason(lines: tuple[FeeLine, ...]) -> str | None:
+    total_net = _ZERO
     for line in lines:
-        if line.amount > _ZERO:
+        _gross, _discount, net = line_cents(line)
+        if net < _ZERO:
+            return REASON_NET_NEGATIVE
+        if net > _ZERO:
             return REASON_FEE_NONZERO
+        total_net += net
+    if total_net != _ZERO:
+        return REASON_FEE_NONZERO
     return None
 
 
@@ -439,16 +488,18 @@ def fee_preview_payload(
         "lines": [
             {
                 "fee_type": line.fee_type,
-                "amount": _format_amount(line.amount),
+                "amount": _format_amount(gross),
                 "currency": line.currency,
                 "source": line.source,
                 "promotional_discount": (
-                    _format_amount(line.promotional_discount)
+                    _format_amount(discount)
                     if line.promotional_discount is not None
                     else None
                 ),
+                "net": _format_amount(net),
             }
             for line in result.lines
+            for gross, discount, net in (line_cents(line),)
         ],
     }
 
@@ -464,10 +515,11 @@ def log_fee_gate(
     log = logger.warning if not result.ok else logger.info
     if result.lines:
         for line in result.lines:
+            gross, discount, net = line_cents(line)
             log(
                 "fee_gate sku=%s path_name=%s offer_id=%s item_id=%s category_id=%s "
-                "category_path=%s fee_type=%s amount=%s currency=%s source=%s "
-                "promotional_discount=%s gate_reason=%s",
+                "category_path=%s fee_type=%s gross=%s discount=%s net=%s "
+                "currency=%s source=%s gate_reason=%s",
                 sku,
                 path_name,
                 offer_id,
@@ -475,21 +527,18 @@ def log_fee_gate(
                 result.category_id,
                 result.category_path,
                 line.fee_type,
-                _format_amount(line.amount),
+                _format_amount(gross),
+                _format_amount(discount),
+                _format_amount(net),
                 line.currency,
                 line.source,
-                (
-                    _format_amount(line.promotional_discount)
-                    if line.promotional_discount is not None
-                    else ""
-                ),
                 result.reason or "ok",
             )
     else:
         log(
             "fee_gate sku=%s path_name=%s offer_id=%s item_id=%s category_id=%s "
-            "category_path=%s fee_type= amount= currency= source= "
-            "promotional_discount= gate_reason=%s",
+            "category_path=%s fee_type= gross= discount= net= "
+            "currency= source= gate_reason=%s",
             sku,
             path_name,
             offer_id,
@@ -637,11 +686,25 @@ def human_block_reason(result: FeeGateResult, *, category_name: str = "") -> str
         )
     if result.reason == REASON_FEE_NONZERO:
         amounts = ", ".join(
-            f"{line.fee_type}={_format_amount(line.amount)} {line.currency}"
+            f"{line.fee_type}={_format_amount(net)} {line.currency}"
             for line in result.lines
-            if line.amount > _ZERO
+            for _gross, _discount, net in (line_cents(line),)
+            if net > _ZERO
         )
         return f"BLOCKED_HIGH_FEE: category {label} fee {amounts}"
+    if result.reason == REASON_NET_NEGATIVE:
+        amounts = ", ".join(
+            f"{line.fee_type} gross={_format_amount(gross)} discount={_format_amount(discount)} net={_format_amount(net)}"
+            for line in result.lines
+            for gross, discount, net in (line_cents(line),)
+            if net < _ZERO
+        )
+        return f"BLOCKED_HIGH_FEE: category {label} negative net fee {amounts}"
+    if result.reason == REASON_DISCOUNT_INVALID:
+        return (
+            f"BLOCKED_HIGH_FEE_UNVERIFIED: category {label} "
+            "promotional discount currency/value invalid"
+        )
     if result.reason == REASON_BLACKLIST_UNAVAILABLE:
         return (
             f"BLOCKED_HIGH_FEE_UNVERIFIED: category {label} "

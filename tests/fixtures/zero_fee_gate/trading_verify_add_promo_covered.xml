@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<VerifyAddFixedPriceItemResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+  <Timestamp>2026-11-04T00:00:00.000Z</Timestamp>
+  <Ack>Success</Ack>
+  <Version>1155</Version>
+  <Build>E1155_CORE</Build>
+  <Fees>
+    <Fee>
+      <Name>InsertionFee</Name>
+      <Fee currencyID="USD">0.10</Fee>
+      <PromotionalDiscount currencyID="USD">0.10</PromotionalDiscount>
+    </Fee>
+    <Fee>
+      <Name>ListingFee</Name>
+      <Fee currencyID="USD">0.10</Fee>
+      <PromotionalDiscount currencyID="USD">0.10</PromotionalDiscount>
+    </Fee>
+  </Fees>
+</VerifyAddFixedPriceItemResponse>

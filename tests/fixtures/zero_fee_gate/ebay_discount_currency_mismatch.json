@@ -1,0 +1,13 @@
+{
+  "feeSummaries": [
+    {
+      "fees": [
+        {
+          "feeType": "InsertionFee",
+          "amount": {"currency": "USD", "value": "0.10"},
+          "promotionalDiscount": {"currency": "CAD", "value": "0.10"}
+        }
+      ]
+    }
+  ]
+}

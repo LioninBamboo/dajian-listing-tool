@@ -1,0 +1,18 @@
+{
+  "feeSummaries": [
+    {
+      "fees": [
+        {
+          "feeType": "InsertionFee",
+          "amount": {"currency": "USD", "value": "0.10"},
+          "promotionalDiscount": {"currency": "USD", "value": "0.10"}
+        },
+        {
+          "feeType": "ListingFee",
+          "amount": {"currency": "USD", "value": "0.10"},
+          "promotionalDiscount": {"currency": "USD", "value": "0.00"}
+        }
+      ]
+    }
+  ]
+}
