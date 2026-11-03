@@ -253,6 +253,21 @@ def _ok_blacklist(tmp_path):
     return str(path)
 
 
+def test_insertion_and_listing_promo_covered_real_shape_is_allowed(tmp_path):
+    import json
+    from pathlib import Path
+
+    payload = json.loads(
+        (Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "zero_fee_gate" / "ebay_insertion_listing_promo_covered.json").read_text(encoding="utf-8")
+    )
+    reason = evaluate_insertion_fee_preview(
+        listing_fees=payload,
+        lookup_attempted=True,
+        blacklist_path=_ok_blacklist(tmp_path),
+    )
+    assert reason is None
+
+
 def test_insertion_fee_real_shape_zero_is_allowed(tmp_path):
     reason = evaluate_insertion_fee_preview(
         listing_fees={

@@ -1,0 +1,16 @@
+{
+  "feeSummaries": [
+    {
+      "fees": [
+        {
+          "feeType": "InsertionFee",
+          "amount": {"currency": "USD", "value": "0.00"}
+        },
+        {
+          "feeType": "BrandNewFeeFromEbay",
+          "amount": {"currency": "USD", "value": "0.05"}
+        }
+      ]
+    }
+  ]
+}

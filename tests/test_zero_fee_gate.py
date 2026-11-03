@@ -13,8 +13,10 @@ import pytest
 from src.utils.zero_fee_gate import (
     REASON_BLACKLIST_UNAVAILABLE,
     REASON_CATEGORY_UNKNOWN,
+    REASON_DISCOUNT_INVALID,
     REASON_FEE_NONZERO,
     REASON_HIGH_FEE_CATEGORY,
+    REASON_NET_NEGATIVE,
     REASON_PREVIEW_UNAVAILABLE,
     SOURCE_INVENTORY,
     SOURCE_VERIFY_ADD,
@@ -28,9 +30,19 @@ from src.utils.zero_fee_gate import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = ROOT / "tests" / "fixtures" / "zero_fee_gate"
 SKU = "W1580P554752"
 CAT_OK = "175758"
 PATH_OK = "Home & Garden > Furniture > Coffee Tables"
+
+
+def _load_fixture(name: str):
+    import json
+
+    path = FIXTURES / name
+    if path.suffix == ".json":
+        return json.loads(path.read_text(encoding="utf-8"))
+    return path.read_text(encoding="utf-8")
 
 
 def _blacklist(tmp_path, ids=None, paths=None, applies=None, text=None, name="bl.json"):
@@ -106,12 +118,19 @@ def test_row1_zero_insertion_passes_and_logs(tmp_path, caplog):
 
 @pytest.mark.parametrize(
     "value",
-    ["0.01", "0.35", "20.00", "0.0000000001"],
+    ["0.01", "0.35", "20.00"],
 )
 def test_rows_2_3_4_10_any_positive_blocks(tmp_path, value):
     result = _gate(tmp_path, preview=_preview(_inv(("INSERTION_FEE", value, "USD", None))))
     assert result.ok is False
     assert result.reason == REASON_FEE_NONZERO
+
+
+def test_sub_cent_gross_rounds_to_zero_cents(tmp_path):
+    result = _gate(tmp_path, preview=_preview(_inv(("INSERTION_FEE", "0.0000000001", "USD", None))))
+    assert result.ok
+    assert result.lines[0].amount == Decimal("0.0000000001")
+    assert result.reason is None
 
 
 def test_row5_non_insertion_line_blocks(tmp_path):
@@ -291,7 +310,7 @@ def test_row22_bypass_env_still_blocks(tmp_path, monkeypatch):
     assert result.reason == REASON_PREVIEW_UNAVAILABLE
 
 
-def test_row23_promotional_discount_not_netted(tmp_path, caplog):
+def test_row23_promotional_discount_is_netted(tmp_path, caplog):
     trading = (
         "<VerifyAddFixedPriceItemResponse><Ack>Success</Ack><Fees>"
         "<Fee><Name>InsertionFee</Name><Fee currencyID=\"USD\">0.35</Fee>"
@@ -299,21 +318,165 @@ def test_row23_promotional_discount_not_netted(tmp_path, caplog):
         "</Fees></VerifyAddFixedPriceItemResponse>"
     )
     sink = []
-    with caplog.at_level(logging.WARNING):
-        with pytest.raises(ZeroFeeGateBlocked) as exc:
-            assert_zero_fee_before_live(
-                path_name="test.row23",
-                sku=SKU,
-                category_id=CAT_OK,
-                category_path=PATH_OK,
-                preview=_preview(trading, source=SOURCE_VERIFY_ADD, ack="Success"),
-                results_sink=sink,
-                blacklist_path=_blacklist(tmp_path),
-            )
-    assert exc.value.result.reason == REASON_FEE_NONZERO
+    with caplog.at_level(logging.INFO):
+        result = assert_zero_fee_before_live(
+            path_name="test.row23",
+            sku=SKU,
+            category_id=CAT_OK,
+            category_path=PATH_OK,
+            preview=_preview(trading, source=SOURCE_VERIFY_ADD, ack="Success"),
+            results_sink=sink,
+            blacklist_path=_blacklist(tmp_path),
+        )
+    assert result.ok
+    assert result.reason is None
     assert sink[0]["lines"][0]["amount"] == "0.35"
     assert sink[0]["lines"][0]["promotional_discount"] == "0.35"
-    assert "0.35" in caplog.text
+    assert sink[0]["lines"][0]["net"] == "0.00"
+    assert "gross=0.35" in caplog.text
+    assert "discount=0.35" in caplog.text
+    assert "net=0.00" in caplog.text
+
+
+def test_real_ebay_insertion_and_listing_promo_covered_passes(tmp_path, caplog):
+    payload = _load_fixture("ebay_insertion_listing_promo_covered.json")
+    sink = []
+    with caplog.at_level(logging.INFO):
+        result = assert_zero_fee_before_live(
+            path_name="test.ebay_real_covered",
+            sku=SKU,
+            category_id=CAT_OK,
+            category_path=PATH_OK,
+            preview=_preview(payload),
+            results_sink=sink,
+            blacklist_path=_blacklist(tmp_path),
+        )
+    assert result.ok
+    assert [line["fee_type"] for line in sink[0]["lines"]] == [
+        "InsertionFee",
+        "ListingFee",
+        "SubtitleFee",
+    ]
+    assert {line["net"] for line in sink[0]["lines"]} == {"0.00"}
+    assert "gross=0.10" in caplog.text
+    assert "discount=0.10" in caplog.text
+    assert "net=0.00" in caplog.text
+
+
+def test_promo_missing_means_discount_zero_so_gross_must_be_zero(tmp_path):
+    result = _gate(
+        tmp_path,
+        preview=_preview(_load_fixture("ebay_insertion_promo_missing.json")),
+    )
+    assert result.ok is False
+    assert result.reason == REASON_FEE_NONZERO
+    assert result.lines[0].promotional_discount is None
+
+
+def test_promo_null_means_discount_zero(tmp_path):
+    payload = {
+        "feeSummaries": [{
+            "fees": [{
+                "feeType": "InsertionFee",
+                "amount": {"value": "0.00", "currency": "USD"},
+                "promotionalDiscount": None,
+            }]
+        }]
+    }
+    result = _gate(tmp_path, preview=_preview(payload))
+    assert result.ok
+    payload["feeSummaries"][0]["fees"][0]["amount"]["value"] = "0.10"
+    result = _gate(tmp_path, preview=_preview(payload))
+    assert result.reason == REASON_FEE_NONZERO
+
+
+def test_zero_gross_absent_discount_passes(tmp_path):
+    result = _gate(tmp_path, preview=_preview(_inv(("InsertionFee", "0", "USD", None))))
+    assert result.ok
+
+
+@pytest.mark.parametrize(
+    "name,reason",
+    [
+        ("ebay_discount_currency_mismatch.json", REASON_DISCOUNT_INVALID),
+        ("ebay_discount_non_usd.json", REASON_DISCOUNT_INVALID),
+        ("ebay_discount_garbage.json", REASON_DISCOUNT_INVALID),
+        ("ebay_discount_exceeds_amount.json", REASON_NET_NEGATIVE),
+        ("ebay_net_one_cent.json", REASON_FEE_NONZERO),
+        ("ebay_unknown_feetype_nonzero_net.json", REASON_FEE_NONZERO),
+        ("ebay_mixed_lines_one_nonzero.json", REASON_FEE_NONZERO),
+    ],
+)
+def test_net_gate_boundary_fixtures_block(tmp_path, name, reason):
+    result = _gate(tmp_path, preview=_preview(_load_fixture(name)))
+    assert result.ok is False
+    assert result.reason == reason
+
+
+@pytest.mark.parametrize(
+    "promo",
+    [
+        {"value": "0.10"},
+        {"currency": "USD"},
+        {"value": "", "currency": "USD"},
+        {"value": "0.10", "currency": ""},
+        {"value": None, "currency": "USD"},
+        "0.10",
+        0.10,
+        ["USD", "0.10"],
+    ],
+)
+def test_discount_garbage_or_missing_currency_blocks(tmp_path, promo):
+    payload = {
+        "feeSummaries": [{
+            "fees": [{
+                "feeType": "InsertionFee",
+                "amount": {"value": "0.10", "currency": "USD"},
+                "promotionalDiscount": promo,
+            }]
+        }]
+    }
+    result = _gate(tmp_path, preview=_preview(payload))
+    assert result.reason == REASON_DISCOUNT_INVALID
+
+
+def test_trading_verify_add_promo_covered_passes(tmp_path, caplog):
+    xml = _load_fixture("trading_verify_add_promo_covered.xml")
+    sink = []
+    with caplog.at_level(logging.INFO):
+        result = assert_zero_fee_before_live(
+            path_name="test.trading_aqua_motors",
+            sku=SKU,
+            category_id=CAT_OK,
+            category_path=PATH_OK,
+            preview=_preview(xml, source=SOURCE_VERIFY_ADD, ack="Success"),
+            results_sink=sink,
+            blacklist_path=_blacklist(tmp_path),
+        )
+    assert result.ok
+    assert [line["fee_type"] for line in sink[0]["lines"]] == ["InsertionFee", "ListingFee"]
+    assert {line["net"] for line in sink[0]["lines"]} == {"0.00"}
+    assert "gross=0.10" in caplog.text
+    assert "discount=0.10" in caplog.text
+
+
+def test_feetype_whole_value_no_substring(tmp_path):
+    result = _gate(
+        tmp_path,
+        preview=_preview(_inv(
+            ("FooInsertionFee", "0.00", "USD", None),
+            ("InsertionFeeExtra", "0.00", "USD", None),
+        )),
+    )
+    assert result.reason == REASON_PREVIEW_UNAVAILABLE
+    result = _gate(
+        tmp_path,
+        preview=_preview(_inv(
+            ("InsertionFee", "0.00", "USD", None),
+            ("FooInsertionFee", "0.05", "USD", None),
+        )),
+    )
+    assert result.reason == REASON_FEE_NONZERO
 
 
 def test_row24_category_id_strip_both_sides(tmp_path):
@@ -374,9 +537,9 @@ def test_numeric_and_string_zero_pass(tmp_path):
         assert result.ok, raw
 
 
-def test_scientific_notation_nonzero_blocks(tmp_path):
+def test_scientific_notation_sub_cent_rounds_to_zero(tmp_path):
     result = _gate(tmp_path, preview=_preview(_inv(("INSERTION_FEE", "1e-8", "USD", None))))
-    assert result.reason == REASON_FEE_NONZERO
+    assert result.ok
 
 
 def test_slash_and_gt_and_whitespace_normalize(tmp_path):
@@ -391,6 +554,13 @@ def test_slash_and_gt_and_whitespace_normalize(tmp_path):
 def test_wrapper_maps_nonzero_to_legacy_name(tmp_path):
     result = _gate(tmp_path, preview=_preview(_inv(("INSERTION_FEE", "0.01", "USD", None))))
     assert wrapper_reason(result) == "high_insertion_fee"
+
+
+def test_wrapper_keeps_discount_reasons_clear(tmp_path):
+    mismatch = _gate(tmp_path, preview=_preview(_load_fixture("ebay_discount_currency_mismatch.json")))
+    assert wrapper_reason(mismatch) == REASON_DISCOUNT_INVALID
+    negative = _gate(tmp_path, preview=_preview(_load_fixture("ebay_discount_exceeds_amount.json")))
+    assert wrapper_reason(negative) == REASON_NET_NEGATIVE
 
 
 def test_publish_offer_helper_blocks_write(tmp_path):
@@ -596,6 +766,53 @@ def test_batch_publish_inventory_block_does_not_write(monkeypatch, tmp_path):
     assert deleted == ["offer-1"]
 
 
+def test_batch_publish_inventory_promo_covered_net_zero_publishes(monkeypatch, tmp_path):
+    import batch_publish
+
+    published = []
+    deleted = []
+
+    class Client:
+        def __init__(self, oauth, policy_manager):
+            pass
+
+        def _prepare_inventory_image_urls(self, sku, raw_images, max_images=24):
+            return ["https://i.ebayimg.com/images/g/AAA/s-l1600.jpg"]
+
+        def create_or_replace_inventory_item(self, sku, product):
+            return {}
+
+        def create_offer(self, *a, **k):
+            return {"offerId": "offer-1"}
+
+        def get_offer(self, offer_id):
+            return {"status": "UNPUBLISHED"}
+
+        def get_listing_fees(self, offer_id):
+            return _load_fixture("ebay_insertion_listing_promo_covered.json")
+
+        def get_inventory_item(self, sku):
+            return {"product": {}}
+
+        def delete_offer(self, offer_id):
+            deleted.append(offer_id)
+
+        def publish_offer(self, offer_id):
+            published.append(offer_id)
+            return {"listingId": "L1"}
+
+    monkeypatch.setattr(
+        "batch_publish.verify_publish_readback",
+        lambda *a, **k: {"status": "ok", "passed": True, "issues": [], "transport_failures": []},
+    )
+    monkeypatch.setattr("batch_publish.build_publish_readback_expectation", lambda **k: {})
+    _stub_batch(monkeypatch, Client)
+    result = batch_publish.publish_single_product(_coffee_product(), dry_run=False)
+    assert result["status"] == "success"
+    assert published == ["offer-1"]
+    assert deleted == []
+
+
 def test_batch_publish_inventory_gate_runs_before_write(monkeypatch, tmp_path):
     import batch_publish
 
@@ -680,6 +897,40 @@ def test_batch_publish_motors_block_does_not_write(monkeypatch, tmp_path):
     result = batch_publish.publish_single_product(_coffee_product(), dry_run=False)
     assert result["status"] != "success"
     assert published == []
+
+
+def test_batch_publish_motors_promo_covered_net_zero_publishes(monkeypatch):
+    import batch_publish
+
+    published = []
+
+    class Client:
+        def __init__(self, oauth, policy_manager):
+            pass
+
+        def _prepare_inventory_image_urls(self, sku, raw_images, max_images=24):
+            return ["https://i.ebayimg.com/images/g/AAA/s-l1600.jpg"]
+
+        def build_motors_add_fixed_price_xml(self, *a, **k):
+            return "<AddFixedPriceItemRequest/>"
+
+        def verify_add_fixed_price_item_motors(self, xml):
+            return FeeGateRaw(
+                source=SOURCE_VERIFY_ADD,
+                payload=_load_fixture("trading_verify_add_promo_covered.xml"),
+                http_status=200,
+                ack="Success",
+            )
+
+        def add_fixed_price_item_motors(self, *a, **k):
+            published.append("motors")
+            return {"itemId": "1887", "ack": "Success"}
+
+    monkeypatch.setattr("batch_publish.uses_motors_trading_channel", lambda *a, **k: True)
+    _stub_batch(monkeypatch, Client)
+    result = batch_publish.publish_single_product(_coffee_product(), dry_run=False)
+    assert result["status"] == "success"
+    assert published == ["motors"]
 
 
 def test_batch_publish_motors_gate_before_write(monkeypatch):
@@ -899,6 +1150,44 @@ def test_sync_relist_block_does_not_write(monkeypatch, tmp_path):
     action = conn.execute("SELECT action FROM inventory_sync_log WHERE sku='S1'").fetchone()[0]
     conn.close()
     assert action == "relist_blocked_fee"
+
+
+def test_sync_relist_promo_covered_net_zero_writes(monkeypatch, tmp_path):
+    from src.plugins.inventory_sync.sync_service import InventorySyncService
+
+    db = tmp_path / "e.db"
+    import sqlite3
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE collected_products (sku TEXT, listing_id TEXT, status TEXT)")
+    conn.execute("INSERT INTO collected_products VALUES ('S1','OLD','PUBLISHED')")
+    conn.commit()
+    conn.close()
+    calls = []
+
+    class Trading:
+        def call(self, name, body, site_id=None):
+            calls.append(name)
+            if name == "VerifyRelistItem":
+                return (
+                    "<r><Ack>Success</Ack><Fees><Fee><Name>InsertionFee</Name>"
+                    "<Fee currencyID=\"USD\">0.10</Fee>"
+                    "<PromotionalDiscount currencyID=\"USD\">0.10</PromotionalDiscount>"
+                    "</Fee></Fees></r>"
+                )
+            return "<r><Ack>Success</Ack><ItemID>189063211766</ItemID></r>"
+
+    svc = InventorySyncService(db_path=str(db))
+    svc.logger = logging.getLogger("test")
+    monkeypatch.setattr(svc, "_trading_client", lambda: (Trading(), "100"))
+    monkeypatch.setattr(svc, "_persist_listing_id", lambda *a, **k: None)
+    monkeypatch.setattr(svc, "_verify_trading_quantity", lambda *a, **k: True)
+    monkeypatch.setattr(svc, "_record_sold_through_restock", lambda *a, **k: None)
+    ok = svc._relist_fixed_price_item(
+        "S1", "OLD", 2, "100",
+        snapshot={"category_id": CAT_OK, "category_name": "Coffee Tables"},
+    )
+    assert ok is True
+    assert calls == ["VerifyRelistItem", "RelistFixedPriceItem"]
 
 
 def test_sync_relist_gate_before_write(monkeypatch, tmp_path):
