@@ -1989,7 +1989,27 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                 # Publish Offer
                 if offer_result and offer_result.get("offerId"):
                     print(f" Publishing offer {offer_result['offerId']}...")
-                    listing = ebay_client.publish_offer(offer_result["offerId"])
+                    from src.utils.zero_fee_gate import (
+                        ZeroFeeGateBlocked,
+                        publish_offer_if_zero_fee,
+                        wrapper_reason,
+                    )
+                    from src.utils.category_tree_cache import build_category_path
+
+                    fee_sink: list = []
+                    try:
+                        listing = publish_offer_if_zero_fee(
+                            ebay_client=ebay_client,
+                            offer_id=offer_result["offerId"],
+                            path_name="server.publish_product",
+                            sku=product.sku,
+                            category_id=str(category_id or ""),
+                            category_path=str(build_category_path(str(category_id or "").strip()) or ""),
+                            category_name=str(category_name or ""),
+                            results_sink=fee_sink,
+                        )
+                    except ZeroFeeGateBlocked:
+                        raise
                     listing_id = listing.get("listingId") if listing else None
                     
                     if listing_id:
@@ -2024,7 +2044,14 @@ async def publish_product(sku: str, background_tasks: BackgroundTasks, db: Sessi
                     
             except Exception as e:
                 from src.clients.ebay_media_images import MediaApiScopeError, MediaImageUploadError
+                from src.utils.zero_fee_gate import ZeroFeeGateBlocked, wrapper_reason
 
+                if isinstance(e, ZeroFeeGateBlocked):
+                    msg = wrapper_reason(e.result) or e.result.reason
+                    product.logs = (product.logs or []) + [str(msg)]
+                    flag_modified(product, "logs")
+                    db.commit()
+                    return {"status": "error", "message": msg, "blocked_fee": True}
                 if isinstance(e, MediaApiScopeError):
                     product.logs = (product.logs or []) + [str(e)]
                     flag_modified(product, "logs")

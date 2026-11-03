@@ -100,6 +100,16 @@ class _FakeClient:
         self.published.append(group_key)
         return {"listingId": "LISTING123"}
 
+    def get_listing_fees(self, offer_id):
+        return {
+            "feeSummaries": [{
+                "fees": [{
+                    "feeType": "INSERTION_FEE",
+                    "amount": {"value": "0.00", "currency": "USD"},
+                }]
+            }]
+        }
+
 
 _VARIANTS = [
     {"sku": "EB-9-a", "value": "Style 1", "price": 16.99, "image_urls": ["a.jpg"]},
@@ -141,7 +151,7 @@ class TestOrchestration:
         publish_variation_group(
             c, group_key="EB-9", title="S", description="d", image_urls=[],
             common_aspects={"Style": ["ignored"], "Brand": ["Unbranded"]},
-            varies_by_aspect="Style", variants=_VARIANTS, dry_run=False,
+            varies_by_aspect="Style", variants=_VARIANTS, category_id="261068", dry_run=False,
         )
         # per-item Style is the variant's value, not the common one
         by_sku = {sku: prod for sku, prod in c.items}

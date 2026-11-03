@@ -93,7 +93,7 @@ def test_publish_uploads_source_video_before_inventory_put(monkeypatch):
                 "feeSummaries": [{
                     "fees": [{
                         "feeType": "INSERTION_FEE",
-                        "amount": {"value": "0.35", "currency": "USD"},
+                        "amount": {"value": "0.00", "currency": "USD"},
                     }]
                 }]
             }

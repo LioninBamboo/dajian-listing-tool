@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,21 @@ def pytest_configure(config):
         "markers",
         "allow_runtime_tree_refresh: permit mocked runtime getCategoryTree refresh",
     )
+
+
+@pytest.fixture(autouse=True)
+def _default_high_fee_blacklist(tmp_path_factory, monkeypatch):
+    """Fail-closed gate needs a readable blacklist. Tests can override the env."""
+    if os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"):
+        yield
+        return
+    path = tmp_path_factory.mktemp("high_fee") / "high_fee_category_blacklist.json"
+    path.write_text(
+        '{"categoryIds": ["__test_sentinel_never_used__"], "categories": []}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", str(path))
+    yield
 
 
 @pytest.fixture(autouse=True)

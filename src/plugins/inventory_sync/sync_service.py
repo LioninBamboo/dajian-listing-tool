@@ -1066,7 +1066,9 @@ class InventorySyncService:
             return True
 
         if quantity > 0 and completed_because_sold(status, ending_reason, quantity_sold):
-            return self._relist_fixed_price_item(sku, listing_id, quantity, site_id)
+            return self._relist_fixed_price_item(
+                sku, listing_id, quantity, site_id, snapshot=snapshot
+            )
 
         if str(status or "").lower() in {"active", "outofstock"}:
             return self._revise_trading_quantity(sku, listing_id, quantity, site_id)
@@ -1101,8 +1103,34 @@ class InventorySyncService:
         self.logger.error(f"Trading quantity update for {sku} was not verified")
         return False
 
-    def _relist_fixed_price_item(self, sku: str, listing_id: str, quantity: int, site_id: str) -> bool:
+    def _relist_fixed_price_item(
+        self,
+        sku: str,
+        listing_id: str,
+        quantity: int,
+        site_id: str,
+        snapshot: Optional[dict] = None,
+    ) -> bool:
         trading, _site = self._trading_client()
+        snap = snapshot
+        if not snap:
+            try:
+                snap = self._get_trading_snapshot(listing_id)
+            except Exception as exc:
+                self.logger.warning(f"{sku}: GetItem for relist fee gate failed: {exc}")
+                snap = None
+        category_id = str((snap or {}).get("category_id") or "").strip()
+        category_name = str((snap or {}).get("category_name") or "").strip()
+        from src.utils.publish_fee_preview import resolve_category_taxonomy_path
+        from src.utils.zero_fee_gate import (
+            SOURCE_VERIFY_RELIST,
+            FeeGateRaw,
+            ZeroFeeGateBlocked,
+            assert_zero_fee_before_live,
+            wrapper_reason,
+        )
+
+        category_path = resolve_category_taxonomy_path(category_id) or category_name
         # ItemID + Quantity + SKU only. Do not send fitment, specifics, or dims.
         xml_body = f"""
         <Item>
@@ -1111,6 +1139,46 @@ class InventorySyncService:
             <SKU>{xml_escape(sku)}</SKU>
         </Item>
         """
+
+        def _verify_relist():
+            try:
+                verify_xml = trading.call("VerifyRelistItem", xml_body, site_id=site_id)
+            except Exception as exc:
+                return FeeGateRaw(source=SOURCE_VERIFY_RELIST, error=exc)
+            return FeeGateRaw(
+                source=SOURCE_VERIFY_RELIST,
+                payload=verify_xml,
+                http_status=200,
+            )
+
+        fee_sink: list = []
+        try:
+            assert_zero_fee_before_live(
+                path_name="sync_service.relist_fixed_price_item",
+                sku=sku,
+                category_id=category_id,
+                category_path=category_path,
+                category_name=category_name,
+                preview=_verify_relist,
+                item_id=str(listing_id),
+                results_sink=fee_sink,
+            )
+        except ZeroFeeGateBlocked as exc:
+            reason = wrapper_reason(exc.result) or exc.result.reason
+            self.logger.warning(f"{sku}: relist blocked by zero-fee gate: {reason}")
+            try:
+                self.record_sync(SyncResult(
+                    sku=sku,
+                    action="relist_blocked_fee",
+                    old_value=str(listing_id or ""),
+                    new_value=reason or "blocked_fee",
+                    message=f"RelistFixedPriceItem blocked: {reason}",
+                    supplier_in_stock=True,
+                ))
+            except Exception as rec_exc:
+                self.logger.warning(f"{sku}: 写入 relist_blocked_fee 失败: {rec_exc}")
+            return False
+
         try:
             response = trading.call("RelistFixedPriceItem", xml_body, site_id=site_id)
         except Exception as exc:

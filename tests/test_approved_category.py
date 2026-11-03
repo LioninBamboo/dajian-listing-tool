@@ -321,7 +321,6 @@ def test_batch_publish_preserves_approved_category(monkeypatch, tmp_path):
         lambda listing, **kwargs: listing,
     )
     _stub_publish_common(monkeypatch, matcher_factory=lambda oauth: _RemapMatcher(oauth))
-    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", "/nonexistent-high-fee-blacklist.json")
 
     result = batch_publish.publish_single_product(
         _publish_bathroom_product(approved=True),
@@ -340,7 +339,6 @@ def test_batch_publish_still_normalizes_unapproved_category(monkeypatch, tmp_pat
         lambda listing, **kwargs: listing,
     )
     _stub_publish_common(monkeypatch, matcher_factory=lambda oauth: _RemapMatcher(oauth))
-    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", "/nonexistent-high-fee-blacklist.json")
 
     result = batch_publish.publish_single_product(
         _publish_bathroom_product(approved=False),
@@ -369,7 +367,6 @@ def test_batch_publish_blocks_blacklisted_approved_category(monkeypatch, tmp_pat
 
 def test_batch_publish_rejects_non_leaf_approved_category(monkeypatch, tmp_path):
     _install_leaf_tree(monkeypatch, tmp_path)
-    monkeypatch.setenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH", "/nonexistent-high-fee-blacklist.json")
     monkeypatch.setattr(batch_publish, "_persist_prepared_listing", lambda **kwargs: None)
     _stub_publish_common(monkeypatch, matcher_factory=lambda oauth: _RemapMatcher(oauth))
 

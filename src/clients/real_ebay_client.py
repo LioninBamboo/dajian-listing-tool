@@ -1088,22 +1088,14 @@ class RealEbayClient:
             f"publish_by_inventory_item_group failed ({response.status_code}): {response.text[:400]}"
         )
 
-    def add_fixed_price_item_motors(self, product: Dict, *, category_id: str,
-                                    price: float, quantity: int = 5) -> Dict:
-        """Publish an eBay Motors parts listing via the Trading API (SiteID 100).
-
-        Motors categories can't be published through the Inventory API (25005),
-        so this posts AddFixedPriceItem. ``product`` carries title/description/
-        image_urls/aspects and optional ``compatibility`` (the collected
-        motorsCompatibility.compatibleProducts). Returns {"itemId", "status"} or
-        raises with eBay's error messages.
-        """
-        import re
+    def build_motors_add_fixed_price_xml(self, product: Dict, *, category_id: str,
+                                         price: float, quantity: int = 5) -> str:
+        """Build AddFixedPriceItem XML once so verify and publish cannot drift."""
         from src.services.motors_trading import build_add_fixed_price_item_xml
         from src.utils.store_profile import get_store_profile
 
         profile = get_store_profile()
-        xml = build_add_fixed_price_item_xml(
+        return build_add_fixed_price_item_xml(
             title=product.get("title", ""),
             description=product.get("description", ""),
             category_id=str(category_id),
@@ -1118,20 +1110,69 @@ class RealEbayClient:
             sku=product.get("sku") or "",
         )
 
+    def post_motors_trading_xml(self, xml: str, *, call_name: str):
+        """POST a Trading XML body. Verify calls swap the request wrapper only."""
+        from src.utils.store_profile import get_store_profile
+
+        profile = get_store_profile()
+        body = xml
+        if call_name == "VerifyAddFixedPriceItem":
+            body = body.replace("AddFixedPriceItemRequest", "VerifyAddFixedPriceItemRequest")
         token = self.oauth.get_valid_token()
         headers = {
-            "X-EBAY-API-CALL-NAME": "AddFixedPriceItem",
+            "X-EBAY-API-CALL-NAME": call_name,
             "X-EBAY-API-SITEID": profile.ebay_site_id,   # 100 = eBay Motors
             "X-EBAY-API-COMPATIBILITY-LEVEL": "1155",
             "X-EBAY-API-IAF-TOKEN": token,
             "Content-Type": "text/xml",
         }
-        resp = self.session.post("https://api.ebay.com/ws/api.dll", headers=headers,
-                                 data=xml.encode("utf-8"), timeout=90)
-        body = resp.text
+        return self.session.post(
+            "https://api.ebay.com/ws/api.dll",
+            headers=headers,
+            data=body.encode("utf-8"),
+            timeout=90,
+        )
+
+    def verify_add_fixed_price_item_motors(self, xml: str):
+        """Read-only Trading fee preview. Does not create a listing."""
+        import re
+        from src.utils.zero_fee_gate import FeeGateRaw, SOURCE_VERIFY_ADD
+
+        resp = self.post_motors_trading_xml(xml, call_name="VerifyAddFixedPriceItem")
+        body = getattr(resp, "text", "") or ""
         ack = (re.search(r"<Ack>(.*?)</Ack>", body) or [None, ""])[1] if "<Ack>" in body else ""
-        error_codes = set(re.findall(r"<ErrorCode>(.*?)</ErrorCode>", body, re.S))
-        item_id = (re.search(r"<ItemID>(.*?)</ItemID>", body) or [None, None])[1]
+        return FeeGateRaw(
+            source=SOURCE_VERIFY_ADD,
+            payload=body,
+            http_status=getattr(resp, "status_code", None),
+            ack=ack,
+        )
+
+    def add_fixed_price_item_motors(self, product: Dict, *, category_id: str,
+                                    price: float, quantity: int = 5,
+                                    xml: Optional[str] = None) -> Dict:
+        """Publish an eBay Motors parts listing via the Trading API (SiteID 100).
+
+        Motors categories can't be published through the Inventory API (25005),
+        so this posts AddFixedPriceItem. ``product`` carries title/description/
+        image_urls/aspects and optional ``compatibility`` (the collected
+        motorsCompatibility.compatibleProducts). Returns {"itemId", "status"} or
+        raises with eBay's error messages. Pass ``xml`` to reuse the exact body
+        that was fee-previewed.
+        """
+        import re
+
+        body = xml if xml is not None else self.build_motors_add_fixed_price_xml(
+            product,
+            category_id=category_id,
+            price=price,
+            quantity=quantity,
+        )
+        resp = self.post_motors_trading_xml(body, call_name="AddFixedPriceItem")
+        text = resp.text
+        ack = (re.search(r"<Ack>(.*?)</Ack>", text) or [None, ""])[1] if "<Ack>" in text else ""
+        error_codes = set(re.findall(r"<ErrorCode>(.*?)</ErrorCode>", text, re.S))
+        item_id = (re.search(r"<ItemID>(.*?)</ItemID>", text) or [None, None])[1]
         if (
             item_id
             and ack in ("Success", "Warning")
@@ -1141,7 +1182,7 @@ class RealEbayClient:
             return {"itemId": item_id, "status": "published", "ack": ack}
         errors = [
             (m.group(1) or "").strip()
-            for m in re.finditer(r"<LongMessage>(.*?)</LongMessage>", body, re.S)
+            for m in re.finditer(r"<LongMessage>(.*?)</LongMessage>", text, re.S)
         ]
         raise Exception(f"Motors AddFixedPriceItem failed (Ack={ack}): {'; '.join(errors)[:400]}")
 

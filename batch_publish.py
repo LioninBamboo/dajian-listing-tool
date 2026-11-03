@@ -78,6 +78,12 @@ from src.utils.approved_category import (
     should_auto_remap_invalid_category,
 )
 from src.utils.publish_fee_preview import evaluate_insertion_fee_preview
+from src.utils.zero_fee_gate import (
+    ZeroFeeGateBlocked,
+    assert_zero_fee_before_live,
+    preview_inventory_listing_fees,
+    wrapper_reason,
+)
 from src.utils.category_decision import TREE_KNOWN_PUBLISHABLE_LEAVES
 from src.services.taxonomy_constants import INVALID_CATEGORY_REMAP, PROTECTED_STORED_CATEGORY_IDS
 from src.utils.dimension_helpers import (
@@ -1825,7 +1831,14 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             blocker
             for blocker in publish_blockers
             if blocker.startswith("unsourced_required_aspect:")
-            or blocker in {"high_insertion_fee", "fee_preview_unavailable"}
+            or blocker in {
+                "high_insertion_fee",
+                "fee_preview_unavailable",
+                "fee_nonzero",
+                "high_fee_category",
+                "high_fee_blacklist_unavailable",
+                "category_unknown",
+            }
         ]
         if skip_reasons:
             result["copy_skip_reasons"] = skip_reasons
@@ -2025,25 +2038,40 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                     f"  [TRADING] Motors publish via AddFixedPriceItem "
                     f"(cat {category_id}, {len(trading_product['compatibility'])} fitment)"
                 )
-                motors_fee_reason = evaluate_insertion_fee_preview(
+                motors_xml = ebay_client.build_motors_add_fixed_price_xml(
+                    trading_product,
                     category_id=category_id,
-                    category_path=category_path,
-                    category_name=category_name or "",
-                    lookup_attempted=False,
-                    blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+                    price=final_price,
+                    quantity=inv_product["quantity"],
                 )
-                if motors_fee_reason:
+                fee_sink: list = []
+                try:
+                    assert_zero_fee_before_live(
+                        path_name="batch_publish.motors_trading",
+                        sku=sku,
+                        category_id=category_id,
+                        category_path=category_path,
+                        category_name=category_name or "",
+                        preview=lambda: ebay_client.verify_add_fixed_price_item_motors(motors_xml),
+                        results_sink=fee_sink,
+                        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+                    )
+                except ZeroFeeGateBlocked as exc:
+                    motors_fee_reason = wrapper_reason(exc.result) or exc.result.reason
                     record_error(sku, motors_fee_reason)
                     return {
                         "status": "error",
                         "message": motors_fee_reason,
                         "copy_skip_reasons": [motors_fee_reason],
+                        "blocked_fee": True,
+                        "fee_preview": fee_sink,
                     }
                 trade = ebay_client.add_fixed_price_item_motors(
                     trading_product,
                     category_id=category_id,
                     price=final_price,
                     quantity=inv_product["quantity"],
+                    xml=motors_xml,
                 )
                 listing_id = trade.get("itemId")
                 if not listing_id:
@@ -2058,6 +2086,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                     "message": f"Published via Trading! Listing: {listing_id}",
                     "listing_id": listing_id,
                     "channel": "trading",
+                    "fee_preview": fee_sink,
                 }
             # --- Inventory API path (tree-0 general / furniture) --------------
 
@@ -2086,20 +2115,29 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                     f" ({listing_status or 'UNKNOWN'}); reusing it."
                 )
             else:
-                fee_reason = preview_offer_listing_fees(
-                    ebay_client,
-                    offer_id,
-                    category_id=category_id,
-                    category_name=category_name,
-                    category_path=category_path,
-                )
-                if fee_reason:
+                fee_sink = []
+                try:
+                    assert_zero_fee_before_live(
+                        path_name="batch_publish.inventory",
+                        sku=sku,
+                        category_id=category_id,
+                        category_path=category_path,
+                        category_name=category_name or "",
+                        preview=lambda: preview_inventory_listing_fees(ebay_client, offer_id),
+                        offer_id=offer_id,
+                        results_sink=fee_sink,
+                        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+                    )
+                except ZeroFeeGateBlocked as exc:
+                    fee_reason = wrapper_reason(exc.result) or exc.result.reason
                     _withdraw_unpublished_offer(ebay_client, offer_id)
                     record_error(sku, fee_reason)
                     return {
                         "status": "error",
                         "message": fee_reason,
                         "copy_skip_reasons": [fee_reason],
+                        "blocked_fee": True,
+                        "fee_preview": fee_sink,
                     }
                 # Publish
                 logger.info(f"  Publishing offer {offer_id}...")
@@ -2157,7 +2195,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             extra_logs = [f"Video: {video_id}"] if video_id else []
             update_product_status(sku, listing_id, offer_id, category_id, extra_logs)
 
-            return {
+            success = {
                 "status": "success",
                 "message": f"Published! Listing: {listing_id}",
                 "listing_id": listing_id,
@@ -2170,6 +2208,9 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
                 "qc_experience_ids": qc_result.get("experience_ids", []),
                 "qc_evidence_refs": qc_result.get("evidence_refs", []),
             }
+            if "fee_sink" in locals():
+                success["fee_preview"] = fee_sink
+            return success
 
         except MediaApiScopeError:
             raise
@@ -2370,25 +2411,22 @@ def preview_offer_listing_fees(
     category_path="",
 ):
     """Call Sell Inventory getListingFees and return a block reason, if any."""
-    listing_fees = None
-    lookup_error = None
+    sink: list = []
     try:
-        getter = getattr(ebay_client, "get_listing_fees", None)
-        if getter is None:
-            raise RuntimeError("get_listing_fees is not available")
-        listing_fees = getter(offer_id)
-    except Exception as exc:
-        lookup_error = exc
-        listing_fees = None
-    return evaluate_insertion_fee_preview(
-        category_id=category_id,
-        category_path=category_path or category_name or "",
-        category_name=category_name or "",
-        listing_fees=listing_fees,
-        lookup_error=lookup_error,
-        lookup_attempted=True,
-        blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
-    )
+        assert_zero_fee_before_live(
+            path_name="batch_publish.preview_offer_listing_fees",
+            sku="",
+            category_id=category_id,
+            category_path=category_path or category_name or "",
+            category_name=category_name or "",
+            preview=lambda: preview_inventory_listing_fees(ebay_client, offer_id),
+            offer_id=str(offer_id or ""),
+            results_sink=sink,
+            blacklist_path=os.getenv("HIGH_FEE_CATEGORY_BLACKLIST_PATH"),
+        )
+    except ZeroFeeGateBlocked as exc:
+        return wrapper_reason(exc.result) or exc.result.reason
+    return None
 
 
 def _create_or_get_offer(ebay_client, sku, price, category_id, listing_description=None, marketplace_id=None) -> str:

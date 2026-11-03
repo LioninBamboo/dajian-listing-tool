@@ -188,6 +188,8 @@ def parse_trading_item_xml(xml_text: str) -> Optional[dict]:
         "quantity": quantity,
         "quantity_sold": sold if sold is not None else 0,
         "available": available,
+        "category_id": _child_text(item, "PrimaryCategory", "CategoryID"),
+        "category_name": _child_text(item, "PrimaryCategory", "CategoryName"),
     }
 
 

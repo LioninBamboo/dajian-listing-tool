@@ -813,7 +813,30 @@ def publish_to_ebay(product: dict) -> dict:
         
         # 3. Publish Offer to make it live
         try:
-            publish_result = ebay_client.publish_offer(offer_id)
+            from src.utils.zero_fee_gate import (
+                ZeroFeeGateBlocked,
+                publish_offer_if_zero_fee,
+                wrapper_reason,
+            )
+
+            fee_sink: list = []
+            try:
+                publish_result = publish_offer_if_zero_fee(
+                    ebay_client=ebay_client,
+                    offer_id=offer_id,
+                    path_name="app.publish_to_ebay",
+                    sku=sku,
+                    category_id=str(category_id or ""),
+                    category_name=str(opt_data.get("categoryName") or ""),
+                    results_sink=fee_sink,
+                )
+            except ZeroFeeGateBlocked as exc:
+                return {
+                    "status": "error",
+                    "message": wrapper_reason(exc.result) or exc.result.reason,
+                    "blocked_fee": True,
+                    "fee_preview": fee_sink,
+                }
             listing_id = publish_result.get("listingId")
             
             if listing_id:
@@ -1189,7 +1212,30 @@ def publish_with_auto_category(product: dict) -> dict:
             offer_id = offer["offerId"]
             
             # 3. Publish to make it live
-            publish_result = ebay_client.publish_offer(offer_id)
+            from src.utils.zero_fee_gate import (
+                ZeroFeeGateBlocked,
+                publish_offer_if_zero_fee,
+                wrapper_reason,
+            )
+
+            fee_sink: list = []
+            try:
+                publish_result = publish_offer_if_zero_fee(
+                    ebay_client=ebay_client,
+                    offer_id=offer_id,
+                    path_name="app.publish_with_auto_category",
+                    sku=sku,
+                    category_id=str(category_id or ""),
+                    category_name=str(category_name or ""),
+                    results_sink=fee_sink,
+                )
+            except ZeroFeeGateBlocked as exc:
+                return {
+                    "status": "error",
+                    "message": wrapper_reason(exc.result) or exc.result.reason,
+                    "blocked_fee": True,
+                    "fee_preview": fee_sink,
+                }
             listing_id = publish_result.get("listingId")
             
             if listing_id:

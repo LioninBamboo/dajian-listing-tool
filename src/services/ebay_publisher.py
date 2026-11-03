@@ -1703,6 +1703,39 @@ class EbayPublisher:
     ) -> PublishResult:
         """执行发布操作"""
         try:
+            from src.utils.zero_fee_gate import (
+                ZeroFeeGateBlocked,
+                assert_zero_fee_before_live,
+                preview_inventory_listing_fees,
+                withdraw_unpublished_offer,
+                wrapper_reason,
+            )
+            from src.utils.category_tree_cache import build_category_path
+
+            product = getattr(self, "_publish_product", None) or {}
+            sku = product.get("sku") if isinstance(product, dict) else ""
+            fee_sink: list = []
+            try:
+                assert_zero_fee_before_live(
+                    path_name="ebay_publisher._do_publish",
+                    sku=str(sku or ""),
+                    category_id=str(category_id or ""),
+                    category_path=str(build_category_path(str(category_id or "").strip()) or ""),
+                    category_name=str(category_name or ""),
+                    preview=lambda: preview_inventory_listing_fees(self.ebay_client, offer_id),
+                    offer_id=str(offer_id or ""),
+                    results_sink=fee_sink,
+                )
+            except ZeroFeeGateBlocked as exc:
+                withdraw_unpublished_offer(self.ebay_client, offer_id)
+                return PublishResult(
+                    status=PublishStatus.ERROR,
+                    message=wrapper_reason(exc.result) or exc.result.reason or "blocked_fee",
+                    offer_id=offer_id,
+                    category_id=category_id,
+                    category_name=category_name,
+                    errors=[exc.result.reason or "blocked_fee"],
+                )
             publish_result = self._publish_offer(offer_id)
             listing_id = publish_result.get("listingId")
             
