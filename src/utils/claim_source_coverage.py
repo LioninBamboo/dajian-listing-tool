@@ -146,6 +146,12 @@ COUNT_NOUNS: dict[str, str] = {
     "packs": "pack",
 }
 
+# Range claims only: seat and person/people describe occupancy.
+_RANGE_NOUN_FAMILY = {
+    "seat": "occupancy",
+    "person": "occupancy",
+}
+
 _STOPWORDS = frozenset({
     "a", "an", "the", "and", "or", "of", "to", "for", "in", "with", "on",
     "at", "by", "from", "as", "is", "are", "be", "its", "your", "our",
@@ -518,24 +524,64 @@ def _is_count_number(token: str) -> bool:
     return bool(token and _FRACTION_OR_NUMBER_RE.fullmatch(token))
 
 
-def _range_at(tokens: list[str], index: int) -> tuple[int, str, str] | None:
-    """NUM NUM NOUN or NUM to NUM NOUN. The range string stays '4-6', not 6."""
-    if index >= len(tokens) or not _is_count_number(tokens[index]):
+def _is_range_endpoint(token: str) -> bool:
+    return bool(token and re.fullmatch(r"\d+(?:\.\d+)?", token))
+
+
+def _slash_range_token(token: str) -> str | None:
+    if not token or "/" not in token:
         return None
-    low = tokens[index]
+    left, sep, right = token.partition("/")
+    if not sep or not _is_range_endpoint(left) or not _is_range_endpoint(right):
+        return None
+    return f"{left}-{right}"
+
+
+def _bare_range_at(tokens: list[str], index: int) -> tuple[int, str] | None:
+    """N-M, N to M, or N/M with no noun required after the numbers."""
+    if index >= len(tokens):
+        return None
+    token = tokens[index]
+    slash = _slash_range_token(token)
+    if slash:
+        return (index + 1, slash)
+    if not _is_range_endpoint(token):
+        return None
     nxt = tokens[index + 1] if index + 1 < len(tokens) else ""
     nxt2 = tokens[index + 2] if index + 2 < len(tokens) else ""
-    nxt3 = tokens[index + 3] if index + 3 < len(tokens) else ""
-    if _is_count_number(nxt):
-        noun = COUNT_NOUNS.get(nxt2)
-        if noun:
-            return (index + 3, f"{low}-{nxt}", noun)
-        return None
-    if nxt == "to" and _is_count_number(nxt2):
-        noun = COUNT_NOUNS.get(nxt3)
-        if noun:
-            return (index + 4, f"{low}-{nxt2}", noun)
+    if _is_range_endpoint(nxt):
+        return (index + 2, f"{token}-{nxt}")
+    if nxt == "to" and _is_range_endpoint(nxt2):
+        return (index + 3, f"{token}-{nxt2}")
     return None
+
+
+def _range_at(tokens: list[str], index: int) -> tuple[int, str, str] | None:
+    """NUM NUM NOUN or NUM to NUM NOUN. The range string stays '4-6', not 6."""
+    bare = _bare_range_at(tokens, index)
+    if not bare:
+        return None
+    end, number = bare
+    noun = COUNT_NOUNS.get(tokens[end] if end < len(tokens) else "")
+    if not noun:
+        return None
+    return (end + 1, number, noun)
+
+
+def _range_noun_key(noun: str) -> str:
+    return _RANGE_NOUN_FAMILY.get(noun, noun)
+
+
+def _count_pairs_match(claim_number: str, claim_noun: str, src_number: str, src_noun: str) -> bool:
+    claim_range = "-" in claim_number
+    src_range = "-" in src_number
+    if claim_range != src_range:
+        return False
+    if claim_number != src_number:
+        return False
+    if claim_range:
+        return _range_noun_key(claim_noun) == _range_noun_key(src_noun)
+    return claim_noun == src_noun
 
 
 def _counts_from_tokens(tokens: list[str]) -> list[tuple[str, str, int]]:
@@ -543,7 +589,9 @@ def _counts_from_tokens(tokens: list[str]) -> list[tuple[str, str, int]]:
 
     Ranges are parsed before noun-before-number binding so 'Seats 4-6
     person' stays ('4-6', 'person'), never ('4', 'seat') plus ('6',
-    'person'). A range never becomes an exact endpoint count.
+    'person'). A noun before N-M / N to M / N/M emits the range with
+    that noun ('Seats: 4-6' → ('4-6', 'seat')), never the low end
+    alone. A range never becomes an exact endpoint count.
     """
     found: list[tuple[str, str, int]] = []
     index = 0
@@ -557,12 +605,24 @@ def _counts_from_tokens(tokens: list[str]) -> list[tuple[str, str, int]]:
         token = tokens[index]
         nxt = tokens[index + 1] if index + 1 < len(tokens) else ""
         noun = COUNT_NOUNS.get(nxt)
-        if _is_count_number(token) and noun:
+        if _is_count_number(token) and noun and _bare_range_at(tokens, index) is None:
             found.append((token, noun, index + 2))
             index += 2
             continue
         noun = COUNT_NOUNS.get(token)
-        if noun and _is_count_number(nxt) and _range_at(tokens, index + 1) is None:
+        if noun and _is_count_number(nxt):
+            after = _range_at(tokens, index + 1)
+            if after:
+                end, number, after_noun = after
+                found.append((number, after_noun, end))
+                index = end
+                continue
+            bare = _bare_range_at(tokens, index + 1)
+            if bare:
+                end, number = bare
+                found.append((number, noun, end))
+                index = end
+                continue
             found.append((nxt, noun, index + 2))
             index += 2
             continue
@@ -581,9 +641,7 @@ def _exact_count_supported(claim_counts: list[tuple[str, str]], index: _SourceIn
         matched = False
         for segment in index.segments:
             for src_number, src_noun, end in segment.counts:
-                if (src_number, src_noun) != (number, noun):
-                    continue
-                if "-" in src_number and "-" not in number:
+                if not _count_pairs_match(number, noun, src_number, src_noun):
                     continue
                 if _suffix_has_trailing_negation(segment.tokens, end):
                     continue

@@ -500,6 +500,54 @@ def test_extract_counts_binds_range_before_preceding_noun():
     assert _extract_counts("Seats: 1 Seat") == [("1", "seat")]
 
 
+@pytest.mark.parametrize(
+    "claim,source",
+    [
+        ("four-seat", "Seats: 4-6"),
+        ("4 seats", "Seats 4-6"),
+        ("four-seat", "Seats 4 to 6"),
+        ("four-person", "Persons: 4-6"),
+        ("three-tier", "Tiers: 3-5"),
+        ("four-piece", "Pieces: 4-6"),
+        ("two-tier", "Tier: 2/3"),
+        ("six-seat", "Seats: 4-6"),
+    ],
+)
+def test_colon_range_low_end_is_not_an_exact_count(claim, source):
+    assert source_supports_claim_phrase(claim, source) is False
+    extracted = _extract_counts(source)
+    assert all("-" in number for number, _noun in extracted), extracted
+    assert ("4", "seat") not in extracted
+    assert ("4", "person") not in extracted
+    assert ("3", "tier") not in extracted
+    assert ("2", "tier") not in extracted
+    assert ("6", "seat") not in extracted
+
+
+@pytest.mark.parametrize(
+    "claim,source",
+    [
+        ("seats 4-6", "Seats 4-6 person"),
+        ("seats 4-6", "4-6 seats"),
+        ("seats 4-6", "Seats: 4-6 Seats"),
+        ("two-seat", "Seats: 2 Seats"),
+        ("one-seat", "Seats: 1 Seat"),
+    ],
+)
+def test_same_range_or_exact_count_still_supported(claim, source):
+    assert source_supports_claim_phrase(claim, source) is True
+
+
+def test_noun_before_bare_range_emits_range_not_low_end():
+    assert _extract_counts("Seats: 4-6") == [("4-6", "seat")]
+    assert _extract_counts("Seats 4-6") == [("4-6", "seat")]
+    assert _extract_counts("Seats 4 to 6") == [("4-6", "seat")]
+    assert _extract_counts("Persons: 4-6") == [("4-6", "person")]
+    assert _extract_counts("Tiers: 3-5") == [("3-5", "tier")]
+    assert _extract_counts("Pieces: 4-6") == [("4-6", "piece")]
+    assert _extract_counts("Tier: 2/3") == [("2-3", "tier")]
+
+
 def test_negation_and_sold_separately_are_not_support():
     assert source_supports_claim_phrase(
         "removable washable cover",
