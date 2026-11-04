@@ -7,6 +7,13 @@ aspect the listing quality gate already requires or derives are kept.
 Unsourced optional claims (materials, voltage/power, warranty, …) are
 stripped; unsourced required aspects are replaced with a source-matching
 value when one exists, otherwise they block publish.
+
+Draft precedence: a non-empty value from the local draft row always wins
+over quality-gate / source / template auto-fill. Auto-fill may only set
+aspects that were empty or missing in the draft. SELECTION_ONLY draft
+values must whole-value-match an allowed value (whitespace/case
+normalized); otherwise publish blocks with ``aspect_value_not_allowed``
+instead of guessing a nearest value.
 """
 
 from __future__ import annotations
@@ -432,6 +439,60 @@ def _allowed_by_norm(allowed_values: Optional[Iterable[str]]) -> dict[str, str]:
     return mapping
 
 
+def match_allowed_whole_value(
+    value: str,
+    allowed_values: Optional[Iterable[str]] = None,
+) -> Optional[str]:
+    """Exact whole-value match after whitespace/case normalization.
+
+    No substring or prefix matching: ``Accent`` does not match
+    ``Accent Chair``. Returns the canonical allowed-list casing.
+    """
+    want = _normalize_text(value)
+    if not want:
+        return None
+    allowed_map = _allowed_by_norm(allowed_values)
+    return allowed_map.get(want)
+
+
+def merge_aspects_for_draft_persist(
+    original: Optional[Mapping[str, Any]],
+    completed: Optional[Mapping[str, Any]],
+) -> dict[str, list[str]]:
+    """Persist auto-filled aspects only where the draft field was empty.
+
+    Non-empty draft values are kept (preferring the completed form when it is
+    only a whitespace/case normalization of the draft value). Auto-filled
+    keys that were missing/empty in the draft are written through.
+    """
+    original = original or {}
+    completed = completed or {}
+    merged: dict[str, list[str]] = {}
+
+    for name, raw in original.items():
+        draft_vals = _aspect_values(raw)
+        if not draft_vals:
+            continue
+        done_vals = _aspect_values(completed.get(name))
+        if done_vals and _normalize_text(done_vals[0]) == _normalize_text(draft_vals[0]):
+            merged[str(name)] = done_vals
+        else:
+            merged[str(name)] = list(draft_vals)
+
+    for name, raw in completed.items():
+        key = str(name)
+        if key in merged:
+            continue
+        done_vals = _aspect_values(raw)
+        if not done_vals:
+            continue
+        if _aspect_values(original.get(name)):
+            continue
+        merged[key] = done_vals
+
+    return merged
+
+
 def _map_mention_to_allowed(
     mention: str,
     allowed_values: Optional[Iterable[str]],
@@ -725,23 +786,68 @@ def _keep_sourced_values(
     return [value for value in values if value_supported_by_source(value, source_text)]
 
 
+def _draft_owned_names(draft_aspects: Optional[Mapping[str, Any]]) -> set[str]:
+    owned: set[str] = set()
+    for name, raw in (draft_aspects or {}).items():
+        key = str(name or "").strip()
+        if not key or is_skipped_aspect(key):
+            continue
+        if _aspect_values(raw):
+            owned.add(key)
+    return owned
+
+
+def _seed_draft_aspects(
+    aspects: MutableMapping[str, Any],
+    draft_aspects: Optional[Mapping[str, Any]],
+) -> set[str]:
+    """Force non-empty draft values into the working set. Returns owned names."""
+    owned = _draft_owned_names(draft_aspects)
+    for name in owned:
+        draft_vals = _aspect_values((draft_aspects or {}).get(name))
+        if draft_vals:
+            aspects[name] = list(draft_vals)
+    return owned
+
+
+def _selection_only_mode(mode: str) -> bool:
+    return str(mode or "").strip().upper() == "SELECTION_ONLY"
+
+
 def guard_unsourced_aspects(
     aspects: MutableMapping[str, Any],
     *,
     source_text: str,
     required_names: Optional[Iterable[str]] = None,
     allowed_values_by_name: Optional[Mapping[str, Iterable[str]]] = None,
+    aspect_modes_by_name: Optional[Mapping[str, str]] = None,
     expected_values_by_name: Optional[Mapping[str, Any]] = None,
+    draft_aspects: Optional[Mapping[str, Any]] = None,
     source_fields: Optional[Mapping[str, Any]] = None,
     sku: str = "",
     log: Optional[LogFn] = None,
 ) -> list[str]:
-    """Strip or block unsourced final aspects. Mutates `aspects` in place."""
+    """Strip or block unsourced final aspects. Mutates `aspects` in place.
+
+    Auto-fill precedence when the draft field is empty/missing:
+    1. ``expected_values_by_name`` (quality-gate derived)
+    2. ``find_source_matching_value`` against allowed / common catalogs
+    3. leave empty; required names then block as ``unsourced_required_aspect``
+
+    Non-empty draft values always beat steps 1–2. SELECTION_ONLY draft values
+    must whole-value-match the allowed list or block as
+    ``aspect_value_not_allowed``.
+    """
     required = {str(name).strip() for name in (required_names or []) if str(name).strip()}
     allowed_map = {
         str(name): [str(value) for value in values if str(value).strip()]
         for name, values in (allowed_values_by_name or {}).items()
     }
+    modes = {
+        str(name): str(mode or "").strip().upper()
+        for name, mode in (aspect_modes_by_name or {}).items()
+    }
+    draft_owned = _seed_draft_aspects(aspects, draft_aspects)
     blockers: list[str] = []
 
     for name in list(aspects.keys()):
@@ -752,12 +858,36 @@ def guard_unsourced_aspects(
         if values and all(is_ebay_sentinel_value(value) for value in values):
             continue
 
+        from_draft = name in draft_owned
+        if from_draft and values:
+            mode = modes.get(name, "")
+            allowed = allowed_map.get(name, [])
+            if _selection_only_mode(mode) and allowed:
+                resolved = match_allowed_whole_value(values[0], allowed)
+                if resolved is None:
+                    display = values[0]
+                    _emit(
+                        log,
+                        f"[ASPECT_BLOCK] {sku} {name}={display} aspect_value_not_allowed".strip(),
+                    )
+                    aspects.pop(name, None)
+                    blockers.append(f"aspect_value_not_allowed:{name}={display}")
+                    continue
+                if resolved != values[0] or len(values) != 1:
+                    _emit(log, f"[ASPECT_NORM] {sku} {name}={resolved}".strip())
+                aspects[name] = [resolved]
+                values = [resolved]
+            # Draft wins over expected / inferred auto-fill. Still drop
+            # unsourced optional claims, but never replace a draft value.
+
         expected = _expected_value_for(name, expected_values_by_name)
-        if expected:
+        if expected and not from_draft:
             if _values_match_expected(values, expected):
                 continue
             aspects[name] = [expected]
             _emit(log, f"[ASPECT_GATE] {sku} {name}={expected}".strip())
+            continue
+        if expected and from_draft and _values_match_expected(values, expected):
             continue
 
         kept = _keep_sourced_values(name, values, source_text, source_fields)
@@ -783,6 +913,11 @@ def guard_unsourced_aspects(
         if name not in required:
             continue
 
+        # Draft had a value: never guess a replacement after stripping.
+        if from_draft:
+            blockers.append(f"unsourced_required_aspect:{name}")
+            continue
+
         replacement = None if power_unsupported else find_source_matching_value(
             name,
             source_text,
@@ -799,6 +934,16 @@ def guard_unsourced_aspects(
         if is_skipped_aspect(name):
             continue
         if first_aspect_text(aspects, name):
+            continue
+        if name in draft_owned:
+            # Draft was non-empty but did not survive validation/strip.
+            # Do not auto-fill over it; keep the existing blocker if any.
+            reason = f"unsourced_required_aspect:{name}"
+            if not any(
+                item == reason or item.startswith(f"aspect_value_not_allowed:{name}=")
+                for item in blockers
+            ):
+                blockers.append(reason)
             continue
         expected = _expected_value_for(name, expected_values_by_name)
         if expected:
@@ -825,6 +970,8 @@ def guard_unsourced_aspects(
             blockers.append(reason)
 
     for name in (expected_values_by_name or {}):
+        if name in draft_owned:
+            continue
         expected = _expected_value_for(name, expected_values_by_name)
         if expected and not first_aspect_text(aspects, name):
             aspects[name] = [expected]
