@@ -7,6 +7,19 @@ aspect the listing quality gate already requires or derives are kept.
 Unsourced optional claims (materials, voltage/power, warranty, …) are
 stripped; unsourced required aspects are replaced with a source-matching
 value when one exists, otherwise they block publish.
+
+Draft precedence applies to Type and free-text descriptive aspects only:
+a seedable non-empty draft value wins over quality-gate / source /
+template auto-fill. Gate-derived hard aspects (counts, assembly, room,
+set includes, indoor/outdoor) never silently keep a disagreeing draft
+or silently swap to the gate — they block as
+``aspect_draft_conflicts_gate:<Name>``.
+
+Draft values are seeded only when source-supported, or when they exactly
+match a SELECTION_ONLY allowed list and the upstream field is empty.
+Otherwise the upstream value is kept and the skip is logged.
+SELECTION_ONLY validates every list value; any not-allowed value blocks
+as ``aspect_value_not_allowed`` (no nearest-guess, no silent truncate).
 """
 
 from __future__ import annotations
@@ -432,6 +445,163 @@ def _allowed_by_norm(allowed_values: Optional[Iterable[str]]) -> dict[str, str]:
     return mapping
 
 
+def match_allowed_whole_value(
+    value: str,
+    allowed_values: Optional[Iterable[str]] = None,
+) -> Optional[str]:
+    """Exact whole-value match after whitespace/case normalization.
+
+    No substring or prefix matching: ``Accent`` does not match
+    ``Accent Chair``. Returns the canonical allowed-list casing.
+    """
+    want = _normalize_text(value)
+    if not want:
+        return None
+    allowed_map = _allowed_by_norm(allowed_values)
+    return allowed_map.get(want)
+
+
+def match_allowed_whole_values(
+    values: Iterable[str],
+    allowed_values: Optional[Iterable[str]] = None,
+) -> tuple[Optional[list[str]], Optional[str]]:
+    """Resolve every value against the allowed list.
+
+    Returns ``(resolved_list, None)`` on success, or ``(None, bad_value)``
+    when any entry fails whole-value equality.
+    """
+    resolved: list[str] = []
+    for raw in values:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        matched = match_allowed_whole_value(text, allowed_values)
+        if matched is None:
+            return None, text
+        resolved.append(matched)
+    if not resolved:
+        return None, None
+    return resolved, None
+
+
+def _normalize_aspect_key(name: str) -> str:
+    return re.sub(r"\s+", " ", str(name or "").strip().lower())
+
+
+def _values_norm_list_equal(left: Iterable[str], right: Iterable[str]) -> bool:
+    left_n = [_normalize_text(item) for item in left if str(item or "").strip()]
+    right_n = [_normalize_text(item) for item in right if str(item or "").strip()]
+    return bool(left_n) and left_n == right_n
+
+
+# Counts / yes-no / room / set membership derived by the quality gate.
+# Disagreeing draft values block — they do not win and are not swapped.
+GATE_HARD_ASPECT_KEYS = frozenset({
+    "number of pieces",
+    "number of items in set",
+    "assembly required",
+    "room",
+    "indoor/outdoor",
+    "set includes",
+})
+
+
+def is_gate_hard_aspect(name: str) -> bool:
+    return _normalize_aspect_key(name) in GATE_HARD_ASPECT_KEYS
+
+
+def _mapping_by_norm_key(
+    mapping: Optional[Mapping[str, Any]],
+) -> dict[str, tuple[str, Any]]:
+    """Map normalized aspect key -> (canonical name, raw value).
+
+    First canonical spelling wins when duplicates differ only by case/space.
+    """
+    out: dict[str, tuple[str, Any]] = {}
+    for name, raw in (mapping or {}).items():
+        key = _normalize_aspect_key(str(name or ""))
+        if not key or key in out:
+            continue
+        out[key] = (str(name), raw)
+    return out
+
+
+def _lookup_norm(
+    by_norm: Mapping[str, tuple[str, Any]],
+    name: str,
+) -> tuple[str, Any] | tuple[None, None]:
+    hit = by_norm.get(_normalize_aspect_key(name))
+    if not hit:
+        return None, None
+    return hit
+
+
+def _find_aspect_key(aspects: Mapping[str, Any], name: str) -> Optional[str]:
+    want = _normalize_aspect_key(name)
+    for key in aspects or {}:
+        if _normalize_aspect_key(str(key)) == want:
+            return str(key)
+    return None
+
+
+def _first_aspect_text_ci(aspects: Mapping[str, Any], name: str) -> str:
+    key = _find_aspect_key(aspects, name)
+    if not key:
+        return ""
+    return first_aspect_text(aspects, key)
+
+
+def merge_aspects_for_draft_persist(
+    original: Optional[Mapping[str, Any]],
+    completed: Optional[Mapping[str, Any]],
+) -> dict[str, list[str]]:
+    """Persist auto-filled aspects only where the draft field was empty.
+
+    Non-empty draft values are kept (preferring the completed form when the
+    whole value list is only a whitespace/case normalization of the draft).
+    When draft and completed keys match after normalization, the completed /
+    upstream eBay spelling is used as the persisted key (no ``' color'`` /
+    ``Color`` duplicates). Auto-filled keys that were missing/empty in the
+    draft are written through.
+    """
+    original = original or {}
+    completed = completed or {}
+    completed_by_norm = _mapping_by_norm_key(completed)
+    original_by_norm = _mapping_by_norm_key(original)
+    merged: dict[str, list[str]] = {}
+    merged_norms: set[str] = set()
+
+    for name, raw in original.items():
+        draft_vals = _aspect_values(raw)
+        if not draft_vals:
+            continue
+        key = _normalize_aspect_key(name)
+        completed_canon, done_raw = _lookup_norm(completed_by_norm, name)
+        done_vals = _aspect_values(done_raw)
+        # Prefer the upstream/eBay canonical spelling when one matches.
+        out_name = str(completed_canon or name).strip() or str(name)
+        if done_vals and _values_norm_list_equal(done_vals, draft_vals):
+            merged[out_name] = done_vals
+        else:
+            merged[out_name] = list(draft_vals)
+        merged_norms.add(key)
+
+    for name, raw in completed.items():
+        key = _normalize_aspect_key(name)
+        if key in merged_norms:
+            continue
+        done_vals = _aspect_values(raw)
+        if not done_vals:
+            continue
+        _orig_canon, orig_raw = _lookup_norm(original_by_norm, name)
+        if _aspect_values(orig_raw):
+            continue
+        merged[str(name)] = done_vals
+        merged_norms.add(key)
+
+    return merged
+
+
 def _map_mention_to_allowed(
     mention: str,
     allowed_values: Optional[Iterable[str]],
@@ -725,39 +895,318 @@ def _keep_sourced_values(
     return [value for value in values if value_supported_by_source(value, source_text)]
 
 
+def _selection_only_mode(mode: str) -> bool:
+    return str(mode or "").strip().upper() == "SELECTION_ONLY"
+
+
+def _mode_for_name(modes_by_norm: Mapping[str, str], name: str) -> str:
+    return modes_by_norm.get(_normalize_aspect_key(name), "")
+
+
+def _allowed_for_name(
+    allowed_by_norm: Mapping[str, list[str]],
+    name: str,
+) -> list[str]:
+    return list(allowed_by_norm.get(_normalize_aspect_key(name), []))
+
+
+def _draft_present_keys(draft_by_norm: Mapping[str, tuple[str, Any]]) -> set[str]:
+    present: set[str] = set()
+    for key, (canon, raw) in draft_by_norm.items():
+        if is_skipped_aspect(canon):
+            continue
+        if _aspect_values(raw):
+            present.add(key)
+    return present
+
+
+def _resolve_selection_only_values(
+    values: list[str],
+    allowed: list[str],
+) -> tuple[Optional[list[str]], Optional[str]]:
+    if not allowed:
+        return list(values), None
+    return match_allowed_whole_values(values, allowed)
+
+
+def _seed_draft_aspects(
+    aspects: MutableMapping[str, Any],
+    draft_aspects: Optional[Mapping[str, Any]],
+    *,
+    source_text: str,
+    source_fields: Optional[Mapping[str, Any]],
+    allowed_by_norm: Mapping[str, list[str]],
+    modes_by_norm: Mapping[str, str],
+    sku: str = "",
+    log: Optional[LogFn] = None,
+) -> tuple[set[str], set[str]]:
+    """Seed seedable draft values into the working set.
+
+    Returns ``(draft_present_norm_keys, draft_seeded_norm_keys)``.
+    Gate-hard aspects are never draft-seeded. A draft value is seeded only
+    when source-supported, or when every value exactly matches a
+    SELECTION_ONLY allowed list and the upstream field is empty. Otherwise
+    the upstream value is kept and the skip is logged.
+    """
+    draft_by_norm = _mapping_by_norm_key(draft_aspects)
+    aspects_by_norm = _mapping_by_norm_key(aspects)
+    present = _draft_present_keys(draft_by_norm)
+    seeded: set[str] = set()
+
+    for key in present:
+        canon, raw = draft_by_norm[key]
+        if is_gate_hard_aspect(canon):
+            continue
+        draft_vals = _aspect_values(raw)
+        if not draft_vals:
+            continue
+
+        upstream_canon, upstream_raw = aspects_by_norm.get(key, (None, None))
+        upstream_vals = _aspect_values(upstream_raw)
+        working_name = upstream_canon or canon
+
+        mode = _mode_for_name(modes_by_norm, canon)
+        allowed = _allowed_for_name(allowed_by_norm, canon)
+        sourced_kept = _keep_sourced_values(
+            canon,
+            draft_vals,
+            source_text,
+            source_fields,
+        )
+        all_sourced = bool(draft_vals) and len(sourced_kept) == len(draft_vals)
+
+        selection_resolved: Optional[list[str]] = None
+        selection_bad: Optional[str] = None
+        if _selection_only_mode(mode) and allowed:
+            selection_resolved, selection_bad = _resolve_selection_only_values(
+                draft_vals,
+                allowed,
+            )
+
+        can_seed = False
+        to_seed: list[str] = []
+        if all_sourced:
+            if _selection_only_mode(mode) and allowed:
+                if selection_resolved is None:
+                    # Sourced but not on the allowed list — leave upstream;
+                    # the main loop still validates if we later treat draft.
+                    _emit(
+                        log,
+                        f"[ASPECT_DRAFT_SKIP] {sku} {working_name}="
+                        f"{draft_vals[0]} not in SELECTION_ONLY "
+                        f"(keeping upstream)".strip(),
+                    )
+                    continue
+                to_seed = selection_resolved
+            else:
+                to_seed = list(draft_vals)
+            can_seed = True
+        elif selection_resolved is not None and not upstream_vals:
+            to_seed = selection_resolved
+            can_seed = True
+
+        if not can_seed:
+            _emit(
+                log,
+                f"[ASPECT_DRAFT_SKIP] {sku} {working_name}={draft_vals[0]} "
+                f"unsourced draft (keeping upstream "
+                f"{upstream_vals[0] if upstream_vals else 'empty'})".strip(),
+            )
+            continue
+
+        target = upstream_canon or canon
+        aspects[target] = list(to_seed)
+        seeded.add(key)
+        aspects_by_norm[key] = (target, aspects[target])
+
+    return present, seeded
+
+
 def guard_unsourced_aspects(
     aspects: MutableMapping[str, Any],
     *,
     source_text: str,
     required_names: Optional[Iterable[str]] = None,
     allowed_values_by_name: Optional[Mapping[str, Iterable[str]]] = None,
+    aspect_modes_by_name: Optional[Mapping[str, str]] = None,
     expected_values_by_name: Optional[Mapping[str, Any]] = None,
+    draft_aspects: Optional[Mapping[str, Any]] = None,
     source_fields: Optional[Mapping[str, Any]] = None,
     sku: str = "",
     log: Optional[LogFn] = None,
 ) -> list[str]:
-    """Strip or block unsourced final aspects. Mutates `aspects` in place."""
-    required = {str(name).strip() for name in (required_names or []) if str(name).strip()}
-    allowed_map = {
-        str(name): [str(value) for value in values if str(value).strip()]
-        for name, values in (allowed_values_by_name or {}).items()
+    """Strip or block unsourced final aspects. Mutates `aspects` in place.
+
+    Auto-fill precedence when the draft field is empty/missing:
+    1. ``expected_values_by_name`` (quality-gate derived)
+    2. ``find_source_matching_value`` against allowed / common catalogs
+    3. leave empty; required names then block as ``unsourced_required_aspect``
+
+    Type / descriptive draft values that were seeded beat steps 1–2.
+    Gate-hard draft-vs-gate disagreements block as
+    ``aspect_draft_conflicts_gate:<Name>``. SELECTION_ONLY draft/working
+    values must whole-value-match every list entry or block as
+    ``aspect_value_not_allowed``.
+    """
+    required = {
+        str(name).strip()
+        for name in (required_names or [])
+        if str(name).strip()
     }
+    required_norms = {_normalize_aspect_key(name) for name in required}
+    allowed_by_norm = {
+        _normalize_aspect_key(str(name)): [
+            str(value) for value in values if str(value).strip()
+        ]
+        for name, values in (allowed_values_by_name or {}).items()
+        if str(name).strip()
+    }
+    modes_by_norm = {
+        _normalize_aspect_key(str(name)): str(mode or "").strip().upper()
+        for name, mode in (aspect_modes_by_name or {}).items()
+        if str(name).strip()
+    }
+    draft_by_norm = _mapping_by_norm_key(draft_aspects)
+    draft_present, draft_seeded = _seed_draft_aspects(
+        aspects,
+        draft_aspects,
+        source_text=source_text,
+        source_fields=source_fields,
+        allowed_by_norm=allowed_by_norm,
+        modes_by_norm=modes_by_norm,
+        sku=sku,
+        log=log,
+    )
     blockers: list[str] = []
+    gate_conflict_norms: set[str] = set()
+    not_allowed_norms: set[str] = set()
+
+    def _expected_for(name: str) -> str:
+        return _expected_value_for(name, expected_values_by_name)
+
+    def _draft_vals_for(name: str) -> list[str]:
+        _canon, raw = _lookup_norm(draft_by_norm, name)
+        return _aspect_values(raw)
+
+    def _has_blocker_for(name: str) -> bool:
+        key = _normalize_aspect_key(name)
+        return any(
+            ":" in item
+            and _normalize_aspect_key(item.split(":", 1)[-1].split("=", 1)[0]) == key
+            for item in blockers
+        )
+
+    def _block_autofill(name_key: str) -> bool:
+        return (
+            name_key in gate_conflict_norms
+            or name_key in not_allowed_norms
+            or name_key in draft_seeded
+            or name_key in draft_present
+        )
+
+    def _emit_not_allowed(name: str, bad: str) -> None:
+        name_key = _normalize_aspect_key(name)
+        if name_key in not_allowed_norms:
+            return
+        _emit(
+            log,
+            f"[ASPECT_BLOCK] {sku} {name}={bad} aspect_value_not_allowed".strip(),
+        )
+        blockers.append(f"aspect_value_not_allowed:{name}={bad}")
+        not_allowed_norms.add(name_key)
+
+    # Draft-present SELECTION_ONLY keys that never entered `aspects` (seed
+    # declined) must still be validated — otherwise illegal values vanish
+    # silently when the main loop only walks working aspect keys.
+    for key in list(draft_present):
+        if key in not_allowed_norms:
+            continue
+        canon, raw = draft_by_norm[key]
+        if is_skipped_aspect(canon) or is_gate_hard_aspect(canon):
+            continue
+        mode = _mode_for_name(modes_by_norm, canon)
+        allowed = _allowed_for_name(allowed_by_norm, canon)
+        if not _selection_only_mode(mode) or not allowed:
+            continue
+        draft_vals = _aspect_values(raw)
+        if not draft_vals:
+            continue
+        resolved, bad = _resolve_selection_only_values(draft_vals, allowed)
+        if resolved is None:
+            _emit_not_allowed(canon, bad or draft_vals[0])
+            if key in draft_seeded:
+                existing = _find_aspect_key(aspects, canon)
+                if existing:
+                    aspects.pop(existing, None)
 
     for name in list(aspects.keys()):
         if is_skipped_aspect(name):
             continue
 
+        name_key = _normalize_aspect_key(name)
         values = _aspect_values(aspects.get(name))
         if values and all(is_ebay_sentinel_value(value) for value in values):
             continue
 
-        expected = _expected_value_for(name, expected_values_by_name)
-        if expected:
+        expected = _expected_for(name)
+        draft_vals = _draft_vals_for(name)
+        draft_was_present = name_key in draft_present
+        draft_was_seeded = name_key in draft_seeded
+
+        if expected and is_gate_hard_aspect(name) and draft_was_present:
+            if _values_match_expected(draft_vals, expected):
+                aspects[name] = [expected]
+                _emit(log, f"[ASPECT_GATE] {sku} {name}={expected}".strip())
+                continue
+            _emit(
+                log,
+                f"[ASPECT_BLOCK] {sku} {name} draft={draft_vals[0] if draft_vals else ''} "
+                f"gate={expected} aspect_draft_conflicts_gate".strip(),
+            )
+            aspects.pop(name, None)
+            blockers.append(f"aspect_draft_conflicts_gate:{name}")
+            gate_conflict_norms.add(name_key)
+            continue
+
+        mode = _mode_for_name(modes_by_norm, name)
+        allowed = _allowed_for_name(allowed_by_norm, name)
+
+        # Always validate working SELECTION_ONLY values (draft or upstream).
+        if (
+            _selection_only_mode(mode)
+            and allowed
+            and values
+            and name_key not in not_allowed_norms
+            and not is_gate_hard_aspect(name)
+        ):
+            resolved, bad = _resolve_selection_only_values(values, allowed)
+            if resolved is None:
+                display = bad or values[0]
+                _emit_not_allowed(name, display)
+                # Invalid working value cannot ship; clear it. A good upstream
+                # that only failed because a draft was seeded on top was already
+                # handled in the draft-present pass when seed was declined.
+                aspects.pop(name, None)
+                continue
+            if resolved != values:
+                _emit(log, f"[ASPECT_NORM] {sku} {name}={resolved}".strip())
+            aspects[name] = resolved
+            values = resolved
+
+        if name_key in not_allowed_norms:
+            continue
+
+        # Non-empty descriptive draft field: never apply expected overwrite
+        # (seeded draft wins; unseedable draft keeps upstream). Still run
+        # source grounding below.
+        if expected and not draft_was_present:
             if _values_match_expected(values, expected):
                 continue
             aspects[name] = [expected]
             _emit(log, f"[ASPECT_GATE] {sku} {name}={expected}".strip())
+            continue
+
+        if expected and draft_was_seeded and _values_match_expected(values, expected):
             continue
 
         kept = _keep_sourced_values(name, values, source_text, source_fields)
@@ -780,13 +1229,19 @@ def guard_unsourced_aspects(
             _emit(log, f"[ASPECT_STRIP] {sku} {name}={display}".strip())
         aspects.pop(name, None)
 
-        if name not in required:
+        if name_key not in required_norms:
+            continue
+
+        # Descriptive draft was present: never guess a replacement after strip,
+        # whether or not the draft value was seedable over upstream.
+        if draft_was_present and not is_gate_hard_aspect(name):
+            blockers.append(f"unsourced_required_aspect:{name}")
             continue
 
         replacement = None if power_unsupported else find_source_matching_value(
             name,
             source_text,
-            allowed_map.get(name, []),
+            allowed,
             source_fields=source_fields,
         )
         if replacement:
@@ -798,10 +1253,30 @@ def guard_unsourced_aspects(
     for name in required:
         if is_skipped_aspect(name):
             continue
-        if first_aspect_text(aspects, name):
+        name_key = _normalize_aspect_key(name)
+        if _first_aspect_text_ci(aspects, name):
             continue
-        expected = _expected_value_for(name, expected_values_by_name)
+        if name_key in gate_conflict_norms or name_key in not_allowed_norms:
+            continue
+        if name_key in draft_seeded:
+            reason = f"unsourced_required_aspect:{name}"
+            if not _has_blocker_for(name):
+                blockers.append(reason)
+            continue
+        # Non-empty descriptive draft that was not seedable: do not auto-fill
+        # over the empty result with expected / source guesses when the draft
+        # field itself was the operator's value. Required still blocks.
+        if name_key in draft_present and not is_gate_hard_aspect(name):
+            reason = f"unsourced_required_aspect:{name}"
+            if not _has_blocker_for(name):
+                blockers.append(reason)
+            continue
+        expected = _expected_for(name)
         if expected:
+            if name_key in draft_present and is_gate_hard_aspect(name):
+                if not _has_blocker_for(name):
+                    blockers.append(f"aspect_draft_conflicts_gate:{name}")
+                continue
             aspects[name] = [expected]
             _emit(log, f"[ASPECT_GATE] {sku} {name}={expected}".strip())
             continue
@@ -813,7 +1288,7 @@ def guard_unsourced_aspects(
         replacement = find_source_matching_value(
             name,
             source_text,
-            allowed_map.get(name, []),
+            _allowed_for_name(allowed_by_norm, name),
             source_fields=source_fields,
         )
         if replacement:
@@ -825,8 +1300,11 @@ def guard_unsourced_aspects(
             blockers.append(reason)
 
     for name in (expected_values_by_name or {}):
-        expected = _expected_value_for(name, expected_values_by_name)
-        if expected and not first_aspect_text(aspects, name):
+        name_key = _normalize_aspect_key(name)
+        if _block_autofill(name_key):
+            continue
+        expected = _expected_for(name)
+        if expected and not _first_aspect_text_ci(aspects, name):
             aspects[name] = [expected]
             _emit(log, f"[ASPECT_GATE] {sku} {name}={expected}".strip())
 

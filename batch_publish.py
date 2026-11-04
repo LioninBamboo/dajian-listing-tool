@@ -66,6 +66,7 @@ from src.utils.publish_aspect_completion import complete_publish_aspects
 from src.utils.publish_source_aspect_guard import (
     build_giga_source_text,
     guard_unsourced_aspects,
+    merge_aspects_for_draft_persist,
     restore_sourced_aspects,
 )
 from src.utils.approved_category import (
@@ -1733,15 +1734,23 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
         if aspect.get("name")
     }
     allowed_values_by_name = {}
+    aspect_modes_by_name = {}
     for aspect in list(required_aspects_meta) + list(recommended_aspects_meta):
         aspect_name = aspect.get("name")
-        if aspect_name and aspect.get("allowed_values"):
+        if not aspect_name:
+            continue
+        if aspect.get("allowed_values"):
             allowed_values_by_name[aspect_name] = aspect["allowed_values"]
+        mode = aspect.get("mode") or aspect.get("aspectMode")
+        if mode:
+            aspect_modes_by_name[aspect_name] = mode
     aspect_blockers = guard_unsourced_aspects(
         completed_aspects,
         source_text=source_text,
         required_names=required_aspect_names_for_guard,
         allowed_values_by_name=allowed_values_by_name,
+        aspect_modes_by_name=aspect_modes_by_name,
+        draft_aspects=original_opt_aspects,
         expected_values_by_name=quality_gate_expected_aspects(
             title=title,
             description=description,
@@ -1848,6 +1857,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             blocker
             for blocker in publish_blockers
             if blocker.startswith("unsourced_required_aspect:")
+            or blocker.startswith("aspect_value_not_allowed:")
+            or blocker.startswith("aspect_draft_conflicts_gate:")
             or blocker in {
                 "high_insertion_fee",
                 "fee_preview_unavailable",
@@ -1864,6 +1875,8 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
     def _persist_prepared_after_success():
         # Persist only after fee gate + publish succeed so a later block
         # cannot write auto-filled aspects into the local draft.
+        # Non-empty draft fields stay as draft (or their allowed-list
+        # normalization); auto-fill is written only where draft was empty.
         if dry_run:
             return
         _persist_prepared_listing(
@@ -1872,7 +1885,10 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             category_name=category_name,
             title=title,
             description=description,
-            aspects=completed_aspects,
+            aspects=merge_aspects_for_draft_persist(
+                original_opt_aspects,
+                completed_aspects,
+            ),
             compatibility=compatibility if compatibility.mode != "not_applicable" else None,
         )
 

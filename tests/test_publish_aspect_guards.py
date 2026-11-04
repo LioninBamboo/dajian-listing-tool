@@ -13,9 +13,14 @@ from src.utils.publish_source_aspect_guard import (
     find_source_matching_value,
     guard_unsourced_aspects,
     is_material_aspect,
+    match_allowed_whole_value,
+    merge_aspects_for_draft_persist,
     restore_sourced_aspects,
     value_supported_by_source,
 )
+
+_TYPE_ALLOWED = ["Accent Chair", "Armchair", "Sofa", "Sectional"]
+_TYPE_SOURCE = "Modern Accent Chair with metal frame. Product Type: Accent Chair."
 
 
 def test_infer_upholstery_fabric_does_not_invent_a_specific_fiber():
@@ -166,6 +171,415 @@ def test_type_kept_when_it_matches_gate_expectation():
     )
     assert blockers == []
     assert aspects["Type"] == ["Storage Ottoman"]
+
+
+def test_match_allowed_whole_value_equality_not_substring():
+    assert match_allowed_whole_value("Accent Chair", _TYPE_ALLOWED) == "Accent Chair"
+    assert match_allowed_whole_value("  accent chair ", _TYPE_ALLOWED) == "Accent Chair"
+    assert match_allowed_whole_value("Accent", _TYPE_ALLOWED) is None
+    assert match_allowed_whole_value("Chair", _TYPE_ALLOWED) is None
+    assert match_allowed_whole_value("accent-chair", _TYPE_ALLOWED) == "Accent Chair"
+    assert match_allowed_whole_value("", _TYPE_ALLOWED) is None
+    assert match_allowed_whole_value(None, _TYPE_ALLOWED) is None
+    assert match_allowed_whole_value("Accent Chair", None) is None
+    assert match_allowed_whole_value("Accent Chair", []) is None
+
+
+def test_draft_type_accent_chair_wins_over_inferred_armchair():
+    aspects = {"Type": ["Armchair"], "Brand": ["AquaVerve"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=_TYPE_SOURCE,
+        required_names=["Type"],
+        allowed_values_by_name={"Type": _TYPE_ALLOWED},
+        aspect_modes_by_name={"Type": "SELECTION_ONLY"},
+        draft_aspects={"Type": ["Accent Chair"]},
+        expected_values_by_name={"Type": "Armchair"},
+    )
+    assert blockers == []
+    assert aspects["Type"] == ["Accent Chair"]
+
+
+def test_empty_draft_type_allows_expected_autofill_armchair():
+    aspects = {"Brand": ["AquaVerve"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=_TYPE_SOURCE,
+        required_names=["Type"],
+        allowed_values_by_name={"Type": _TYPE_ALLOWED},
+        aspect_modes_by_name={"Type": "SELECTION_ONLY"},
+        draft_aspects={"Brand": ["AquaVerve"]},
+        expected_values_by_name={"Type": "Armchair"},
+    )
+    assert blockers == []
+    assert aspects["Type"] == ["Armchair"]
+
+
+def test_draft_type_whitespace_case_normalizes_to_allowed_value():
+    aspects = {"Type": ["Armchair"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=_TYPE_SOURCE,
+        required_names=["Type"],
+        allowed_values_by_name={"Type": _TYPE_ALLOWED},
+        aspect_modes_by_name={"Type": "SELECTION_ONLY"},
+        draft_aspects={"Type": ["  accent chair "]},
+        expected_values_by_name={"Type": "Armchair"},
+    )
+    assert blockers == []
+    assert aspects["Type"] == ["Accent Chair"]
+
+
+def test_draft_type_prefix_does_not_match_allowed_and_blocks():
+    aspects = {"Type": ["Armchair"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=_TYPE_SOURCE,
+        required_names=["Type"],
+        allowed_values_by_name={"Type": _TYPE_ALLOWED},
+        aspect_modes_by_name={"Type": "SELECTION_ONLY"},
+        draft_aspects={"Type": ["Accent"]},
+        expected_values_by_name={"Type": "Accent Chair"},
+    )
+    assert blockers == ["aspect_value_not_allowed:Type=Accent"]
+    # Invalid draft does not wipe upstream; SKU still blocked.
+    assert aspects["Type"] == ["Armchair"]
+
+
+def test_free_text_draft_value_not_blocked_by_allowed_list():
+    """FREE_TEXT must not apply SELECTION_ONLY blocking; unsourced draft keeps upstream."""
+    aspects = {"Type": ["Accent Chair"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=_TYPE_SOURCE,
+        required_names=["Type"],
+        allowed_values_by_name={"Type": _TYPE_ALLOWED},
+        aspect_modes_by_name={"Type": "FREE_TEXT"},
+        draft_aspects={"Type": ["Accent Chair Custom"]},
+        expected_values_by_name={"Type": "Armchair"},
+    )
+    assert all(not item.startswith("aspect_value_not_allowed:") for item in blockers)
+    # Unsourced FREE_TEXT draft is not seeded over sourced upstream Accent Chair.
+    assert blockers == []
+    assert aspects["Type"] == ["Accent Chair"]
+
+
+def test_missing_required_type_still_blocks_when_no_draft_and_no_inference():
+    aspects = {"Brand": ["AquaVerve"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Plain household widget with no furniture type",
+        required_names=["Type"],
+        allowed_values_by_name={"Type": _TYPE_ALLOWED},
+        aspect_modes_by_name={"Type": "SELECTION_ONLY"},
+        draft_aspects={},
+        expected_values_by_name={},
+    )
+    assert blockers == ["unsourced_required_aspect:Type"]
+    assert "Type" not in aspects
+
+
+def test_draft_material_wins_over_inferred_wood():
+    material_allowed = ["MDF/Chipboard", "Solid Wood", "Wood", "Metal"]
+    source = build_giga_source_text(
+        title="Kitchen Island Cabinet",
+        description="MDF cabinet body with storage.",
+        attributes={"Material": "MDF/Chipboard"},
+    )
+    aspects = {"Material": ["Wood"], "Type": ["Kitchen Island"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=source,
+        required_names=["Material"],
+        allowed_values_by_name={"Material": material_allowed},
+        aspect_modes_by_name={"Material": "SELECTION_ONLY"},
+        draft_aspects={"Material": ["MDF/Chipboard"], "Type": ["Kitchen Island"]},
+        expected_values_by_name={},
+        source_fields={"Material": "MDF/Chipboard"},
+    )
+    assert blockers == []
+    assert aspects["Material"] == ["MDF/Chipboard"]
+
+
+def test_autofill_precedence_expected_before_source_match_when_draft_empty():
+    """Empty draft: expected_values win over find_source_matching_value."""
+    aspects = {}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=_TYPE_SOURCE,
+        required_names=["Type"],
+        allowed_values_by_name={"Type": _TYPE_ALLOWED},
+        aspect_modes_by_name={"Type": "SELECTION_ONLY"},
+        draft_aspects={},
+        expected_values_by_name={"Type": "Armchair"},
+    )
+    assert blockers == []
+    assert aspects["Type"] == ["Armchair"]
+
+
+def test_draft_owned_required_stripped_does_not_get_source_replacement():
+    aspects = {"Type": ["Apothecary Cabinet"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Bathroom Vanity with Sink silver glass",
+        required_names=["Type"],
+        allowed_values_by_name={"Type": ["Apothecary Cabinet", "Bathroom Vanity"]},
+        aspect_modes_by_name={"Type": "SELECTION_ONLY"},
+        draft_aspects={"Type": ["Apothecary Cabinet"]},
+        expected_values_by_name={"Type": "Bathroom Vanity"},
+    )
+    assert "unsourced_required_aspect:Type" in blockers
+    assert "Type" not in aspects
+
+
+def test_draft_vs_gate_conflict_blocks_number_of_pieces_and_assembly():
+    aspects = {
+        "Number of Pieces": ["7"],
+        "Assembly Required": ["No"],
+        "Type": ["Dining Set"],
+    }
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=(
+            "5 Piece Dining Table Set with 4 Chairs. Assembly Required: Yes."
+        ),
+        required_names=[],
+        draft_aspects={
+            "Number of Pieces": ["7"],
+            "Assembly Required": ["No"],
+            "Type": ["Dining Set"],
+        },
+        expected_values_by_name={
+            "Number of Pieces": "5",
+            "Assembly Required": "Yes",
+            "Type": "Dining Set",
+        },
+    )
+    assert "aspect_draft_conflicts_gate:Number of Pieces" in blockers
+    assert "aspect_draft_conflicts_gate:Assembly Required" in blockers
+    assert "Number of Pieces" not in aspects
+    assert "Assembly Required" not in aspects
+    # Type is descriptive and source-supported — not a silent gate swap target.
+    assert aspects.get("Type") == ["Dining Set"]
+
+
+def test_unsourced_optional_draft_keeps_sourced_upstream_color():
+    logs = []
+    aspects = {"Color": ["Black"], "Type": ["Cabinet"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Black wood storage cabinet",
+        required_names=[],
+        draft_aspects={"Color": ["Walnut"], "Type": ["Cabinet"]},
+        log=logs.append,
+    )
+    assert blockers == []
+    assert aspects["Color"] == ["Black"]
+    assert any("Walnut" in line and "ASPECT_DRAFT_SKIP" in line for line in logs)
+
+
+def test_unsourced_type_draft_does_not_drop_sourced_upstream_accent_chair():
+    aspects = {"Type": ["Accent Chair"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=_TYPE_SOURCE,
+        required_names=["Type"],
+        allowed_values_by_name={"Type": list(_TYPE_ALLOWED) + ["Apothecary Cabinet"]},
+        aspect_modes_by_name={"Type": "SELECTION_ONLY"},
+        draft_aspects={"Type": ["Apothecary Cabinet"]},
+        expected_values_by_name={"Type": "Armchair"},
+    )
+    assert blockers == []
+    assert aspects["Type"] == ["Accent Chair"]
+
+
+def test_multi_value_selection_only_keeps_all_allowed_values():
+    aspects = {"Style": ["Modern"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Modern Contemporary living room sofa",
+        required_names=[],
+        allowed_values_by_name={
+            "Style": ["Modern", "Contemporary", "Traditional"],
+        },
+        aspect_modes_by_name={"Style": "SELECTION_ONLY"},
+        draft_aspects={"Style": ["Modern", "Contemporary"]},
+    )
+    assert blockers == []
+    assert aspects["Style"] == ["Modern", "Contemporary"]
+
+
+def test_multi_value_selection_only_blocks_any_invalid_value():
+    aspects = {"Style": ["Modern"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Modern living room sofa",
+        required_names=[],
+        allowed_values_by_name={"Style": ["Modern", "Contemporary"]},
+        aspect_modes_by_name={"Style": "SELECTION_ONLY"},
+        draft_aspects={"Style": ["Modern", "Garage"]},
+    )
+    assert blockers == ["aspect_value_not_allowed:Style=Garage"]
+    # Upstream Modern kept — invalid draft must not wipe it.
+    assert aspects["Style"] == ["Modern"]
+
+
+def test_merge_aspects_for_draft_persist_compares_whole_lists():
+    merged = merge_aspects_for_draft_persist(
+        {"Style": [" modern ", "Contemporary"], "Brand": ["AquaVerve"]},
+        {
+            "Style": ["Modern", "Contemporary"],
+            "Brand": ["AquaVerve"],
+            "Color": ["Black"],
+        },
+    )
+    assert merged["Style"] == ["Modern", "Contemporary"]
+    assert merged["Color"] == ["Black"]
+
+
+def test_merge_aspects_persists_full_list_not_truncated_first_value():
+    merged = merge_aspects_for_draft_persist(
+        {"Room": ["Living Room", "Bedroom"]},
+        {"Room": ["Living Room"]},
+    )
+    # Draft whole list wins over a truncated completed form.
+    assert merged["Room"] == ["Living Room", "Bedroom"]
+
+
+def test_aspect_key_normalization_avoids_duplicate_type_keys():
+    aspects = {"type": ["Armchair"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=_TYPE_SOURCE,
+        required_names=["Type"],
+        allowed_values_by_name={"Type": _TYPE_ALLOWED},
+        aspect_modes_by_name={"Type": "SELECTION_ONLY"},
+        draft_aspects={"Type": ["Accent Chair"]},
+        expected_values_by_name={"Type": "Armchair"},
+    )
+    assert blockers == []
+    # Single logical Type remains (canonical key from upstream spelling).
+    type_keys = [key for key in aspects if key.casefold().strip() == "type"]
+    assert len(type_keys) == 1
+    assert aspects[type_keys[0]] == ["Accent Chair"]
+
+
+def test_motors_fitment_type_unsourced_draft_keeps_upstream_universal():
+    aspects = {
+        "Fitment Type": ["Universal"],
+        "Type": ["Cabin Air Filter"],
+    }
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Cabin Air Filter universal fit for most vehicles",
+        required_names=[],
+        draft_aspects={"Fitment Type": ["Bogus Fitment"]},
+    )
+    assert blockers == []
+    assert aspects["Fitment Type"] == ["Universal"]
+    assert aspects["Type"] == ["Cabin Air Filter"]
+
+
+def test_merge_aspects_for_draft_persist_keeps_draft_and_writes_empty_autofill():
+    original = {"Type": ["Accent Chair"], "Brand": ["AquaVerve"]}
+    completed = {
+        "Type": ["Armchair"],
+        "Brand": ["AquaVerve"],
+        "Color": ["Black"],
+        "Material": ["Wood"],
+    }
+    merged = merge_aspects_for_draft_persist(original, completed)
+    assert merged["Type"] == ["Accent Chair"]
+    assert merged["Brand"] == ["AquaVerve"]
+    assert merged["Color"] == ["Black"]
+    assert merged["Material"] == ["Wood"]
+
+
+def test_merge_aspects_for_draft_persist_keeps_normalized_draft_form():
+    merged = merge_aspects_for_draft_persist(
+        {"Type": ["  accent chair "]},
+        {"Type": ["Accent Chair"], "Room": ["Living Room"]},
+    )
+    assert merged["Type"] == ["Accent Chair"]
+    assert merged["Room"] == ["Living Room"]
+
+
+def test_unseeded_invalid_selection_only_draft_is_not_silently_dropped():
+    """Illegal draft values must block even when seed declines and aspects stay empty."""
+    aspects = {}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="x",
+        draft_aspects={"Features": ["Foo", "Armless"]},
+        allowed_values_by_name={
+            "Features": ["Armless", "Stackable", "Swivel"],
+        },
+        aspect_modes_by_name={"Features": "SELECTION_ONLY"},
+    )
+    assert blockers == ["aspect_value_not_allowed:Features=Foo"]
+    assert aspects == {}
+
+
+def test_sourced_but_not_allowed_draft_features_still_blocks():
+    aspects = {}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="armless foldable chair",
+        draft_aspects={"Features": ["Armless", "Foldable"]},
+        allowed_values_by_name={
+            "Features": ["Armless", "Stackable", "Swivel"],
+        },
+        aspect_modes_by_name={"Features": "SELECTION_ONLY"},
+    )
+    assert blockers == ["aspect_value_not_allowed:Features=Foldable"]
+    assert aspects == {}
+
+
+def test_required_invalid_selection_only_draft_uses_not_allowed_not_unsourced():
+    aspects = {}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="x",
+        required_names=["Features"],
+        draft_aspects={"Features": ["Foo"]},
+        allowed_values_by_name={
+            "Features": ["Armless", "Stackable", "Swivel"],
+        },
+        aspect_modes_by_name={"Features": "SELECTION_ONLY"},
+    )
+    assert blockers == ["aspect_value_not_allowed:Features=Foo"]
+    assert all(not item.startswith("unsourced_required_aspect:") for item in blockers)
+    assert aspects == {}
+
+
+def test_working_selection_only_aspects_without_draft_block_illegal_values():
+    aspects = {"Features": ["Armless", "Foldable"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="armless foldable chair",
+        allowed_values_by_name={
+            "Features": ["Armless", "Stackable", "Swivel"],
+        },
+        aspect_modes_by_name={"Features": "SELECTION_ONLY"},
+    )
+    assert blockers == ["aspect_value_not_allowed:Features=Foldable"]
+    assert "Features" not in aspects
+
+
+def test_merge_persist_uses_canonical_ebay_key_spelling():
+    merged = merge_aspects_for_draft_persist(
+        {" color": ["Black"]},
+        {"Color": ["Black"], "Room": ["Living Room"]},
+    )
+    assert "Color" in merged
+    assert " color" not in merged
+    assert merged["Color"] == ["Black"]
+    assert merged["Room"] == ["Living Room"]
+    color_keys = [
+        key for key in merged
+        if key.casefold().replace(" ", "") == "color"
+    ]
+    assert color_keys == ["Color"]
 
 
 def test_material_marble_still_stripped_when_source_lacks_it():
@@ -764,6 +1178,12 @@ def _stub_publish_common(monkeypatch, *, matcher_factory=None, qc_blockers=None)
             "fact_sheet_version": 4,
         },
     )
+    # Accent-chair / sofa category rows need a green prepublish verdict so
+    # draft-aspect assertions are not masked by leaf_family_conflict.
+    monkeypatch.setattr(
+        "src.utils.category_decision.prepublish_category_check",
+        lambda *args, **kwargs: type("V", (), {"ok": True, "reason": None, "suggestion": None})(),
+    )
     monkeypatch.setattr("src.services.ebay_auth.EbayOAuthService", _FakeOAuth)
     monkeypatch.setattr(
         "src.services.ebay_category_matcher.EbayCategoryMatcher",
@@ -893,6 +1313,169 @@ def test_publish_keeps_sourced_type_when_template_tries_to_overwrite(monkeypatch
 
     assert result["status"] == "dry_run"
     assert captured["aspects"]["Type"] == ["Bathroom Vanity"]
+
+
+def _accent_chair_product(**overrides):
+    product = _product(
+        sku="W5568P534216",
+        title="Modern Accent Chair Metal Frame Accent Chair",
+        description="Modern Accent Chair. Product Type: Accent Chair. Metal frame.",
+        attributes={
+            "Assembled Length (in.)": "28",
+            "Assembled Width (in.)": "30",
+            "Assembled Height (in.)": "32",
+            "Type": "Accent Chair",
+        },
+        optimization={
+            "title": "Modern Accent Chair Metal Frame Living Room Chair",
+            "description": _long_description(
+                "Modern Accent Chair with metal frame. Product Type: Accent Chair."
+            ),
+            "categoryId": "38208",
+            "categoryName": "Sofas, Armchairs & Couches",
+            "aspects": {
+                "Brand": ["AquaVerve"],
+                "Type": ["Accent Chair"],
+                "Item Length": ["28 in"],
+                "Item Width": ["30 in"],
+                "Item Height": ["32 in"],
+            },
+        },
+    )
+    product.update(overrides)
+    return product
+
+
+def _accent_chair_matcher(oauth, *, draft_type="Accent Chair", mode="SELECTION_ONLY"):
+    return _FakeCategoryMatcher(
+        oauth,
+        category_id="38208",
+        category_name="Sofas, Armchairs & Couches",
+        required=[{
+            "name": "Type",
+            "required": True,
+            "mode": mode,
+            "allowed_values": list(_TYPE_ALLOWED),
+        }],
+        returned_aspects={
+            "Brand": ["AquaVerve"],
+            "Type": ["Armchair"],
+            "Item Length": ["28 in"],
+            "Item Width": ["30 in"],
+            "Item Height": ["32 in"],
+        },
+    )
+
+
+def test_publish_dry_run_keeps_draft_accent_chair_over_inferred_armchair(monkeypatch):
+    captured = {}
+    real_guard = batch_publish.guard_unsourced_aspects
+
+    def _capture(aspects, **kwargs):
+        result = real_guard(aspects, **kwargs)
+        captured["aspects"] = dict(aspects)
+        captured["draft_aspects"] = dict(kwargs.get("draft_aspects") or {})
+        captured["modes"] = dict(kwargs.get("aspect_modes_by_name") or {})
+        return result
+
+    monkeypatch.setattr(batch_publish, "guard_unsourced_aspects", _capture)
+    monkeypatch.setattr(batch_publish, "_persist_prepared_listing", lambda **kwargs: None)
+    _stub_publish_common(monkeypatch, matcher_factory=_accent_chair_matcher)
+
+    result = batch_publish.publish_single_product(_accent_chair_product(), dry_run=True)
+
+    assert result["status"] == "dry_run"
+    assert captured["draft_aspects"]["Type"] == ["Accent Chair"]
+    assert captured["modes"]["Type"] == "SELECTION_ONLY"
+    assert captured["aspects"]["Type"] == ["Accent Chair"]
+
+
+def test_publish_blocks_selection_only_draft_prefix_not_nearest_guess(monkeypatch):
+    _stub_publish_common(monkeypatch, matcher_factory=_accent_chair_matcher)
+    monkeypatch.setattr(batch_publish, "_persist_prepared_listing", lambda **kwargs: None)
+    product = _accent_chair_product()
+    product["optimization"] = dict(product["optimization"])
+    product["optimization"]["aspects"] = dict(product["optimization"]["aspects"])
+    product["optimization"]["aspects"]["Type"] = ["Accent"]
+
+    result = batch_publish.publish_single_product(product, dry_run=True)
+
+    assert result["status"] == "error"
+    assert "aspect_value_not_allowed:Type=Accent" in result["message"]
+    assert result["copy_skip_reasons"] == ["aspect_value_not_allowed:Type=Accent"]
+
+
+def test_live_publish_persists_draft_type_not_inferred_armchair(monkeypatch):
+    persisted = []
+    published = []
+
+    class _FakeEbayClient:
+        def __init__(self, oauth, policy_manager):
+            self.sent_aspects = None
+
+        def _prepare_inventory_image_urls(self, sku, raw_images, max_images=24):
+            return ["https://i.ebayimg.com/images/g/AAA/s-l1600.jpg"]
+
+        def create_or_replace_inventory_item(self, sku, product):
+            self.sent_aspects = dict((product or {}).get("aspects") or {})
+            return {"status": "success"}
+
+        def create_offer(self, sku, price, category_id=None, listing_description=None, marketplace_id=None):
+            return {"offerId": "offer-accent"}
+
+        def get_offer(self, offer_id):
+            return {"status": "UNPUBLISHED"}
+
+        def get_listing_fees(self, offer_id):
+            return {
+                "feeSummaries": [{
+                    "fees": [{
+                        "feeType": "InsertionFee",
+                        "amount": {"value": "0.00", "currency": "USD"},
+                    }]
+                }]
+            }
+
+        def get_inventory_item(self, sku):
+            return {"product": {}}
+
+        def publish_offer(self, offer_id):
+            published.append(offer_id)
+            return {"listingId": "366783187245"}
+
+    clients = []
+
+    def _client_factory(oauth, policy_manager):
+        client = _FakeEbayClient(oauth, policy_manager)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        batch_publish,
+        "_persist_prepared_listing",
+        lambda **kwargs: persisted.append(kwargs),
+    )
+    monkeypatch.setattr(batch_publish, "_try_upload_video", lambda *args, **kwargs: (None, "ok"))
+    monkeypatch.setattr(batch_publish, "_sync_motors_compatibility", lambda *args, **kwargs: None)
+    monkeypatch.setattr(batch_publish, "resolve_publish_quantity", lambda sku, logger=None: 1)
+    monkeypatch.setattr(batch_publish, "update_product_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "batch_publish.verify_publish_readback",
+        lambda *a, **k: {"status": "ok", "passed": True, "issues": [], "transport_failures": []},
+    )
+    monkeypatch.setattr("batch_publish.build_publish_readback_expectation", lambda **k: {})
+    monkeypatch.setattr("src.clients.real_ebay_client.RealEbayClient", _client_factory)
+    _stub_publish_common(monkeypatch, matcher_factory=_accent_chair_matcher)
+
+    result = batch_publish.publish_single_product(_accent_chair_product(), dry_run=False)
+
+    assert result["status"] == "success"
+    assert published == ["offer-accent"]
+    assert clients[0].sent_aspects["Type"] == ["Accent Chair"]
+    assert persisted
+    assert persisted[0]["aspects"]["Type"] == ["Accent Chair"]
+    # Empty draft Color may be auto-filled later; Type must never become Armchair.
+    assert persisted[0]["aspects"]["Type"] != ["Armchair"]
 
 
 def test_publish_blocks_when_insertion_fee_is_at_least_20(monkeypatch):
