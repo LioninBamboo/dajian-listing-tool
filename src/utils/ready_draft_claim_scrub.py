@@ -40,9 +40,7 @@ from src.utils.claim_diff_engine import (
     leather_claim_kind,
 )
 from src.utils.claim_source_coverage import (
-    is_bare_leather_claim,
-    is_hard_claim_phrase,
-    join_source_fields,
+    FEATURE_CLAIM_TYPES,
     source_supports_claim_phrase,
 )
 from src.utils.claim_strip import claim_matches_text, claim_pattern, collapse_ws, normalize_entities
@@ -481,19 +479,17 @@ def collect_flagged_claims(
                 code=code,
             )
         )
-    source_blob = join_source_fields(
-        source_title,
-        source_description,
-        source_attributes,
-        source_specs,
-    )
     return [
         item
         for item in found
-        if item.claim_type not in {"semantic_feature", "unsupported_feature"}
-        or is_hard_claim_phrase(item.claim_text)
-        or is_bare_leather_claim(item.claim_text)
-        or not source_supports_claim_phrase(item.claim_text, source_blob)
+        if item.claim_type not in FEATURE_CLAIM_TYPES
+        or not source_supports_claim_phrase(
+            item.claim_text,
+            source_title,
+            source_description,
+            source_attributes,
+            source_specs,
+        )
     ]
 
 

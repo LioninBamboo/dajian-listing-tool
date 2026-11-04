@@ -7,6 +7,7 @@ audit_fix_ready_drafts, and READY-draft claim scrub.
 from __future__ import annotations
 
 import ast
+import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ import pytest
 from src.services import listing_qc
 from src.utils.claim_source_coverage import (
     CLAIM_PARAPHRASE_SYNONYMS,
+    FEATURE_CLAIM_TYPES,
     SOURCE_FIELD_PRECEDENCE,
     content_tokens,
     filter_supported_paraphrase_violations,
@@ -24,6 +26,7 @@ from src.utils.claim_source_coverage import (
     phrase_in_text,
     source_supports_claim_phrase,
 )
+from src.utils.ready_draft_claim_scrub import FlaggedClaim
 from src.utils.listing_fact_sheet import compare_fact_sheets
 from src.utils.ready_draft_claim_scrub import collect_flagged_claims, scrub_candidate
 
@@ -34,7 +37,7 @@ OWNER_SUPPORTED = [
     ("W2105P595057", "rubberized non-slip foot pads", "anti-slip rubber foot pads"),
     ("W2105P595057", "high-density rebound cushioning", "high-density rebound filling"),
     ("W2105P595057", "padded seat", "seat cushion with high-density resilient foam"),
-    ("W2105P595057", "barrelback", "Curved Barrel lounge back"),
+    ("W2105P595057", "barrelback", "Curved Barrel back"),
     ("W2105P595057", "compact footprint", "compact size"),
     ("W5870P523908", "one-seat", "Seats: 1 Seat"),
     ("W5870P523908", "shaped", "in Pumpkin Shape"),
@@ -214,14 +217,17 @@ def test_unknown_words_are_not_fuzzy_matched():
 
 
 def test_numeric_claims_stay_exact():
-    assert source_supports_claim_phrase("0 lb", "") is False
+    assert is_hard_claim_phrase("0 lb") is True
+    assert is_hard_claim_phrase("45 lbs") is True
+    assert is_hard_claim_phrase("Load capacity 45 lbs") is True
+    assert is_hard_claim_phrase("assemble in 30 mins") is True
+    assert is_hard_claim_phrase("12.5 lb") is True
+    assert source_supports_claim_phrase("0 lb", "0 lb hook") is False
     assert source_supports_claim_phrase("12.5 lb", "12 lb") is False
     assert source_supports_claim_phrase("4-6", "6") is False
     assert source_supports_claim_phrase("1/2", "1") is False
-    assert source_supports_claim_phrase("45 lbs", "45 lbs") is False or is_hard_claim_phrase("45 lbs")
-    assert is_hard_claim_phrase("Load capacity 45 lbs") is True
-    assert is_hard_claim_phrase("assemble in 30 mins") is True
-    assert source_supports_claim_phrase("Load capacity 45 lbs", "") is False
+    assert source_supports_claim_phrase("45 lbs", "45 lbs") is False
+    assert source_supports_claim_phrase("Load capacity 45 lbs", "Load capacity 45 lbs") is False
     assert source_supports_claim_phrase("4-6 person", "6 person") is False
 
 
@@ -250,7 +256,7 @@ def test_synonym_table_is_one_small_structure():
 
 
 def test_extra_edges_hyphen_plural_countertop_and_space_saving():
-    assert source_supports_claim_phrase("barrel-back", "Curved Barrel lounge back") is True
+    assert source_supports_claim_phrase("barrel-back", "Curved Barrel back") is True
     assert source_supports_claim_phrase("foot pads", "anti-slip rubber foot pad") is True
     assert source_supports_claim_phrase("countertop friendly", "Bamboo Countertop Rack") is True
     assert source_supports_claim_phrase("space-saving", "won't take up extra space") is True
@@ -388,12 +394,19 @@ def test_claim_scrub_still_flags_hard_absences():
         attributes={"Material": "MDF"},
     )
     flags = collect_flagged_claims(cand, source)
-    joined = " ".join(f"{item.claim_type} {item.claim_text}" for item in flags).lower()
-    assert "45" in joined or "solid wood" in joined or "leather" in joined
+    texts = [item.claim_text.lower() for item in flags]
+    types = [item.claim_type.lower() for item in flags]
+    assert any("45" in text for text in texts)
+    assert any("solid wood" in text for text in texts)
+    assert any(text == "leather" or "leather" in text for text in texts)
+    assert any(item == "semantic_capacity" for item in types)
+    assert any(item in {"material_upgrade", "semantic_material", "claim_material_upgrade"} for item in types)
     out, result = scrub_candidate(cand, source, sku="HARD")
     text = f"{out['title']} {out['description']}".lower()
-    assert result.status in {"cleaned", "needs_manual"}
-    assert "45" not in text or result.status == "needs_manual"
+    assert result.status == "cleaned"
+    assert "45" not in text
+    assert "solid wood" not in text
+    assert "leather" not in text or "pu leather" in text
 
 
 def test_filter_does_not_drop_material_or_capacity():
@@ -442,3 +455,168 @@ def test_coverage_module_has_no_writes():
     assert "publish_offer" not in names
     assert "write_text" not in names
     assert "open(" not in source
+
+
+def test_number_words_are_hard_before_digit_conversion():
+    assert is_hard_claim_phrase("two-seat sofa") is True
+    assert is_hard_claim_phrase("six-person") is True
+    assert is_hard_claim_phrase("four-tier") is True
+    assert is_hard_claim_phrase("one-seat") is True
+    assert is_hard_claim_phrase("single seater") is True
+    assert is_hard_claim_phrase("padded seat") is False
+    assert source_supports_claim_phrase(
+        "two-seat sofa",
+        "Seats: 1 Seat. Includes 2 pillows.",
+    ) is False
+    assert source_supports_claim_phrase("six-person", "4-6 person") is False
+    assert source_supports_claim_phrase("four-tier", "3 tier shelf, 4 hooks") is False
+    assert source_supports_claim_phrase("one-seat", "Seats: 1 Seat") is True
+
+
+def test_negation_and_sold_separately_are_not_support():
+    assert source_supports_claim_phrase(
+        "removable washable cover",
+        "cover is not removable and not washable",
+    ) is False
+    assert source_supports_claim_phrase(
+        "rechargeable battery",
+        "battery not rechargeable",
+    ) is False
+    assert source_supports_claim_phrase("led lights", "no led lights") is False
+    assert source_supports_claim_phrase("padded seat", "cushion not included") is False
+    assert source_supports_claim_phrase("padded seat", "cushion sold separately") is False
+    assert source_supports_claim_phrase("arms", "armless chair") is False
+    assert source_supports_claim_phrase("non-slip", "anti-slip rubber pads") is True
+
+
+def test_compounds_join_adjacent_source_tokens_only():
+    assert source_supports_claim_phrase("outdoor", "door handle and pull out tray") is False
+    assert source_supports_claim_phrase(
+        "weatherproof",
+        "weather cover, proof of purchase",
+    ) is False
+    assert source_supports_claim_phrase("headrest", "head cushion and a foot rest") is False
+    assert source_supports_claim_phrase("tabletop", "table lamp, laptop stand") is False
+    assert source_supports_claim_phrase("cupholder", "cup size, card holder") is False
+    assert source_supports_claim_phrase("barrelback", "Curved Barrel back") is True
+
+
+def test_multiword_claims_stay_inside_one_source_segment():
+    assert source_supports_claim_phrase(
+        "adjustable backrest",
+        "adjustable feet, padded backrest",
+    ) is False
+    assert source_supports_claim_phrase(
+        "with arms",
+        "armless chair, arms not included",
+    ) is False
+    assert source_supports_claim_phrase(
+        "rust-resistant",
+        "water-resistant finish prevents rust",
+    ) is False
+
+
+def test_hard_materials_reject_faux_look_grain_qualifiers():
+    assert is_hard_claim_phrase("wood frame") is True
+    assert is_hard_claim_phrase("marble top") is True
+    assert is_hard_claim_phrase("velvet upholstered") is True
+    assert is_hard_claim_phrase("weatherproof") is True
+    assert is_hard_claim_phrase("uv-resistant") is True
+    assert is_hard_claim_phrase("rechargeable battery") is True
+    assert source_supports_claim_phrase("wood frame", "wood grain MDF frame") is False
+    assert source_supports_claim_phrase("marble top", "faux marble top") is False
+    assert source_supports_claim_phrase("velvet upholstered", "velvet-look fabric") is False
+    assert source_supports_claim_phrase("iron frame", "iron-look finish") is False
+    assert source_supports_claim_phrase("stone top", "stone-style laminate") is False
+
+
+def test_filling_does_not_cover_padded_seat():
+    padded_group = next(group for group in CLAIM_PARAPHRASE_SYNONYMS if "padded" in group)
+    assert "filling" not in padded_group
+    assert source_supports_claim_phrase(
+        "padded seat",
+        "easy filling water tank seat",
+    ) is False
+    assert source_supports_claim_phrase(
+        "padded seat",
+        "seat cushion with high-density resilient foam",
+    ) is True
+    assert source_supports_claim_phrase(
+        "high-density rebound cushioning",
+        "high-density rebound filling",
+    ) is True
+
+
+def test_empty_claim_type_is_never_relaxed():
+    kept = filter_supported_paraphrase_violations(
+        [{"claim_type": "", "claim_text": "padded seat", "severity": "MEDIUM"}],
+        "seat cushion with high-density resilient foam",
+    )
+    assert kept == [{"claim_type": "", "claim_text": "padded seat", "severity": "MEDIUM"}]
+    dropped = filter_supported_paraphrase_violations(
+        [{"claim_type": "semantic_feature", "claim_text": "padded seat", "severity": "MEDIUM"}],
+        "seat cushion with high-density resilient foam",
+    )
+    assert dropped == []
+
+
+def test_claim_unsupported_feature_matches_unsupported_feature():
+    assert "claim_unsupported_feature" in FEATURE_CLAIM_TYPES
+    assert "unsupported_feature" in FEATURE_CLAIM_TYPES
+    source = "seat cushion with high-density resilient foam"
+    for claim_type in ("unsupported_feature", "claim_unsupported_feature", "semantic_feature"):
+        kept = filter_supported_paraphrase_violations(
+            [{"claim_type": claim_type, "claim_text": "padded seat"}],
+            source,
+        )
+        assert kept == [], claim_type
+        flagged = filter_supported_paraphrase_violations(
+            [{"claim_type": claim_type, "claim_text": "led lights"}],
+            "no led lights",
+        )
+        assert flagged == [{"claim_type": claim_type, "claim_text": "led lights"}], claim_type
+    item = FlaggedClaim(
+        claim_type="claim_unsupported_feature",
+        claim_text="padded seat",
+        source_evidence="NOT_FOUND",
+        location="title",
+        detector="claim_diff",
+        severity="HIGH",
+    )
+    assert item.claim_type in FEATURE_CLAIM_TYPES
+    assert source_supports_claim_phrase(item.claim_text, source) is True
+
+
+def test_large_source_and_many_claims_finish_under_one_second():
+    source = " ".join(f"widget{index:04d}" for index in range(1500))
+    violations = [
+        {"claim_type": "semantic_feature", "claim_text": f"mystery feature {index}"}
+        for index in range(20)
+    ]
+    start = time.perf_counter()
+    kept = filter_supported_paraphrase_violations(violations, source)
+    elapsed = time.perf_counter() - start
+    assert kept == violations
+    assert elapsed < 1.0
+
+
+def test_review_probes_also_flag_in_factsheet():
+    probes = [
+        ("two-seat sofa", "Seats: 1 Seat. Includes 2 pillows."),
+        ("six-person", "4-6 person"),
+        ("four-tier", "3 tier shelf, 4 hooks"),
+        ("removable washable cover", "cover is not removable and not washable"),
+        ("rechargeable battery", "battery not rechargeable"),
+        ("led lights", "no led lights"),
+        ("padded seat", "cushion not included"),
+        ("weatherproof", "weather cover, proof of purchase"),
+        ("adjustable backrest", "adjustable feet, padded backrest"),
+        ("with arms", "armless chair, arms not included"),
+        ("rust-resistant", "water-resistant finish prevents rust"),
+        ("wood frame", "wood grain MDF frame"),
+        ("marble top", "faux marble top"),
+        ("velvet upholstered", "velvet-look fabric"),
+        ("padded seat", "easy filling water tank seat"),
+    ]
+    for claim, source in probes:
+        assert _feature_violations(claim, source), (claim, source)
