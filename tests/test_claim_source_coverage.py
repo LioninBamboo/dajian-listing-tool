@@ -548,6 +548,35 @@ def test_noun_before_bare_range_emits_range_not_low_end():
     assert _extract_counts("Tier: 2/3") == [("2-3", "tier")]
 
 
+@pytest.mark.parametrize(
+    "claim,source",
+    [
+        ("two-seat", "Seat: 2.5 inch thick cushion"),
+        ("two-tier", "Tier 2.5 ft tall"),
+        ("one-piece", "Pieces 1.2 lbs each"),
+        ("1 seat", "Seats: 1.5"),
+        ("two-seat", "Seat 2.0"),
+        ("four-seat", "Seats: 4.0"),
+    ],
+)
+def test_decimal_measurements_are_not_integer_counts(claim, source):
+    assert source_supports_claim_phrase(claim, source) is False
+    assert _extract_counts(source) == []
+
+
+@pytest.mark.parametrize(
+    "claim,source",
+    [
+        ("four-seat", "Seats: 4"),
+        ("one-seat", "Seats: 1 Seat"),
+        ("two-seat", "Seats: 2 Seats"),
+        ("swivel seat", "Swivel seat. Cushion not included."),
+    ],
+)
+def test_integer_counts_and_sentence_periods_still_work(claim, source):
+    assert source_supports_claim_phrase(claim, source) is True
+
+
 def test_negation_and_sold_separately_are_not_support():
     assert source_supports_claim_phrase(
         "removable washable cover",

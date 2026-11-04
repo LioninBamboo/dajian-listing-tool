@@ -241,7 +241,8 @@ _LEATHER_PREFIX_RE = re.compile(
 )
 
 _HTML_RE = re.compile(r"<[^>]+>")
-_SEGMENT_SPLIT_RE = re.compile(r"[.!?|;,\n\r]+")
+# Split sentences/fields, but never on a '.' that sits between digits (2.5).
+_SEGMENT_SPLIT_RE = re.compile(r"(?:(?<!\d)\.|\.(?!\d)|[!?|;,\n\r])+")
 _FRACTION_OR_NUMBER_RE = re.compile(
     r"\d+(?:\.\d+)?(?:\s*/\s*\d+(?:\.\d+)?)?",
 )
@@ -521,11 +522,12 @@ def _suffix_has_trailing_negation(tokens: list[str], start: int) -> bool:
 
 
 def _is_count_number(token: str) -> bool:
-    return bool(token and _FRACTION_OR_NUMBER_RE.fullmatch(token))
+    """Whole integers only. Decimals (2.5, 1.0, 4.0) are measurements."""
+    return bool(token and re.fullmatch(r"\d+", token))
 
 
 def _is_range_endpoint(token: str) -> bool:
-    return bool(token and re.fullmatch(r"\d+(?:\.\d+)?", token))
+    return _is_count_number(token)
 
 
 def _slash_range_token(token: str) -> str | None:
