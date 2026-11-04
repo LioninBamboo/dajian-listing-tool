@@ -17,6 +17,7 @@ from src.utils.claim_source_coverage import (
     CLAIM_PARAPHRASE_SYNONYMS,
     FEATURE_CLAIM_TYPES,
     SOURCE_FIELD_PRECEDENCE,
+    _extract_counts,
     content_tokens,
     filter_supported_paraphrase_violations,
     is_bare_leather_claim,
@@ -473,6 +474,32 @@ def test_number_words_are_hard_before_digit_conversion():
     assert source_supports_claim_phrase("one-seat", "Seats: 1 Seat") is True
 
 
+@pytest.mark.parametrize(
+    "claim,source",
+    [
+        ("six-person", "Seats 4-6 person"),
+        ("six-person", "Seats: 4-6 person"),
+        ("six-person", "Seats 4-6 people"),
+        ("six-person", "Seats 4 to 6 person"),
+        ("four-tier", "Shelf tier 3-4 tiers"),
+    ],
+)
+def test_range_does_not_support_exact_count_claim(claim, source):
+    assert source_supports_claim_phrase(claim, source) is False
+    assert ("6", "person") not in _extract_counts(source)
+    assert ("4", "seat") not in _extract_counts(source)
+    assert ("4", "tier") not in _extract_counts(source)
+
+
+def test_extract_counts_binds_range_before_preceding_noun():
+    assert _extract_counts("Seats 4-6 person") == [("4-6", "person")]
+    assert _extract_counts("Seats: 4-6 person") == [("4-6", "person")]
+    assert _extract_counts("Seats 4-6 people") == [("4-6", "person")]
+    assert _extract_counts("Seats 4 to 6 person") == [("4-6", "person")]
+    assert _extract_counts("Shelf tier 3-4 tiers") == [("3-4", "tier")]
+    assert _extract_counts("Seats: 1 Seat") == [("1", "seat")]
+
+
 def test_negation_and_sold_separately_are_not_support():
     assert source_supports_claim_phrase(
         "removable washable cover",
@@ -487,6 +514,32 @@ def test_negation_and_sold_separately_are_not_support():
     assert source_supports_claim_phrase("padded seat", "cushion sold separately") is False
     assert source_supports_claim_phrase("arms", "armless chair") is False
     assert source_supports_claim_phrase("non-slip", "anti-slip rubber pads") is True
+
+
+@pytest.mark.parametrize(
+    "claim,source",
+    [
+        ("led lights", "LED lights: none"),
+        ("led lights", "LED lights: N/A"),
+        ("removable cover", "Removable cover is not available"),
+        ("anti-slip", "anti-slip pads not included"),
+        ("anti-slip", "anti-slip mat sold separately"),
+        ("padded seat", "padded seat cushion not included"),
+        ("swivel", "swivels are sold separately"),
+        ("swivel", "swivel base not included"),
+    ],
+)
+def test_trailing_negation_makes_phrase_unsupported(claim, source):
+    assert source_supports_claim_phrase(claim, source) is False
+
+
+def test_trailing_negation_does_not_break_owner_positives():
+    assert source_supports_claim_phrase("non-slip", "anti-slip rubber pads") is True
+    assert source_supports_claim_phrase(
+        "padded seat",
+        "seat cushion with high-density resilient foam",
+    ) is True
+    assert source_supports_claim_phrase("one-seat", "Seats: 1 Seat") is True
 
 
 def test_compounds_join_adjacent_source_tokens_only():
@@ -617,6 +670,15 @@ def test_review_probes_also_flag_in_factsheet():
         ("marble top", "faux marble top"),
         ("velvet upholstered", "velvet-look fabric"),
         ("padded seat", "easy filling water tank seat"),
+        ("six-person", "Seats 4-6 person"),
+        ("six-person", "Seats 4 to 6 person"),
+        ("four-tier", "Shelf tier 3-4 tiers"),
+        ("led lights", "LED lights: none"),
+        ("led lights", "LED lights: N/A"),
+        ("removable cover", "Removable cover is not available"),
+        ("anti-slip", "anti-slip pads not included"),
+        ("padded seat", "padded seat cushion not included"),
+        ("swivel", "swivel base not included"),
     ]
     for claim, source in probes:
         assert _feature_violations(claim, source), (claim, source)

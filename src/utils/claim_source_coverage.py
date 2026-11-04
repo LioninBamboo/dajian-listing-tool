@@ -163,6 +163,11 @@ _MARKETING_ADJECTIVES = frozenset({
 })
 
 _NEGATION_WORDS = frozenset({"not", "no", "without", "except", "excluding"})
+_TRAILING_ABSENT = frozenset({"none", "na"})
+_TRAILING_NOT_WORDS = frozenset({
+    "included", "include", "available", "required", "removable",
+    "washable", "rechargeable",
+})
 _QUALIFIER_WORDS = frozenset({
     "faux", "look", "grain", "imitation", "style", "fake", "artificial",
 })
@@ -249,7 +254,7 @@ class _SegmentIndex:
     compounds: set[str]
     negated: set[int]
     qualified: set[int]
-    counts: list[tuple[str, str]]
+    counts: list[tuple[str, str, int]]
 
 
 @dataclass
@@ -279,6 +284,7 @@ def normalize_for_coverage(text: Any) -> str:
     raw = raw.replace("can't", "cannot")
     raw = raw.casefold()
     raw = raw.replace("'", "")
+    raw = re.sub(r"\bn\s*/\s*a\b", " na ", raw)
     raw = re.sub(r"[–—_/]+", "-", raw)
     raw = re.sub(r"[^a-z0-9./-]+", " ", raw)
     raw = re.sub(r"\s+", " ", raw).strip()
@@ -489,26 +495,75 @@ def _index_source(*fields: Any) -> _SourceIndex:
     return _SourceIndex(segments=[item for item in segments if item.tokens])
 
 
-def _counts_from_tokens(tokens: list[str]) -> list[tuple[str, str]]:
-    """Exact (number_or_range, count_noun) pairs. Ranges stay '4-6', not 6."""
-    found: list[tuple[str, str]] = []
+def _suffix_has_trailing_negation(tokens: list[str], start: int) -> bool:
+    """True when the match is undone by later absence wording in the segment."""
+    suffix = tokens[start:]
+    if not suffix:
+        return False
+    if any(token in _TRAILING_ABSENT for token in suffix):
+        return True
+    length = len(suffix)
+    for index, token in enumerate(suffix):
+        nxt = suffix[index + 1] if index + 1 < length else ""
+        if token == "sold" and nxt == "separately":
+            return True
+        if token != "not" or not nxt or nxt in _STOPWORDS or nxt in _NEGATION_WORDS:
+            continue
+        if nxt in _TRAILING_NOT_WORDS or nxt not in _MARKETING_ADJECTIVES:
+            return True
+    return False
+
+
+def _is_count_number(token: str) -> bool:
+    return bool(token and _FRACTION_OR_NUMBER_RE.fullmatch(token))
+
+
+def _range_at(tokens: list[str], index: int) -> tuple[int, str, str] | None:
+    """NUM NUM NOUN or NUM to NUM NOUN. The range string stays '4-6', not 6."""
+    if index >= len(tokens) or not _is_count_number(tokens[index]):
+        return None
+    low = tokens[index]
+    nxt = tokens[index + 1] if index + 1 < len(tokens) else ""
+    nxt2 = tokens[index + 2] if index + 2 < len(tokens) else ""
+    nxt3 = tokens[index + 3] if index + 3 < len(tokens) else ""
+    if _is_count_number(nxt):
+        noun = COUNT_NOUNS.get(nxt2)
+        if noun:
+            return (index + 3, f"{low}-{nxt}", noun)
+        return None
+    if nxt == "to" and _is_count_number(nxt2):
+        noun = COUNT_NOUNS.get(nxt3)
+        if noun:
+            return (index + 4, f"{low}-{nxt2}", noun)
+    return None
+
+
+def _counts_from_tokens(tokens: list[str]) -> list[tuple[str, str, int]]:
+    """Exact (number_or_range, count_noun, end) triples.
+
+    Ranges are parsed before noun-before-number binding so 'Seats 4-6
+    person' stays ('4-6', 'person'), never ('4', 'seat') plus ('6',
+    'person'). A range never becomes an exact endpoint count.
+    """
+    found: list[tuple[str, str, int]] = []
     index = 0
     while index < len(tokens):
+        ranged = _range_at(tokens, index)
+        if ranged:
+            end, number, noun = ranged
+            found.append((number, noun, end))
+            index = end
+            continue
         token = tokens[index]
         nxt = tokens[index + 1] if index + 1 < len(tokens) else ""
-        nxt2 = tokens[index + 2] if index + 2 < len(tokens) else ""
         noun = COUNT_NOUNS.get(nxt)
-        if _FRACTION_OR_NUMBER_RE.fullmatch(token) and _FRACTION_OR_NUMBER_RE.fullmatch(nxt) and COUNT_NOUNS.get(nxt2):
-            found.append((f"{token}-{nxt}", COUNT_NOUNS[nxt2]))
-            index += 3
-            continue
-        if _FRACTION_OR_NUMBER_RE.fullmatch(token) and noun:
-            found.append((token, noun))
+        if _is_count_number(token) and noun:
+            found.append((token, noun, index + 2))
             index += 2
             continue
         noun = COUNT_NOUNS.get(token)
-        if noun and _FRACTION_OR_NUMBER_RE.fullmatch(nxt):
-            found.append((nxt, noun))
+        if noun and _is_count_number(nxt) and _range_at(tokens, index + 1) is None:
+            found.append((nxt, noun, index + 2))
             index += 2
             continue
         index += 1
@@ -516,14 +571,27 @@ def _counts_from_tokens(tokens: list[str]) -> list[tuple[str, str]]:
 
 
 def _extract_counts(text: Any) -> list[tuple[str, str]]:
-    return _counts_from_tokens(_lex_tokens(text, convert_numbers=True))
+    return [(number, noun) for number, noun, _end in _counts_from_tokens(_lex_tokens(text, convert_numbers=True))]
 
 
 def _exact_count_supported(claim_counts: list[tuple[str, str]], index: _SourceIndex) -> bool:
     if not claim_counts:
         return False
-    for pair in claim_counts:
-        if not any(pair in segment.counts for segment in index.segments):
+    for number, noun in claim_counts:
+        matched = False
+        for segment in index.segments:
+            for src_number, src_noun, end in segment.counts:
+                if (src_number, src_noun) != (number, noun):
+                    continue
+                if "-" in src_number and "-" not in number:
+                    continue
+                if _suffix_has_trailing_negation(segment.tokens, end):
+                    continue
+                matched = True
+                break
+            if matched:
+                break
+        if not matched:
             return False
     return True
 
@@ -543,14 +611,24 @@ def _phrase_in_segment(
         for index, variants in enumerate(segment.variants):
             if honor_negation and index in segment.negated:
                 continue
-            if target & variants:
+            if target & variants and not _suffix_has_trailing_negation(segment.tokens, index + 1):
                 return True
-        return bool(target & segment.compounds)
+        if not (target & segment.compounds):
+            return False
+        for index in range(len(segment.tokens) - 1):
+            if honor_negation and (index in segment.negated or index + 1 in segment.negated):
+                continue
+            joined = segment.tokens[index] + segment.tokens[index + 1]
+            if joined in target or token_variants(joined) & target:
+                if not _suffix_has_trailing_negation(segment.tokens, index + 2):
+                    return True
+        return False
     for start in range(len(segment.tokens) - n + 1):
         if honor_negation and any(start + offset in segment.negated for offset in range(n)):
             continue
         if all(phrase_vars[offset] & segment.variants[start + offset] for offset in range(n)):
-            return True
+            if not _suffix_has_trailing_negation(segment.tokens, start + n):
+                return True
     return False
 
 
@@ -572,7 +650,7 @@ def _token_in_segment(token: str, segment: _SegmentIndex) -> bool:
     for index, item_vars in enumerate(segment.variants):
         if not _usable_position(segment, index):
             continue
-        if variants & item_vars:
+        if variants & item_vars and not _suffix_has_trailing_negation(segment.tokens, index + 1):
             return True
     if not (variants & segment.compounds):
         return False
@@ -581,18 +659,21 @@ def _token_in_segment(token: str, segment: _SegmentIndex) -> bool:
             continue
         joined = segment.tokens[index] + segment.tokens[index + 1]
         if joined in variants or token_variants(joined) & variants:
-            return True
+            if not _suffix_has_trailing_negation(segment.tokens, index + 2):
+                return True
     return False
 
 
-def _window_covers(claim_tokens: list[str], segment: _SegmentIndex, start: int, end: int) -> bool:
+def _window_covers(claim_tokens: list[str], segment: _SegmentIndex, start: int, end: int) -> int | None:
     pos = start
+    last_end = start
     for token in claim_tokens:
         variants = token_variants(token)
         found = False
         while pos < end:
             if _usable_position(segment, pos) and variants & segment.variants[pos]:
                 pos += 1
+                last_end = pos
                 found = True
                 break
             if (
@@ -603,12 +684,13 @@ def _window_covers(claim_tokens: list[str], segment: _SegmentIndex, start: int, 
                 joined = segment.tokens[pos] + segment.tokens[pos + 1]
                 if joined in variants or token_variants(joined) & variants:
                     pos += 2
+                    last_end = pos
                     found = True
                     break
             pos += 1
         if not found:
-            return False
-    return True
+            return None
+    return last_end
 
 
 def _segment_covers_tokens(claim_tokens: list[str], segment: _SegmentIndex) -> bool:
@@ -621,7 +703,8 @@ def _segment_covers_tokens(claim_tokens: list[str], segment: _SegmentIndex) -> b
         end = min(len(segment.tokens), start + window)
         if end - start < len(claim_tokens):
             continue
-        if _window_covers(claim_tokens, segment, start, end):
+        hit = _window_covers(claim_tokens, segment, start, end)
+        if hit is not None and not _suffix_has_trailing_negation(segment.tokens, hit):
             return True
     return False
 
