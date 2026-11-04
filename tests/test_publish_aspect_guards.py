@@ -504,6 +504,84 @@ def test_merge_aspects_for_draft_persist_keeps_normalized_draft_form():
     assert merged["Room"] == ["Living Room"]
 
 
+def test_unseeded_invalid_selection_only_draft_is_not_silently_dropped():
+    """Illegal draft values must block even when seed declines and aspects stay empty."""
+    aspects = {}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="x",
+        draft_aspects={"Features": ["Foo", "Armless"]},
+        allowed_values_by_name={
+            "Features": ["Armless", "Stackable", "Swivel"],
+        },
+        aspect_modes_by_name={"Features": "SELECTION_ONLY"},
+    )
+    assert blockers == ["aspect_value_not_allowed:Features=Foo"]
+    assert aspects == {}
+
+
+def test_sourced_but_not_allowed_draft_features_still_blocks():
+    aspects = {}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="armless foldable chair",
+        draft_aspects={"Features": ["Armless", "Foldable"]},
+        allowed_values_by_name={
+            "Features": ["Armless", "Stackable", "Swivel"],
+        },
+        aspect_modes_by_name={"Features": "SELECTION_ONLY"},
+    )
+    assert blockers == ["aspect_value_not_allowed:Features=Foldable"]
+    assert aspects == {}
+
+
+def test_required_invalid_selection_only_draft_uses_not_allowed_not_unsourced():
+    aspects = {}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="x",
+        required_names=["Features"],
+        draft_aspects={"Features": ["Foo"]},
+        allowed_values_by_name={
+            "Features": ["Armless", "Stackable", "Swivel"],
+        },
+        aspect_modes_by_name={"Features": "SELECTION_ONLY"},
+    )
+    assert blockers == ["aspect_value_not_allowed:Features=Foo"]
+    assert all(not item.startswith("unsourced_required_aspect:") for item in blockers)
+    assert aspects == {}
+
+
+def test_working_selection_only_aspects_without_draft_block_illegal_values():
+    aspects = {"Features": ["Armless", "Foldable"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="armless foldable chair",
+        allowed_values_by_name={
+            "Features": ["Armless", "Stackable", "Swivel"],
+        },
+        aspect_modes_by_name={"Features": "SELECTION_ONLY"},
+    )
+    assert blockers == ["aspect_value_not_allowed:Features=Foldable"]
+    assert "Features" not in aspects
+
+
+def test_merge_persist_uses_canonical_ebay_key_spelling():
+    merged = merge_aspects_for_draft_persist(
+        {" color": ["Black"]},
+        {"Color": ["Black"], "Room": ["Living Room"]},
+    )
+    assert "Color" in merged
+    assert " color" not in merged
+    assert merged["Color"] == ["Black"]
+    assert merged["Room"] == ["Living Room"]
+    color_keys = [
+        key for key in merged
+        if key.casefold().replace(" ", "") == "color"
+    ]
+    assert color_keys == ["Color"]
+
+
 def test_material_marble_still_stripped_when_source_lacks_it():
     aspects = {"Material": ["Marble"], "Type": ["Storage Ottoman"]}
     blockers = guard_unsourced_aspects(

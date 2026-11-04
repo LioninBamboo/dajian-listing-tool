@@ -559,11 +559,15 @@ def merge_aspects_for_draft_persist(
 
     Non-empty draft values are kept (preferring the completed form when the
     whole value list is only a whitespace/case normalization of the draft).
-    Auto-filled keys that were missing/empty in the draft are written through.
+    When draft and completed keys match after normalization, the completed /
+    upstream eBay spelling is used as the persisted key (no ``' color'`` /
+    ``Color`` duplicates). Auto-filled keys that were missing/empty in the
+    draft are written through.
     """
     original = original or {}
     completed = completed or {}
     completed_by_norm = _mapping_by_norm_key(completed)
+    original_by_norm = _mapping_by_norm_key(original)
     merged: dict[str, list[str]] = {}
     merged_norms: set[str] = set()
 
@@ -572,12 +576,14 @@ def merge_aspects_for_draft_persist(
         if not draft_vals:
             continue
         key = _normalize_aspect_key(name)
-        _canon, done_raw = _lookup_norm(completed_by_norm, name)
+        completed_canon, done_raw = _lookup_norm(completed_by_norm, name)
         done_vals = _aspect_values(done_raw)
+        # Prefer the upstream/eBay canonical spelling when one matches.
+        out_name = str(completed_canon or name).strip() or str(name)
         if done_vals and _values_norm_list_equal(done_vals, draft_vals):
-            merged[str(name)] = done_vals
+            merged[out_name] = done_vals
         else:
-            merged[str(name)] = list(draft_vals)
+            merged[out_name] = list(draft_vals)
         merged_norms.add(key)
 
     for name, raw in completed.items():
@@ -587,7 +593,7 @@ def merge_aspects_for_draft_persist(
         done_vals = _aspect_values(raw)
         if not done_vals:
             continue
-        _canon, orig_raw = _lookup_norm(_mapping_by_norm_key(original), name)
+        _orig_canon, orig_raw = _lookup_norm(original_by_norm, name)
         if _aspect_values(orig_raw):
             continue
         merged[str(name)] = done_vals
@@ -1098,6 +1104,41 @@ def guard_unsourced_aspects(
             or name_key in draft_present
         )
 
+    def _emit_not_allowed(name: str, bad: str) -> None:
+        name_key = _normalize_aspect_key(name)
+        if name_key in not_allowed_norms:
+            return
+        _emit(
+            log,
+            f"[ASPECT_BLOCK] {sku} {name}={bad} aspect_value_not_allowed".strip(),
+        )
+        blockers.append(f"aspect_value_not_allowed:{name}={bad}")
+        not_allowed_norms.add(name_key)
+
+    # Draft-present SELECTION_ONLY keys that never entered `aspects` (seed
+    # declined) must still be validated — otherwise illegal values vanish
+    # silently when the main loop only walks working aspect keys.
+    for key in list(draft_present):
+        if key in not_allowed_norms:
+            continue
+        canon, raw = draft_by_norm[key]
+        if is_skipped_aspect(canon) or is_gate_hard_aspect(canon):
+            continue
+        mode = _mode_for_name(modes_by_norm, canon)
+        allowed = _allowed_for_name(allowed_by_norm, canon)
+        if not _selection_only_mode(mode) or not allowed:
+            continue
+        draft_vals = _aspect_values(raw)
+        if not draft_vals:
+            continue
+        resolved, bad = _resolve_selection_only_values(draft_vals, allowed)
+        if resolved is None:
+            _emit_not_allowed(canon, bad or draft_vals[0])
+            if key in draft_seeded:
+                existing = _find_aspect_key(aspects, canon)
+                if existing:
+                    aspects.pop(existing, None)
+
     for name in list(aspects.keys()):
         if is_skipped_aspect(name):
             continue
@@ -1129,32 +1170,31 @@ def guard_unsourced_aspects(
 
         mode = _mode_for_name(modes_by_norm, name)
         allowed = _allowed_for_name(allowed_by_norm, name)
+
+        # Always validate working SELECTION_ONLY values (draft or upstream).
         if (
-            draft_was_present
-            and not is_gate_hard_aspect(name)
-            and _selection_only_mode(mode)
+            _selection_only_mode(mode)
             and allowed
-            and draft_vals
+            and values
+            and name_key not in not_allowed_norms
+            and not is_gate_hard_aspect(name)
         ):
-            resolved, bad = _resolve_selection_only_values(draft_vals, allowed)
+            resolved, bad = _resolve_selection_only_values(values, allowed)
             if resolved is None:
-                display = bad or draft_vals[0]
-                _emit(
-                    log,
-                    f"[ASPECT_BLOCK] {sku} {name}={display} aspect_value_not_allowed".strip(),
-                )
-                blockers.append(f"aspect_value_not_allowed:{name}={display}")
-                not_allowed_norms.add(name_key)
-                # Only clear a value we ourselves seeded; never wipe a good
-                # sourced upstream just because the draft was invalid.
-                if draft_was_seeded:
-                    aspects.pop(name, None)
+                display = bad or values[0]
+                _emit_not_allowed(name, display)
+                # Invalid working value cannot ship; clear it. A good upstream
+                # that only failed because a draft was seeded on top was already
+                # handled in the draft-present pass when seed was declined.
+                aspects.pop(name, None)
                 continue
-            if draft_was_seeded:
-                if resolved != values:
-                    _emit(log, f"[ASPECT_NORM] {sku} {name}={resolved}".strip())
-                aspects[name] = resolved
-                values = resolved
+            if resolved != values:
+                _emit(log, f"[ASPECT_NORM] {sku} {name}={resolved}".strip())
+            aspects[name] = resolved
+            values = resolved
+
+        if name_key in not_allowed_norms:
+            continue
 
         # Non-empty descriptive draft field: never apply expected overwrite
         # (seeded draft wins; unseedable draft keeps upstream). Still run
