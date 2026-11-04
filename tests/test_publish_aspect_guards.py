@@ -242,12 +242,13 @@ def test_draft_type_prefix_does_not_match_allowed_and_blocks():
         expected_values_by_name={"Type": "Accent Chair"},
     )
     assert blockers == ["aspect_value_not_allowed:Type=Accent"]
-    assert "Type" not in aspects
+    # Invalid draft does not wipe upstream; SKU still blocked.
+    assert aspects["Type"] == ["Armchair"]
 
 
 def test_free_text_draft_value_not_blocked_by_allowed_list():
-    """FREE_TEXT (or missing mode) must not apply SELECTION_ONLY blocking."""
-    aspects = {"Type": ["Armchair"]}
+    """FREE_TEXT must not apply SELECTION_ONLY blocking; unsourced draft keeps upstream."""
+    aspects = {"Type": ["Accent Chair"]}
     blockers = guard_unsourced_aspects(
         aspects,
         source_text=_TYPE_SOURCE,
@@ -257,10 +258,10 @@ def test_free_text_draft_value_not_blocked_by_allowed_list():
         draft_aspects={"Type": ["Accent Chair Custom"]},
         expected_values_by_name={"Type": "Armchair"},
     )
-    # Custom draft value is not source-supported → stripped → required blocks,
-    # but never aspect_value_not_allowed (that is SELECTION_ONLY-only).
     assert all(not item.startswith("aspect_value_not_allowed:") for item in blockers)
-    assert "unsourced_required_aspect:Type" in blockers
+    # Unsourced FREE_TEXT draft is not seeded over sourced upstream Accent Chair.
+    assert blockers == []
+    assert aspects["Type"] == ["Accent Chair"]
 
 
 def test_missing_required_type_still_blocks_when_no_draft_and_no_inference():
@@ -329,6 +330,154 @@ def test_draft_owned_required_stripped_does_not_get_source_replacement():
     )
     assert "unsourced_required_aspect:Type" in blockers
     assert "Type" not in aspects
+
+
+def test_draft_vs_gate_conflict_blocks_number_of_pieces_and_assembly():
+    aspects = {
+        "Number of Pieces": ["7"],
+        "Assembly Required": ["No"],
+        "Type": ["Dining Set"],
+    }
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=(
+            "5 Piece Dining Table Set with 4 Chairs. Assembly Required: Yes."
+        ),
+        required_names=[],
+        draft_aspects={
+            "Number of Pieces": ["7"],
+            "Assembly Required": ["No"],
+            "Type": ["Dining Set"],
+        },
+        expected_values_by_name={
+            "Number of Pieces": "5",
+            "Assembly Required": "Yes",
+            "Type": "Dining Set",
+        },
+    )
+    assert "aspect_draft_conflicts_gate:Number of Pieces" in blockers
+    assert "aspect_draft_conflicts_gate:Assembly Required" in blockers
+    assert "Number of Pieces" not in aspects
+    assert "Assembly Required" not in aspects
+    # Type is descriptive and source-supported — not a silent gate swap target.
+    assert aspects.get("Type") == ["Dining Set"]
+
+
+def test_unsourced_optional_draft_keeps_sourced_upstream_color():
+    logs = []
+    aspects = {"Color": ["Black"], "Type": ["Cabinet"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Black wood storage cabinet",
+        required_names=[],
+        draft_aspects={"Color": ["Walnut"], "Type": ["Cabinet"]},
+        log=logs.append,
+    )
+    assert blockers == []
+    assert aspects["Color"] == ["Black"]
+    assert any("Walnut" in line and "ASPECT_DRAFT_SKIP" in line for line in logs)
+
+
+def test_unsourced_type_draft_does_not_drop_sourced_upstream_accent_chair():
+    aspects = {"Type": ["Accent Chair"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=_TYPE_SOURCE,
+        required_names=["Type"],
+        allowed_values_by_name={"Type": list(_TYPE_ALLOWED) + ["Apothecary Cabinet"]},
+        aspect_modes_by_name={"Type": "SELECTION_ONLY"},
+        draft_aspects={"Type": ["Apothecary Cabinet"]},
+        expected_values_by_name={"Type": "Armchair"},
+    )
+    assert blockers == []
+    assert aspects["Type"] == ["Accent Chair"]
+
+
+def test_multi_value_selection_only_keeps_all_allowed_values():
+    aspects = {"Style": ["Modern"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Modern Contemporary living room sofa",
+        required_names=[],
+        allowed_values_by_name={
+            "Style": ["Modern", "Contemporary", "Traditional"],
+        },
+        aspect_modes_by_name={"Style": "SELECTION_ONLY"},
+        draft_aspects={"Style": ["Modern", "Contemporary"]},
+    )
+    assert blockers == []
+    assert aspects["Style"] == ["Modern", "Contemporary"]
+
+
+def test_multi_value_selection_only_blocks_any_invalid_value():
+    aspects = {"Style": ["Modern"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Modern living room sofa",
+        required_names=[],
+        allowed_values_by_name={"Style": ["Modern", "Contemporary"]},
+        aspect_modes_by_name={"Style": "SELECTION_ONLY"},
+        draft_aspects={"Style": ["Modern", "Garage"]},
+    )
+    assert blockers == ["aspect_value_not_allowed:Style=Garage"]
+    # Upstream Modern kept — invalid draft must not wipe it.
+    assert aspects["Style"] == ["Modern"]
+
+
+def test_merge_aspects_for_draft_persist_compares_whole_lists():
+    merged = merge_aspects_for_draft_persist(
+        {"Style": [" modern ", "Contemporary"], "Brand": ["AquaVerve"]},
+        {
+            "Style": ["Modern", "Contemporary"],
+            "Brand": ["AquaVerve"],
+            "Color": ["Black"],
+        },
+    )
+    assert merged["Style"] == ["Modern", "Contemporary"]
+    assert merged["Color"] == ["Black"]
+
+
+def test_merge_aspects_persists_full_list_not_truncated_first_value():
+    merged = merge_aspects_for_draft_persist(
+        {"Room": ["Living Room", "Bedroom"]},
+        {"Room": ["Living Room"]},
+    )
+    # Draft whole list wins over a truncated completed form.
+    assert merged["Room"] == ["Living Room", "Bedroom"]
+
+
+def test_aspect_key_normalization_avoids_duplicate_type_keys():
+    aspects = {"type": ["Armchair"]}
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text=_TYPE_SOURCE,
+        required_names=["Type"],
+        allowed_values_by_name={"Type": _TYPE_ALLOWED},
+        aspect_modes_by_name={"Type": "SELECTION_ONLY"},
+        draft_aspects={"Type": ["Accent Chair"]},
+        expected_values_by_name={"Type": "Armchair"},
+    )
+    assert blockers == []
+    # Single logical Type remains (canonical key from upstream spelling).
+    type_keys = [key for key in aspects if key.casefold().strip() == "type"]
+    assert len(type_keys) == 1
+    assert aspects[type_keys[0]] == ["Accent Chair"]
+
+
+def test_motors_fitment_type_unsourced_draft_keeps_upstream_universal():
+    aspects = {
+        "Fitment Type": ["Universal"],
+        "Type": ["Cabin Air Filter"],
+    }
+    blockers = guard_unsourced_aspects(
+        aspects,
+        source_text="Cabin Air Filter universal fit for most vehicles",
+        required_names=[],
+        draft_aspects={"Fitment Type": ["Bogus Fitment"]},
+    )
+    assert blockers == []
+    assert aspects["Fitment Type"] == ["Universal"]
+    assert aspects["Type"] == ["Cabin Air Filter"]
 
 
 def test_merge_aspects_for_draft_persist_keeps_draft_and_writes_empty_autofill():

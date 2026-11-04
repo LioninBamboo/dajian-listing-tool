@@ -1858,6 +1858,7 @@ def publish_single_product(product: dict, dry_run: bool = False) -> dict:
             for blocker in publish_blockers
             if blocker.startswith("unsourced_required_aspect:")
             or blocker.startswith("aspect_value_not_allowed:")
+            or blocker.startswith("aspect_draft_conflicts_gate:")
             or blocker in {
                 "high_insertion_fee",
                 "fee_preview_unavailable",
