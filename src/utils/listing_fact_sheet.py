@@ -1039,6 +1039,11 @@ def compare_fact_sheets(
         source_blob_parts.append(source["capacity"])
     source_blob_text = " | ".join(source_blob_parts)
 
+    from src.utils.claim_source_coverage import (
+        is_hard_claim_phrase,
+        source_supports_claim_phrase,
+    )
+
     generic_terms = set(_GENERIC_MATERIAL_MEMBERS)
     for material in live["materials"]:
         if _generic_material_supported(material, source["materials"]):
@@ -1075,6 +1080,12 @@ def compare_fact_sheets(
     for feature in live["features"]:
         if is_subjective_feature(feature):
             continue
+        # Owner 2026-11-02: a GIGA paraphrase is supported. Hard claims skip
+        # the synonym table and stay on the strict detectors below.
+        if not is_hard_claim_phrase(feature):
+            support_fields = [source_text, source_blob_text, *source["features"]]
+            if source_supports_claim_phrase(feature, *support_fields):
+                continue
         # Grounding A: feature literally in source copy -> supported
         if source_text is not None and _claim_in_text(feature, source_text):
             continue
@@ -1589,6 +1600,16 @@ def check_fact_sheet_violations(
                     continue
             filtered_capacity_violations.append(violation)
         violations = filtered_capacity_violations
+
+    from src.utils.claim_source_coverage import filter_supported_paraphrase_violations
+
+    violations = filter_supported_paraphrase_violations(
+        violations,
+        source_title,
+        source_description,
+        source_attributes,
+        source_specs,
+    )
     
     filtered_violations = []
     for v in violations:
