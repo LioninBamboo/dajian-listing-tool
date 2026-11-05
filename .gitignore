@@ -98,6 +98,10 @@ archive/temp_data/
 /scripts/_*.py.bak*
 /tools/_*.py
 /tools/wave3_*.py
+/tools/w465_listing/
+/tools/w714_listing/
+/tools/restore_stub_images_from_dajian.py
+/docs/CURSOR_WEEKLY_LISTING_HANDOFF_*.md
 
 # OS files
 .DS_Store
