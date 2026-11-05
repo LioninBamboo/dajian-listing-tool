@@ -15,6 +15,7 @@ from typing import Any
 
 from src.utils import listing_fact_sheet as _fact_sheet
 from src.utils import listing_quality_gate as _quality_gate
+from src.utils.claim_source_coverage import filter_supported_paraphrase_violations
 from src.services import qc_experience_registry as _experience_registry
 from src.services.vehicle_compatibility import (
     analyze_ebay_motors_compatibility,
@@ -783,6 +784,13 @@ def _run_motors_listing_qc(
             source_attributes=source_attributes,
             source_specs=source_specs,
         )
+        fact_violations = filter_supported_paraphrase_violations(
+            fact_violations,
+            source_title,
+            source_description,
+            source_attributes,
+            source_specs,
+        )
     except Exception as exc:
         fact_violations = []
         gate_errors.append(f"FactSheet guard error: {exc}")
@@ -1129,7 +1137,16 @@ def run_listing_qc(
         source_attributes=source_attributes,
         source_specs=source_specs,
     )
+    fact_violations = filter_supported_paraphrase_violations(
+        fact_violations,
+        source_title,
+        source_description,
+        source_attributes,
+        source_specs,
+    )
     fact_status = str(fact_result.get("status") or "unavailable").lower()
+    if fact_status == "violations" and not fact_violations:
+        fact_status = "pass"
     if fact_violations and fact_status == "pass":
         fact_status = "violations"
     result["fact_sheet_status"] = fact_status

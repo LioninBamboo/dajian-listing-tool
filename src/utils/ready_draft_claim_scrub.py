@@ -39,6 +39,10 @@ from src.utils.claim_diff_engine import (
     detect_claim_violations,
     leather_claim_kind,
 )
+from src.utils.claim_source_coverage import (
+    FEATURE_CLAIM_TYPES,
+    source_supports_claim_phrase,
+)
 from src.utils.claim_strip import claim_matches_text, claim_pattern, collapse_ws, normalize_entities
 from src.utils.listing_quality_gate import (
     ASSEMBLY_NO_REQUIRED_PATTERNS,
@@ -475,7 +479,18 @@ def collect_flagged_claims(
                 code=code,
             )
         )
-    return found
+    return [
+        item
+        for item in found
+        if item.claim_type not in FEATURE_CLAIM_TYPES
+        or not source_supports_claim_phrase(
+            item.claim_text,
+            source_title,
+            source_description,
+            source_attributes,
+            source_specs,
+        )
+    ]
 
 
 def _blocker_texts(claims: list[FlaggedClaim]) -> list[str]:
