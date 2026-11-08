@@ -7,6 +7,7 @@ this repo without dumping Motors-only history onto GitHub.
 
 from __future__ import annotations
 
+import pytest
 from unittest.mock import MagicMock, patch
 
 from src.services.motors_trading import (
@@ -104,7 +105,7 @@ def test_update_ebay_price_uses_trading_revise_when_channel_is_trading():
             oauth, "W465P475235", 56.63, expected_listing_id="188760790738"
         )
 
-    assert ok is True
+    assert ok.written_price == pytest.approx(56.63)
     post.assert_called_once()
     headers = post.call_args.kwargs["headers"]
     assert headers["X-EBAY-API-CALL-NAME"] == "ReviseFixedPriceItem"
@@ -137,7 +138,7 @@ def test_update_ebay_price_treats_trading_warning_ack_as_success():
             oauth, "W465P475235", 56.63, expected_listing_id="188760790738"
         )
 
-    assert ok is True
+    assert ok.written_price == pytest.approx(56.63)
 
 
 def test_update_ebay_price_uses_inventory_put_on_main_store():
@@ -175,7 +176,7 @@ def test_update_ebay_price_uses_inventory_put_on_main_store():
             oauth, "SKU1", 12.34, expected_listing_id="123"
         )
 
-    assert ok is True
+    assert ok.written_price == pytest.approx(12.34)
     get.assert_called()
     put.assert_called()
     post.assert_not_called()

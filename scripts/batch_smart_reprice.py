@@ -865,12 +865,17 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
     - 守门员自身异常 → fail-closed (返回 PRICE_GUARD_ERROR, 不写 eBay)
 
     Returns:
-        True on successful write.
+        PriceWriteResult on successful write. ``written_price`` is the amount
+        sent to eBay after the guard, which can be above ``new_price``.
         False on guard refusal or write failure.
         PRICE_GUARD_ERROR (false-y str "guard_error") when precheck_price raises.
     """
     # ── 守门员: 死线 + 广告自适应 (与 InventorySyncService 共用) ──
-    from src.services.repricing_guard import precheck_price, reprice_write_channel
+    from src.services.repricing_guard import (
+        PriceWriteResult,
+        precheck_price,
+        reprice_write_channel,
+    )
     try:
         decision = precheck_price(
             sku=sku, new_price=new_price,
@@ -891,7 +896,9 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
         return PRICE_GUARD_ERROR
 
     if reprice_write_channel(expected_listing_id) == "trading":
-        return update_trading_price(oauth, sku, new_price, expected_listing_id)
+        if update_trading_price(oauth, sku, new_price, expected_listing_id):
+            return PriceWriteResult(new_price)
+        return False
 
     token = oauth.get_valid_token()
     headers = {
@@ -935,7 +942,7 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
                     r = requests.put(put_url, headers=headers, json=offer, timeout=60, verify=False)
 
                     if r.status_code in (200, 204):
-                        return True
+                        return PriceWriteResult(new_price)
 
                     err_msg = ''
                     try:
@@ -960,7 +967,7 @@ def update_ebay_price(oauth, sku: str, new_price: float, expected_listing_id: st
                                              else 'needs manual restore')
                                 log.info(f"  {sku}: promotion-aware update OK "
                                         f"(promo {promo_info})")
-                                return True
+                                return PriceWriteResult(new_price)
                             else:
                                 log.error(f"  {sku}: promotion-aware update failed: "
                                          f"{pa_result.get('error', '?')}")
@@ -1386,28 +1393,33 @@ def run_batch_reprice(dry_run: bool = True, send_email: bool = False,
                  f"src={mkt.get('source', 'UNKNOWN')} margin={pricing['margin']:.1%}")
 
         if not dry_run:
+            from src.services.repricing_guard import price_committed_on_ebay
+
             ok = update_ebay_price(oauth, sku, new_price, expected_listing_id=p.get('listing_id'))
             if ok:
+                landed_price = price_committed_on_ebay(ok, new_price)
                 verified, live_price = verify_ebay_price_update(
                     oauth,
                     sku,
-                    new_price,
+                    landed_price,
                     expected_listing_id=p.get('listing_id'),
                 )
                 result['verified_price'] = live_price
                 if verified:
                     result['status'] = 'updated'
+                    result['requested_price'] = new_price
+                    result['new_price'] = landed_price
                     try:
                         db_path = PROJECT_ROOT / "ebay_collection.db"
                         conn = sqlite3.connect(str(db_path))
                         cost_data = p['cost_breakdown']
-                        cost_data['selling_price'] = new_price
+                        cost_data['selling_price'] = landed_price
                         cost_data['market_avg_price'] = market_avg
                         cost_data['pricing_strategy'] = strategy
                         cost_data['repriced_at'] = datetime.now().isoformat()
                         conn.execute(
                             "UPDATE collected_products SET cost_breakdown = ?, suggested_price = ? WHERE sku = ?",
-                            (json.dumps(cost_data), new_price, sku)
+                            (json.dumps(cost_data), landed_price, sku)
                         )
                         conn.commit()
                         conn.close()

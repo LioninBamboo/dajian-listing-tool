@@ -1622,6 +1622,7 @@ class SalesHealthChecker:
         # Import reprice function
         sys.path.insert(0, str(PROJECT_ROOT / 'scripts'))
         from batch_smart_reprice import update_ebay_price, verify_ebay_price_update
+        from src.services.repricing_guard import price_committed_on_ebay
 
         success = 0
         failed = 0
@@ -1637,10 +1638,11 @@ class SalesHealthChecker:
                 expected_listing_id=item.get('listing_id'),
             )
             if ok:
+                landed_price = price_committed_on_ebay(ok, new_price)
                 verified, live_price = verify_ebay_price_update(
                     oauth,
                     sku,
-                    new_price,
+                    landed_price,
                     expected_listing_id=item.get('listing_id'),
                 )
                 if verified:
@@ -1649,7 +1651,7 @@ class SalesHealthChecker:
                         'sku': sku,
                         'action': item.get('action', 'price_cut'),
                         'old_price': item['old_price'],
-                        'new_price': new_price,
+                        'new_price': landed_price,
                         'reason': item['reason'],
                         'status': 'success',
                     })
@@ -1660,7 +1662,7 @@ class SalesHealthChecker:
                             "cost_breakdown = json_set(cost_breakdown, '$.selling_price', ?, '$.health_repriced_at', ?), "
                             "suggested_price = ? "
                             "WHERE sku = ?",
-                            (new_price, datetime.now().isoformat(), new_price, sku)
+                            (landed_price, datetime.now().isoformat(), landed_price, sku)
                         )
                         conn.commit()
                         conn.close()
@@ -1676,7 +1678,7 @@ class SalesHealthChecker:
                     })
                     log.warning(
                         f"  {sku}: auto-fix repricing not verified on eBay "
-                        f"(live={live_price}, expected={new_price:.2f})"
+                        f"(live={live_price}, expected={landed_price:.2f})"
                     )
             else:
                 failed += 1

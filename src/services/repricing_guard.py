@@ -78,6 +78,41 @@ class PriceGuardResult:
             "floor_no_ad": self.floor_no_ad,
         }
 
+
+class PriceWriteResult:
+    """Successful eBay price write.
+
+    Truthy so existing ``if ok`` checks keep working. ``written_price`` is the
+    amount actually sent, which may be higher than the caller's target when
+    the guard lifts a price to the with-ad floor.
+    """
+
+    __slots__ = ("written_price",)
+
+    def __init__(self, written_price: float):
+        self.written_price = float(written_price)
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __repr__(self) -> str:
+        return f"PriceWriteResult(written_price={self.written_price:.2f})"
+
+
+def price_committed_on_ebay(write_result: Any, requested: float) -> float:
+    """Return the price a successful write put on eBay.
+
+    A legacy ``True`` result has no adjusted price and falls back to
+    ``requested``. Verification and local selling-price persistence must use
+    this value, not the pre-guard target.
+    """
+
+    written = getattr(write_result, "written_price", None)
+    if written is None:
+        return float(requested)
+    return float(written)
+
+
 # ─── DB 查询小工具 ───
 
 def _fetch_cost_and_listing(db_path: str, sku: str) -> Tuple[Optional[float], Optional[str]]:

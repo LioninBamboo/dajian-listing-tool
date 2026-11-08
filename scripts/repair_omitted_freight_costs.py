@@ -125,6 +125,7 @@ def apply_live_price(sku: str, listing_id, price: float) -> tuple[bool, str]:
             update_ebay_price,
             verify_ebay_price_update,
         )
+        from src.services.repricing_guard import price_committed_on_ebay
     except Exception as exc:
         return False, f"import_failed: {exc}"
 
@@ -136,8 +137,9 @@ def apply_live_price(sku: str, listing_id, price: float) -> tuple[bool, str]:
         if not ok:
             # Common for already-ended / delisted items — treat as skippable.
             return False, "update_ebay_price_returned_false"
+        landed = price_committed_on_ebay(ok, price)
         verified, live = verify_ebay_price_update(
-            oauth, sku, price, expected_listing_id=listing_id
+            oauth, sku, landed, expected_listing_id=listing_id
         )
         if not verified:
             return False, f"verify_failed live={live}"

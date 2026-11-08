@@ -6,6 +6,7 @@ exceptions now skip the SKU. batch_smart_reprice records status=guard_error.
 
 from __future__ import annotations
 
+import pytest
 from unittest.mock import MagicMock, patch
 
 from src.services.pricing_engine import PricingEngine
@@ -100,7 +101,7 @@ def test_batch_reprice_guard_pass_still_writes_inventory():
             oauth, "SKU-OK", 12.34, expected_listing_id="123"
         )
 
-    assert ok is True
+    assert ok.written_price == pytest.approx(12.34)
     get.assert_called()
     put.assert_called()
     post.assert_not_called()

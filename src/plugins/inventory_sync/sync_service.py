@@ -1518,7 +1518,7 @@ class InventorySyncService:
         """
         # ── 守门员: 死线 + 广告自适应 (统一逻辑见 src/services/repricing_guard.py) ──
         try:
-            from src.services.repricing_guard import precheck_price
+            from src.services.repricing_guard import PriceWriteResult, precheck_price
             decision = precheck_price(
                 sku=sku, new_price=new_price,
                 db_path=self.db_path, allow_ad_disable=True,
@@ -1573,7 +1573,7 @@ class InventorySyncService:
         
         if resp.status_code in [200, 204]:
             self.logger.info(f"Updated {sku} price to ${new_price:.2f}")
-            return True
+            return PriceWriteResult(new_price)
         else:
             # 检查是否被促销阻止
             err_msg = ''
@@ -1597,7 +1597,7 @@ class InventorySyncService:
                         promo_status = '已恢复' if pa_result.get('promotion_restored') else '需手动恢复'
                         self.logger.info(
                             f"✅ {sku}: 促销模式改价成功 ${new_price:.2f} (促销{promo_status})")
-                        return True
+                        return PriceWriteResult(new_price)
                     else:
                         self.logger.error(
                             f"❌ {sku}: 促销模式改价失败: {pa_result.get('error', '?')}")
@@ -1784,20 +1784,24 @@ class InventorySyncService:
         new_selling_price = self.calculate_new_price(product_price, ship)
 
         if not dry_run:
+            from src.services.repricing_guard import price_committed_on_ebay
+
             ebay_ok = self.update_ebay_price(sku, new_selling_price)
             if ebay_ok:
-                verified, live_price = self.verify_ebay_price(sku, new_selling_price)
+                written_price = price_committed_on_ebay(ebay_ok, new_selling_price)
+                verified, live_price = self.verify_ebay_price(sku, written_price)
                 if verified:
                     self.update_product_cost_in_db(
-                        sku, product_price, ship, new_selling_price
+                        sku, product_price, ship, written_price
                     )
+                    new_selling_price = written_price
                     self._incr_price_counter("price_writes")
                     if decision.reason == "below_floor":
                         self._incr_price_counter("floor_raises")
                 else:
                     self.logger.warning(
                         f"  {sku}: eBay 改价返回成功但未通过 live 校验 "
-                        f"(live={live_price}, expected={new_selling_price:.2f})"
+                        f"(live={live_price}, expected={written_price:.2f})"
                     )
                     raise RuntimeError(f"eBay price verification failed for {sku}")
             else:
