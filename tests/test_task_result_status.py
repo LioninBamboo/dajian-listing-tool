@@ -84,3 +84,90 @@ class TestInventoryItemLevelErrors:
             }
         }
         assert classify_daily_task_outcome(results) == "failed"
+
+
+class TestMiSnapshotAutoPrepareItemLevel:
+    """2026-11-18: MI 快照+digest 已落地, 但 auto_prepare 3 条草稿被质检拦住,
+    nested ``failed`` 把整个 ``--mi-only`` 判成 failed, 健康面板误报链路故障。"""
+
+    _SNAPSHOT_OK = {
+        "status": "ok",
+        "opportunities": 30,
+        "snapshot": "mi_opportunities_20261118_104501.json",
+        "auto_prepared": {
+            "success": 0,
+            "failed": 3,
+            "skipped": 1,
+            "requested": 4,
+            "matched": 4,
+            "prepared_skus": [],
+        },
+    }
+
+    def test_qc_blocked_drafts_are_partial_not_failed(self):
+        from src.utils.task_result_status import (
+            classify_daily_task_outcome,
+            exit_code_for_task_results,
+        )
+
+        results = {"mi_snapshot": dict(self._SNAPSHOT_OK)}
+        assert classify_daily_task_outcome(results) == "partial_success"
+        assert exit_code_for_task_results(results) == 2
+
+    def test_missing_snapshot_still_failed(self):
+        from src.utils.task_result_status import classify_daily_task_outcome
+
+        payload = dict(self._SNAPSHOT_OK)
+        payload["snapshot"] = None
+        assert classify_daily_task_outcome({"mi_snapshot": payload}) == "failed"
+
+    def test_snapshot_error_still_failed(self):
+        from src.utils.task_result_status import classify_daily_task_outcome
+
+        results = {
+            "mi_snapshot": {
+                **self._SNAPSHOT_OK,
+                "error": "disk full",
+            }
+        }
+        assert classify_daily_task_outcome(results) == "failed"
+
+    def test_clean_auto_prepare_is_success(self):
+        from src.utils.task_result_status import classify_daily_task_outcome
+
+        results = {
+            "mi_snapshot": {
+                **self._SNAPSHOT_OK,
+                "auto_prepared": {
+                    "success": 4,
+                    "failed": 0,
+                    "requested": 4,
+                    "matched": 4,
+                    "prepared_skus": ["A", "B", "C", "D"],
+                },
+            }
+        }
+        assert classify_daily_task_outcome(results) == "success"
+
+
+class TestFinanceDegradedSkip:
+    def test_finance_degraded_skip_does_not_fail_daily_tasks(self):
+        from src.utils.task_result_status import classify_daily_task_outcome
+
+        results = {
+            "inventory": {"checked_count": 10, "error_count": 0},
+            "finance": {
+                "status": "degraded_skipped",
+                "reason": "HTTPSConnectionPool timed out",
+            },
+        }
+        assert classify_daily_task_outcome(results) == "success"
+
+    def test_finance_error_key_still_failed(self):
+        from src.utils.task_result_status import classify_daily_task_outcome
+
+        results = {
+            "inventory": {"checked_count": 10, "error_count": 0},
+            "finance": {"error": "HTTPSConnectionPool timed out"},
+        }
+        assert classify_daily_task_outcome(results) == "failed"

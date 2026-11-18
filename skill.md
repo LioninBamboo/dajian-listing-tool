@@ -330,7 +330,7 @@ extension/content.js -> POST /api/collect -> server.py -> ebay_collection.db
 
 要求：
 
-- `run_mi_snapshot()` 当前跑在默认 `python daily_tasks.py` 全量工作负载里，没有独立 `--mi-only` 开关。
+- `run_mi_snapshot()` 跑在默认 `python daily_tasks.py` 全量工作负载里；scheduler `task_mi_snapshot` 另外调用 `python daily_tasks.py --mi-only`。
 - `run_mi_snapshot()` 会把命中的 `PENDING` / `COLLECTED` 机会 SKU 自动起草为本地 `READY`，但不会自动刊登。
 - MI 快照写入 `reports/mi_opportunities_*.json`，digest 归档写入 `reports/mi_digest_*.html`。
 - 长周期趋势保存在 `reports/mi_long_window_history.json`，告警抑制状态保存在 `reports/mi_alerts_state.json`，黑名单保存在 `reports/mi_blacklist.json`。
@@ -429,7 +429,7 @@ python daily_tasks.py
 说明：
 
 - 默认全量 `daily_tasks.py` 已包含 MI snapshot、MI digest 和 MI 告警链路。
-- 当前没有独立 `--mi-only` 开关。
+- scheduler `10:00` 的 `task_mi_snapshot` 调用 `python daily_tasks.py --mi-only`，与全量任务解耦。
 
 ### 7.4 手动调价 / 健康诊断
 

@@ -119,7 +119,7 @@ Shipping and image rules:
 
 MI is now a first-class subsystem.
 
-- `daily_tasks.run_mi_snapshot()` runs during the default daily workload. There is currently no standalone `--mi-only` CLI switch.
+- `daily_tasks.run_mi_snapshot()` runs during the default daily workload. `scheduler_daemon.py` also runs `python daily_tasks.py --mi-only` at 10:00.
 - During `run_mi_snapshot()` and the Streamlit MI page's `🚀 开始发掘爆品` action, discovered `PENDING` / `COLLECTED` opportunities are automatically prepared into local `READY` drafts in the background.
 - Those MI auto-draft steps do not publish. Publish remains a separate audit + manual or button-triggered action.
 - `daily_tasks.py` writes MI snapshots to `reports/mi_opportunities_*.json` and archives digest HTML to `reports/mi_digest_*.html`.

@@ -112,19 +112,44 @@ def _is_inventory_item_level_failure(result: Any) -> bool:
     return saw_item_level_failure
 
 
-# Sub-task name -> recognizer for "completed run with item-level errors only".
-_ITEM_LEVEL_FAILURE_RECOGNIZERS = {
-    "smart_reprice": _is_reprice_item_level_failure,
-    "inventory": _is_inventory_item_level_failure,
-    "inventory_sync": _is_inventory_item_level_failure,
-}
-
-
 def _int_field(payload: Mapping[str, Any], key: str) -> int:
     try:
         return int(payload.get(key) or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _is_mi_snapshot_item_level_failure(result: Any) -> bool:
+    """True when the MI snapshot landed but per-SKU auto_prepare QC failed.
+
+    ``run_mi_snapshot`` keeps ``status='ok'`` after writing the snapshot and
+    digest. Nested ``auto_prepared.failed`` counts quality-gate blocked drafts,
+    which must not mark the scheduler ``mi_snapshot`` task as a pipeline miss.
+    """
+
+    if not isinstance(result, Mapping):
+        return False
+    if str(result.get("status") or "").strip().lower() not in {"ok", "success"}:
+        return False
+    if result.get("error"):
+        return False
+    if not result.get("snapshot"):
+        return False
+    auto_prepared = result.get("auto_prepared")
+    if not isinstance(auto_prepared, Mapping):
+        return False
+    if auto_prepared.get("error"):
+        return False
+    return _int_field(auto_prepared, "failed") > 0
+
+
+# Sub-task name -> recognizer for "completed run with item-level errors only".
+_ITEM_LEVEL_FAILURE_RECOGNIZERS = {
+    "smart_reprice": _is_reprice_item_level_failure,
+    "inventory": _is_inventory_item_level_failure,
+    "inventory_sync": _is_inventory_item_level_failure,
+    "mi_snapshot": _is_mi_snapshot_item_level_failure,
+}
 
 
 def is_analyze_soft_degradation(payload: Any) -> bool:
@@ -156,6 +181,9 @@ def classify_daily_task_outcome(results: Any) -> str:
     (and no analyze ``error``) is at least ``partial_success``. An analyze
     ``error`` remains ``failed``. A smart-reprice ``status='partial'`` time-budget
     stop is also ``partial_success`` (not silent success, not failed).
+    ``results['mi_snapshot']`` with ``status='ok'`` and nested
+    ``auto_prepared.failed > 0`` is ``partial_success``; a top-level snapshot
+    ``error`` remains ``failed``.
     """
 
     if not has_task_failure(results):

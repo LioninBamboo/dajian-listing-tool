@@ -2698,7 +2698,10 @@ def main():
             )
         except Exception as e:
             logger.error(f"财务同步异常 (非阻塞): {e}")
-            results['finance'] = {'error': str(e)}
+            results['finance'] = {
+                'status': 'degraded_skipped',
+                'reason': str(e),
+            }
     
     logger.info("\n" + "="*60)
     logger.info("任务完成汇总")
