@@ -119,6 +119,49 @@ def test_no_false_positive_when_source_supports():
     assert not any(v.claim_text == "foldable" for v in violations)
 
 
+def test_not_easy_to_collapse_in_generated_copy_is_not_foldable_claim():
+    """W5501P555488: cushion durability copy is not a foldable product claim."""
+    source = build_source_constraints(
+        {},
+        {},
+        "the seat cushion is soft, skin-friendly and not easy to collapse.",
+        "Upholstered Storage Bench with Forged Iron Frame",
+    )
+    assert "foldable" not in source["supported_features"]
+    violations = detect_claim_violations(
+        source,
+        "Upholstered Storage Bench with Forged Iron Frame 44.1 x 17.7 x 22.4 in Beige",
+        "The seat cushion is soft, skin-friendly and not easy to collapse. "
+        "The humanized sitting design provides stable and comfortable support.",
+        {"Material": ["Linen", "Metal"]},
+    )
+    assert not any(v.claim_text == "foldable" for v in violations)
+
+
+def test_folded_towels_in_generated_copy_is_not_foldable_claim():
+    """N725P497044K: stored folded towels are not a foldable product claim."""
+    source = build_source_constraints(
+        {},
+        {},
+        "from folded towels and toiletries to larger bathroom supplies.",
+        "Bathroom Storage Cabinet",
+    )
+    assert "foldable" not in source["supported_features"]
+    violations = detect_claim_violations(
+        source,
+        "Bathroom Storage Cabinet",
+        "Customize the internal layout from folded towels and toiletries to larger bathroom supplies.",
+        {},
+    )
+    assert not any(v.claim_text == "foldable" for v in violations)
+
+
+def test_real_foldable_generated_claim_still_flags_when_source_unsupported():
+    source = build_source_constraints({}, {}, "A nice chair.", "Chair")
+    violations = detect_claim_violations(source, "Foldable chair", "Easy to fold", {})
+    assert any(v.claim_text == "foldable" for v in violations)
+
+
 def test_foldable_title_only_folding_mattress_is_supported_not_claim_violation():
     """Real W5532-class source: fold evidence only in title ('Folding Mattress')."""
     title = (

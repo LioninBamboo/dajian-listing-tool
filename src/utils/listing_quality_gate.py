@@ -133,6 +133,27 @@ FOLDABLE_SOURCE_EVIDENCE_PATTERNS: tuple[str, ...] = (
     r"折叠",
 )
 
+# Cushion durability ("will not collapse" / "not easy to collapse") and
+# stored-item copy ("folded towels") are not foldable-product evidence.
+# Source arbiter and generated-side claim matching both strip these first.
+_NON_FOLDABLE_COLLAPSE_RE = re.compile(
+    r"\b(?:will|does|do|can)\s+not\s+collaps(?:e|es|ed|ing|ible)\b|"
+    r"\bwon['’]?t\s+collaps(?:e|es|ed|ing|ible)\b|"
+    r"\bnot\s+easy\s+to\s+collaps(?:e|es|ed|ing|ible)\b",
+    flags=re.IGNORECASE,
+)
+_FOLDED_STORED_ITEMS_RE = re.compile(
+    r"\bfolded\s+(?:towels?|clothes|clothing|laundry|blankets?|linens?|items?)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def strip_non_foldable_collapse_copy(text: str) -> str:
+    """Drop durability/stored-item phrases that look like fold/collapse tokens."""
+    cleaned = _NON_FOLDABLE_COLLAPSE_RE.sub(" ", text or "")
+    return _FOLDED_STORED_ITEMS_RE.sub(" ", cleaned)
+
+
 NATURALLY_FOLDABLE_TITLE_KEYWORDS: tuple[str, ...] = (
     "umbrella",
     "camping chair",
@@ -399,14 +420,21 @@ def _generated_claim_locations(
 ) -> list[str]:
     patterns = CLAIM_PATTERNS[claim_name]
     locations: list[str] = []
+    title_text = title
+    description_text = description
+    if claim_name == "foldable":
+        title_text = strip_non_foldable_collapse_copy(title)
+        description_text = strip_non_foldable_collapse_copy(description)
 
-    if _text_matches_any(title, patterns):
+    if _text_matches_any(title_text, patterns):
         locations.append("title")
-    if _text_matches_any(description, patterns):
+    if _text_matches_any(description_text, patterns):
         locations.append("description")
 
     for key, value in aspects.items():
         aspect_text = f"{key}: {' '.join(_as_list(value))}"
+        if claim_name == "foldable":
+            aspect_text = strip_non_foldable_collapse_copy(aspect_text)
         if _text_matches_any(aspect_text, patterns):
             locations.append(f"aspects.{key}")
     return locations
@@ -493,15 +521,7 @@ def source_supports_foldable(
     combined = " ".join(text for _, text in entries)
     combined = re.sub(r"<[^>]+>", " ", combined)
     combined = re.sub(r"\s+", " ", combined)
-    # Cushion durability copy such as "will not collapse after long-term
-    # sitting" describes resistance to deformation, not a foldable product.
-    combined = re.sub(
-        r"\b(?:will|does|do|can)\s+not\s+collaps(?:e|es|ed|ing|ible)\b|"
-        r"\bwon['’]?t\s+collaps(?:e|es|ed|ing|ible)\b",
-        " ",
-        combined,
-        flags=re.IGNORECASE,
-    )
+    combined = strip_non_foldable_collapse_copy(combined)
     return any(
         re.search(pattern, combined, flags=re.IGNORECASE)
         for pattern in FOLDABLE_SOURCE_EVIDENCE_PATTERNS

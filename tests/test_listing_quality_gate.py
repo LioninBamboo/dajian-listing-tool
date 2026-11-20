@@ -1783,6 +1783,40 @@ def test_quality_gate_blocks_unsupported_foldable_claim_from_ai_draft():
     assert any(issue.code == "unsupported_foldable_claim" for issue in issues)
 
 
+def test_quality_gate_does_not_treat_cushion_durability_collapse_as_foldable():
+    """W5501-class: 'not easy to collapse' is cushion durability, not a fold claim."""
+    source_description = (
+        "<div>the seat cushion is soft, skin-friendly and not easy to collapse. "
+        "The humanized sitting design provides stable and comfortable support.</div>"
+    )
+    generated = {
+        "title": "Upholstered Storage Bench with Forged Iron Frame",
+        "description": source_description,
+        "categoryId": "20468",
+        "categoryName": "Benches",
+        "aspects": {
+            "Brand": ["AquaVerve"],
+            "Item Length": ["44.1 in"],
+            "Item Width": ["17.7 in"],
+            "Item Height": ["22.4 in"],
+            "Type": ["Storage Bench"],
+        },
+    }
+    issues = validate_listing_quality(
+        generated,
+        source_title="Upholstered Storage Bench with Forged Iron Frame",
+        source_description=source_description,
+        attributes={
+            "Assembled Length (in.)": "44.1",
+            "Assembled Width (in.)": "17.7",
+            "Assembled Height (in.)": "22.4",
+        },
+        specs={},
+        images=["img1", "img2"],
+    )
+    assert not any(issue.code == "unsupported_foldable_claim" for issue in issues)
+
+
 def test_normalize_generated_listing_restores_supported_foldable_feature():
     normalized = normalize_generated_listing(
         {
@@ -2057,6 +2091,24 @@ class TestFoldableArbiterInflections:
         from src.utils.listing_quality_gate import source_supports_foldable
         assert source_supports_foldable(
             source_description="The high-density sponge cushion will not collapse after long-term sitting."
+        ) is False
+
+    def test_not_easy_to_collapse_is_not_foldable_evidence(self):
+        from src.utils.listing_quality_gate import source_supports_foldable
+        assert source_supports_foldable(
+            source_description=(
+                "the seat cushion is soft, skin-friendly and not easy to collapse. "
+                "The humanized sitting design provides stable and comfortable support."
+            )
+        ) is False
+
+    def test_folded_towels_are_not_foldable_evidence(self):
+        from src.utils.listing_quality_gate import source_supports_foldable
+        assert source_supports_foldable(
+            source_description=(
+                "Customize the internal layout to accommodate items of different sizes, "
+                "from folded towels and toiletries to larger bathroom supplies."
+            )
         ) is False
 
 

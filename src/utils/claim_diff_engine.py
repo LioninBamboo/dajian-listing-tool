@@ -600,12 +600,15 @@ def _check_feature_claims(
     violations = []
     generated_text = _get_generated_text(generated_title, generated_description, generated_aspects)
     supported_features = source_constraints.get("supported_features", set())
+    from src.utils.listing_quality_gate import strip_non_foldable_collapse_copy
+    foldable_generated_text = strip_non_foldable_collapse_copy(generated_text)
     
     for feature_name, patterns in FEATURE_CLAIM_PATTERNS.items():
         if feature_name == "foldable" and source_constraints.get("naturally_foldable"):
             continue
-            
-        generated_has = any(re.search(p, generated_text) for p in patterns)
+
+        match_text = foldable_generated_text if feature_name == "foldable" else generated_text
+        generated_has = any(re.search(p, match_text) for p in patterns)
         source_has = feature_name in supported_features
         
         if generated_has and not source_has:
