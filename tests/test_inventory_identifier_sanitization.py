@@ -33,9 +33,9 @@ def test_identifier_sanitizer_backfills_mpn_for_unbranded_items():
     )
 
     assert brand == "Unbranded"
-    assert mpn == "Does Not Apply"
+    assert mpn == "Does not apply"
     assert identifiers == {}
-    assert aspects["MPN"] == ["Does Not Apply"]
+    assert aspects["MPN"] == ["Does not apply"]
 
 
 def test_identifier_sanitizer_preserves_official_unavailable_upc_text():
@@ -51,9 +51,26 @@ def test_identifier_sanitizer_preserves_official_unavailable_upc_text():
     )
 
     assert brand == "AquaVerve"
-    assert mpn == ""
+    assert mpn == "Does not apply"
     assert identifiers == {"upc": ["Does not apply"]}
     assert aspects["UPC"] == ["Does not apply"]
+    assert aspects["MPN"] == ["Does not apply"]
+
+
+def test_identifier_sanitizer_backfills_mpn_for_house_brand():
+    """House-brand furniture still needs BrandMPN for getListingFees."""
+    aspects = {"Brand": ["AquaVerve"]}
+
+    brand, mpn, identifiers = _sanitize_inventory_identifiers(
+        "W708P588816",
+        aspects,
+        {},
+    )
+
+    assert brand == "AquaVerve"
+    assert mpn == "Does not apply"
+    assert identifiers == {}
+    assert aspects["MPN"] == ["Does not apply"]
 
 
 def test_missing_upc_publish_error_adds_official_unavailable_marker():

@@ -126,8 +126,10 @@ def _sanitize_inventory_identifiers(
     brand = str(product.get("brand") or _first_text_value(cleaned_aspects.get("Brand"))).strip()
     mpn = str(product.get("mpn") or _first_text_value(cleaned_aspects.get("MPN"))).strip()
 
-    if brand.lower() in UNBRANDED_MARKERS and not mpn:
-        mpn = "Does Not Apply"
+    if brand and not mpn:
+        # House brand (AquaVerve) still needs BrandMPN for getListingFees.
+        # eBay US official unavailable text: "Does not apply".
+        mpn = PRODUCT_IDENTIFIER_UNAVAILABLE_TEXT
         cleaned_aspects["MPN"] = [mpn]
 
     identifiers: dict[str, list[str]] = {}
