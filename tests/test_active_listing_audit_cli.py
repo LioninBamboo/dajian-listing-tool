@@ -3955,3 +3955,22 @@ def test_source_detail_prefetch_uses_batch_endpoint():
     cached = audit_fix_active_listings._CachedSourceDetailClient(details)
     assert cached.get_product_detail_by_sku("S3")["productName"] == "Product S3"
     assert cached.get_product_detail_by_sku("missing") is None
+
+
+def test_seating_capacity_keep_list_includes_stool():
+    """Shop/counter stools keep Seating Capacity; coffee tables still drop it."""
+    should_remove = audit_fix_active_listings.NON_APPLICABLE_RULES["Seating Capacity"]
+    assert should_remove("ceramic coffee table rectangular white modern") is True
+    assert should_remove("10x10 ft outdoor gazebo party tent steel frame") is True
+    assert should_remove(
+        "heavy duty hydraulic shop stool adjustable mechanic stool"
+    ) is False
+    assert should_remove(
+        "vienna contemporary fabric tufted wingback 31 inch counter stools"
+    ) is False
+    assert should_remove(
+        "bar table set of 3 with pu leather upholstered stools"
+    ) is False
+    assert should_remove("modern chenille sofa") is False
+    assert should_remove("dining chair set of 2") is False
+

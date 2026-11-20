@@ -200,7 +200,9 @@ NON_APPLICABLE_RULES = {
     "Compatible Mattress Size": lambda t: not any(kw in t for kw in BED_KEYWORDS),
     "For Gun Type": lambda t: not any(kw in t for kw in SAFE_KEYWORDS),
     "Firmness": lambda t: "mattress" not in t,
-    "Seating Capacity": lambda t: not any(kw in t for kw in ["sofa", "chair", "bench", "couch", "dining"]),
+    "Seating Capacity": lambda t: not any(
+        kw in t for kw in ["sofa", "chair", "bench", "couch", "dining", "stool"]
+    ),
 }
 
 WOOD_SPECIES_PATTERNS = {
