@@ -52,6 +52,7 @@ This file is for future coding agents working in this repository. It is intentio
 - Daily MI snapshot first recycles eligible local `ENDED` rows back to `PENDING` (`recycle_ended_for_mi`, cap `MI_ENDED_RECYCLE_LIMIT` default 20). `DELISTED` is not recycled.
 - The same snapshot then ingests bounded GigaCloud-uncollected SKUs as `PENDING` (`ingest_uncollected_for_mi`, cap `MI_GIGA_INGEST_LIMIT` default 10). Live, ENDED, DELISTED, low-score, auto-family, and zero-stock SKUs are skipped.
 - `scheduler_daemon.py` `task_mi_snapshot()` runs `python daily_tasks.py --mi-only`. Snapshot + digest success with per-SKU auto_prepare QC failures is `partial_success` (exit 2), not a pipeline miss. A top-level `mi_snapshot.error` remains `failed`.
+- Completed `smart_reprice` with `status='ok'` and `summary.errors == 0` is pipeline success even when nested `marketplace_insights_access.error` / `market_research.*.error` is Marketplace Insights 403; Browse fallback already priced the catalog. Per-SKU write errors in `summary.errors` stay `partial_success`.
 - `scheduler_daemon.py` runs `task_mi_self_check()` at `09:35`; it must treat missing snapshot, missing digest, missing or empty trend history, unreadable trend history, and stale trend state as failures.
 - MI diagnostic entrypoint is `python scripts/mi_diagnose.py` or `python scripts/mi_diagnose.py --json`.
 - MI artifacts live in `reports/mi_opportunities_*.json`, `reports/mi_digest_*.html`, `reports/mi_long_window_history.json`, `reports/mi_alerts_state.json`, and `reports/mi_blacklist.json`.

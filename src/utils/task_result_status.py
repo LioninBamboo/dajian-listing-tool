@@ -53,6 +53,14 @@ def has_task_failure(result: Any) -> bool:
     return False
 
 
+def _is_reprice_completed(result: Any) -> bool:
+    if not isinstance(result, Mapping):
+        return False
+    if str(result.get("status") or "").strip().lower() not in {"ok", "success", "partial"}:
+        return False
+    return isinstance(result.get("summary"), Mapping)
+
+
 def _is_reprice_item_level_failure(result: Any) -> bool:
     """Return True only for a completed repricing run with failed SKU rows.
 
@@ -62,17 +70,28 @@ def _is_reprice_item_level_failure(result: Any) -> bool:
     apply a second set of price changes.
     """
 
-    if not isinstance(result, Mapping):
-        return False
-    if str(result.get("status") or "").strip().lower() not in {"ok", "success", "partial"}:
+    if not _is_reprice_completed(result):
         return False
     summary = result.get("summary")
-    if not isinstance(summary, Mapping):
-        return False
     try:
         return int(summary.get("errors") or 0) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _is_reprice_market_fallback_noise(result: Any) -> bool:
+    """Completed reprice whose only nested errors are Insights/Browse fallbacks.
+
+    Marketplace Insights 403 is expected on stores without that scope. The
+    catalog still prices via Browse. Nested ``error`` keys must not fail the
+    daily pipeline after ``summary.errors == 0``.
+    """
+
+    if not _is_reprice_completed(result):
+        return False
+    if _is_reprice_item_level_failure(result):
+        return False
+    return str(result.get("status") or "").strip().lower() in {"ok", "success"}
 
 
 def _is_inventory_item_level_failure(result: Any) -> bool:
@@ -183,7 +202,9 @@ def classify_daily_task_outcome(results: Any) -> str:
     stop is also ``partial_success`` (not silent success, not failed).
     ``results['mi_snapshot']`` with ``status='ok'`` and nested
     ``auto_prepared.failed > 0`` is ``partial_success``; a top-level snapshot
-    ``error`` remains ``failed``.
+    ``error`` remains ``failed``. A completed ``smart_reprice`` with
+    ``status='ok'`` / ``summary.errors == 0`` and nested Marketplace Insights
+    403 fallback errors is ``success``.
     """
 
     if not has_task_failure(results):
@@ -199,18 +220,26 @@ def classify_daily_task_outcome(results: Any) -> str:
     # Every failing sub-task must be a completed run whose only errors are
     # item-level; one genuine task failure still makes the whole run "failed".
     saw_item_level = False
+    saw_ignored_noise = False
     for task_name, payload in results.items():
         if not has_task_failure(payload):
             continue
         if task_name == "analyze" and is_analyze_soft_degradation(payload):
             saw_item_level = True
             continue
+        if task_name == "smart_reprice" and _is_reprice_market_fallback_noise(payload):
+            saw_ignored_noise = True
+            continue
         recognizer = _ITEM_LEVEL_FAILURE_RECOGNIZERS.get(task_name)
         if recognizer is not None and recognizer(payload):
             saw_item_level = True
             continue
         return "failed"
-    return "partial_success" if saw_item_level else "failed"
+    if saw_item_level:
+        return "partial_success"
+    if saw_ignored_noise:
+        return "success"
+    return "failed"
 
 
 def exit_code_for_task_results(results: Any) -> int:

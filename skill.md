@@ -430,6 +430,7 @@ python daily_tasks.py
 
 - 默认全量 `daily_tasks.py` 已包含 MI snapshot、MI digest 和 MI 告警链路。
 - scheduler `10:00` 的 `task_mi_snapshot` 调用 `python daily_tasks.py --mi-only`，与全量任务解耦。
+- 改价已完成（`smart_reprice.status=ok` 且 `summary.errors=0`）时，嵌套的 Marketplace Insights 403（`marketplace_insights_access.error`）不算链路失败；Browse fallback 已给目录定价。`summary.errors > 0` 仍是 `partial_success`。
 
 ### 7.4 手动调价 / 健康诊断
 

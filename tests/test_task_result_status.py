@@ -171,3 +171,44 @@ class TestFinanceDegradedSkip:
             "finance": {"error": "HTTPSConnectionPool timed out"},
         }
         assert classify_daily_task_outcome(results) == "failed"
+
+
+class TestRepriceInsightsFallback:
+    """2026-11-19: catalog reprice finished (264 writes, summary.errors=0) but
+    nested marketplace_insights_access.error 403 failed the whole daily_tasks
+    run. Browse fallback already priced the catalog."""
+
+    _REPRICE_OK = {
+        "status": "ok",
+        "summary": {"total": 1470, "price_changes": 264, "errors": 0},
+        "marketplace_insights_access": {
+            "error": "Insufficient permissions to fulfill the request.",
+        },
+        "market_research": {
+            "79691": {"error": "Insufficient permissions to fulfill the request."},
+        },
+    }
+
+    def test_insights_403_after_completed_reprice_is_success(self):
+        from src.utils.task_result_status import (
+            classify_daily_task_outcome,
+            exit_code_for_task_results,
+        )
+
+        results = {"smart_reprice": dict(self._REPRICE_OK)}
+        assert classify_daily_task_outcome(results) == "success"
+        assert exit_code_for_task_results(results) == 0
+
+    def test_insights_403_plus_sku_write_errors_is_partial(self):
+        from src.utils.task_result_status import classify_daily_task_outcome
+
+        payload = dict(self._REPRICE_OK)
+        payload["summary"] = {"total": 1470, "price_changes": 264, "errors": 3}
+        assert classify_daily_task_outcome({"smart_reprice": payload}) == "partial_success"
+
+    def test_reprice_top_level_error_still_failed(self):
+        from src.utils.task_result_status import classify_daily_task_outcome
+
+        assert classify_daily_task_outcome(
+            {"smart_reprice": {"status": "error", "error": "token expired"}}
+        ) == "failed"
