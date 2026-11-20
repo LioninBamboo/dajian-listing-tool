@@ -171,3 +171,58 @@ def test_calculate_smart_final_price_stores_live_stock(monkeypatch):
     assert product["shipping"] == 12.0
     assert product["live_quantity"] == 0
     assert product["live_in_stock"] is False
+
+
+def test_calculate_smart_final_price_costs_on_promo_caps_on_list(monkeypatch):
+    import sys
+    import types
+
+    product = {
+        "sku": "W3912P584678",
+        "price": 26.1,
+        "shipping": 18.09,
+        "suggested_price": 0,
+        "attributes": {},
+        "specs": {},
+        "cost_breakdown": {"total_dajian_cost": 44.19},
+    }
+
+    class _FakeClient:
+        def __init__(self, key, secret):
+            pass
+
+        def get_stock_info(self, sku):
+            return {
+                "in_stock": True,
+                "quantity": 100,
+                "price": 29.0,
+                "list_price": 29.0,
+                "effective_price": 26.1,
+                "shipping_fee": 18.09,
+            }
+
+    class _PE:
+        @staticmethod
+        def calculate_selling_price(cost, margin):
+            return {"selling_price": round(float(cost) * (1 + margin), 2)}
+
+        @staticmethod
+        def calculate_dajian_cost(price, shipping, is_oversize=False):
+            return {"total_dajian_cost": float(price) + float(shipping), "unit": float(price)}
+
+    fake_mod = types.ModuleType("src.clients.dajian_client")
+    fake_mod.DaJianClient = _FakeClient
+    monkeypatch.setitem(sys.modules, "src.clients.dajian_client", fake_mod)
+    monkeypatch.setenv("DAJIAN_API_KEY", "k")
+    monkeypatch.setenv("DAJIAN_API_SECRET", "s")
+    monkeypatch.setattr(batch_publish, "PricingEngine", _PE)
+
+    final = batch_publish.calculate_smart_final_price(product, market_price=None)
+
+    assert final > 0
+    assert product["price"] == 26.1
+    assert product["shipping"] == 18.09
+    assert product["specs"]["_supplier_list_price"] == 29.0
+    assert product["cost_breakdown"]["total_dajian_cost"] == 44.19
+    assert product["live_quantity"] == 100
+    assert product["live_in_stock"] is True

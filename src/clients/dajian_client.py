@@ -30,6 +30,31 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
 
 
+def _positive_money(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number <= 0:
+        return None
+    return number
+
+
+def resolve_supplier_unit_prices(price_info: Optional[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    """Split GIGA list price from an active promo for cap vs landed-cost."""
+    info = price_info if isinstance(price_info, dict) else {}
+    list_price = _positive_money(info.get("price"))
+    discounted = _positive_money(info.get("discountedPrice"))
+    exclusive = _positive_money(info.get("exclusivePrice"))
+    effective = discounted or exclusive or list_price
+    return {
+        "list_price": list_price,
+        "discounted_price": discounted,
+        "exclusive_price": exclusive,
+        "effective_price": effective,
+    }
+
+
 def extract_available_inventory_quantity(inventory_info: Optional[Dict]) -> int:
     """Prefer buyer-allocated quantity; fall back to seller-available quantity."""
     if not isinstance(inventory_info, dict):
@@ -847,9 +872,11 @@ class DaJianClient:
     def get_stock_info(self, sku: str) -> Dict:
         """
         获取库存信息 (使用官方 API)
-        
-        Returns:
-            {"in_stock": bool, "quantity": int, "price": float, "shipping_fee": float, "total_cost": float}
+
+        ``price`` / ``list_price`` are the pre-discount unit price used by the
+        $250 goods-value cap. ``effective_price`` prefers an active promo
+        (discountedPrice, then exclusivePrice) for landed-cost math.
+        ``total_cost`` is effective_price + shipping.
         """
         # 使用官方价格 API 获取价格和是否可购买
         price_info = self.get_product_price(sku)
@@ -857,7 +884,9 @@ class DaJianClient:
             return {"in_stock": False, "quantity": 0, "price": 0, "error": "Product not found in price API"}
         
         available = price_info.get("skuAvailable", False)
-        price = float(price_info.get("price", 0) or 0)
+        prices = resolve_supplier_unit_prices(price_info)
+        list_price = prices["list_price"] or 0.0
+        effective = prices["effective_price"] or 0.0
         shipping = float(price_info.get("shippingFee", 0) or 0)
         currency = str(price_info.get("currency") or "").strip() or None
         
@@ -875,9 +904,13 @@ class DaJianClient:
         payload = {
             "in_stock": in_stock,
             "quantity": qty,
-            "price": price,
+            "price": list_price,
+            "list_price": list_price,
+            "discounted_price": prices["discounted_price"],
+            "exclusive_price": prices["exclusive_price"],
+            "effective_price": effective,
             "shipping_fee": shipping,
-            "total_cost": price + shipping
+            "total_cost": effective + shipping,
         }
         if currency:
             payload["currency"] = currency

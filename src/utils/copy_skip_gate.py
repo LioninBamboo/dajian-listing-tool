@@ -286,7 +286,11 @@ def evaluate_goods_value_cap(
     currency always blocks. When ``apply`` is False (eBay-listing drafts
     without a live GIGA quote) the cap is not applied.
     """
-    amount, value_ccy, parse_err = parse_supplier_unit_price(product_price)
+    cap_price = product_price
+    mapped_list = _as_float((specs or {}).get("_supplier_list_price")) if isinstance(specs, Mapping) else None
+    if mapped_list is not None and mapped_list > 0:
+        cap_price = mapped_list
+    amount, value_ccy, parse_err = parse_supplier_unit_price(cap_price)
     explicit = None if currency in (None, "") else str(currency).strip()
     mapped = _currency_from_maps(specs, attributes)
     named = explicit or mapped or value_ccy
@@ -351,19 +355,35 @@ def lookup_live_supplier_quote(sku: str) -> dict[str, Any] | None:
         return None
     if info.get("error"):
         return None
-    price = _as_float(info.get("price"))
+    list_price = _as_float(info.get("list_price")) or _as_float(info.get("price"))
+    effective = _as_float(info.get("effective_price")) or list_price
     shipping = _as_float(info.get("shipping_fee"))
-    if (price is None or price <= 0) and (shipping is None or shipping <= 0):
+    if (effective is None or effective <= 0) and (shipping is None or shipping <= 0):
         return None
     quote: dict[str, Any] = {}
-    if price is not None and price > 0:
-        quote["price"] = price
+    if effective is not None and effective > 0:
+        quote["price"] = effective
+    if list_price is not None and list_price > 0:
+        quote["list_price"] = list_price
     if shipping is not None and shipping >= 0 and "price" in quote:
         quote["shipping"] = shipping
     ccy = info.get("currency")
     if ccy not in (None, ""):
         quote["currency"] = str(ccy).strip()
     return quote or None
+
+
+def _product_field(product: Any, name: str) -> Any:
+    if isinstance(product, dict):
+        return product.get(name)
+    return getattr(product, name, None)
+
+
+def _set_product_field(product: Any, name: str, value: Any) -> None:
+    if isinstance(product, dict):
+        product[name] = value
+    else:
+        setattr(product, name, value)
 
 
 def apply_live_supplier_quote(product: Any, quote: Mapping[str, Any] | None) -> bool:
@@ -373,12 +393,26 @@ def apply_live_supplier_quote(product: Any, quote: Mapping[str, Any] | None) -> 
     changed = False
     price = _as_float(quote.get("price"))
     shipping = _as_float(quote.get("shipping"))
-    if price is not None and price > 0 and _as_float(getattr(product, "price", None)) != price:
-        product.price = price
+    if price is not None and price > 0 and _as_float(_product_field(product, "price")) != price:
+        _set_product_field(product, "price", price)
         changed = True
-    if shipping is not None and shipping >= 0 and _as_float(getattr(product, "shipping", None)) != shipping:
-        product.shipping = shipping
+    if shipping is not None and shipping >= 0 and _as_float(_product_field(product, "shipping")) != shipping:
+        _set_product_field(product, "shipping", shipping)
         changed = True
+    list_price = _as_float(quote.get("list_price"))
+    if list_price is not None and list_price > 0:
+        if isinstance(product, dict):
+            specs = dict(product.get("specs") or {})
+            if specs.get("_supplier_list_price") != round(list_price, 2):
+                specs["_supplier_list_price"] = round(list_price, 2)
+                product["specs"] = specs
+                changed = True
+        else:
+            specs = dict(getattr(product, "specs", None) or {})
+            if specs.get("_supplier_list_price") != round(list_price, 2):
+                specs["_supplier_list_price"] = round(list_price, 2)
+                product.specs = specs
+                changed = True
     ccy = quote.get("currency")
     if ccy not in (None, ""):
         value = str(ccy).strip()

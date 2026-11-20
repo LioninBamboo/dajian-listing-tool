@@ -83,6 +83,8 @@ def main():
             live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(product.sku))
             apply_cargo = cargo_gate_applies(specs, live_quote_applied=live_applied)
             if live_applied:
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(product, "specs")
                 print(f"  💲 Live supplier quote: price=${product.price} ship=${product.shipping}")
 
             dajian_costs = PricingEngine.calculate_dajian_cost(

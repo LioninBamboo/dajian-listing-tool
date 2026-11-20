@@ -257,6 +257,7 @@ def analyze_collected_products(
 
                 live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(product.sku))
                 if live_applied:
+                    _flag_modified(product, "specs")
                     logger.info(
                         f"  💲 Live supplier quote: price=${product.price} ship=${product.shipping}"
                     )

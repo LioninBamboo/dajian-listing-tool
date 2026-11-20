@@ -1102,18 +1102,24 @@ def calculate_smart_final_price(product: dict, market_price: float | None = None
         secret = os.getenv("DAJIAN_API_SECRET")
         if key and secret:
             info = DaJianClient(key, secret).get_stock_info(product.get("sku") or "")
-            live_price = info.get("price")
-            live_ship = info.get("shipping_fee")
             if "quantity" in info:
                 product["live_quantity"] = int(info.get("quantity") or 0)
             if "in_stock" in info:
                 product["live_in_stock"] = bool(info.get("in_stock"))
-            if live_price is not None:
-                product_price = float(live_price)
-                product["price"] = product_price
-            if live_ship is not None:
-                shipping = float(live_ship)
-                product["shipping"] = shipping
+            from src.utils.copy_skip_gate import apply_live_supplier_quote
+
+            list_price = info.get("list_price") or info.get("price")
+            quote = {
+                "price": info.get("effective_price") or list_price,
+                "list_price": list_price,
+            }
+            if info.get("shipping_fee") is not None:
+                quote["shipping"] = info.get("shipping_fee")
+            if info.get("currency") not in (None, ""):
+                quote["currency"] = info.get("currency")
+            apply_live_supplier_quote(product, quote)
+            product_price = float(product.get("price") or 0)
+            shipping = float(product.get("shipping") or 0)
             logger.info(
                 f"  [PRICE] Live supplier cost: price=${product_price:.2f} "
                 f"ship=${shipping:.2f}"

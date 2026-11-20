@@ -682,6 +682,7 @@ def analyze_product_task(sku: str):
         live_applied = apply_live_supplier_quote(product, lookup_live_supplier_quote(sku))
         apply_cargo = cargo_gate_applies(specs, live_quote_applied=live_applied)
         if live_applied:
+            flag_modified(product, "specs")
             logging.info(
                 f"[PRICE] {sku} live supplier quote: price=${product.price} ship=${product.shipping}"
             )
